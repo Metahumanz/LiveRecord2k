@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   Download,
   FileVideo,
+  FileCode2,
   FolderOpen,
   Gauge,
   HardDrive,
@@ -24,6 +25,7 @@ import {
   Radio,
   RefreshCw,
   Save,
+  Scissors,
   Settings2,
   Sparkles,
   Square,
@@ -31,14 +33,26 @@ import {
   Video,
   X
 } from 'lucide-react';
-import type { AppSettings, AppState, LogEntry, RoomState } from './vite-env';
+import type { AppSettings, AppState, ExportResult, LogEntry, RecordingState, RoomState } from './vite-env';
 import { recorder } from './recorderClient';
 
-type Page = 'overview' | 'rooms' | 'settings' | 'logs';
+type Page = 'overview' | 'rooms' | 'export' | 'settings' | 'logs';
+
+type ExportDraft = {
+  cleanPath: string;
+  danmakuPath: string;
+  cssPath: string;
+  startTime: string;
+  endTime: string;
+  mode: 'clean' | 'burn';
+  overlayMode: AppSettings['burnOverlayMode'];
+  outputDir: string;
+};
 
 const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
   { id: 'overview', label: '总览', icon: <Home size={20} /> },
   { id: 'rooms', label: '直播间', icon: <ListVideo size={20} /> },
+  { id: 'export', label: '剪辑', icon: <Scissors size={20} /> },
   { id: 'settings', label: '设置', icon: <Settings2 size={20} /> },
   { id: 'logs', label: '日志', icon: <MessageSquareText size={20} /> }
 ];
@@ -65,17 +79,39 @@ const containerOptions = [
   { label: 'MKV', value: 'mkv' }
 ] as const;
 
+const overlayModeOptions = [
+  { label: '仅弹幕', value: 'danmaku' },
+  { label: '弹幕和礼物', value: 'danmaku-gift' }
+] as const;
+
+const exportModeOptions = [
+  { label: '纯净片段', value: 'clean' },
+  { label: '烧录片段', value: 'burn' }
+] as const;
+
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
   const [state, setState] = useState<AppState | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
   const [roomInput, setRoomInput] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
+  const [exportDraft, setExportDraft] = useState<ExportDraft>({
+    cleanPath: '',
+    danmakuPath: '',
+    cssPath: '',
+    startTime: '00:00:00',
+    endTime: '',
+    mode: 'clean',
+    overlayMode: 'danmaku-gift',
+    outputDir: ''
+  });
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
 
   useEffect(() => {
     recorder.getInitialState().then((nextState) => {
       setState(nextState);
       setSettingsDraft(nextState.settings);
+      setExportDraft((current) => hydrateExportDraft(current, nextState));
     });
     return recorder.onStateChanged((nextState) => {
       setState(nextState);
@@ -88,6 +124,7 @@ export default function App() {
         }
         return current;
       });
+      setExportDraft((current) => hydrateExportDraft(current, nextState));
     });
   }, []);
 
@@ -128,6 +165,55 @@ export default function App() {
       return;
     }
     await run('image-mode', () => recorder.saveSettings({ roomImageMode: mode }));
+  }
+
+  function selectExportRecording(recording: RecordingState) {
+    setExportResult(null);
+    setExportDraft((current) => ({
+      ...current,
+      cleanPath: recording.cleanPath,
+      danmakuPath: recording.danmakuPath || '',
+      cssPath: recording.cssPath || '',
+      overlayMode: state?.settings.burnOverlayMode || current.overlayMode,
+      outputDir: current.outputDir || state?.settings.outputDir || ''
+    }));
+  }
+
+  async function prepareExportSubtitles() {
+    setBusy('export-subtitles');
+    try {
+      const result = await recorder.prepareSubtitleAssets({
+        cleanPath: exportDraft.cleanPath,
+        danmakuPath: exportDraft.danmakuPath,
+        cssPath: exportDraft.cssPath,
+        startTime: exportDraft.startTime,
+        endTime: exportDraft.endTime,
+        overlayMode: exportDraft.overlayMode,
+        outputDir: exportDraft.outputDir
+      });
+      setExportResult(result);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function exportClip() {
+    setBusy('export-clip');
+    try {
+      const result = await recorder.exportClip({
+        mode: exportDraft.mode,
+        cleanPath: exportDraft.cleanPath,
+        danmakuPath: exportDraft.danmakuPath,
+        cssPath: exportDraft.cssPath,
+        startTime: exportDraft.startTime,
+        endTime: exportDraft.endTime,
+        overlayMode: exportDraft.overlayMode,
+        outputDir: exportDraft.outputDir
+      });
+      setExportResult(result);
+    } finally {
+      setBusy(null);
+    }
   }
 
   if (!state || !settingsDraft) {
@@ -185,11 +271,25 @@ export default function App() {
           <RoomsPage
             rooms={state.rooms}
             roomImageMode={state.settings.roomImageMode}
+            burnOverlayMode={state.settings.burnOverlayMode}
             onRoomImageModeChange={changeRoomImageMode}
             roomInput={roomInput}
             setRoomInput={setRoomInput}
             addRoom={addRoom}
             busy={busy}
+            run={run}
+          />
+        ) : null}
+        {page === 'export' ? (
+          <ExportPage
+            state={state}
+            draft={exportDraft}
+            result={exportResult}
+            busy={busy}
+            setDraft={setExportDraft}
+            selectRecording={selectExportRecording}
+            prepareSubtitles={prepareExportSubtitles}
+            exportClip={exportClip}
             run={run}
           />
         ) : null}
@@ -280,6 +380,7 @@ function OverviewPage({
                 key={room.id}
                 room={room}
                 roomImageMode={state.settings.roomImageMode}
+                burnOverlayMode={state.settings.burnOverlayMode}
                 busy={null}
                 run={run}
               />
@@ -385,6 +486,7 @@ function updateTitle(status: AppState['update']['status']) {
 function RoomsPage({
   rooms,
   roomImageMode,
+  burnOverlayMode,
   onRoomImageModeChange,
   roomInput,
   setRoomInput,
@@ -394,6 +496,7 @@ function RoomsPage({
 }: {
   rooms: RoomState[];
   roomImageMode: AppSettings['roomImageMode'];
+  burnOverlayMode: AppSettings['burnOverlayMode'];
   onRoomImageModeChange: (mode: AppSettings['roomImageMode']) => Promise<void>;
   roomInput: string;
   setRoomInput: (value: string) => void;
@@ -446,7 +549,14 @@ function RoomsPage({
           </div>
         ) : (
           rooms.map((room) => (
-            <RoomCard key={room.id} room={room} roomImageMode={roomImageMode} busy={busy} run={run} />
+            <RoomCard
+              key={room.id}
+              room={room}
+              roomImageMode={roomImageMode}
+              burnOverlayMode={burnOverlayMode}
+              busy={busy}
+              run={run}
+            />
           ))
         )}
       </section>
@@ -484,6 +594,217 @@ function ImageModeSwitch({
         <span>实时画面</span>
       </button>
     </div>
+  );
+}
+
+function ExportPage({
+  state,
+  draft,
+  result,
+  busy,
+  setDraft,
+  selectRecording,
+  prepareSubtitles,
+  exportClip,
+  run
+}: {
+  state: AppState;
+  draft: ExportDraft;
+  result: ExportResult | null;
+  busy: string | null;
+  setDraft: (draft: ExportDraft) => void;
+  selectRecording: (recording: RecordingState) => void;
+  prepareSubtitles: () => Promise<void>;
+  exportClip: () => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+}) {
+  const selectedRecording = state.recordings.find((recording) => recording.cleanPath === draft.cleanPath);
+  const canExport = Boolean(draft.cleanPath && draft.startTime && draft.endTime);
+  const canPrepare = Boolean(draft.cleanPath && draft.danmakuPath);
+
+  return (
+    <>
+      <PageHeader
+        title="剪辑导出"
+        subtitle="纯净片段走源流复制，烧录片段会先生成 CSS/ASS 再编码"
+        actions={
+          <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
+            <FolderOpen size={18} />
+            打开目录
+          </button>
+        }
+      />
+
+      <section className="export-layout">
+        <section className="inspector-card export-panel">
+          <div className="card-heading">
+            <div className="section-title">
+              <FileVideo size={18} />
+              <span>源文件</span>
+            </div>
+          </div>
+
+          <label className="field">
+            <span>最近录像</span>
+            <select
+              value={selectedRecording?.cleanPath || ''}
+              onChange={(event) => {
+                const next = state.recordings.find((recording) => recording.cleanPath === event.target.value);
+                if (next) {
+                  selectRecording(next);
+                }
+              }}
+            >
+              <option value="">手动填写路径</option>
+              {state.recordings.map((recording) => (
+                <option key={recording.id || recording.cleanPath} value={recording.cleanPath}>
+                  {recordingLabel(recording)}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>纯净视频</span>
+            <input
+              value={draft.cleanPath}
+              onChange={(event) => setDraft({ ...draft, cleanPath: event.target.value })}
+              placeholder="C:\Videos\xxx.clean.mp4"
+            />
+          </label>
+
+          <label className="field">
+            <span>弹幕事件</span>
+            <input
+              value={draft.danmakuPath}
+              onChange={(event) => setDraft({ ...draft, danmakuPath: event.target.value })}
+              placeholder="C:\Videos\xxx.danmaku.jsonl"
+            />
+          </label>
+
+          <label className="field">
+            <span>样式 CSS</span>
+            <input
+              value={draft.cssPath}
+              onChange={(event) => setDraft({ ...draft, cssPath: event.target.value })}
+              placeholder="留空则自动生成 .danmaku.css"
+            />
+          </label>
+        </section>
+
+        <section className="inspector-card export-panel">
+          <div className="card-heading">
+            <div className="section-title">
+              <Scissors size={18} />
+              <span>片段</span>
+            </div>
+          </div>
+
+          <div className="time-grid">
+            <label className="field">
+              <span>开始时间</span>
+              <input
+                value={draft.startTime}
+                onChange={(event) => setDraft({ ...draft, startTime: event.target.value })}
+                placeholder="00:12:30.5"
+              />
+            </label>
+            <label className="field">
+              <span>结束时间</span>
+              <input
+                value={draft.endTime}
+                onChange={(event) => setDraft({ ...draft, endTime: event.target.value })}
+                placeholder="00:18:00"
+              />
+            </label>
+          </div>
+
+          <label className="field">
+            <span>输出目录</span>
+            <input
+              value={draft.outputDir}
+              onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
+              placeholder={state.settings.outputDir}
+            />
+          </label>
+
+          <div className="settings-grid">
+            <label className="field">
+              <span>导出版本</span>
+              <select
+                value={draft.mode}
+                onChange={(event) => setDraft({ ...draft, mode: event.target.value as ExportDraft['mode'] })}
+              >
+                {exportModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="field">
+              <span>烧录内容</span>
+              <select
+                value={draft.overlayMode}
+                onChange={(event) =>
+                  setDraft({ ...draft, overlayMode: event.target.value as AppSettings['burnOverlayMode'] })
+                }
+              >
+                {overlayModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="split-buttons export-actions">
+            <button
+              className="wide-button fill"
+              disabled={!canPrepare || busy === 'export-subtitles'}
+              onClick={prepareSubtitles}
+            >
+              <FileCode2 size={18} />
+              只生成字幕
+            </button>
+            <button
+              className="wide-button fill primary"
+              disabled={!canExport || busy === 'export-clip'}
+              onClick={exportClip}
+            >
+              <Scissors size={18} />
+              导出片段
+            </button>
+          </div>
+        </section>
+
+        <section className="inspector-card export-panel export-result-panel">
+          <div className="card-heading">
+            <div className="section-title">
+              <CheckCircle2 size={18} />
+              <span>结果</span>
+            </div>
+          </div>
+          {result ? (
+            <div className="result-lines">
+              <PathLine label="输出视频" value={result.outputPath || ''} />
+              <PathLine label="样式 CSS" value={result.cssPath || ''} />
+              <PathLine label="字幕 ASS" value={result.assPath || ''} />
+              {typeof result.eventCount === 'number' ? (
+                <PathLine label="事件数量" value={String(result.eventCount)} />
+              ) : null}
+            </div>
+          ) : (
+            <div className="empty-state compact-empty">
+              <Scissors size={36} />
+              <span>选择录像和时间段后开始导出</span>
+            </div>
+          )}
+        </section>
+      </section>
+    </>
   );
 }
 
@@ -640,6 +961,25 @@ function SettingsPage({
                   setSettingsDraft({ ...settingsDraft, burnCrf: Number(event.target.value) })
                 }
               />
+            </label>
+
+            <label className="field">
+              <span>弹幕版内容</span>
+              <select
+                value={settingsDraft.burnOverlayMode}
+                onChange={(event) =>
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    burnOverlayMode: event.target.value as AppSettings['burnOverlayMode']
+                  })
+                }
+              >
+                {overlayModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </label>
           </div>
 
@@ -946,11 +1286,13 @@ function RoomPreview({
 function RoomCard({
   room,
   roomImageMode,
+  burnOverlayMode,
   busy,
   run
 }: {
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
+  burnOverlayMode: AppSettings['burnOverlayMode'];
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
 }) {
@@ -961,6 +1303,11 @@ function RoomCard({
     : room.stream
       ? `${displayCodec(room.stream.codec)} · 清晰度 ${room.stream.qn}`
       : '未选流';
+  const [cardOverlayMode, setCardOverlayMode] = useState<AppSettings['burnOverlayMode']>(burnOverlayMode);
+
+  useEffect(() => {
+    setCardOverlayMode(burnOverlayMode);
+  }, [burnOverlayMode]);
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
@@ -1065,11 +1412,34 @@ function RoomCard({
               录制
             </button>
           )}
+          <select
+            className="action-select"
+            value={cardOverlayMode}
+            disabled={!room.currentRecording || room.recording || room.burning}
+            title="弹幕版内容"
+            onChange={(event) => setCardOverlayMode(event.target.value as AppSettings['burnOverlayMode'])}
+          >
+            {overlayModeOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
           <button
             className="icon-button"
-            title="生成弹幕版"
+            title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}）`}
             disabled={!room.currentRecording || room.recording || room.burning}
-            onClick={() => run(`burn-${roomKey}`, () => recorder.burnDanmaku(room.id))}
+            onClick={() =>
+              run(`subtitles-${roomKey}`, () => recorder.prepareDanmaku(room.id, { overlayMode: cardOverlayMode }))
+            }
+          >
+            <FileCode2 size={18} />
+          </button>
+          <button
+            className="icon-button"
+            title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}）`}
+            disabled={!room.currentRecording || room.recording || room.burning}
+            onClick={() => run(`burn-${roomKey}`, () => recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode }))}
           >
             <Sparkles size={18} />
           </button>
@@ -1170,6 +1540,41 @@ function getStats(rooms: RoomState[]) {
   };
 }
 
+function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft {
+  if (current.cleanPath) {
+    return {
+      ...current,
+      overlayMode: current.overlayMode || state.settings.burnOverlayMode,
+      outputDir: current.outputDir || state.settings.outputDir
+    };
+  }
+  const recording = state.recordings[0];
+  if (!recording) {
+    return {
+      ...current,
+      overlayMode: state.settings.burnOverlayMode,
+      outputDir: current.outputDir || state.settings.outputDir
+    };
+  }
+  return {
+    ...current,
+    cleanPath: recording.cleanPath,
+    danmakuPath: recording.danmakuPath || '',
+    cssPath: recording.cssPath || '',
+    overlayMode: state.settings.burnOverlayMode,
+    outputDir: current.outputDir || state.settings.outputDir
+  };
+}
+
+function recordingLabel(recording: RecordingState) {
+  const title = recording.roomTitle || recording.anchor || filename(recording.cleanPath);
+  return `${formatDateTime(recording.startedAt)} · ${title}`;
+}
+
+function overlayModeLabel(mode: AppSettings['burnOverlayMode']) {
+  return mode === 'danmaku' ? '仅弹幕' : '弹幕和礼物';
+}
+
 function getRoomStatus(room: RoomState) {
   if (room.recording) {
     return { label: '录制中', kind: 'recording' };
@@ -1188,6 +1593,15 @@ function formatClock(time: number) {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit'
+  }).format(time);
+}
+
+function formatDateTime(time: number) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
   }).format(time);
 }
 
