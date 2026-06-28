@@ -1,6 +1,6 @@
 {
   "name": "live-record-2k",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": true,
   "description": "本地 WebUI 哔哩哔哩直播录制工具，输出无弹幕源文件和有弹幕烧录版。",
   "type": "module",

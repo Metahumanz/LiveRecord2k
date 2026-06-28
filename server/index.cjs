@@ -75,6 +75,9 @@ class LiveRecordService {
       latestVersion: '',
       message: '尚未检查更新',
       checkedAt: 0,
+      downloadReceivedBytes: 0,
+      downloadTotalBytes: 0,
+      downloadProgress: null,
       queued: false,
       manifest: null
     };
@@ -110,6 +113,7 @@ class LiveRecordService {
 
   async init() {
     await this.loadStore();
+    await this.loadLastUpdateStatus();
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
     await this.refreshRecordingLibrary({ silent: true });
     for (const room of this.rooms.values()) {
@@ -984,6 +988,7 @@ class LiveRecordService {
       );
       const container = normalizeContainer(this.settings.outputContainer);
       const cleanPath = path.join(this.settings.outputDir, `${baseName}.clean.${container}`);
+      const capturePath = container === 'mp4' ? path.join(this.settings.outputDir, `${baseName}.recording.mkv`) : cleanPath;
       const danmakuPath = path.join(this.settings.outputDir, `${baseName}.danmaku.jsonl`);
       const cssPath = path.join(this.settings.outputDir, `${baseName}.danmaku.css`);
       const assPath = path.join(this.settings.outputDir, `${baseName}.danmaku.ass`);
@@ -996,9 +1001,7 @@ class LiveRecordService {
       const args = createRecordingArgs({
         streamUrl: stream.url,
         headers: this.createFfmpegHeaders(room),
-        outputPath: cleanPath,
-        container,
-        streamCodec: stream.codec
+        outputPath: capturePath
       });
 
       const ffmpeg = spawn(this.ffmpegPath, args, {
@@ -1014,6 +1017,7 @@ class LiveRecordService {
         danmakuClient: null,
         startedAt: Date.now(),
         cleanPath,
+        capturePath,
         danmakuPath,
         cssPath,
         assPath,
@@ -1029,6 +1033,7 @@ class LiveRecordService {
         ignoredCommandCount: 0,
         lastIgnoredEmitAt: 0,
         ffmpegProbeBuffer: '',
+        ffmpegLogBuffer: '',
         videoInfo: null,
         rotateTimer: null,
         mediaWatchTimer: null,
@@ -1068,14 +1073,18 @@ class LiveRecordService {
             : '手动';
       this.log(
         'success',
-        `${roomLabel(room)} ${startReason}开始录制：${path.basename(cleanPath)}`
+        `${roomLabel(room)} ${startReason}开始录制：${path.basename(cleanPath)}${
+          capturePath !== cleanPath ? `（临时写入 ${path.basename(capturePath)}）` : ''
+        }`
       );
+      this.log('info', `${roomLabel(room)} 录制临时路径：${capturePath}`);
       if (this.settings.notifyRecordingStarted && !options.silentNotify) {
         this.notify('开始录制', `${roomLabel(room)} 正在写入 ${path.basename(cleanPath)}`);
       }
 
       ffmpeg.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8');
+        session.ffmpegLogBuffer = `${session.ffmpegLogBuffer}${text}`.slice(-12000);
         if (!session.videoInfo) {
           session.ffmpegProbeBuffer = `${session.ffmpegProbeBuffer}${text}`.slice(-6000);
           const videoInfo = parseFfmpegVideoInfo(session.ffmpegProbeBuffer);
@@ -1103,6 +1112,14 @@ class LiveRecordService {
       });
 
       ffmpeg.on('close', async (code, signal) => {
+        const captureSize = await getFileSize(session.capturePath || session.cleanPath);
+        if (captureSize <= 0) {
+          const detail = compactLogLine(session.ffmpegLogBuffer || '没有 stderr 输出');
+          this.log(
+            'error',
+            `${roomLabel(room)} 录制进程没有生成临时视频文件，退出码 ${code}，信号 ${signal || '-'}。ffmpeg：${detail}`
+          );
+        }
         await this.finishRecording(room.id, code, signal);
       });
 
@@ -1255,7 +1272,7 @@ class LiveRecordService {
       if (session.videoInfo) {
         return;
       }
-      const fileSize = await getFileSize(session.cleanPath);
+      const fileSize = await getFileSize(session.capturePath || session.cleanPath);
       if (fileSize >= MIN_PLAYABLE_BYTES) {
         this.log(
           'warn',
@@ -1315,21 +1332,23 @@ class LiveRecordService {
     await new Promise((resolve) => session.eventStream.end(resolve));
     room.recording = false;
     const elapsedSec = Math.max(0, (Date.now() - session.startedAt) / 1000);
-    const fileSizeBeforeFinalize = await getFileSize(session.cleanPath);
+    const capturePath = session.capturePath || session.cleanPath;
+    const fileSizeBeforeFinalize = await getFileSize(capturePath);
     const validBeforeFinalize = isRecordingFileLikelyPlayable({
       fileSize: fileSizeBeforeFinalize,
       elapsedSec,
       videoInfo: session.videoInfo
     });
+    let finalized = normalizeContainer(this.settings.outputContainer) !== 'mp4';
     if (validBeforeFinalize) {
-      await this.finalizeRecordingContainer(room, session);
+      finalized = await this.finalizeRecordingContainer(room, session);
     }
     const fileSize = await getFileSize(session.cleanPath);
     const valid = isRecordingFileLikelyPlayable({
       fileSize,
       elapsedSec,
       videoInfo: session.videoInfo
-    });
+    }) && finalized;
     const finishedRecording = {
       startedAt: session.startedAt,
       cleanPath: session.cleanPath,
@@ -1361,7 +1380,9 @@ class LiveRecordService {
         'error',
         `${roomLabel(room)} 当前录像文件过小或没有视频流，已跳过历史列表：${path.basename(
           session.cleanPath
-        )}（${formatBytes(fileSize)}）。`
+        )}（最终 ${formatBytes(fileSize)}，临时 ${formatBytes(fileSizeBeforeFinalize)}）。${
+          capturePath !== session.cleanPath && fs.existsSync(capturePath) ? `可检查临时文件：${capturePath}` : ''
+        }`
       );
     }
     this.recordingSessions.delete(roomId);
@@ -1450,14 +1471,19 @@ class LiveRecordService {
 
   async finalizeRecordingContainer(room, session) {
     if (normalizeContainer(this.settings.outputContainer) !== 'mp4') {
-      return;
+      return true;
+    }
+    const sourcePath = session.capturePath || session.cleanPath;
+    if (!fs.existsSync(sourcePath)) {
+      this.log('error', `${roomLabel(room)} 临时录制文件不存在，无法生成 MP4：${sourcePath}`);
+      return false;
     }
     const tmpPath = replaceExtension(session.cleanPath, '.finalizing.mp4');
     try {
       await fsp.rm(tmpPath, { force: true });
       await runFfmpegJob(
         this.ffmpegPath,
-        createMp4FinalizeArgs({ inputPath: session.cleanPath, outputPath: tmpPath, streamCodec: session.videoInfo?.codec }),
+        createMp4FinalizeArgs({ inputPath: sourcePath, outputPath: tmpPath, streamCodec: session.videoInfo?.codec }),
         (line) => {
           if (/error|failed|invalid/i.test(line)) {
             this.log('warn', `${roomLabel(room)} MP4 收尾：${compactLogLine(line)}`);
@@ -1468,12 +1494,26 @@ class LiveRecordService {
       if (finalizedSize >= MIN_PLAYABLE_BYTES) {
         await fsp.rm(session.cleanPath, { force: true });
         await fsp.rename(tmpPath, session.cleanPath);
+        if (sourcePath !== session.cleanPath) {
+          await fsp.rm(sourcePath, { force: true }).catch(() => {});
+        }
+        this.log(
+          'success',
+          `${roomLabel(room)} MP4 封装完成：${path.basename(session.cleanPath)}（${formatBytes(finalizedSize)}）`
+        );
+        return true;
       } else {
         await fsp.rm(tmpPath, { force: true });
+        this.log(
+          'error',
+          `${roomLabel(room)} MP4 封装结果过小：${path.basename(tmpPath)}（${formatBytes(finalizedSize)}）`
+        );
+        return false;
       }
     } catch (error) {
       await fsp.rm(tmpPath, { force: true }).catch(() => {});
-      this.log('warn', `${roomLabel(room)} MP4 收尾失败，保留原文件：${error.message}`);
+      this.log('error', `${roomLabel(room)} MP4 封装失败，已保留临时文件 ${sourcePath}：${error.message}`);
+      return false;
     }
   }
 
@@ -1888,7 +1928,10 @@ class LiveRecordService {
       status: 'checking',
       currentVersion: APP_VERSION,
       message: '正在检查更新...',
-      checkedAt: Date.now()
+      checkedAt: Date.now(),
+      downloadReceivedBytes: 0,
+      downloadTotalBytes: 0,
+      downloadProgress: null
     };
     this.emitState();
     try {
@@ -1902,6 +1945,9 @@ class LiveRecordService {
         latestVersion,
         message: hasUpdate ? `发现新版本 ${latestVersion}` : `当前已是最新版本 ${APP_VERSION}`,
         checkedAt: Date.now(),
+        downloadReceivedBytes: 0,
+        downloadTotalBytes: 0,
+        downloadProgress: null,
         manifest
       };
       this.log(hasUpdate ? 'success' : 'info', this.updateState.message);
@@ -1912,7 +1958,10 @@ class LiveRecordService {
         ...this.updateState,
         status: 'error',
         message: `检查更新失败：${error.message}`,
-        checkedAt: Date.now()
+        checkedAt: Date.now(),
+        downloadReceivedBytes: 0,
+        downloadTotalBytes: 0,
+        downloadProgress: null
       };
       this.log('error', this.updateState.message);
       this.emitState();
@@ -1966,7 +2015,10 @@ class LiveRecordService {
         ...this.updateState,
         status: 'downloading',
         queued: false,
-        message: `正在下载 ${manifest.version} 更新包...`
+        message: `正在下载 ${manifest.version} 更新包...`,
+        downloadReceivedBytes: 0,
+        downloadTotalBytes: 0,
+        downloadProgress: 0
       };
       this.emitState();
 
@@ -1974,7 +2026,8 @@ class LiveRecordService {
       this.updateState = {
         ...this.updateState,
         status: 'ready',
-        message: `更新包已准备好，正在应用 ${manifest.version}...`
+        message: `更新包已准备好，正在应用 ${manifest.version}...`,
+        downloadProgress: 100
       };
       this.emitState();
 
@@ -1991,12 +2044,14 @@ class LiveRecordService {
         stdio: 'ignore',
         windowsHide: true
       }).unref();
+      this.armUpdateApplyWatchdog(manifest);
     } catch (error) {
       this.updateState = {
         ...this.updateState,
         status: 'error',
         queued: false,
-        message: `更新失败：${error.message}`
+        message: `更新失败：${error.message}`,
+        downloadProgress: null
       };
       this.log('error', this.updateState.message);
       this.emitState();
@@ -2019,7 +2074,45 @@ class LiveRecordService {
     const updateDir = path.join(path.dirname(this.storePath), 'updates');
     await fsp.mkdir(updateDir, { recursive: true });
     const packagePath = path.join(updateDir, `bili-record-2k-${sanitizeFilename(manifest.version)}.zip`);
-    await downloadFile(manifest.packageUrl, packagePath);
+    let lastEmitAt = 0;
+    await downloadFile(manifest.packageUrl, packagePath, (progress) => {
+      if (progress.retrying) {
+        this.updateState = {
+          ...this.updateState,
+          status: 'downloading',
+          message: `下载连接中断，正在重试 ${progress.attempt}/${Math.max(1, Number(progress.maxAttempts || 1) - 1)}：${
+            progress.error?.message || progress.error || '网络错误'
+          }`
+        };
+        this.emitState();
+        return;
+      }
+      const receivedBytes = Number(progress.receivedBytes || 0);
+      const totalBytes = Number(progress.totalBytes || 0);
+      const percent = totalBytes > 0 ? clamp(Math.round((receivedBytes / totalBytes) * 100), 0, 100) : null;
+      const now = Date.now();
+      this.updateState = {
+        ...this.updateState,
+        status: 'downloading',
+        message:
+          percent === null
+            ? `正在下载 ${manifest.version} 更新包：已下载 ${formatBytes(receivedBytes)}`
+            : `正在下载 ${manifest.version} 更新包：${percent}%（${formatBytes(receivedBytes)} / ${formatBytes(totalBytes)}）`,
+        downloadReceivedBytes: receivedBytes,
+        downloadTotalBytes: totalBytes,
+        downloadProgress: percent
+      };
+      if (progress.done || now - lastEmitAt > 300) {
+        lastEmitAt = now;
+        this.emitState();
+      }
+    });
+    this.updateState = {
+      ...this.updateState,
+      message: manifest.sha256 ? '更新包下载完成，正在校验...' : '更新包下载完成。',
+      downloadProgress: 100
+    };
+    this.emitState();
     if (manifest.sha256) {
       const actual = await fileSha256(packagePath);
       if (actual.toLowerCase() !== String(manifest.sha256).toLowerCase()) {
@@ -2033,6 +2126,8 @@ class LiveRecordService {
   async createUpdaterScript(packagePath, manifest) {
     const updateDir = path.join(path.dirname(this.storePath), 'updates');
     const scriptPath = path.join(updateDir, 'apply-update.ps1');
+    const statusPath = path.join(updateDir, 'last-update-status.json');
+    const logPath = path.join(updateDir, 'apply-update.log');
     const launcherPath = path.join(APP_ROOT, 'BiliRecord2K.exe');
     const script = `
 $ErrorActionPreference = 'Stop'
@@ -2040,19 +2135,165 @@ $zipPath = ${psLiteral(packagePath)}
 $appRoot = ${psLiteral(APP_ROOT)}
 $extractPath = Join-Path ${psLiteral(updateDir)} 'extract'
 $launcherPath = ${psLiteral(launcherPath)}
-Start-Sleep -Milliseconds 1200
-Get-Process -Name 'BiliRecord2K','BiliRecord2K.Service' -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 800
-Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
-Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
-Copy-Item -Path (Join-Path $extractPath '*') -Destination $appRoot -Recurse -Force
-Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
+$statusPath = ${psLiteral(statusPath)}
+$logPath = ${psLiteral(logPath)}
+$targetVersion = ${psLiteral(manifest.version)}
+$currentPid = ${process.pid}
+
+function Write-UpdateLog([string]$message) {
+  $line = "$(Get-Date -Format o) $message"
+  Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
+}
+
+function Write-UpdateStatus([string]$status, [string]$message) {
+  $payload = [ordered]@{
+    status = $status
+    message = $message
+    version = $targetVersion
+    time = (Get-Date).ToString('o')
+    logPath = $logPath
+  }
+  $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statusPath -Encoding UTF8
+}
+
+try {
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $statusPath) | Out-Null
+  Write-UpdateStatus 'applying' "正在应用 $targetVersion"
+  Write-UpdateLog "开始应用 $targetVersion，zip=$zipPath，appRoot=$appRoot，currentPid=$currentPid"
+  Start-Sleep -Milliseconds 900
+
+  Get-Process -Name 'BiliRecord2K','BiliRecord2K.Service' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Id -ne $PID } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+  if ($currentPid -gt 0 -and $currentPid -ne $PID) {
+    Stop-Process -Id $currentPid -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Milliseconds 1400
+
+  Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+  Write-UpdateLog '正在解压更新包'
+  Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
+
+  $sourceRoot = $extractPath
+  if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'BiliRecord2K.exe'))) {
+    $candidate = Get-ChildItem -LiteralPath $extractPath -Directory -ErrorAction SilentlyContinue |
+      Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'BiliRecord2K.exe') } |
+      Select-Object -First 1
+    if ($candidate) {
+      $sourceRoot = $candidate.FullName
+    }
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'BiliRecord2K.exe'))) {
+    throw "更新包结构无效：找不到 BiliRecord2K.exe"
+  }
+
+  Write-UpdateLog "正在复制文件：$sourceRoot -> $appRoot"
+  Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $appRoot -Recurse -Force
+  Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Path -LiteralPath $launcherPath)) {
+    throw "更新后找不到启动器：$launcherPath"
+  }
+  Write-UpdateStatus 'success' "已更新到 $targetVersion"
+  Write-UpdateLog '正在重启应用'
+  Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
+} catch {
+  $message = $_.Exception.Message
+  Write-UpdateStatus 'error' $message
+  Write-UpdateLog "更新失败：$message"
+  try {
+    if (Test-Path -LiteralPath $launcherPath) {
+      Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
+    }
+  } catch {
+    Write-UpdateLog "回滚启动失败：$($_.Exception.Message)"
+  }
+  exit 1
+}
 `;
     await fsp.writeFile(scriptPath, script.trimStart(), 'utf8');
     await fsp.writeFile(path.join(updateDir, 'last-update.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     return scriptPath;
+  }
+
+  async loadLastUpdateStatus() {
+    const statusPath = this.getUpdateStatusPath();
+    try {
+      const status = JSON.parse(await fsp.readFile(statusPath, 'utf8'));
+      const updateStatus = String(status.status || '');
+      const version = normalizeVersion(status.version || '');
+      const message = String(status.message || '');
+      if (updateStatus === 'error' || updateStatus === 'applying') {
+        this.updateState = {
+          ...this.updateState,
+          status: 'error',
+          latestVersion: version,
+          message:
+            updateStatus === 'applying'
+              ? `上次更新停在应用阶段，可能被文件占用或安全软件拦截。${status.logPath ? `日志：${status.logPath}` : ''}`
+              : `上次更新失败：${message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`,
+          checkedAt: Date.now()
+        };
+        this.log('error', this.updateState.message);
+      } else if (updateStatus === 'success') {
+        if (version && compareVersions(version, APP_VERSION) > 0) {
+          this.updateState = {
+            ...this.updateState,
+            status: 'error',
+            latestVersion: version,
+            message: `更新脚本完成到 ${version}，但当前仍是 ${APP_VERSION}。可能是旧进程没有退出，或更新包被复制到了错误目录。${
+              status.logPath ? `日志：${status.logPath}` : ''
+            }`,
+            checkedAt: Date.now()
+          };
+          this.log('error', this.updateState.message);
+          return;
+        }
+        this.log('success', version ? `已更新到 ${version}。` : '更新已完成。');
+        await fsp.rm(statusPath, { force: true });
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        this.log('warn', `读取更新状态失败：${error.message}`);
+      }
+    }
+  }
+
+  getUpdateStatusPath() {
+    return path.join(path.dirname(this.storePath), 'updates', 'last-update-status.json');
+  }
+
+  armUpdateApplyWatchdog(manifest) {
+    const statusPath = this.getUpdateStatusPath();
+    const timer = setTimeout(async () => {
+      if (this.updateState.status !== 'applying') {
+        return;
+      }
+      let status = null;
+      try {
+        status = JSON.parse(await fsp.readFile(statusPath, 'utf8'));
+      } catch {
+        // The updater may have failed before it could write status.
+      }
+      if (status?.status === 'error') {
+        this.updateState = {
+          ...this.updateState,
+          status: 'error',
+          queued: false,
+          message: `更新脚本失败：${status.message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`
+        };
+      } else {
+        this.updateState = {
+          ...this.updateState,
+          status: 'error',
+          queued: false,
+          message: `更新脚本没有结束当前服务，可能被安全软件或文件占用拦截。请查看 ${statusPath} 或手动重启后再试。`
+        };
+      }
+      this.log('error', this.updateState.message);
+      this.emitState();
+    }, 45000);
+    timer.unref?.();
   }
 
   scheduleQueuedUpdateCheck(delayMs = 1500) {
@@ -2932,7 +3173,7 @@ function createAss(events, options = {}) {
   return `${lines.join('\n')}\n`;
 }
 
-function createRecordingArgs({ streamUrl, headers, outputPath, container, streamCodec }) {
+function createRecordingArgs({ streamUrl, headers, outputPath }) {
   const args = [
     '-hide_banner',
     '-stats',
@@ -2957,26 +3198,42 @@ function createRecordingArgs({ streamUrl, headers, outputPath, container, stream
     headers,
     '-i',
     streamUrl,
+    '-ignore_unknown',
     '-map',
-    '0',
+    '0:v:0',
+    '-map',
+    '0:a?',
     '-c',
-    'copy'
+    'copy',
+    '-dn',
+    '-sn',
+    '-f',
+    'matroska',
+    outputPath
   ];
-
-  if (container === 'mp4') {
-    if (isHevcCodec(streamCodec)) {
-      args.push('-tag:v', 'hvc1');
-    }
-    args.push('-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', outputPath);
-    return args;
-  }
-
-  args.push('-f', 'matroska', outputPath);
   return args;
 }
 
 function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
-  const args = ['-hide_banner', '-y', '-i', inputPath, '-map', '0', '-c', 'copy'];
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts',
+    '-i',
+    inputPath,
+    '-ignore_unknown',
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a?',
+    '-c',
+    'copy',
+    '-dn',
+    '-sn',
+    '-avoid_negative_ts',
+    'make_zero'
+  ];
   if (isHevcCodec(streamCodec)) {
     args.push('-tag:v', 'hvc1');
   }
@@ -3558,10 +3815,31 @@ function getAppVersion() {
   return '0.0.1';
 }
 
-function requestUrlBuffer(rawUrl, options = {}, redirectCount = 0) {
+async function requestUrlBuffer(rawUrl, options = {}, redirectCount = 0) {
   if (redirectCount > 8) {
-    return Promise.reject(new Error('请求重定向次数过多。'));
+    throw new Error('请求重定向次数过多。');
   }
+  const maxAttempts = redirectCount === 0 ? clamp(Number(options.retries ?? 4), 1, 8) : 1;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await requestUrlBufferOnce(rawUrl, options, redirectCount);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isTransientNetworkError(error)) {
+        break;
+      }
+      options.onRetry?.({ attempt, maxAttempts, error });
+      await delay(Math.min(800 * attempt, 3000));
+    }
+  }
+  if (lastError && maxAttempts > 1 && isTransientNetworkError(lastError)) {
+    throw new Error(`网络请求失败（已重试 ${maxAttempts - 1} 次）：${lastError.message}`);
+  }
+  throw lastError;
+}
+
+function requestUrlBufferOnce(rawUrl, options = {}, redirectCount = 0) {
   const target = new URL(rawUrl);
   const proxy = getProxyForUrl(target);
   return proxy
@@ -3587,6 +3865,25 @@ function requestUrlDirect(target, options, redirectCount) {
     request.on('error', reject);
     request.end(options.body);
   });
+}
+
+function isTransientNetworkError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_SOCKET'].includes(code) ||
+    message.includes('econnreset') ||
+    message.includes('socket hang up') ||
+    message.includes('timeout') ||
+    message.includes('请求超时') ||
+    message.includes('tls') ||
+    message.includes('代理请求超时') ||
+    message.includes('代理 connect 超时')
+  );
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function requestFfmpegStop(child, options = {}) {
@@ -3798,13 +4095,20 @@ function collectUrlResponse(response, target, options, redirectCount, resolve, r
     return;
   }
   const chunks = [];
-  response.on('data', (chunk) => chunks.push(chunk));
+  const totalBytes = Number(response.headers['content-length'] || 0);
+  let receivedBytes = 0;
+  response.on('data', (chunk) => {
+    chunks.push(chunk);
+    receivedBytes += chunk.length;
+    options.onProgress?.({ receivedBytes, totalBytes, done: false });
+  });
   response.on('end', () => {
     const body = Buffer.concat(chunks);
     if (statusCode < 200 || statusCode >= 300) {
       reject(new Error(`请求失败：HTTP ${statusCode} ${body.toString('utf8').slice(0, 180)}`.trim()));
       return;
     }
+    options.onProgress?.({ receivedBytes: body.length, totalBytes, done: true });
     resolve(body);
   });
   response.on('error', reject);
@@ -3941,6 +4245,9 @@ async function readTextSource(source) {
       headers: {
         Accept: 'application/json, text/plain, */*',
         'User-Agent': `${APP_NAME}/${APP_VERSION}`
+      },
+      onRetry: ({ attempt, maxAttempts, error }) => {
+        console.warn(`更新源请求失败，正在重试 ${attempt}/${maxAttempts - 1}: ${error.message}`);
       }
     });
     return body.toString('utf8');
@@ -3993,17 +4300,33 @@ function compareVersions(a, b) {
   return 0;
 }
 
-async function downloadFile(url, targetPath) {
+async function downloadFile(url, targetPath, onProgress) {
   if (!/^https?:\/\//i.test(String(url || ''))) {
     throw new Error('更新包下载地址无效。');
   }
+  const tmpPath = `${targetPath}.tmp`;
+  await fsp.rm(tmpPath, { force: true });
   const body = await requestUrlBuffer(url, {
     headers: {
       Accept: 'application/zip, application/octet-stream, */*',
       'User-Agent': `${APP_NAME}/${APP_VERSION}`
+    },
+    onProgress,
+    onRetry: ({ attempt, maxAttempts, error }) => {
+      onProgress?.({
+        retrying: true,
+        attempt,
+        maxAttempts,
+        error,
+        receivedBytes: 0,
+        totalBytes: 0,
+        done: false
+      });
     }
   });
-  await fsp.writeFile(targetPath, body);
+  await fsp.writeFile(tmpPath, body);
+  await fsp.rm(targetPath, { force: true });
+  await fsp.rename(tmpPath, targetPath);
 }
 
 async function fileSha256(filePath) {

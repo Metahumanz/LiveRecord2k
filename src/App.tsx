@@ -434,6 +434,7 @@ function UpdateNotice({
             {update.message}
             {update.latestVersion ? ` · 当前 ${update.currentVersion}` : ''}
           </p>
+          <UpdateProgress update={update} />
         </div>
       </div>
       <div className="update-actions">
@@ -471,6 +472,29 @@ function UpdateNotice({
         {busyUpdating ? <span className="update-waiting">处理中</span> : null}
       </div>
     </section>
+  );
+}
+
+function UpdateProgress({ update }: { update: AppState['update'] }) {
+  const active = ['downloading', 'ready', 'applying'].includes(update.status);
+  const received = Number(update.downloadReceivedBytes || 0);
+  const total = Number(update.downloadTotalBytes || 0);
+  const rawProgress = typeof update.downloadProgress === 'number' ? update.downloadProgress : Number.NaN;
+  const percent = Number.isFinite(rawProgress) ? clampNumber(rawProgress, 0, 100) : Number.NaN;
+  if (!active && !received && !Number.isFinite(percent)) {
+    return null;
+  }
+  const hasPercent = Number.isFinite(percent);
+  const label = hasPercent
+    ? `${Math.round(percent)}%${total ? ` · ${formatFileSize(received)} / ${formatFileSize(total)}` : ''}`
+    : `已下载 ${formatFileSize(received)}`;
+  return (
+    <div className="update-progress">
+      <div className={hasPercent ? 'update-progress-track' : 'update-progress-track indeterminate'}>
+        <span style={hasPercent ? { width: `${percent}%` } : undefined} />
+      </div>
+      <small>{label}</small>
+    </div>
   );
 }
 
@@ -1191,6 +1215,7 @@ function SettingsPage({
           <PathLine label="当前版本" value={state.version || '-'} />
           <PathLine label="最新版本" value={state.update.latestVersion || '尚未检查'} />
           <PathLine label="更新状态" value={state.update.message || '尚未检查更新'} />
+          <UpdateProgress update={state.update} />
           <div className="split-buttons">
             <button
               className="wide-button fill"

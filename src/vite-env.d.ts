@@ -100,6 +100,9 @@ export type UpdateState = {
   latestVersion?: string;
   message: string;
   checkedAt?: number;
+  downloadReceivedBytes?: number;
+  downloadTotalBytes?: number;
+  downloadProgress?: number | null;
   queued?: boolean;
   activeJobs?: boolean;
   manifest?: {
