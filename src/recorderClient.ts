@@ -28,6 +28,7 @@ export const recorder: RecorderApi = {
   prepareDanmaku: (roomId, options) => api<AppState>('/api/rooms/subtitles', { roomId, options }),
   prepareSubtitleAssets: (request) => api('/api/export/subtitles', request),
   exportClip: (request) => api('/api/export/clip', request),
+  scanRecordings: () => api<AppState>('/api/recordings/scan', {}),
   clearLogs: () => api<AppState>('/api/logs/clear', {}),
   openOutputDir: () => api<AppState>('/api/shell/open-output', {}),
   openConfigDir: () => api<AppState>('/api/shell/open-config', {}),

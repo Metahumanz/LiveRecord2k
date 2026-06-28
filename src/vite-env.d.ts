@@ -40,6 +40,13 @@ export type RecordingState = {
   cssPath?: string;
   assPath?: string;
   burnedPath?: string;
+  mergeGroup?: string;
+  mergeSequence?: number;
+  mergeOutputPath?: string;
+  mergedFrom?: string[];
+  durationSec?: number;
+  fileSize?: number;
+  valid?: boolean;
   eventCount: number;
   danmakuStatus?: 'connecting' | 'connected' | 'disconnected' | 'error';
   danmakuMessage?: string;
@@ -177,6 +184,7 @@ export type RecorderApi = {
   prepareDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode'] }) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
+  scanRecordings: () => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
   openConfigDir: () => Promise<AppState>;

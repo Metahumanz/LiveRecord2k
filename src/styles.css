@@ -82,6 +82,7 @@ button {
   gap: 22px;
   padding: 30px;
   min-height: 100vh;
+  overflow: hidden;
 }
 
 .brand {
@@ -638,9 +639,10 @@ button:disabled {
 
 .room-card {
   min-width: 0;
+  min-height: 438px;
   overflow: hidden;
   display: grid;
-  grid-template-rows: 156px auto;
+  grid-template-rows: 164px minmax(260px, auto);
 }
 
 .room-card.is-recording {
@@ -714,6 +716,7 @@ button:disabled {
 
 .room-content {
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -813,6 +816,7 @@ button:disabled {
 .action-row {
   gap: 8px;
   margin-top: auto;
+  flex-wrap: wrap;
 }
 
 .action-select {
@@ -858,7 +862,7 @@ button:disabled {
 .export-layout {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(360px, 1.05fr) minmax(360px, 1fr);
+  grid-template-columns: minmax(360px, 0.92fr) minmax(460px, 1.08fr);
   align-content: start;
   gap: 16px;
   overflow: auto;
@@ -886,6 +890,159 @@ button:disabled {
 .result-lines {
   display: grid;
   gap: 2px;
+}
+
+.recording-list {
+  max-height: 300px;
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+  padding-right: 2px;
+}
+
+.recording-row {
+  width: 100%;
+  min-height: 66px;
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.045);
+  color: #dbe8e5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.recording-row:hover,
+.recording-row.active {
+  border-color: rgba(121, 222, 213, 0.48);
+  background: rgba(121, 222, 213, 0.11);
+}
+
+.recording-row span,
+.recording-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-row span {
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.recording-row small {
+  color: #93a49f;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.export-empty {
+  min-height: 156px;
+}
+
+.clip-preview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #090d10;
+}
+
+.clip-preview video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: #000;
+}
+
+.clip-preview-empty {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  color: #7f938d;
+  font-weight: 900;
+}
+
+.timeline-editor {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.timeline-labels {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+  color: #96a8a3;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+}
+
+.timeline-labels strong {
+  color: #79ded5;
+  font-size: 15px;
+}
+
+.timeline-labels span:last-child {
+  text-align: right;
+}
+
+.range-stack {
+  display: grid;
+  gap: 4px;
+}
+
+.range-stack input {
+  width: 100%;
+  accent-color: #79ded5;
+}
+
+.changelog-box {
+  margin-top: 14px;
+  color: #dce8e5;
+}
+
+.changelog-box summary {
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.changelog-list {
+  max-height: 280px;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding-right: 4px;
+}
+
+.changelog-list article {
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.changelog-list h4 {
+  margin: 0 0 8px;
+  color: #79ded5;
+  font-size: 15px;
+}
+
+.changelog-list ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #aebfba;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .inline-toggles {

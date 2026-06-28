@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import type { AppSettings, AppState, ExportResult, LogEntry, RecordingState, RoomState } from './vite-env';
 import { recorder } from './recorderClient';
+import changelogText from '../CHANGELOG.md?raw';
 
 type Page = 'overview' | 'rooms' | 'export' | 'settings' | 'logs';
 
@@ -88,6 +89,8 @@ const exportModeOptions = [
   { label: '纯净片段', value: 'clean' },
   { label: '烧录片段', value: 'burn' }
 ] as const;
+
+const changelogEntries = parseChangelog(changelogText);
 
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
@@ -618,20 +621,55 @@ function ExportPage({
   exportClip: () => Promise<void>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
 }) {
-  const selectedRecording = state.recordings.find((recording) => recording.cleanPath === draft.cleanPath);
-  const canExport = Boolean(draft.cleanPath && draft.startTime && draft.endTime);
+  const recordings = state.recordings.filter((recording) => recording.valid !== false && recording.cleanPath);
+  const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
+  const [mediaDuration, setMediaDuration] = useState(0);
+  const draftStart = parseTimelineInput(draft.startTime);
+  const draftEnd = parseTimelineInput(draft.endTime);
+  const timelineDuration = Math.max(mediaDuration, Number(selectedRecording?.durationSec || 0));
+  const timelineStart = Number.isFinite(draftStart) ? clampNumber(draftStart, 0, Math.max(timelineDuration, draftStart)) : 0;
+  const timelineEnd = Number.isFinite(draftEnd)
+    ? clampNumber(draftEnd, 0, Math.max(timelineDuration, draftEnd))
+    : timelineDuration;
+  const canUseTimeline = timelineDuration > 0;
+  const canExport = Boolean(draft.cleanPath && Number.isFinite(draftStart) && Number.isFinite(draftEnd) && draftEnd > draftStart);
   const canPrepare = Boolean(draft.cleanPath && draft.danmakuPath);
+  const mediaSource = draft.cleanPath ? mediaUrl(draft.cleanPath) : '';
+
+  useEffect(() => {
+    setMediaDuration(0);
+  }, [draft.cleanPath]);
+
+  function updateTimelineStart(value: number) {
+    const next = clampNumber(value, 0, Math.max(0, timelineEnd - 0.1));
+    setDraft({ ...draft, startTime: formatTimelineTime(next) });
+  }
+
+  function updateTimelineEnd(value: number) {
+    const next = clampNumber(value, Math.min(timelineStart + 0.1, timelineDuration || value), timelineDuration || value);
+    setDraft({ ...draft, endTime: formatTimelineTime(next) });
+  }
 
   return (
     <>
       <PageHeader
         title="剪辑导出"
-        subtitle="纯净片段走源流复制，烧录片段会先生成 CSS/ASS 再编码"
+        subtitle="选择历史录像，拖动时间轴，导出纯净或烧录片段"
         actions={
-          <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
-            <FolderOpen size={18} />
-            打开目录
-          </button>
+          <>
+            <button
+              className="wide-button"
+              disabled={busy === 'scan-recordings'}
+              onClick={() => run('scan-recordings', recorder.scanRecordings)}
+            >
+              <RefreshCw size={18} />
+              刷新历史
+            </button>
+            <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
+              <FolderOpen size={18} />
+              打开目录
+            </button>
+          </>
         }
       />
 
@@ -644,25 +682,26 @@ function ExportPage({
             </div>
           </div>
 
-          <label className="field">
-            <span>最近录像</span>
-            <select
-              value={selectedRecording?.cleanPath || ''}
-              onChange={(event) => {
-                const next = state.recordings.find((recording) => recording.cleanPath === event.target.value);
-                if (next) {
-                  selectRecording(next);
-                }
-              }}
-            >
-              <option value="">手动填写路径</option>
-              {state.recordings.map((recording) => (
-                <option key={recording.id || recording.cleanPath} value={recording.cleanPath}>
-                  {recordingLabel(recording)}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="recording-list">
+            {recordings.length === 0 ? (
+              <div className="empty-state compact-empty export-empty">输出目录里还没有可用源文件</div>
+            ) : (
+              recordings.map((recording) => (
+                <button
+                  key={recording.id || recording.cleanPath}
+                  className={recording.cleanPath === draft.cleanPath ? 'recording-row active' : 'recording-row'}
+                  type="button"
+                  onClick={() => selectRecording(recording)}
+                >
+                  <span>{recordingLabel(recording)}</span>
+                  <small>
+                    {filename(recording.cleanPath)}
+                    {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
+                  </small>
+                </button>
+              ))
+            )}
+          </div>
 
           <label className="field">
             <span>纯净视频</span>
@@ -697,6 +736,60 @@ function ExportPage({
             <div className="section-title">
               <Scissors size={18} />
               <span>片段</span>
+            </div>
+          </div>
+
+          <div className="clip-preview">
+            {mediaSource ? (
+              <video
+                key={draft.cleanPath}
+                src={mediaSource}
+                controls
+                preload="metadata"
+                onLoadedMetadata={(event) => {
+                  const duration = event.currentTarget.duration;
+                  if (!Number.isFinite(duration) || duration <= 0) {
+                    return;
+                  }
+                  setMediaDuration(duration);
+                  if (!draft.endTime || !Number.isFinite(parseTimelineInput(draft.endTime))) {
+                    setDraft({ ...draft, endTime: formatTimelineTime(duration) });
+                  }
+                }}
+              />
+            ) : (
+              <div className="clip-preview-empty">
+                <FileVideo size={38} />
+                <span>选择录像后预览</span>
+              </div>
+            )}
+          </div>
+
+          <div className="timeline-editor">
+            <div className="timeline-labels">
+              <span>{formatTimelineTime(timelineStart)}</span>
+              <strong>{formatTimelineTime(Math.max(0, timelineEnd - timelineStart))}</strong>
+              <span>{formatTimelineTime(timelineEnd)}</span>
+            </div>
+            <div className="range-stack">
+              <input
+                type="range"
+                min={0}
+                max={Math.max(1, timelineDuration)}
+                step={0.1}
+                value={Math.min(timelineStart, Math.max(1, timelineDuration))}
+                disabled={!canUseTimeline}
+                onChange={(event) => updateTimelineStart(Number(event.target.value))}
+              />
+              <input
+                type="range"
+                min={0}
+                max={Math.max(1, timelineDuration)}
+                step={0.1}
+                value={Math.min(timelineEnd || timelineDuration, Math.max(1, timelineDuration))}
+                disabled={!canUseTimeline}
+                onChange={(event) => updateTimelineEnd(Number(event.target.value))}
+              />
             </div>
           </div>
 
@@ -1094,7 +1187,63 @@ function SettingsPage({
           </div>
         </SettingPanel>
 
+        <SettingPanel title="版本更新" icon={<Download size={18} />}>
+          <PathLine label="当前版本" value={state.version || '-'} />
+          <PathLine label="最新版本" value={state.update.latestVersion || '尚未检查'} />
+          <PathLine label="更新状态" value={state.update.message || '尚未检查更新'} />
+          <div className="split-buttons">
+            <button
+              className="wide-button fill"
+              type="button"
+              disabled={busy === 'update-check'}
+              onClick={() => run('update-check', recorder.checkUpdate)}
+            >
+              <RefreshCw size={18} />
+              检查更新
+            </button>
+            {state.update.status === 'available' || state.update.status === 'blocked' ? (
+              hasActiveJobs ? (
+                <button
+                  className="wide-button fill active"
+                  type="button"
+                  disabled={busy === 'update-queue'}
+                  onClick={() => run('update-queue', recorder.queueUpdate)}
+                >
+                  <Clock3 size={18} />
+                  录制结束后更新
+                </button>
+              ) : (
+                <button
+                  className="wide-button fill primary"
+                  type="button"
+                  disabled={busy === 'update-apply'}
+                  onClick={() => run('update-apply', recorder.applyUpdate)}
+                >
+                  <Download size={18} />
+                  立即更新
+                </button>
+              )
+            ) : null}
+          </div>
+          <details className="changelog-box">
+            <summary>更新日志</summary>
+            <div className="changelog-list">
+              {changelogEntries.map((entry) => (
+                <article key={entry.version}>
+                  <h4>{entry.version}</h4>
+                  <ul>
+                    {entry.items.map((item, index) => (
+                      <li key={`${entry.version}-${index}`}>{item}</li>
+                    ))}
+                  </ul>
+                </article>
+              ))}
+            </div>
+          </details>
+        </SettingPanel>
+
         <SettingPanel title="运行路径" icon={<HardDrive size={18} />}>
+          <PathLine label="当前版本" value={state.version || ''} />
           <PathLine label="当前端口" value={String(state.currentPort || '')} />
           <PathLine label="配置文件" value={state.storePath || ''} />
           <PathLine label="应用目录" value={state.appRoot || ''} />
@@ -1262,8 +1411,18 @@ function RoomPreview({
   status: ReturnType<typeof getRoomStatus>;
 }) {
   const rawImageUrl = roomImageMode === 'cover' ? room.cover : room.keyframe;
-  const imageUrl = rawImageUrl ? imageProxyUrl(rawImageUrl, room.lastCheckedAt) : '';
-  const imageKey = rawImageUrl ? `${rawImageUrl}:${room.lastCheckedAt || 0}` : '';
+  const [previewVersion, setPreviewVersion] = useState(Date.now());
+  useEffect(() => {
+    if (roomImageMode !== 'keyframe') {
+      return;
+    }
+    setPreviewVersion(Date.now());
+    const timer = window.setInterval(() => setPreviewVersion(Date.now()), 5000);
+    return () => window.clearInterval(timer);
+  }, [rawImageUrl, roomImageMode]);
+  const imageVersion = roomImageMode === 'keyframe' ? previewVersion : room.lastCheckedAt;
+  const imageUrl = rawImageUrl ? imageProxyUrl(rawImageUrl, imageVersion) : '';
+  const imageKey = rawImageUrl ? `${rawImageUrl}:${imageVersion || 0}` : '';
   const [failedSrc, setFailedSrc] = useState('');
   const canShowImage = Boolean(rawImageUrl && imageUrl && failedSrc !== imageKey);
 
@@ -1568,7 +1727,8 @@ function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft 
 
 function recordingLabel(recording: RecordingState) {
   const title = recording.roomTitle || recording.anchor || filename(recording.cleanPath);
-  return `${formatDateTime(recording.startedAt)} · ${title}`;
+  const merged = recording.mergedFrom?.length ? '合并' : '源流';
+  return `${formatDateTime(recording.startedAt)} · ${merged} · ${title}`;
 }
 
 function overlayModeLabel(mode: AppSettings['burnOverlayMode']) {
@@ -1630,11 +1790,90 @@ function formatVideoInfo(videoInfo: NonNullable<RoomState['currentRecording']>['
 }
 
 function imageProxyUrl(url: string, version?: number) {
-  const params = new URLSearchParams({ url });
+  let targetUrl = url;
+  if (version) {
+    try {
+      const target = new URL(url);
+      target.searchParams.set('_br2k_preview', String(version));
+      targetUrl = target.toString();
+    } catch {
+      targetUrl = url;
+    }
+  }
+  const params = new URLSearchParams({ url: targetUrl });
   if (version) {
     params.set('v', String(version));
   }
   return `/api/image?${params.toString()}`;
+}
+
+function mediaUrl(filePath: string) {
+  return `/api/media?${new URLSearchParams({ path: filePath }).toString()}`;
+}
+
+function parseTimelineInput(value: string) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return Number.NaN;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    return Number(text);
+  }
+  const parts = text.split(':').map((part) => Number(part));
+  if (parts.length > 3 || parts.some((part) => !Number.isFinite(part) || part < 0)) {
+    return Number.NaN;
+  }
+  while (parts.length < 3) {
+    parts.unshift(0);
+  }
+  return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+function formatTimelineTime(value: number) {
+  const totalTenths = Math.max(0, Math.round((Number(value) || 0) * 10));
+  const hours = Math.floor(totalTenths / 36000);
+  const minutes = Math.floor((totalTenths % 36000) / 600);
+  const seconds = Math.floor((totalTenths % 600) / 10);
+  const tenths = totalTenths % 10;
+  const secondText = `${String(seconds).padStart(2, '0')}${tenths ? `.${tenths}` : ''}`;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${secondText}`;
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  const safeMax = Math.max(min, max);
+  return Math.min(safeMax, Math.max(min, Number(value) || 0));
+}
+
+function formatFileSize(bytes: number) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${Math.round(value / 1024)} KB`;
+  }
+  return `${Math.round(value)} B`;
+}
+
+function parseChangelog(markdown: string) {
+  const entries: Array<{ version: string; items: string[] }> = [];
+  let current: { version: string; items: string[] } | null = null;
+  for (const line of markdown.split(/\r?\n/)) {
+    const heading = /^##\s+(.+)$/.exec(line);
+    if (heading) {
+      current = { version: heading[1], items: [] };
+      entries.push(current);
+      continue;
+    }
+    const item = /^-\s+(.+)$/.exec(line);
+    if (item && current) {
+      current.items.push(item[1]);
+    }
+  }
+  return entries.slice(0, 6);
 }
 
 function loginStatusLabel(status: NonNullable<AppState['login']>['status']) {
