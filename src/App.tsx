@@ -5,11 +5,14 @@ import {
   CircleAlert,
   Clock3,
   Cpu,
+  CheckCircle2,
+  Download,
   FileVideo,
   FolderOpen,
   Gauge,
   HardDrive,
   Home,
+  Image as ImageIcon,
   ListVideo,
   LogIn,
   MessageSquareText,
@@ -41,6 +44,7 @@ const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
 ];
 
 const qnOptions = [
+  { label: '4K / 超高清优先', value: 25000 },
   { label: '2K / 原画优先', value: 15000 },
   { label: '原画', value: 10000 },
   { label: '蓝光', value: 400 },
@@ -119,6 +123,13 @@ export default function App() {
     }
   }
 
+  async function changeRoomImageMode(mode: AppSettings['roomImageMode']) {
+    if (!state || state.settings.roomImageMode === mode) {
+      return;
+    }
+    await run('image-mode', () => recorder.saveSettings({ roomImageMode: mode }));
+  }
+
   if (!state || !settingsDraft) {
     return (
       <main className="loading-screen">
@@ -168,11 +179,13 @@ export default function App() {
 
       <section className="workspace-panel">
         {page === 'overview' ? (
-          <OverviewPage state={state} stats={stats} setPage={setPage} run={run} />
+          <OverviewPage state={state} stats={stats} busy={busy} setPage={setPage} run={run} />
         ) : null}
         {page === 'rooms' ? (
           <RoomsPage
             rooms={state.rooms}
+            roomImageMode={state.settings.roomImageMode}
+            onRoomImageModeChange={changeRoomImageMode}
             roomInput={roomInput}
             setRoomInput={setRoomInput}
             addRoom={addRoom}
@@ -201,11 +214,13 @@ export default function App() {
 function OverviewPage({
   state,
   stats,
+  busy,
   setPage,
   run
 }: {
   state: AppState;
   stats: ReturnType<typeof getStats>;
+  busy: string | null;
   setPage: (page: Page) => void;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
 }) {
@@ -217,9 +232,17 @@ function OverviewPage({
         title="总览"
         subtitle={`${state.settings.outputContainer.toUpperCase()} · ${
           state.settings.preferHevc ? 'H.265 优先' : 'H.264 优先'
-        } · 清晰度 ${state.settings.targetQn}`}
+        } · 清晰度 ${state.settings.targetQn} · ${state.settings.segmentMinutes} 分钟分段`}
         actions={
           <>
+            <button
+              className="wide-button"
+              disabled={busy === 'update-check'}
+              onClick={() => run('update-check', recorder.checkUpdate)}
+            >
+              <RefreshCw size={18} />
+              检查更新
+            </button>
             <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
               <HardDrive size={18} />
               打开目录
@@ -239,6 +262,8 @@ function OverviewPage({
         <BigMetric icon={<MessageSquareText size={22} />} label="弹幕事件" value={stats.events} />
       </section>
 
+      <UpdateNotice state={state} stats={stats} busy={busy} run={run} />
+
       <section className="panel-band">
         <div className="band-heading">
           <div className="section-title">
@@ -251,7 +276,13 @@ function OverviewPage({
         ) : (
           <div className="room-grid overview-rooms">
             {activeRooms.map((room) => (
-              <RoomCard key={room.id} room={room} busy={null} run={run} />
+              <RoomCard
+                key={room.id}
+                room={room}
+                roomImageMode={state.settings.roomImageMode}
+                busy={null}
+                run={run}
+              />
             ))}
           </div>
         )}
@@ -260,8 +291,101 @@ function OverviewPage({
   );
 }
 
+function UpdateNotice({
+  state,
+  stats,
+  busy,
+  run
+}: {
+  state: AppState;
+  stats: ReturnType<typeof getStats>;
+  busy: string | null;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+}) {
+  const update = state.update;
+  if (!update || update.status === 'idle') {
+    return null;
+  }
+
+  const activeJobs = stats.recording > 0 || stats.burning > 0;
+  const busyUpdating = ['checking', 'downloading', 'ready', 'applying'].includes(update.status);
+  const canInstall = update.status === 'available' || update.status === 'blocked';
+  const showQueue = canInstall && activeJobs;
+  const kind =
+    update.status === 'error' || update.status === 'blocked'
+      ? 'error'
+      : update.status === 'up-to-date'
+        ? 'ok'
+        : update.status === 'queued'
+          ? 'queued'
+          : 'available';
+
+  return (
+    <section className={`update-notice ${kind}`}>
+      <div className="update-copy">
+        {update.status === 'up-to-date' ? <CheckCircle2 size={20} /> : <Download size={20} />}
+        <div>
+          <strong>{updateTitle(update.status)}</strong>
+          <p>
+            {update.message}
+            {update.latestVersion ? ` · 当前 ${update.currentVersion}` : ''}
+          </p>
+        </div>
+      </div>
+      <div className="update-actions">
+        {showQueue ? (
+          <button
+            className="wide-button active"
+            disabled={busy === 'update-queue'}
+            onClick={() => run('update-queue', recorder.queueUpdate)}
+          >
+            <Clock3 size={18} />
+            录制结束后更新
+          </button>
+        ) : null}
+        {canInstall && !activeJobs ? (
+          <button
+            className="wide-button primary"
+            disabled={busy === 'update-apply'}
+            onClick={() => run('update-apply', recorder.applyUpdate)}
+          >
+            <Download size={18} />
+            立即更新
+          </button>
+        ) : null}
+        {update.status === 'error' ? (
+          <button
+            className="wide-button"
+            disabled={busy === 'update-check'}
+            onClick={() => run('update-check', recorder.checkUpdate)}
+          >
+            <RefreshCw size={18} />
+            重试
+          </button>
+        ) : null}
+        {update.status === 'queued' ? <span className="update-waiting">等待任务结束</span> : null}
+        {busyUpdating ? <span className="update-waiting">处理中</span> : null}
+      </div>
+    </section>
+  );
+}
+
+function updateTitle(status: AppState['update']['status']) {
+  if (status === 'available') return '有新版本';
+  if (status === 'queued') return '更新已排队';
+  if (status === 'checking') return '正在检查更新';
+  if (status === 'downloading') return '正在下载更新';
+  if (status === 'ready' || status === 'applying') return '正在应用更新';
+  if (status === 'up-to-date') return '已是最新';
+  if (status === 'blocked') return '暂不更新';
+  if (status === 'error') return '更新失败';
+  return '更新';
+}
+
 function RoomsPage({
   rooms,
+  roomImageMode,
+  onRoomImageModeChange,
   roomInput,
   setRoomInput,
   addRoom,
@@ -269,6 +393,8 @@ function RoomsPage({
   run
 }: {
   rooms: RoomState[];
+  roomImageMode: AppSettings['roomImageMode'];
+  onRoomImageModeChange: (mode: AppSettings['roomImageMode']) => Promise<void>;
   roomInput: string;
   setRoomInput: (value: string) => void;
   addRoom: () => Promise<void>;
@@ -281,26 +407,33 @@ function RoomsPage({
         title="直播间"
         subtitle={`${rooms.length} 个房间`}
         actions={
-          <div className="add-room page-add-room">
-            <input
-              value={roomInput}
-              onChange={(event) => setRoomInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  addRoom();
-                }
-              }}
-              inputMode="numeric"
-              placeholder="输入房间号"
+          <div className="rooms-toolbar">
+            <ImageModeSwitch
+              value={roomImageMode}
+              busy={busy === 'image-mode'}
+              onChange={onRoomImageModeChange}
             />
-            <button
-              className="wide-button primary"
-              disabled={busy === 'add-room'}
-              onClick={addRoom}
-            >
-              <Plus size={18} />
-              添加
-            </button>
+            <div className="add-room page-add-room">
+              <input
+                value={roomInput}
+                onChange={(event) => setRoomInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    addRoom();
+                  }
+                }}
+                inputMode="numeric"
+                placeholder="输入房间号"
+              />
+              <button
+                className="wide-button primary"
+                disabled={busy === 'add-room'}
+                onClick={addRoom}
+              >
+                <Plus size={18} />
+                添加
+              </button>
+            </div>
           </div>
         }
       />
@@ -312,10 +445,45 @@ function RoomsPage({
             <span>暂无直播间</span>
           </div>
         ) : (
-          rooms.map((room) => <RoomCard key={room.id} room={room} busy={busy} run={run} />)
+          rooms.map((room) => (
+            <RoomCard key={room.id} room={room} roomImageMode={roomImageMode} busy={busy} run={run} />
+          ))
         )}
       </section>
     </>
+  );
+}
+
+function ImageModeSwitch({
+  value,
+  busy,
+  onChange
+}: {
+  value: AppSettings['roomImageMode'];
+  busy: boolean;
+  onChange: (mode: AppSettings['roomImageMode']) => Promise<void>;
+}) {
+  return (
+    <div className="preview-switch" aria-label="卡片画面模式">
+      <button
+        className={value === 'cover' ? 'active' : ''}
+        disabled={busy}
+        onClick={() => onChange('cover')}
+        title="卡片只显示直播间封面"
+      >
+        <ImageIcon size={17} />
+        <span>封面</span>
+      </button>
+      <button
+        className={value === 'keyframe' ? 'active' : ''}
+        disabled={busy}
+        onClick={() => onChange('keyframe')}
+        title="卡片显示 B 站实时关键帧"
+      >
+        <MonitorDot size={17} />
+        <span>实时画面</span>
+      </button>
+    </div>
   );
 }
 
@@ -431,6 +599,19 @@ function SettingsPage({
                 ))}
               </select>
             </label>
+
+            <label className="field">
+              <span>分段时长（分钟）</span>
+              <input
+                type="number"
+                min={1}
+                max={1440}
+                value={settingsDraft.segmentMinutes}
+                onChange={(event) =>
+                  setSettingsDraft({ ...settingsDraft, segmentMinutes: Number(event.target.value) })
+                }
+              />
+            </label>
           </div>
 
           <div className="settings-grid">
@@ -480,6 +661,13 @@ function SettingsPage({
                 label="H.265 优先"
                 checked={settingsDraft.preferHevc}
                 onChange={(checked) => setSettingsDraft({ ...settingsDraft, preferHevc: checked })}
+              />
+              <Toggle
+                label="默认实时画面"
+                checked={settingsDraft.roomImageMode === 'keyframe'}
+                onChange={(checked) =>
+                  setSettingsDraft({ ...settingsDraft, roomImageMode: checked ? 'keyframe' : 'cover' })
+                }
               />
               <Toggle
                 label="自动生成弹幕版"
@@ -568,9 +756,25 @@ function SettingsPage({
 
         <SettingPanel title="运行路径" icon={<HardDrive size={18} />}>
           <PathLine label="当前端口" value={String(state.currentPort || '')} />
+          <PathLine label="配置文件" value={state.storePath || ''} />
           <PathLine label="应用目录" value={state.appRoot || ''} />
           <PathLine label="网页目录" value={state.distRoot || ''} />
           <PathLine label="ffmpeg" value={state.ffmpegPath || ''} />
+          <label className="field">
+            <span>更新源</span>
+            <input
+              value={settingsDraft.updateManifestUrl}
+              onChange={(event) => setSettingsDraft({ ...settingsDraft, updateManifestUrl: event.target.value })}
+            />
+          </label>
+          <button
+            className="wide-button fill"
+            type="button"
+            onClick={() => run('open-config', recorder.openConfigDir)}
+          >
+            <FolderOpen size={18} />
+            打开配置目录
+          </button>
           <button
             className="wide-button fill danger"
             type="button"
@@ -708,27 +912,59 @@ function PathLine({ label, value }: { label: string; value: string }) {
   );
 }
 
+function RoomPreview({
+  room,
+  roomImageMode,
+  status
+}: {
+  room: RoomState;
+  roomImageMode: AppSettings['roomImageMode'];
+  status: ReturnType<typeof getRoomStatus>;
+}) {
+  const rawImageUrl = roomImageMode === 'cover' ? room.cover : room.keyframe;
+  const imageUrl = rawImageUrl ? imageProxyUrl(rawImageUrl, room.lastCheckedAt) : '';
+  const imageKey = rawImageUrl ? `${rawImageUrl}:${room.lastCheckedAt || 0}` : '';
+  const [failedSrc, setFailedSrc] = useState('');
+  const canShowImage = Boolean(rawImageUrl && imageUrl && failedSrc !== imageKey);
+
+  return (
+    <div className="room-cover">
+      {canShowImage ? (
+        <img src={imageUrl} alt="" onError={() => setFailedSrc(imageKey)} />
+      ) : (
+        <div className="cover-fallback">
+          <Radio size={32} />
+          <span>{roomImageMode === 'cover' ? '无封面' : '无实时画面'}</span>
+        </div>
+      )}
+      <span className={`status-pill ${status.kind}`}>{status.label}</span>
+      <span className="preview-mode">{roomImageMode === 'cover' ? '封面' : '实时'}</span>
+    </div>
+  );
+}
+
 function RoomCard({
   room,
+  roomImageMode,
   busy,
   run
 }: {
   room: RoomState;
+  roomImageMode: AppSettings['roomImageMode'];
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
 }) {
   const status = getRoomStatus(room);
   const roomKey = room.id;
-  const streamText = room.stream
-    ? `${displayCodec(room.stream.codec)} · 清晰度 ${room.stream.qn}`
-    : '未选流';
+  const streamText = room.currentRecording?.videoInfo
+    ? formatVideoInfo(room.currentRecording.videoInfo, room.stream?.codec)
+    : room.stream
+      ? `${displayCodec(room.stream.codec)} · 清晰度 ${room.stream.qn}`
+      : '未选流';
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
-      <div className="room-cover">
-        {room.cover ? <img src={room.cover} alt="" /> : <Radio size={32} />}
-        <span className={`status-pill ${status.kind}`}>{status.label}</span>
-      </div>
+      <RoomPreview room={room} roomImageMode={roomImageMode} status={status} />
 
       <div className="room-content">
         <div className="room-heading">
@@ -768,6 +1004,14 @@ function RoomCard({
             <span>
               <MessageSquareText size={15} />
               弹幕事件 {room.currentRecording.eventCount}
+            </span>
+            <span>
+              <Radio size={15} />
+              {room.currentRecording.danmakuMessage || '弹幕通道准备中'}
+            </span>
+            <span>
+              <Activity size={15} />
+              热度 {room.currentRecording.danmakuPopularity ?? 0} · 互动 {room.currentRecording.ignoredDanmakuCount ?? 0}
             </span>
             <span title={room.currentRecording.cleanPath}>
               <FileVideo size={15} />
@@ -960,6 +1204,23 @@ function displayCodec(codec: string) {
     return 'H.264';
   }
   return codec.toUpperCase();
+}
+
+function formatVideoInfo(videoInfo: NonNullable<RoomState['currentRecording']>['videoInfo'], fallbackCodec?: string) {
+  if (!videoInfo) {
+    return fallbackCodec ? displayCodec(fallbackCodec) : '正在探测';
+  }
+  const codec = displayCodec(fallbackCodec || videoInfo.codec || '');
+  const fps = videoInfo.fps ? ` · ${videoInfo.fps}fps` : '';
+  return `${codec} · ${videoInfo.width}x${videoInfo.height}${fps}`;
+}
+
+function imageProxyUrl(url: string, version?: number) {
+  const params = new URLSearchParams({ url });
+  if (version) {
+    params.set('v', String(version));
+  }
+  return `/api/image?${params.toString()}`;
 }
 
 function loginStatusLabel(status: NonNullable<AppState['login']>['status']) {
