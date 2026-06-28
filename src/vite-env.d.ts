@@ -7,6 +7,7 @@ export type RoomState = {
   title?: string;
   anchor?: string;
   cover?: string;
+  keyframe?: string;
   liveStatus?: number;
   monitoring: boolean;
   recording: boolean;
@@ -21,6 +22,8 @@ export type StreamChoice = {
   url: string;
   codec: string;
   qn: number;
+  requestedQn?: number;
+  acceptQn?: number[];
   protocol: string;
   format: string;
   host: string;
@@ -33,6 +36,16 @@ export type RecordingState = {
   assPath?: string;
   burnedPath?: string;
   eventCount: number;
+  danmakuStatus?: 'connecting' | 'connected' | 'disconnected' | 'error';
+  danmakuMessage?: string;
+  danmakuPopularity?: number;
+  ignoredDanmakuCount?: number;
+  videoInfo?: {
+    codec?: string;
+    width: number;
+    height: number;
+    fps?: number;
+  } | null;
 };
 
 export type AppSettings = {
@@ -41,7 +54,9 @@ export type AppSettings = {
   pollIntervalSec: number;
   targetQn: number;
   preferHevc: boolean;
+  roomImageMode: 'cover' | 'keyframe';
   outputContainer: 'mp4' | 'mkv';
+  segmentMinutes: number;
   autoBurnDanmaku: boolean;
   burnCodec: string;
   burnCrf: number;
@@ -52,7 +67,36 @@ export type AppSettings = {
   notifyBurnStarted: boolean;
   notifyBurnEnded: boolean;
   openBrowserOnStart: boolean;
+  updateManifestUrl: string;
   serverPort: number;
+};
+
+export type UpdateState = {
+  status:
+    | 'idle'
+    | 'checking'
+    | 'available'
+    | 'up-to-date'
+    | 'blocked'
+    | 'queued'
+    | 'downloading'
+    | 'ready'
+    | 'applying'
+    | 'error';
+  currentVersion: string;
+  latestVersion?: string;
+  message: string;
+  checkedAt?: number;
+  queued?: boolean;
+  activeJobs?: boolean;
+  manifest?: {
+    version: string;
+    tagName?: string;
+    packageUrl: string;
+    sha256?: string;
+    releaseUrl?: string;
+    notes?: string;
+  } | null;
 };
 
 export type LoginState = {
@@ -74,9 +118,12 @@ export type AppState = {
   rooms: RoomState[];
   logs: LogEntry[];
   login?: LoginState;
+  version: string;
+  update: UpdateState;
   ffmpegPath?: string;
   startupEnabled: boolean;
   currentPort: number;
+  storePath?: string;
   appRoot?: string;
   distRoot?: string;
 };
@@ -96,6 +143,10 @@ export type RecorderApi = {
   burnDanmaku: (roomId: string) => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
+  openConfigDir: () => Promise<AppState>;
+  checkUpdate: () => Promise<AppState>;
+  applyUpdate: () => Promise<AppState>;
+  queueUpdate: () => Promise<AppState>;
   setStartup: (enabled: boolean) => Promise<AppState>;
   testNotification: () => Promise<AppState>;
   shutdown: () => Promise<void>;
