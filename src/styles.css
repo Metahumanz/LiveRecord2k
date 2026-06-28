@@ -57,13 +57,12 @@ button {
 .app-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 320px minmax(620px, 1fr) 430px;
+  grid-template-columns: 300px minmax(760px, 1fr);
   gap: 0;
 }
 
 .nav-panel,
-.workspace-panel,
-.inspector-panel {
+.workspace-panel {
   min-height: 100vh;
   min-width: 0;
 }
@@ -82,15 +81,7 @@ button {
   grid-template-rows: auto 1fr;
   gap: 22px;
   padding: 30px;
-}
-
-.inspector-panel {
-  display: grid;
-  grid-template-rows: auto auto minmax(220px, 1fr);
-  gap: 16px;
-  padding: 24px;
-  border-left: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(13, 19, 23, 0.82);
+  min-height: 100vh;
 }
 
 .brand {
@@ -148,6 +139,31 @@ button {
 
 .nav-section.compact {
   margin-top: auto;
+}
+
+.page-nav {
+  display: grid;
+  gap: 8px;
+}
+
+.nav-button {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  border-radius: 8px;
+  color: #b8c9c4;
+  background: transparent;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.nav-button:hover,
+.nav-button.active {
+  color: #10201f;
+  background: #79ded5;
 }
 
 .section-title,
@@ -387,6 +403,61 @@ button:disabled {
   font-size: 15px;
 }
 
+.header-actions,
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.page-add-room {
+  min-width: 420px;
+  margin-top: 0;
+}
+
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 16px;
+}
+
+.big-metric {
+  min-height: 132px;
+  display: grid;
+  align-content: center;
+  gap: 9px;
+  padding: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: rgba(18, 25, 30, 0.78);
+  color: #aebeba;
+}
+
+.big-metric strong {
+  color: #eff7f4;
+  font-size: 42px;
+  line-height: 1;
+}
+
+.panel-band {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.band-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.compact-empty {
+  min-height: 220px;
+}
+
 .status-strip {
   gap: 8px;
   flex-wrap: wrap;
@@ -440,6 +511,10 @@ button:disabled {
   gap: 16px;
   overflow: auto;
   padding-right: 4px;
+}
+
+.overview-rooms {
+  overflow: visible;
 }
 
 .empty-state {
@@ -614,6 +689,54 @@ button:disabled {
   min-width: 0;
 }
 
+.settings-page-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr);
+  align-content: start;
+  gap: 16px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.settings-panel {
+  align-self: start;
+}
+
+.settings-panel:nth-child(2) {
+  grid-row: span 2;
+}
+
+.inline-toggles {
+  align-self: end;
+  margin-bottom: 0;
+}
+
+.path-line {
+  display: grid;
+  gap: 7px;
+  padding: 11px 0;
+  color: #aebfba;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.path-line + .path-line {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.path-line p {
+  margin: 0;
+  overflow: hidden;
+  color: #dbe7e4;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .inline-status {
   margin: 10px 0 0;
   color: #9fb0ac;
@@ -624,6 +747,14 @@ button:disabled {
   min-height: 0;
   display: grid;
   grid-template-rows: auto 1fr;
+}
+
+.full-log-panel {
+  grid-template-rows: 1fr;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: rgba(18, 25, 30, 0.78);
+  padding: 16px;
 }
 
 .log-header {
@@ -790,16 +921,15 @@ button:disabled {
   }
 
   .app-shell {
-    grid-template-columns: 260px minmax(420px, 1fr);
+    grid-template-columns: 250px minmax(620px, 1fr);
   }
 
-  .inspector-panel {
-    grid-column: 1 / -1;
-    min-height: auto;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    grid-template-rows: auto;
-    border-left: 0;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
+  .overview-grid {
+    grid-template-columns: repeat(2, minmax(160px, 1fr));
+  }
+
+  .settings-page-grid {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -813,8 +943,7 @@ button:disabled {
   }
 
   .nav-panel,
-  .workspace-panel,
-  .inspector-panel {
+  .workspace-panel {
     min-height: auto;
   }
 
@@ -823,7 +952,18 @@ button:disabled {
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   }
 
-  .inspector-panel {
+  .page-add-room {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .workspace-header,
+  .header-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .overview-grid {
     grid-template-columns: 1fr;
   }
 }

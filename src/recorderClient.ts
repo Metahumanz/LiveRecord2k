@@ -26,9 +26,10 @@ export const recorder: RecorderApi = {
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
   burnDanmaku: (roomId) => api<AppState>('/api/rooms/burn', { roomId }),
   clearLogs: () => api<AppState>('/api/logs/clear', {}),
-  async openOutputDir() {
-    await api('/api/shell/open-output', {});
-  },
+  openOutputDir: () => api<AppState>('/api/shell/open-output', {}),
+  setStartup: (enabled) => api<AppState>('/api/system/startup', { enabled }),
+  testNotification: () => api<AppState>('/api/system/test-notification', {}),
+  shutdown: () => api('/api/system/shutdown', {}),
   onStateChanged(callback) {
     listeners.add(callback);
     ensureEventSource();
@@ -41,26 +42,6 @@ export const recorder: RecorderApi = {
     };
   }
 };
-
-export async function requestBrowserNotificationPermission() {
-  if (!('Notification' in window)) {
-    return 'unsupported';
-  }
-  if (Notification.permission === 'granted') {
-    return 'granted';
-  }
-  return Notification.requestPermission();
-}
-
-export function showBrowserNotification(title: string, body: string) {
-  if (!('Notification' in window) || Notification.permission !== 'granted') {
-    return;
-  }
-  new Notification(title, {
-    body,
-    icon: '/app-icon.png'
-  });
-}
 
 async function api<T = unknown>(url: string, body?: unknown): Promise<T> {
   const response = await fetch(url, {

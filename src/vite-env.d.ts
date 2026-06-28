@@ -51,6 +51,8 @@ export type AppSettings = {
   notifyRecordingEnded: boolean;
   notifyBurnStarted: boolean;
   notifyBurnEnded: boolean;
+  openBrowserOnStart: boolean;
+  serverPort: number;
 };
 
 export type LoginState = {
@@ -73,6 +75,10 @@ export type AppState = {
   logs: LogEntry[];
   login?: LoginState;
   ffmpegPath?: string;
+  startupEnabled: boolean;
+  currentPort: number;
+  appRoot?: string;
+  distRoot?: string;
 };
 
 export type RecorderApi = {
@@ -89,6 +95,9 @@ export type RecorderApi = {
   stopRecording: (roomId: string) => Promise<AppState>;
   burnDanmaku: (roomId: string) => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
-  openOutputDir: () => Promise<void>;
+  openOutputDir: () => Promise<AppState>;
+  setStartup: (enabled: boolean) => Promise<AppState>;
+  testNotification: () => Promise<AppState>;
+  shutdown: () => Promise<void>;
   onStateChanged: (callback: (state: AppState) => void) => () => void;
 };

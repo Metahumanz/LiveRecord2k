@@ -25,10 +25,16 @@ const DANMAKU_OP = {
   AUTH: 7
 };
 
+const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
-const PORT = clamp(Number(process.env.PORT || 5173), 1, 65535);
+const DEFAULT_PORT = 3263;
 const HOST = process.env.HOST || '127.0.0.1';
-const DEV_MODE = process.argv.includes('--dev') || !process.argv.includes('--prod');
+const PROD_MODE = process.argv.includes('--prod');
+const DEV_MODE = process.argv.includes('--dev') || !PROD_MODE;
+const OPEN_BROWSER = !process.argv.includes('--no-open') && process.env.BILI_RECORD_NO_OPEN !== '1';
+const APP_ROOT = getAppRoot();
+const DIST_ROOT = path.join(APP_ROOT, 'dist');
+const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
 class LiveRecordService {
   constructor() {
@@ -41,6 +47,8 @@ class LiveRecordService {
     this.recordingSessions = new Map();
     this.burnSessions = new Map();
     this.clients = new Set();
+    this.notifications = [];
+    this.notificationSeq = 0;
     this.loginSession = null;
     this.ffmpegPath = findFfmpegPath();
   }
@@ -61,7 +69,9 @@ class LiveRecordService {
       notifyRecordingStarted: true,
       notifyRecordingEnded: true,
       notifyBurnStarted: true,
-      notifyBurnEnded: true
+      notifyBurnEnded: true,
+      openBrowserOnStart: true,
+      serverPort: DEFAULT_PORT
     };
   }
 
@@ -116,6 +126,7 @@ class LiveRecordService {
       ...this.createDefaultSettings(),
       ...settings,
       outputContainer: normalizeContainer(settings.outputContainer),
+      burnCodec: normalizeBurnCodec(settings.burnCodec),
       pollIntervalSec: clamp(Number(settings.pollIntervalSec || 15), 5, 300),
       targetQn: Number(settings.targetQn || 15000),
       burnCrf: clamp(Number(settings.burnCrf || 24), 16, 35),
@@ -126,7 +137,9 @@ class LiveRecordService {
       notifyRecordingStarted: settings.notifyRecordingStarted !== false,
       notifyRecordingEnded: settings.notifyRecordingEnded !== false,
       notifyBurnStarted: settings.notifyBurnStarted !== false,
-      notifyBurnEnded: settings.notifyBurnEnded !== false
+      notifyBurnEnded: settings.notifyBurnEnded !== false,
+      openBrowserOnStart: settings.openBrowserOnStart !== false,
+      serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535)
     };
   }
 
@@ -158,7 +171,11 @@ class LiveRecordService {
       })),
       logs: this.logs,
       login: this.getPublicLoginState(),
-      ffmpegPath: this.ffmpegPath
+      ffmpegPath: this.ffmpegPath,
+      startupEnabled: isStartupEnabled(),
+      currentPort: this.currentPort || DEFAULT_PORT,
+      appRoot: APP_ROOT,
+      distRoot: DIST_ROOT
     };
   }
 
@@ -207,6 +224,47 @@ class LiveRecordService {
     this.emitState();
   }
 
+  notify(title, message) {
+    const notification = {
+      id: ++this.notificationSeq,
+      time: Date.now(),
+      title: String(title || APP_NAME),
+      message: String(message || '')
+    };
+    this.notifications.push(notification);
+    if (this.notifications.length > 80) {
+      this.notifications.splice(0, this.notifications.length - 80);
+    }
+    if (process.env.BILI_RECORD_TRAY !== '1') {
+      showWindowsToast(notification.title, notification.message);
+    }
+  }
+
+  getTrayStateText(afterSeq) {
+    const port = this.currentPort || DEFAULT_PORT;
+    const rooms = Array.from(this.rooms.values());
+    const monitoringCount = rooms.filter((room) => room.monitoring).length;
+    const liveCount = rooms.filter((room) => room.liveStatus === 1).length;
+    const recordingCount = rooms.filter((room) => room.recording).length;
+    const burningCount = rooms.filter((room) => room.burning).length;
+    const statusLabel = recordingCount ? '录制中' : burningCount ? '烧录中' : monitoringCount ? '监听中' : '空闲';
+    const tooltip =
+      `哔哩录播 2K | ${statusLabel} | ` +
+      `监听 ${monitoringCount} / 直播 ${liveCount} / 录制 ${recordingCount} / 烧录 ${burningCount} | ` +
+      `端口 ${port}`;
+
+    const notification = this.notifications.find((item) => item.id > afterSeq);
+    const seq = notification ? notification.id : this.notificationSeq;
+    return [
+      `seq=${seq}`,
+      `url=${encodeURIComponent(`http://${HOST}:${port}`)}`,
+      `tooltip=${encodeURIComponent(tooltip)}`,
+      `notify=${notification ? 1 : 0}`,
+      `title=${encodeURIComponent(notification?.title || '')}`,
+      `message=${encodeURIComponent(notification?.message || '')}`
+    ].join('\n');
+  }
+
   async chooseOutputDir() {
     this.log('info', 'WebUI 模式请直接填写输出目录路径。');
     return undefined;
@@ -215,6 +273,8 @@ class LiveRecordService {
   async openOutputDir() {
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
     openPath(this.settings.outputDir);
+    this.log('info', `已打开输出目录：${this.settings.outputDir}`);
+    return this.getState();
   }
 
   async startQrLogin() {
@@ -430,6 +490,12 @@ class LiveRecordService {
           room.liveStatus === 1 ? 'success' : 'info',
           `${roomLabel(room)}：${room.liveStatus === 1 ? '开播' : '下播'}`
         );
+        if (room.liveStatus === 1 && this.settings.notifyLiveStarted) {
+          this.notify('开播提醒', `${roomLabel(room)} 已开播`);
+        }
+        if (previousLiveStatus === 1 && room.liveStatus !== 1 && this.settings.notifyLiveEnded) {
+          this.notify('下播提醒', `${roomLabel(room)} 已下播`);
+        }
       } else {
         this.log(
           info.liveStatus === 1 ? 'success' : 'info',
@@ -670,6 +736,9 @@ class LiveRecordService {
         'success',
         `${roomLabel(room)} ${autoStart ? '开播自动' : '手动'}开始录制：${path.basename(cleanPath)}`
       );
+      if (this.settings.notifyRecordingStarted) {
+        this.notify('开始录制', `${roomLabel(room)} 正在写入 ${path.basename(cleanPath)}`);
+      }
 
       ffmpeg.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8');
@@ -778,8 +847,14 @@ class LiveRecordService {
         'success',
         `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，弹幕事件 ${session.eventCount} 条。`
       );
+      if (this.settings.notifyRecordingEnded) {
+        this.notify('录制结束', `${roomLabel(room)} 弹幕事件 ${session.eventCount} 条`);
+      }
     } else {
       this.log('error', `${roomLabel(room)} 录制进程异常退出：退出码 ${code}，信号 ${signal || '-'}`);
+      if (this.settings.notifyRecordingEnded) {
+        this.notify('录制异常结束', `${roomLabel(room)} 退出码 ${code}`);
+      }
     }
 
     this.emitState();
@@ -824,6 +899,9 @@ class LiveRecordService {
       room.burning = true;
       this.burnSessions.set(room.id, ffmpeg);
       this.log('info', `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}`);
+      if (this.settings.notifyBurnStarted) {
+        this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`);
+      }
 
       ffmpeg.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8');
@@ -839,8 +917,14 @@ class LiveRecordService {
         this.burnSessions.delete(room.id);
         if (code === 0) {
           this.log('success', `${roomLabel(room)} 有弹幕版已生成：${path.basename(burnedPath)}`);
+          if (this.settings.notifyBurnEnded) {
+            this.notify('弹幕版已生成', `${roomLabel(room)} ${path.basename(burnedPath)}`);
+          }
         } else {
           this.log('error', `${roomLabel(room)} 烧录失败：退出码 ${code}，信号 ${signal || '-'}`);
+          if (this.settings.notifyBurnEnded) {
+            this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${code}`);
+          }
         }
         this.emitState();
       });
@@ -892,6 +976,33 @@ class LiveRecordService {
     this.logs = [];
     this.emitState();
     return this.getState();
+  }
+
+  async setStartup(enabled) {
+    if (process.platform !== 'win32') {
+      throw new Error('开机自启目前只支持 Windows。');
+    }
+    setStartupEnabled(Boolean(enabled));
+    this.log(Boolean(enabled) ? 'success' : 'info', Boolean(enabled) ? '已开启开机自启。' : '已关闭开机自启。');
+    this.emitState();
+    return this.getState();
+  }
+
+  async testNotification() {
+    this.notify('测试通知', '哔哩录播 2K Windows 通知功能正常');
+    this.log('success', '已发送 Windows 测试通知。');
+    this.emitState();
+    return this.getState();
+  }
+
+  async requestShutdown() {
+    this.log('info', '正在退出后台服务。');
+    this.emitState();
+    setTimeout(() => {
+      this.shutdown();
+      setTimeout(() => process.exit(0), 1500).unref();
+    }, 250).unref();
+    return { ok: true };
   }
 
   getRoom(roomId) {
@@ -1023,16 +1134,34 @@ async function start() {
   const service = new LiveRecordService();
   await service.init();
   const vite = DEV_MODE ? await createViteMiddleware() : null;
+  const port = getRuntimePort(service.settings.serverPort);
+  service.currentPort = port;
 
   const server = http.createServer((request, response) => {
-    handleRequest(service, vite, request, response).catch((error) => {
+    handleRequest(service, vite, port, request, response).catch((error) => {
       writeJson(response, 500, { error: error.message || String(error) });
     });
   });
 
-  server.listen(PORT, HOST, () => {
-    console.log(`哔哩录播 2K WebUI 已启动: http://${HOST}:${PORT}`);
+  const url = `http://${HOST}:${port}`;
+  server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+      if (OPEN_BROWSER) {
+        openUrl(url);
+      }
+      console.log(`端口 ${port} 已被占用，已尝试打开现有 WebUI: ${url}`);
+      process.exit(0);
+      return;
+    }
+    throw error;
+  });
+
+  server.listen(port, HOST, () => {
+    console.log(`哔哩录播 2K WebUI 已启动: ${url}`);
     console.log('浏览器关闭后，保持这个 Node 进程运行即可继续监听/录制。');
+    if (OPEN_BROWSER && service.settings.openBrowserOnStart) {
+      setTimeout(() => openUrl(url), 300);
+    }
   });
 
   const shutdown = () => {
@@ -1046,32 +1175,38 @@ async function start() {
 
 async function createViteMiddleware() {
   const { createServer } = await import('vite');
-  return createServer({
+  const vite = await createServer({
     server: { middlewareMode: true },
     appType: 'spa'
   });
+  return vite;
 }
 
-async function handleRequest(service, vite, request, response) {
-  const parsed = new URL(request.url || '/', `http://${request.headers.host || `${HOST}:${PORT}`}`);
+async function handleRequest(service, vite, port, request, response) {
+  const parsed = new URL(request.url || '/', `http://${request.headers.host || `${HOST}:${port}`}`);
   if (parsed.pathname.startsWith('/api/')) {
-    await handleApi(service, parsed.pathname, request, response);
+    await handleApi(service, parsed, request, response);
     return;
   }
 
   if (vite) {
-    vite.middlewares(request, response, () => {
-      writeJson(response, 404, { error: 'Not found' });
-    });
+    await serveVite(vite, parsed.pathname, request, response);
     return;
   }
 
   await serveStatic(parsed.pathname, response);
 }
 
-async function handleApi(service, pathname, request, response) {
+async function handleApi(service, parsed, request, response) {
+  const pathname = parsed.pathname;
   if (request.method === 'GET' && pathname === '/api/state') {
     writeJson(response, 200, service.getState());
+    return;
+  }
+
+  if (request.method === 'GET' && pathname === '/api/tray/state') {
+    const afterSeq = Number(parsed.searchParams.get('after') || 0);
+    writeText(response, 200, service.getTrayStateText(afterSeq));
     return;
   }
 
@@ -1105,7 +1240,10 @@ async function handleApi(service, pathname, request, response) {
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId),
     '/api/logs/clear': () => service.clearLogs(),
-    '/api/shell/open-output': () => service.openOutputDir()
+    '/api/shell/open-output': () => service.openOutputDir(),
+    '/api/system/startup': () => service.setStartup(body.enabled),
+    '/api/system/test-notification': () => service.testNotification(),
+    '/api/system/shutdown': () => service.requestShutdown()
   };
 
   const action = routes[pathname];
@@ -1135,6 +1273,42 @@ async function readJsonBody(request) {
   return JSON.parse(raw);
 }
 
+async function serveVite(vite, pathname, request, response) {
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    vite.middlewares(request, response, (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+    response.on('finish', () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    });
+  });
+
+  if (response.writableEnded) {
+    return;
+  }
+
+  const indexPath = path.join(APP_ROOT, 'index.html');
+  const rawHtml = await fsp.readFile(indexPath, 'utf8');
+  const html = await vite.transformIndexHtml(pathname, rawHtml);
+  response.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-cache'
+  });
+  response.end(html);
+}
+
 function writeJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -1143,8 +1317,16 @@ function writeJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
+function writeText(response, statusCode, text) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  response.end(text);
+}
+
 async function serveStatic(pathname, response) {
-  const root = path.resolve(process.cwd(), 'dist');
+  const root = DIST_ROOT;
   const decodedPath = decodeURIComponent(pathname);
   const safePath = decodedPath === '/' ? '/index.html' : decodedPath;
   let filePath = path.resolve(root, `.${safePath}`);
@@ -1611,6 +1793,12 @@ function normalizeContainer(value) {
   return value === 'mkv' ? 'mkv' : 'mp4';
 }
 
+function normalizeBurnCodec(value) {
+  const codec = String(value || '').trim();
+  const supported = new Set(['libx265', 'libx264', 'hevc_nvenc', 'hevc_qsv', 'hevc_amf']);
+  return supported.has(codec) ? codec : 'libx265';
+}
+
 function getContainerFromPath(filePath) {
   return path.extname(filePath).toLowerCase() === '.mkv' ? 'mkv' : 'mp4';
 }
@@ -1685,11 +1873,36 @@ function guardName(level) {
   return '舰长';
 }
 
+function getRuntimePort(settingsPort) {
+  const argv = process.argv;
+  const inline = argv.find((arg) => arg.startsWith('--port='));
+  if (inline) {
+    return clamp(Number(inline.split('=').slice(1).join('=')), 1, 65535);
+  }
+  const portIndex = argv.indexOf('--port');
+  if (portIndex >= 0 && argv[portIndex + 1]) {
+    return clamp(Number(argv[portIndex + 1]), 1, 65535);
+  }
+  if (process.env.PORT) {
+    return clamp(Number(process.env.PORT), 1, 65535);
+  }
+  return clamp(Number(settingsPort || DEFAULT_PORT), 1, 65535);
+}
+
+function getAppRoot() {
+  const execDir = path.dirname(process.execPath);
+  if (process.pkg || fs.existsSync(path.join(execDir, 'dist'))) {
+    return execDir;
+  }
+  return path.resolve(__dirname, '..');
+}
+
 function findFfmpegPath() {
   const localBinary = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
   const candidates = [
+    path.join(APP_ROOT, 'bin', localBinary),
+    path.join(APP_ROOT, localBinary),
     path.join(process.cwd(), 'bin', localBinary),
-    path.join(process.cwd(), localBinary),
     ffmpegStatic,
     'ffmpeg'
   ].filter(Boolean);
@@ -1709,9 +1922,93 @@ function findFfmpegPath() {
   return 'ffmpeg';
 }
 
+function isStartupEnabled() {
+  if (process.platform !== 'win32') {
+    return false;
+  }
+  const result = spawnSync('reg.exe', ['query', RUN_KEY, '/v', APP_NAME], {
+    encoding: 'utf8',
+    windowsHide: true
+  });
+  return result.status === 0;
+}
+
+function setStartupEnabled(enabled) {
+  const command = createStartupCommand();
+  const args = enabled
+    ? ['add', RUN_KEY, '/v', APP_NAME, '/t', 'REG_SZ', '/d', command, '/f']
+    : ['delete', RUN_KEY, '/v', APP_NAME, '/f'];
+  const result = spawnSync('reg.exe', args, {
+    encoding: 'utf8',
+    windowsHide: true
+  });
+  if (result.status !== 0 && enabled) {
+    throw new Error((result.stderr || result.stdout || '写入开机自启失败').trim());
+  }
+  if (result.status !== 0 && !enabled && !/unable|找不到|不存在/i.test(result.stderr || result.stdout || '')) {
+    throw new Error((result.stderr || result.stdout || '删除开机自启失败').trim());
+  }
+}
+
+function createStartupCommand() {
+  const execDir = path.dirname(process.execPath);
+  const launcherPath = path.join(execDir, 'BiliRecord2K.exe');
+  if (fs.existsSync(path.join(execDir, 'dist')) && fs.existsSync(launcherPath)) {
+    return `"${launcherPath}" --prod --no-open`;
+  }
+  if (process.pkg || fs.existsSync(path.join(execDir, 'dist'))) {
+    return `"${process.execPath}" --prod --no-open`;
+  }
+  return `"${process.execPath}" "${path.join(APP_ROOT, 'server', 'index.cjs')}" --prod --no-open`;
+}
+
+function showWindowsToast(title, message) {
+  if (process.platform !== 'win32') {
+    return;
+  }
+  const script = `
+$ErrorActionPreference = 'Stop'
+function DecodeText([string]$value) {
+  [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value))
+}
+$title = [System.Security.SecurityElement]::Escape((DecodeText '${base64Utf8(title)}'))
+$message = [System.Security.SecurityElement]::Escape((DecodeText '${base64Utf8(message)}'))
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xmlText = "<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$message</text></binding></visual></toast>"
+$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$xml.LoadXml($xmlText)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${APP_NAME}').Show($toast)
+`;
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true
+  });
+  child.unref();
+}
+
+function base64Utf8(value) {
+  return Buffer.from(String(value || ''), 'utf8').toString('base64');
+}
+
+function openUrl(url) {
+  if (process.platform === 'win32') {
+    spawn('cmd.exe', ['/c', 'start', '', url], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true
+    }).unref();
+    return;
+  }
+  openPath(url);
+}
+
 function openPath(targetPath) {
   if (process.platform === 'win32') {
-    spawn('explorer.exe', [targetPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    spawn('explorer.exe', [targetPath], { detached: true, stdio: 'ignore' }).unref();
     return;
   }
   if (process.platform === 'darwin') {
