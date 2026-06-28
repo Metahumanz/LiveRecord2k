@@ -30,9 +30,14 @@ export type StreamChoice = {
 };
 
 export type RecordingState = {
+  id?: string;
+  roomId?: string;
+  roomTitle?: string;
+  anchor?: string;
   startedAt: number;
   cleanPath: string;
   danmakuPath: string;
+  cssPath?: string;
   assPath?: string;
   burnedPath?: string;
   eventCount: number;
@@ -58,6 +63,7 @@ export type AppSettings = {
   outputContainer: 'mp4' | 'mkv';
   segmentMinutes: number;
   autoBurnDanmaku: boolean;
+  burnOverlayMode: 'danmaku' | 'danmaku-gift';
   burnCodec: string;
   burnCrf: number;
   notifyLiveStarted: boolean;
@@ -106,6 +112,32 @@ export type LoginState = {
   expiresAt?: number;
 };
 
+export type ExportResult = {
+  ok: boolean;
+  mode: 'clean' | 'burn' | 'subtitles';
+  outputPath?: string;
+  cleanPath?: string;
+  cssPath?: string;
+  assPath?: string;
+  eventCount?: number;
+};
+
+export type ExportClipRequest = {
+  mode: 'clean' | 'burn';
+  cleanPath: string;
+  danmakuPath?: string;
+  cssPath?: string;
+  startTime: string;
+  endTime: string;
+  overlayMode?: 'danmaku' | 'danmaku-gift';
+  outputDir?: string;
+  outputPath?: string;
+};
+
+export type SubtitleRequest = Omit<ExportClipRequest, 'mode'> & {
+  overlayMode?: 'danmaku' | 'danmaku-gift';
+};
+
 export type LogEntry = {
   id: string;
   time: number;
@@ -116,6 +148,7 @@ export type LogEntry = {
 export type AppState = {
   settings: AppSettings;
   rooms: RoomState[];
+  recordings: RecordingState[];
   logs: LogEntry[];
   login?: LoginState;
   version: string;
@@ -140,7 +173,10 @@ export type RecorderApi = {
   setMonitoring: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
-  burnDanmaku: (roomId: string) => Promise<AppState>;
+  burnDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode']; prepareOnly?: boolean }) => Promise<AppState>;
+  prepareDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode'] }) => Promise<AppState>;
+  prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
+  exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
   openConfigDir: () => Promise<AppState>;

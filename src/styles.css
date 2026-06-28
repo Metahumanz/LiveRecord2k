@@ -815,6 +815,24 @@ button:disabled {
   margin-top: auto;
 }
 
+.action-select {
+  min-height: 44px;
+  width: 126px;
+  flex: 0 0 126px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 7px;
+  outline: 0;
+  background: #0d1418;
+  color: #dbe7e4;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.action-select:disabled {
+  opacity: 0.5;
+}
+
 .inspector-card {
   min-width: 0;
 }
@@ -835,6 +853,39 @@ button:disabled {
 
 .settings-panel:nth-child(2) {
   grid-row: span 2;
+}
+
+.export-layout {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(360px, 1.05fr) minmax(360px, 1fr);
+  align-content: start;
+  gap: 16px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.export-panel {
+  align-self: start;
+}
+
+.export-result-panel {
+  grid-column: 1 / -1;
+}
+
+.time-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.export-actions {
+  margin-top: 16px;
+}
+
+.result-lines {
+  display: grid;
+  gap: 2px;
 }
 
 .inline-toggles {
@@ -1059,6 +1110,11 @@ button:disabled {
   }
 
   .settings-page-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .export-layout,
+  .time-grid {
     grid-template-columns: 1fr;
   }
 }

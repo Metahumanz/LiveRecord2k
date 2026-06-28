@@ -59,6 +59,7 @@ class LiveRecordService {
     this.monitorTimers = new Map();
     this.recordingSessions = new Map();
     this.burnSessions = new Map();
+    this.recordings = [];
     this.clients = new Set();
     this.notifications = [];
     this.notificationSeq = 0;
@@ -88,6 +89,7 @@ class LiveRecordService {
       outputContainer: 'mp4',
       segmentMinutes: 60,
       autoBurnDanmaku: true,
+      burnOverlayMode: 'danmaku-gift',
       burnCodec: 'libx265',
       burnCrf: 24,
       notifyLiveStarted: true,
@@ -122,6 +124,7 @@ class LiveRecordService {
         const room = this.normalizeRoom(savedRoom);
         this.rooms.set(room.id, room);
       }
+      this.recordings = (store.recordings || []).map((recording) => this.normalizeRecording(recording)).filter(Boolean);
     } catch (error) {
       if (error.code !== 'ENOENT') {
         this.log('warn', `读取配置失败，将使用默认配置：${error.message}`);
@@ -142,11 +145,7 @@ class LiveRecordService {
       liveStatus: room.liveStatus,
       monitoring: room.monitoring
     }));
-    await fsp.writeFile(
-      this.storePath,
-      JSON.stringify({ settings: this.settings, rooms }, null, 2),
-      'utf8'
-    );
+    await fsp.writeFile(this.storePath, JSON.stringify({ settings: this.settings, rooms, recordings: this.recordings }, null, 2), 'utf8');
   }
 
   normalizeSettings(settings) {
@@ -162,6 +161,7 @@ class LiveRecordService {
       preferHevc: Boolean(settings.preferHevc),
       roomImageMode: normalizeRoomImageMode(settings.roomImageMode),
       autoBurnDanmaku: Boolean(settings.autoBurnDanmaku),
+      burnOverlayMode: normalizeBurnOverlayMode(settings.burnOverlayMode),
       notifyLiveStarted: settings.notifyLiveStarted !== false,
       notifyLiveEnded: settings.notifyLiveEnded !== false,
       notifyRecordingStarted: settings.notifyRecordingStarted !== false,
@@ -194,6 +194,27 @@ class LiveRecordService {
     };
   }
 
+  normalizeRecording(recording) {
+    const cleanPath = String(recording?.cleanPath || '').trim();
+    if (!cleanPath) {
+      return null;
+    }
+    return {
+      id: String(recording.id || cleanPath),
+      roomId: recording.roomId ? String(recording.roomId) : '',
+      roomTitle: String(recording.roomTitle || ''),
+      anchor: String(recording.anchor || ''),
+      startedAt: Number(recording.startedAt || Date.now()),
+      cleanPath,
+      danmakuPath: String(recording.danmakuPath || deriveSiblingPath(cleanPath, 'danmaku', 'jsonl')),
+      cssPath: String(recording.cssPath || deriveSiblingPath(cleanPath, 'danmaku', 'css')),
+      assPath: String(recording.assPath || deriveSiblingPath(cleanPath, 'danmaku', 'ass')),
+      burnedPath: String(recording.burnedPath || deriveBurnedPath(cleanPath, 'danmaku-gift')),
+      eventCount: Number(recording.eventCount || 0),
+      videoInfo: recording.videoInfo || null
+    };
+  }
+
   getState() {
     return {
       settings: { ...this.settings },
@@ -201,6 +222,7 @@ class LiveRecordService {
         ...room,
         stream: room.stream ? { ...room.stream, url: '[hidden]' } : undefined
       })),
+      recordings: this.recordings,
       logs: this.logs,
       login: this.getPublicLoginState(),
       version: APP_VERSION,
@@ -884,6 +906,7 @@ class LiveRecordService {
       const container = normalizeContainer(this.settings.outputContainer);
       const cleanPath = path.join(this.settings.outputDir, `${baseName}.clean.${container}`);
       const danmakuPath = path.join(this.settings.outputDir, `${baseName}.danmaku.jsonl`);
+      const cssPath = path.join(this.settings.outputDir, `${baseName}.danmaku.css`);
       const assPath = path.join(this.settings.outputDir, `${baseName}.danmaku.ass`);
       const burnedPath = path.join(this.settings.outputDir, `${baseName}.danmaku.${container}`);
 
@@ -909,6 +932,7 @@ class LiveRecordService {
         startedAt: Date.now(),
         cleanPath,
         danmakuPath,
+        cssPath,
         assPath,
         burnedPath,
         eventCount: 0,
@@ -932,6 +956,7 @@ class LiveRecordService {
         startedAt: session.startedAt,
         cleanPath,
         danmakuPath,
+        cssPath,
         assPath,
         burnedPath,
         eventCount: 0,
@@ -1194,6 +1219,7 @@ class LiveRecordService {
       startedAt: session.startedAt,
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
+      cssPath: session.cssPath,
       assPath: session.assPath,
       burnedPath: session.burnedPath,
       eventCount: session.eventCount,
@@ -1206,6 +1232,8 @@ class LiveRecordService {
     if (room.currentRecording) {
       Object.assign(room.currentRecording, finishedRecording);
     }
+    this.rememberRecording(room, finishedRecording);
+    await this.saveStore();
     this.recordingSessions.delete(roomId);
     const shouldContinueSegment = session.rotating && !session.stopping;
 
@@ -1254,7 +1282,21 @@ class LiveRecordService {
     }
   }
 
-  async startBurnDanmaku(roomId) {
+  rememberRecording(room, recording) {
+    const item = this.normalizeRecording({
+      ...recording,
+      id: `${recording.cleanPath}:${recording.startedAt || Date.now()}`,
+      roomId: room.id,
+      roomTitle: room.title || '',
+      anchor: room.anchor || ''
+    });
+    if (!item) {
+      return;
+    }
+    this.recordings = [item, ...this.recordings.filter((saved) => saved.cleanPath !== item.cleanPath)].slice(0, 80);
+  }
+
+  async startBurnDanmaku(roomId, options = {}) {
     const room = this.getRoom(roomId);
     if (room.burning) {
       return this.getState();
@@ -1265,11 +1307,26 @@ class LiveRecordService {
       return this.getState();
     }
 
-    await this.startBurnRecording(room, recording);
+    await this.startBurnRecording(room, recording, options);
     return this.getState();
   }
 
-  async startBurnRecording(room, recording) {
+  async prepareDanmakuForRoom(roomId, options = {}) {
+    const room = this.getRoom(roomId);
+    const recording = room.currentRecording;
+    if (!recording?.cleanPath || !recording?.danmakuPath) {
+      this.log('warn', `${roomLabel(room)} 没有可生成字幕的最近录像。`);
+      return this.getState();
+    }
+    const assets = await this.generateSubtitleAssets(recording, {
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode
+    });
+    this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
+    this.emitState();
+    return this.getState();
+  }
+
+  async startBurnRecording(room, recording, options = {}) {
     if (room.burning) {
       this.log('warn', `${roomLabel(room)} 已有弹幕版正在生成，跳过 ${path.basename(recording.cleanPath)}。`);
       return false;
@@ -1280,13 +1337,18 @@ class LiveRecordService {
     }
 
     try {
-      await this.generateAss(recording);
-      const burnedPath = recording.burnedPath || deriveSiblingPath(recording.cleanPath, 'danmaku');
+      const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+      const assets = await this.generateSubtitleAssets(recording, { overlayMode });
+      if (options.prepareOnly) {
+        this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
+        return true;
+      }
+      const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
       recording.burnedPath = burnedPath;
 
       const args = createBurnArgs({
         cleanPath: recording.cleanPath,
-        assPath: recording.assPath,
+        assPath: assets.assPath,
         burnedPath,
         codec: this.settings.burnCodec,
         crf: this.settings.burnCrf,
@@ -1298,7 +1360,7 @@ class LiveRecordService {
       });
       room.burning = true;
       this.burnSessions.set(room.id, ffmpeg);
-      this.log('info', `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}`);
+      this.log('info', `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(overlayMode)}）`);
       if (this.settings.notifyBurnStarted) {
         this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`);
       }
@@ -1338,28 +1400,131 @@ class LiveRecordService {
     return true;
   }
 
-  async generateAss(recording) {
-    const raw = await fsp.readFile(recording.danmakuPath, 'utf8').catch((error) => {
-      if (error.code === 'ENOENT') {
-        return '';
-      }
-      throw error;
+  async generateSubtitleAssets(recording, options = {}) {
+    const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+    const events = await readDanmakuEvents(recording.danmakuPath);
+    const cssPath = options.cssPath || recording.cssPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'css');
+    await ensureDanmakuCss(cssPath);
+    const style = await readDanmakuStyle(cssPath);
+    const assPath =
+      options.assPath ||
+      recording.assPath ||
+      deriveSiblingPath(recording.cleanPath, overlayMode === 'danmaku' ? 'danmaku-only' : 'danmaku', 'ass');
+    const ass = createAss(events, {
+      overlayMode,
+      style,
+      startTime: options.startTime,
+      endTime: options.endTime,
+      shiftTime: options.shiftTime
     });
-    const events = raw
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line);
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-    const ass = createAss(events);
-    recording.assPath = recording.assPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'ass');
-    await fsp.writeFile(recording.assPath, ass, 'utf8');
-    return recording.assPath;
+    await fsp.writeFile(assPath, ass, 'utf8');
+    recording.cssPath = cssPath;
+    recording.assPath = assPath;
+    return { cssPath, assPath, eventCount: events.length };
+  }
+
+  async prepareSubtitleExport(options = {}) {
+    const recording = this.normalizeRecording(options.recording || options);
+    if (!recording) {
+      throw new Error('请选择录像文件。');
+    }
+    const startTime = parseTimeInput(options.startTime ?? options.start);
+    const endTime = parseTimeInput(options.endTime ?? options.end);
+    const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+    const suffix = createClipSuffix(startTime, endTime, overlayMode);
+    const assets = await this.generateSubtitleAssets(recording, {
+      overlayMode,
+      startTime,
+      endTime,
+      shiftTime: Number.isFinite(startTime),
+      cssPath: options.cssPath || recording.cssPath,
+      assPath: deriveSiblingPath(recording.cleanPath, suffix, 'ass')
+    });
+    this.log('success', `字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
+    return {
+      ok: true,
+      mode: 'subtitles',
+      cleanPath: recording.cleanPath,
+      cssPath: assets.cssPath,
+      assPath: assets.assPath,
+      eventCount: assets.eventCount
+    };
+  }
+
+  async exportClip(options = {}) {
+    const recording = this.normalizeRecording(options.recording || options);
+    if (!recording) {
+      throw new Error('请选择录像文件。');
+    }
+    if (!fs.existsSync(recording.cleanPath)) {
+      throw new Error(`源视频不存在：${recording.cleanPath}`);
+    }
+    const mode = normalizeExportMode(options.mode);
+    const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+    const startTime = parseTimeInput(options.startTime ?? options.start);
+    const endTime = parseTimeInput(options.endTime ?? options.end);
+    if (!Number.isFinite(startTime) || startTime < 0) {
+      throw new Error('开始时间无效，请输入 00:00:00 或秒数。');
+    }
+    if (!Number.isFinite(endTime) || endTime <= startTime) {
+      throw new Error('结束时间必须大于开始时间。');
+    }
+    const duration = endTime - startTime;
+    const outputDir = String(options.outputDir || path.dirname(recording.cleanPath));
+    await fsp.mkdir(outputDir, { recursive: true });
+    const outputPath =
+      options.outputPath ||
+      deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime);
+
+    let cssPath = recording.cssPath;
+    let assPath = recording.assPath;
+    let args;
+    if (mode === 'clean') {
+      args = createClipCopyArgs({
+        cleanPath: recording.cleanPath,
+        outputPath,
+        startTime,
+        duration,
+        container: getContainerFromPath(outputPath)
+      });
+    } else {
+      const assets = await this.generateSubtitleAssets(recording, {
+        overlayMode,
+        startTime,
+        endTime,
+        shiftTime: true,
+        cssPath: options.cssPath || recording.cssPath,
+        assPath: deriveSiblingPath(outputPath, 'subtitle', 'ass')
+      });
+      cssPath = assets.cssPath;
+      assPath = assets.assPath;
+      args = createBurnArgs({
+        cleanPath: recording.cleanPath,
+        assPath,
+        burnedPath: outputPath,
+        codec: this.settings.burnCodec,
+        crf: this.settings.burnCrf,
+        container: getContainerFromPath(outputPath),
+        startTime,
+        duration
+      });
+    }
+
+    this.log('info', `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`);
+    await runFfmpegJob(this.ffmpegPath, args, (line) => {
+      if (/error|failed|invalid/i.test(line)) {
+        this.log('warn', `剪辑导出：${compactLogLine(line)}`);
+      }
+    });
+    this.log('success', `片段已导出：${path.basename(outputPath)}`);
+    return {
+      ok: true,
+      mode,
+      outputPath,
+      cleanPath: recording.cleanPath,
+      cssPath,
+      assPath: mode === 'burn' ? assPath : undefined
+    };
   }
 
   createFfmpegHeaders(room) {
@@ -1871,7 +2036,10 @@ async function handleApi(service, parsed, request, response) {
     '/api/rooms/monitor': () => service.setMonitoring(body.roomId, body.enabled),
     '/api/rooms/record/start': () => service.startRecording(body.roomId, false),
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
-    '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId),
+    '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
+    '/api/rooms/subtitles': () => service.prepareDanmakuForRoom(body.roomId, body.options || {}),
+    '/api/export/subtitles': () => service.prepareSubtitleExport(body),
+    '/api/export/clip': () => service.exportClip(body),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
     '/api/shell/open-config': () => service.openConfigDir(),
@@ -2176,36 +2344,192 @@ function normalizeDanmakuEvent(command, startedAt) {
   return null;
 }
 
-function createAss(events) {
-  const sorted = [...events].sort((a, b) => a.time - b.time);
+const DEFAULT_DANMAKU_STYLE = {
+  playWidth: 1920,
+  playHeight: 1080,
+  fontFamily: 'Microsoft YaHei',
+  danmakuFontSize: 38,
+  danmakuOutline: 2,
+  danmakuLanes: 8,
+  danmakuDuration: 8,
+  danmakuTop: 36,
+  danmakuLineHeight: 46,
+  boxFontSize: 30,
+  panelLeft: 34,
+  superChatLanes: 3,
+  superChatBottom: 618,
+  giftLanes: 4,
+  giftBottom: 934
+};
+
+async function readDanmakuEvents(danmakuPath) {
+  const raw = await fsp.readFile(danmakuPath, 'utf8').catch((error) => {
+    if (error.code === 'ENOENT') {
+      return '';
+    }
+    throw error;
+  });
+  return raw
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function ensureDanmakuCss(cssPath) {
+  try {
+    await fsp.access(cssPath);
+  } catch {
+    await fsp.writeFile(cssPath, createDefaultDanmakuCss(), 'utf8');
+  }
+  return cssPath;
+}
+
+async function readDanmakuStyle(cssPath) {
+  const raw = await fsp.readFile(cssPath, 'utf8').catch(() => '');
+  return normalizeDanmakuStyle(parseCssVariables(raw));
+}
+
+function createDefaultDanmakuCss() {
+  return `/* BiliRecord2K 弹幕烧录样式。修改后重新生成字幕/烧录即可生效。 */
+:root {
+  --play-width: 1920;
+  --play-height: 1080;
+  --font-family: Microsoft YaHei;
+  --danmaku-font-size: 38;
+  --danmaku-outline: 2;
+  --danmaku-lanes: 8;
+  --danmaku-duration: 8;
+  --danmaku-top: 36;
+  --danmaku-line-height: 46;
+  --box-font-size: 30;
+  --panel-left: 34;
+  --superchat-lanes: 3;
+  --superchat-bottom: 618;
+  --gift-lanes: 4;
+  --gift-bottom: 934;
+}
+`;
+}
+
+function parseCssVariables(css) {
+  const values = {};
+  const pattern = /--([a-z0-9-]+)\s*:\s*([^;]+);/gi;
+  let match;
+  while ((match = pattern.exec(String(css || '')))) {
+    values[match[1]] = match[2].trim();
+  }
+  return values;
+}
+
+function normalizeDanmakuStyle(values = {}) {
+  const pickNumber = (key, fallback, min, max) => clamp(Number(values[key] ?? fallback), min, max);
+  const fontFamily = String(values['font-family'] || DEFAULT_DANMAKU_STYLE.fontFamily)
+    .replace(/["']/g, '')
+    .trim();
+  return {
+    playWidth: pickNumber('play-width', DEFAULT_DANMAKU_STYLE.playWidth, 640, 7680),
+    playHeight: pickNumber('play-height', DEFAULT_DANMAKU_STYLE.playHeight, 360, 4320),
+    fontFamily: fontFamily || DEFAULT_DANMAKU_STYLE.fontFamily,
+    danmakuFontSize: pickNumber('danmaku-font-size', DEFAULT_DANMAKU_STYLE.danmakuFontSize, 12, 96),
+    danmakuOutline: pickNumber('danmaku-outline', DEFAULT_DANMAKU_STYLE.danmakuOutline, 0, 8),
+    danmakuLanes: Math.round(pickNumber('danmaku-lanes', DEFAULT_DANMAKU_STYLE.danmakuLanes, 1, 24)),
+    danmakuDuration: pickNumber('danmaku-duration', DEFAULT_DANMAKU_STYLE.danmakuDuration, 2, 20),
+    danmakuTop: pickNumber('danmaku-top', DEFAULT_DANMAKU_STYLE.danmakuTop, 0, 2000),
+    danmakuLineHeight: pickNumber('danmaku-line-height', DEFAULT_DANMAKU_STYLE.danmakuLineHeight, 16, 180),
+    boxFontSize: pickNumber('box-font-size', DEFAULT_DANMAKU_STYLE.boxFontSize, 12, 80),
+    panelLeft: pickNumber('panel-left', DEFAULT_DANMAKU_STYLE.panelLeft, 0, 2000),
+    superChatLanes: Math.round(pickNumber('superchat-lanes', DEFAULT_DANMAKU_STYLE.superChatLanes, 1, 10)),
+    superChatBottom: pickNumber('superchat-bottom', DEFAULT_DANMAKU_STYLE.superChatBottom, 0, 4000),
+    giftLanes: Math.round(pickNumber('gift-lanes', DEFAULT_DANMAKU_STYLE.giftLanes, 1, 16)),
+    giftBottom: pickNumber('gift-bottom', DEFAULT_DANMAKU_STYLE.giftBottom, 0, 4000)
+  };
+}
+
+function prepareAssEvents(events, options = {}) {
+  const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
+  const startTime = Number(options.startTime);
+  const endTime = Number(options.endTime);
+  const hasStart = Number.isFinite(startTime);
+  const hasEnd = Number.isFinite(endTime);
+  return [...events]
+    .filter((event) => {
+      if (overlayMode === 'danmaku' && event.type !== 'danmaku') {
+        return false;
+      }
+      if (!['danmaku', 'superchat', 'gift', 'guard'].includes(event.type)) {
+        return false;
+      }
+      const eventStart = Number(event.time || 0);
+      const eventEnd = eventStart + getDanmakuEventDuration(event);
+      if (hasStart && eventEnd < startTime) {
+        return false;
+      }
+      if (hasEnd && eventStart > endTime) {
+        return false;
+      }
+      return true;
+    })
+    .map((event) => ({
+      ...event,
+      time: options.shiftTime && hasStart ? Math.max(0, Number(event.time || 0) - startTime) : Number(event.time || 0)
+    }))
+    .sort((a, b) => a.time - b.time);
+}
+
+function getDanmakuEventDuration(event) {
+  if (event.type === 'superchat') {
+    return clamp(Number(event.duration || 60), 30, 180);
+  }
+  if (event.type === 'danmaku') {
+    return 8;
+  }
+  return event.type === 'guard' ? 8 : 5;
+}
+
+function createAss(events, options = {}) {
+  const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
+  const style = normalizeDanmakuStyle(options.style);
+  const sorted = prepareAssEvents(events, {
+    overlayMode,
+    startTime: options.startTime,
+    endTime: options.endTime,
+    shiftTime: options.shiftTime
+  });
   const lines = [
     '[Script Info]',
     'ScriptType: v4.00+',
     'WrapStyle: 2',
     'ScaledBorderAndShadow: yes',
-    'PlayResX: 1920',
-    'PlayResY: 1080',
+    `PlayResX: ${style.playWidth}`,
+    `PlayResY: ${style.playHeight}`,
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    'Style: Danmaku,Microsoft YaHei,38,&H00FFFFFF,&H000000FF,&H96000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,7,20,20,20,1',
-    'Style: BoxText,Microsoft YaHei,30,&H00FFFFFF,&H000000FF,&H32000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1',
+    `Style: Danmaku,${style.fontFamily},${style.danmakuFontSize},&H00FFFFFF,&H000000FF,&H96000000,&H64000000,0,0,0,0,100,100,0,0,1,${style.danmakuOutline},0,7,20,20,20,1`,
+    `Style: BoxText,${style.fontFamily},${style.boxFontSize},&H00FFFFFF,&H000000FF,&H32000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1`,
     'Style: Shape,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text'
   ];
 
-  const danmakuRows = Array(8).fill(0);
-  const scRows = Array(3).fill(0);
-  const giftRows = Array(4).fill(0);
+  const danmakuRows = Array(style.danmakuLanes).fill(0);
+  const scRows = Array(style.superChatLanes).fill(0);
+  const giftRows = Array(style.giftLanes).fill(0);
 
   for (const event of sorted) {
     if (event.type === 'danmaku') {
-      const duration = 8;
+      const duration = style.danmakuDuration;
       const row = chooseLane(danmakuRows, event.time, duration);
-      const y = 36 + row * 46;
-      const width = estimateTextWidth(event.text, 38);
+      const y = style.danmakuTop + row * style.danmakuLineHeight;
+      const width = estimateTextWidth(event.text, style.danmakuFontSize);
       const color = assColorFromRgb(event.color || 0xffffff);
       lines.push(
         dialogue(
@@ -2222,8 +2546,8 @@ function createAss(events) {
     if (event.type === 'superchat') {
       const duration = clamp(Number(event.duration || 60), 30, 180);
       const row = chooseLane(scRows, event.time, duration);
-      const x = 34;
-      const y = 618 - row * 132;
+      const x = style.panelLeft;
+      const y = style.superChatBottom - row * 132;
       const palette = superChatPalette(event.price || 0);
       const title = `${event.user || '用户'}  ￥${event.price || 0}`;
       lines.push(drawRect(7, event.time, event.time + duration, x, y, 570, 42, palette.header));
@@ -2252,8 +2576,8 @@ function createAss(events) {
     if (event.type === 'gift' || event.type === 'guard') {
       const duration = event.type === 'guard' ? 8 : 5;
       const row = chooseLane(giftRows, event.time, duration);
-      const x = 34;
-      const y = 934 - row * 56;
+      const x = style.panelLeft;
+      const y = style.giftBottom - row * 56;
       const label =
         event.type === 'guard'
           ? `${event.user || '用户'} 开通 ${event.giftName || '舰长'} x${event.count || 1}`
@@ -2311,8 +2635,15 @@ function createRecordingArgs({ streamUrl, headers, outputPath, container, stream
   return args;
 }
 
-function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container }) {
-  const args = ['-hide_banner', '-y', '-i', cleanPath, '-vf', `ass='${escapeFilterPath(assPath)}'`, '-c:v', codec || 'libx265'];
+function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration }) {
+  const args = ['-hide_banner', '-y', '-i', cleanPath];
+  if (Number.isFinite(Number(startTime)) && Number(startTime) > 0) {
+    args.push('-ss', formatFfmpegSeconds(startTime));
+  }
+  if (Number.isFinite(Number(duration)) && Number(duration) > 0) {
+    args.push('-t', formatFfmpegSeconds(duration));
+  }
+  args.push('-vf', `ass='${escapeFilterPath(assPath)}'`, '-c:v', codec || 'libx265');
 
   if ((codec || '').includes('nvenc')) {
     args.push('-preset', 'p5', '-cq', String(crf), '-b:v', '0');
@@ -2332,6 +2663,30 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container 
   }
 
   args.push('-c:a', 'copy', burnedPath);
+  return args;
+}
+
+function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, container }) {
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-ss',
+    formatFfmpegSeconds(startTime),
+    '-i',
+    cleanPath,
+    '-t',
+    formatFfmpegSeconds(duration),
+    '-map',
+    '0',
+    '-c',
+    'copy',
+    '-avoid_negative_ts',
+    'make_zero'
+  ];
+  if (container === 'mp4') {
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
   return args;
 }
 
@@ -2488,6 +2843,18 @@ function normalizeRoomImageMode(value) {
   return value === 'cover' ? 'cover' : 'keyframe';
 }
 
+function normalizeBurnOverlayMode(value) {
+  return value === 'danmaku' ? 'danmaku' : 'danmaku-gift';
+}
+
+function normalizeExportMode(value) {
+  return value === 'burn' ? 'burn' : 'clean';
+}
+
+function overlayModeLabel(value) {
+  return normalizeBurnOverlayMode(value) === 'danmaku' ? '仅弹幕' : '弹幕和礼物';
+}
+
 function basenameWithoutExt(url) {
   const value = String(url || '').trim();
   if (!value) {
@@ -2524,6 +2891,87 @@ function deriveSiblingPath(filePath, suffix, extension) {
   const ext = extension || parsed.ext.replace(/^\./, '') || 'mp4';
   const base = parsed.name.replace(/\.clean$/i, '');
   return path.join(parsed.dir, `${base}.${suffix}.${ext}`);
+}
+
+function deriveBurnedPath(filePath, overlayMode) {
+  return deriveSiblingPath(filePath, normalizeBurnOverlayMode(overlayMode) === 'danmaku' ? 'danmaku-only' : 'danmaku');
+}
+
+function deriveClipPath(cleanPath, outputDir, mode, startTime, endTime) {
+  const parsed = path.parse(cleanPath);
+  const container = parsed.ext.replace(/^\./, '') || 'mp4';
+  const base = parsed.name.replace(/\.clean$/i, '');
+  const suffix = createClipSuffix(startTime, endTime, mode);
+  return path.join(outputDir, `${base}.${suffix}.${container}`);
+}
+
+function createClipSuffix(startTime, endTime, mode) {
+  const start = safeTimeSlug(startTime);
+  const end = Number.isFinite(Number(endTime)) ? safeTimeSlug(endTime) : 'end';
+  return `clip_${start}-${end}.${normalizeClipModeName(mode)}`;
+}
+
+function normalizeClipModeName(mode) {
+  if (mode === 'clean') {
+    return 'clean';
+  }
+  return normalizeBurnOverlayMode(mode) === 'danmaku' ? 'danmaku-only' : 'danmaku';
+}
+
+function safeTimeSlug(value) {
+  return formatFfmpegSeconds(value).replace('.', '_').replace(/:/g, '');
+}
+
+function parseTimeInput(value) {
+  if (value === undefined || value === null || value === '') {
+    return Number.NaN;
+  }
+  if (typeof value === 'number') {
+    return value;
+  }
+  const text = String(value).trim();
+  if (!text) {
+    return Number.NaN;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    return Number(text);
+  }
+  const parts = text.split(':').map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part) || part < 0) || parts.length > 3) {
+    return Number.NaN;
+  }
+  while (parts.length < 3) {
+    parts.unshift(0);
+  }
+  return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+function formatFfmpegSeconds(value) {
+  const safe = Math.max(0, Number(value) || 0);
+  return safe.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function runFfmpegJob(ffmpegPath, args, onStderr) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      stderr = `${stderr}${text}`.slice(-8000);
+      onStderr?.(text);
+    });
+    child.on('error', reject);
+    child.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`ffmpeg 退出码 ${code}，信号 ${signal || '-'}：${compactLogLine(stderr)}`));
+    });
+  });
 }
 
 function isHevcCodec(codec) {
