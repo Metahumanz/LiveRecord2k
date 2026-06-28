@@ -34,6 +34,7 @@ async function main() {
   await bundleServer();
   await fsp.cp(path.join(root, 'dist'), path.join(releaseDir, 'dist'), { recursive: true });
   await fsp.cp(path.join(root, 'assets'), path.join(releaseDir, 'assets'), { recursive: true });
+  await writeVersionFile();
 
   await buildServiceExe();
   await buildLauncherExe();
@@ -47,6 +48,23 @@ async function main() {
   console.log(`  launcher: ${launcherExePath}`);
   console.log(`  service:  ${serviceExePath}`);
   console.log(`  zip:      ${zipPath}`);
+}
+
+async function writeVersionFile() {
+  const packageJson = JSON.parse(await fsp.readFile(path.join(root, 'package.json'), 'utf8'));
+  await fsp.writeFile(
+    path.join(releaseDir, 'version.json'),
+    `${JSON.stringify(
+      {
+        name: packageJson.name,
+        version: packageJson.version,
+        builtAt: new Date().toISOString()
+      },
+      null,
+      2
+    )}\n`,
+    'utf8'
+  );
 }
 
 async function bundleServer() {
