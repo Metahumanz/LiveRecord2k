@@ -1,9 +1,11 @@
 const http = require('node:http');
+const https = require('node:https');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const zlib = require('node:zlib');
+const tls = require('node:tls');
 const crypto = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 const WebSocket = require('ws');
@@ -32,6 +34,8 @@ const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
 const DEFAULT_PORT = 3263;
 const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
+const MIN_PLAYABLE_BYTES = 128 * 1024;
+const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
 const WBI_MIXIN_KEY_TABLE = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14,
   39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59,
@@ -107,6 +111,7 @@ class LiveRecordService {
   async init() {
     await this.loadStore();
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
+    await this.refreshRecordingLibrary({ silent: true });
     for (const room of this.rooms.values()) {
       if (room.monitoring) {
         this.startMonitorTimer(room.id);
@@ -210,6 +215,13 @@ class LiveRecordService {
       cssPath: String(recording.cssPath || deriveSiblingPath(cleanPath, 'danmaku', 'css')),
       assPath: String(recording.assPath || deriveSiblingPath(cleanPath, 'danmaku', 'ass')),
       burnedPath: String(recording.burnedPath || deriveBurnedPath(cleanPath, 'danmaku-gift')),
+      mergeGroup: String(recording.mergeGroup || ''),
+      mergeSequence: Number(recording.mergeSequence || 0),
+      mergeOutputPath: String(recording.mergeOutputPath || ''),
+      mergedFrom: Array.isArray(recording.mergedFrom) ? recording.mergedFrom.map(String) : undefined,
+      durationSec: Number(recording.durationSec || 0),
+      fileSize: Number(recording.fileSize || 0),
+      valid: recording.valid !== false,
       eventCount: Number(recording.eventCount || 0),
       videoInfo: recording.videoInfo || null
     };
@@ -489,11 +501,15 @@ class LiveRecordService {
 
   async saveSettings(nextSettings) {
     const oldPollInterval = this.settings.pollIntervalSec;
+    const oldOutputDir = this.settings.outputDir;
     this.settings = this.normalizeSettings({
       ...this.settings,
       ...nextSettings
     });
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
+    if (oldOutputDir !== this.settings.outputDir) {
+      await this.refreshRecordingLibrary({ silent: true });
+    }
     await this.saveStore();
     if (oldPollInterval !== this.settings.pollIntervalSec) {
       for (const room of this.rooms.values()) {
@@ -707,6 +723,8 @@ class LiveRecordService {
     const assetResponse = await fetch(target.toString(), {
       headers: {
         Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
         Referer: 'https://live.bilibili.com/',
         'User-Agent': USER_AGENT,
         Cookie: sanitizeHeaderValue(this.settings.cookie)
@@ -728,6 +746,67 @@ class LiveRecordService {
       'Cache-Control': 'no-store'
     });
     response.end(body);
+  }
+
+  async serveMedia(rawPath, request, response) {
+    const filePath = path.resolve(String(rawPath || ''));
+    if (!this.isKnownMediaPath(filePath)) {
+      writeJson(response, 403, { error: '视频路径不在录像库或输出目录内' });
+      return;
+    }
+    let stat;
+    try {
+      stat = await fsp.stat(filePath);
+    } catch {
+      writeJson(response, 404, { error: '视频文件不存在' });
+      return;
+    }
+    if (!stat.isFile()) {
+      writeJson(response, 400, { error: '路径不是视频文件' });
+      return;
+    }
+
+    const total = stat.size;
+    const range = request.headers.range;
+    const headers = {
+      'Content-Type': mimeType(filePath),
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store'
+    };
+    if (!range) {
+      response.writeHead(200, { ...headers, 'Content-Length': String(total) });
+      fs.createReadStream(filePath).pipe(response);
+      return;
+    }
+
+    const match = /^bytes=(\d*)-(\d*)$/i.exec(range);
+    if (!match) {
+      response.writeHead(416, { 'Content-Range': `bytes */${total}` });
+      response.end();
+      return;
+    }
+    const start = match[1] ? Number(match[1]) : 0;
+    const end = match[2] ? Math.min(Number(match[2]), total - 1) : total - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+      response.writeHead(416, { 'Content-Range': `bytes */${total}` });
+      response.end();
+      return;
+    }
+    response.writeHead(206, {
+      ...headers,
+      'Content-Length': String(end - start + 1),
+      'Content-Range': `bytes ${start}-${end}/${total}`
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(response);
+  }
+
+  isKnownMediaPath(filePath) {
+    const normalized = path.resolve(filePath).toLowerCase();
+    const outputRoot = path.resolve(this.settings.outputDir).toLowerCase();
+    if (normalized === outputRoot || normalized.startsWith(`${outputRoot}${path.sep}`)) {
+      return true;
+    }
+    return this.recordings.some((recording) => path.resolve(recording.cleanPath).toLowerCase() === normalized);
   }
 
   async fetchDanmuInfo(roomId) {
@@ -909,6 +988,10 @@ class LiveRecordService {
       const cssPath = path.join(this.settings.outputDir, `${baseName}.danmaku.css`);
       const assPath = path.join(this.settings.outputDir, `${baseName}.danmaku.ass`);
       const burnedPath = path.join(this.settings.outputDir, `${baseName}.danmaku.${container}`);
+      const mergeGroup = String(options.mergeGroup || baseName);
+      const mergeSequence = Number(options.mergeSequence || 0);
+      const mergeOutputPath =
+        options.mergeOutputPath || path.join(this.settings.outputDir, `${sanitizeFilename(mergeGroup)}.merged.${container}`);
 
       const args = createRecordingArgs({
         streamUrl: stream.url,
@@ -935,6 +1018,9 @@ class LiveRecordService {
         cssPath,
         assPath,
         burnedPath,
+        mergeGroup,
+        mergeSequence,
+        mergeOutputPath,
         eventCount: 0,
         lastEventEmitAt: 0,
         danmakuStatus: 'connecting',
@@ -945,6 +1031,7 @@ class LiveRecordService {
         ffmpegProbeBuffer: '',
         videoInfo: null,
         rotateTimer: null,
+        mediaWatchTimer: null,
         rotating: false,
         segmentMinutes: this.settings.segmentMinutes,
         finished: false,
@@ -959,6 +1046,9 @@ class LiveRecordService {
         cssPath,
         assPath,
         burnedPath,
+        mergeGroup,
+        mergeSequence,
+        mergeOutputPath,
         eventCount: 0,
         danmakuStatus: 'connecting',
         danmakuMessage: '弹幕通道连接中',
@@ -968,9 +1058,17 @@ class LiveRecordService {
       };
       this.recordingSessions.set(room.id, session);
       this.armRecordingRotation(room, session);
+      this.armNoMediaWatch(room, session);
+      const startReason = options.streamReconnect
+        ? '直播流续录'
+        : options.segmentContinue
+          ? '分段继续'
+          : autoStart
+            ? '开播自动'
+            : '手动';
       this.log(
         'success',
-        `${roomLabel(room)} ${options.segmentContinue ? '分段继续' : autoStart ? '开播自动' : '手动'}开始录制：${path.basename(cleanPath)}`
+        `${roomLabel(room)} ${startReason}开始录制：${path.basename(cleanPath)}`
       );
       if (this.settings.notifyRecordingStarted && !options.silentNotify) {
         this.notify('开始录制', `${roomLabel(room)} 正在写入 ${path.basename(cleanPath)}`);
@@ -1149,6 +1247,32 @@ class LiveRecordService {
     session.rotateTimer.unref?.();
   }
 
+  armNoMediaWatch(room, session) {
+    session.mediaWatchTimer = setTimeout(async () => {
+      if (session.finished || session.stopping || this.recordingSessions.get(room.id) !== session) {
+        return;
+      }
+      if (session.videoInfo) {
+        return;
+      }
+      const fileSize = await getFileSize(session.cleanPath);
+      if (fileSize >= MIN_PLAYABLE_BYTES) {
+        this.log(
+          'warn',
+          `${roomLabel(room)} 录制已写入 ${formatBytes(fileSize)}，但还没解析到视频信息；继续观察。`
+        );
+        return;
+      }
+      session.noMediaDetected = true;
+      this.log(
+        'error',
+        `${roomLabel(room)} 录制 ${Math.round(NO_MEDIA_TIMEOUT_MS / 1000)} 秒仍未写入有效视频数据，正在重连直播流。`
+      );
+      requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
+    }, NO_MEDIA_TIMEOUT_MS);
+    session.mediaWatchTimer.unref?.();
+  }
+
   async rotateRecordingSegment(roomId) {
     const room = this.getRoom(roomId);
     const session = this.recordingSessions.get(room.id);
@@ -1157,20 +1281,7 @@ class LiveRecordService {
     }
     session.rotating = true;
     this.log('info', `${roomLabel(room)} 已达到 ${session.segmentMinutes} 分钟分段时长，正在切换到新文件。`);
-    if (session.ffmpeg.stdin && !session.ffmpeg.stdin.destroyed) {
-      try {
-        session.ffmpeg.stdin.write('q');
-      } catch {
-        session.ffmpeg.kill();
-      }
-    } else {
-      session.ffmpeg.kill();
-    }
-    setTimeout(() => {
-      if (!session.ffmpeg.killed && room.recording) {
-        session.ffmpeg.kill();
-      }
-    }, 5000);
+    requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 5000 });
     this.emitState();
     return this.getState();
   }
@@ -1184,20 +1295,7 @@ class LiveRecordService {
     session.stopping = true;
     clearTimeout(session.rotateTimer);
     session.danmakuClient?.close('手动停止');
-    if (session.ffmpeg.stdin && !session.ffmpeg.stdin.destroyed) {
-      try {
-        session.ffmpeg.stdin.write('q');
-      } catch {
-        session.ffmpeg.kill();
-      }
-    } else {
-      session.ffmpeg.kill();
-    }
-    setTimeout(() => {
-      if (!session.ffmpeg.killed && room.recording) {
-        session.ffmpeg.kill();
-      }
-    }, 5000);
+    requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 5000 });
     this.log('info', `${roomLabel(room)} 正在停止录制。`);
     this.emitState();
     return this.getState();
@@ -1211,10 +1309,27 @@ class LiveRecordService {
     }
 
     clearTimeout(session.rotateTimer);
+    clearTimeout(session.mediaWatchTimer);
     session.finished = true;
     session.danmakuClient?.close('录制结束');
     await new Promise((resolve) => session.eventStream.end(resolve));
     room.recording = false;
+    const elapsedSec = Math.max(0, (Date.now() - session.startedAt) / 1000);
+    const fileSizeBeforeFinalize = await getFileSize(session.cleanPath);
+    const validBeforeFinalize = isRecordingFileLikelyPlayable({
+      fileSize: fileSizeBeforeFinalize,
+      elapsedSec,
+      videoInfo: session.videoInfo
+    });
+    if (validBeforeFinalize) {
+      await this.finalizeRecordingContainer(room, session);
+    }
+    const fileSize = await getFileSize(session.cleanPath);
+    const valid = isRecordingFileLikelyPlayable({
+      fileSize,
+      elapsedSec,
+      videoInfo: session.videoInfo
+    });
     const finishedRecording = {
       startedAt: session.startedAt,
       cleanPath: session.cleanPath,
@@ -1222,6 +1337,12 @@ class LiveRecordService {
       cssPath: session.cssPath,
       assPath: session.assPath,
       burnedPath: session.burnedPath,
+      mergeGroup: session.mergeGroup,
+      mergeSequence: session.mergeSequence,
+      mergeOutputPath: session.mergeOutputPath,
+      durationSec: elapsedSec,
+      fileSize,
+      valid,
       eventCount: session.eventCount,
       danmakuStatus: session.danmakuStatus,
       danmakuMessage: session.danmakuMessage,
@@ -1232,24 +1353,43 @@ class LiveRecordService {
     if (room.currentRecording) {
       Object.assign(room.currentRecording, finishedRecording);
     }
-    this.rememberRecording(room, finishedRecording);
-    await this.saveStore();
+    if (valid) {
+      this.rememberRecording(room, finishedRecording);
+      await this.saveStore();
+    } else {
+      this.log(
+        'error',
+        `${roomLabel(room)} 当前录像文件过小或没有视频流，已跳过历史列表：${path.basename(
+          session.cleanPath
+        )}（${formatBytes(fileSize)}）。`
+      );
+    }
     this.recordingSessions.delete(roomId);
     const shouldContinueSegment = session.rotating && !session.stopping;
+    const unexpectedStreamEnd = !session.stopping && !shouldContinueSegment;
+    const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
+    const elapsedText = formatDurationSeconds(elapsedSec);
 
     if (shouldContinueSegment) {
       this.log(
         'success',
-        `${roomLabel(room)} 分段文件完成：${path.basename(session.cleanPath)}，弹幕事件 ${session.eventCount} 条。`
+        `${roomLabel(room)} 分段文件完成：${path.basename(session.cleanPath)}，时长 ${elapsedText}，弹幕事件 ${session.eventCount} 条。`
       );
-    } else if (code === 0 || session.stopping) {
+    } else if (session.stopping) {
       this.log(
         'success',
-        `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，弹幕事件 ${session.eventCount} 条。`
+        `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，时长 ${elapsedText}，弹幕事件 ${session.eventCount} 条。`
       );
       if (this.settings.notifyRecordingEnded) {
         this.notify('录制结束', `${roomLabel(room)} 弹幕事件 ${session.eventCount} 条`);
       }
+    } else if (code === 0) {
+      this.log(
+        'warn',
+        `${roomLabel(room)} 直播流提前结束，已保存当前文件：${path.basename(session.cleanPath)}，时长 ${elapsedText}，弹幕事件 ${session.eventCount} 条。${
+          shouldReconnectLiveStream ? '正在尝试续录。' : ''
+        }`
+      );
     } else {
       this.log('error', `${roomLabel(room)} 录制进程异常退出：退出码 ${code}，信号 ${signal || '-'}`);
       if (this.settings.notifyRecordingEnded) {
@@ -1259,15 +1399,16 @@ class LiveRecordService {
 
     this.emitState();
 
-    if (this.settings.autoBurnDanmaku && session.eventCount > 0) {
-      setTimeout(() => {
-        this.startBurnRecording(room, finishedRecording).catch((error) => {
-          this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
-        });
-      }, 500);
-    }
-
     if (shouldContinueSegment) {
+      if (this.settings.autoBurnDanmaku && session.eventCount > 0) {
+        setTimeout(() => {
+          if (finishedRecording.valid) {
+            this.startBurnRecording(room, finishedRecording).catch((error) => {
+              this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
+            });
+          }
+        }, 500);
+      }
       setTimeout(() => {
         const currentRoom = this.rooms.get(roomId);
         if (!currentRoom || currentRoom.recording) {
@@ -1277,8 +1418,62 @@ class LiveRecordService {
           this.log('error', `${roomLabel(currentRoom)} 分段继续录制失败：${error.message}`);
         });
       }, 300);
+    } else if (shouldReconnectLiveStream) {
+      setTimeout(() => {
+        const currentRoom = this.rooms.get(roomId);
+        if (!currentRoom || currentRoom.recording || !currentRoom.monitoring) {
+          return;
+        }
+        this.startRecording(roomId, true, {
+          streamReconnect: true,
+          silentNotify: true,
+          mergeGroup: session.mergeGroup,
+          mergeSequence: Number(session.mergeSequence || 0) + 1,
+          mergeOutputPath: session.mergeOutputPath
+        })
+          .then(async () => {
+            if (!currentRoom.recording) {
+              await this.finalizeReconnectGroup(currentRoom, session.mergeGroup, valid ? finishedRecording : null);
+            }
+          })
+          .catch((error) => {
+            this.log('error', `${roomLabel(currentRoom)} 直播流续录失败：${error.message}`);
+            this.finalizeReconnectGroup(currentRoom, session.mergeGroup, valid ? finishedRecording : null).catch((mergeError) => {
+              this.log('error', `${roomLabel(currentRoom)} 续录片段合并失败：${mergeError.message}`);
+            });
+          });
+      }, 1200);
     } else {
-      this.scheduleQueuedUpdateCheck();
+      await this.finalizeReconnectGroup(room, session.mergeGroup, valid ? finishedRecording : null);
+    }
+  }
+
+  async finalizeRecordingContainer(room, session) {
+    if (normalizeContainer(this.settings.outputContainer) !== 'mp4') {
+      return;
+    }
+    const tmpPath = replaceExtension(session.cleanPath, '.finalizing.mp4');
+    try {
+      await fsp.rm(tmpPath, { force: true });
+      await runFfmpegJob(
+        this.ffmpegPath,
+        createMp4FinalizeArgs({ inputPath: session.cleanPath, outputPath: tmpPath, streamCodec: session.videoInfo?.codec }),
+        (line) => {
+          if (/error|failed|invalid/i.test(line)) {
+            this.log('warn', `${roomLabel(room)} MP4 收尾：${compactLogLine(line)}`);
+          }
+        }
+      );
+      const finalizedSize = await getFileSize(tmpPath);
+      if (finalizedSize >= MIN_PLAYABLE_BYTES) {
+        await fsp.rm(session.cleanPath, { force: true });
+        await fsp.rename(tmpPath, session.cleanPath);
+      } else {
+        await fsp.rm(tmpPath, { force: true });
+      }
+    } catch (error) {
+      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      this.log('warn', `${roomLabel(room)} MP4 收尾失败，保留原文件：${error.message}`);
     }
   }
 
@@ -1294,6 +1489,133 @@ class LiveRecordService {
       return;
     }
     this.recordings = [item, ...this.recordings.filter((saved) => saved.cleanPath !== item.cleanPath)].slice(0, 80);
+  }
+
+  async refreshRecordingLibrary(options = {}) {
+    const discovered = await discoverRecordingFiles(this.settings.outputDir);
+    if (discovered.length === 0) {
+      return this.getState();
+    }
+    const existing = new Map(this.recordings.map((recording) => [path.resolve(recording.cleanPath).toLowerCase(), recording]));
+    for (const recording of discovered) {
+      const key = path.resolve(recording.cleanPath).toLowerCase();
+      const current = existing.get(key);
+      existing.set(
+        key,
+        this.normalizeRecording({
+          ...(current || {}),
+          ...recording,
+          roomId: current?.roomId || recording.roomId,
+          roomTitle: current?.roomTitle || recording.roomTitle,
+          anchor: current?.anchor || recording.anchor,
+          videoInfo: current?.videoInfo || recording.videoInfo
+        })
+      );
+    }
+    this.recordings = Array.from(existing.values())
+      .filter(Boolean)
+      .filter((recording) => recording.valid !== false)
+      .sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0))
+      .slice(0, 160);
+    await this.saveStore();
+    if (!options.silent) {
+      this.log('success', `录像库已刷新，找到 ${discovered.length} 个源文件。`);
+      this.emitState();
+    }
+    return this.getState();
+  }
+
+  async finalizeReconnectGroup(room, mergeGroup, fallbackRecording) {
+    const recording = await this.mergeReconnectGroupIfNeeded(room, mergeGroup, fallbackRecording);
+    if (this.settings.autoBurnDanmaku && recording?.valid !== false && Number(recording?.eventCount || 0) > 0) {
+      setTimeout(() => {
+        this.startBurnRecording(room, recording).catch((error) => {
+          this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
+        });
+      }, 500);
+    } else {
+      this.scheduleQueuedUpdateCheck();
+    }
+    return recording;
+  }
+
+  async mergeReconnectGroupIfNeeded(room, mergeGroup, fallbackRecording) {
+    const groupId = String(mergeGroup || '').trim();
+    if (!groupId) {
+      return fallbackRecording;
+    }
+    const segments = this.recordings
+      .filter((recording) => recording.mergeGroup === groupId && !recording.mergedFrom?.length)
+      .filter((recording) => recording.valid !== false)
+      .filter((recording) => recording.cleanPath && recording.cleanPath !== recording.mergeOutputPath)
+      .filter((recording) => fs.existsSync(recording.cleanPath))
+      .sort((a, b) => {
+        const sequenceDiff = Number(a.mergeSequence || 0) - Number(b.mergeSequence || 0);
+        return sequenceDiff || Number(a.startedAt || 0) - Number(b.startedAt || 0);
+      });
+    if (segments.length < 2) {
+      return fallbackRecording;
+    }
+
+    const outputPath = segments[0].mergeOutputPath || deriveSiblingPath(segments[0].cleanPath, 'merged');
+    const container = getContainerFromPath(outputPath);
+    const tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
+    const concatPath = replaceExtension(outputPath, '.concat.txt');
+    const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
+    const cssPath = deriveSiblingPath(outputPath, 'danmaku', 'css');
+    const assPath = deriveSiblingPath(outputPath, 'danmaku', 'ass');
+    const burnedPath = deriveBurnedPath(outputPath, this.settings.burnOverlayMode);
+
+    this.log('info', `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}`);
+    await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
+    await fsp.rm(tmpPath, { force: true });
+    await runFfmpegJob(
+      this.ffmpegPath,
+      createConcatCopyArgs({ concatPath, outputPath: tmpPath, container }),
+      (line) => {
+        if (/error|failed|invalid/i.test(line)) {
+          this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
+        }
+      }
+    );
+    await fsp.rm(outputPath, { force: true });
+    await fsp.rename(tmpPath, outputPath);
+    await fsp.rm(concatPath, { force: true });
+    await mergeDanmakuFiles(segments, danmakuPath);
+    await copyFirstExistingFile(segments.map((segment) => segment.cssPath).filter(Boolean), cssPath, createDefaultDanmakuCss());
+
+    const mergedRecording = this.normalizeRecording({
+      id: `${outputPath}:${Date.now()}`,
+      roomId: room.id,
+      roomTitle: room.title || '',
+      anchor: room.anchor || '',
+      startedAt: segments[0].startedAt,
+      cleanPath: outputPath,
+      danmakuPath,
+      cssPath,
+      assPath,
+      burnedPath,
+      mergeGroup: groupId,
+      mergeSequence: 0,
+      mergeOutputPath: outputPath,
+      mergedFrom: segments.map((segment) => segment.cleanPath),
+      durationSec: segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0),
+      fileSize: await getFileSize(outputPath),
+      valid: true,
+      eventCount: segments.reduce((sum, segment) => sum + Number(segment.eventCount || 0), 0),
+      videoInfo: segments[0].videoInfo || null
+    });
+    this.recordings = [mergedRecording, ...this.recordings.filter((recording) => recording.cleanPath !== outputPath)].slice(0, 80);
+    room.currentRecording = mergedRecording;
+    await this.saveStore();
+    this.log(
+      'success',
+      `${roomLabel(room)} 续录片段已合并：${path.basename(outputPath)}，共 ${segments.length} 段，时长 ${formatDurationSeconds(
+        mergedRecording.durationSec
+      )}。`
+    );
+    this.emitState();
+    return mergedRecording;
   }
 
   async startBurnDanmaku(roomId, options = {}) {
@@ -1331,7 +1653,7 @@ class LiveRecordService {
       this.log('warn', `${roomLabel(room)} 已有弹幕版正在生成，跳过 ${path.basename(recording.cleanPath)}。`);
       return false;
     }
-    if (!recording?.cleanPath || !recording?.danmakuPath) {
+    if (!recording?.cleanPath || !recording?.danmakuPath || recording.valid === false) {
       this.log('warn', `${roomLabel(room)} 没有可烧录的最近录像。`);
       return false;
     }
@@ -1428,6 +1750,9 @@ class LiveRecordService {
     if (!recording) {
       throw new Error('请选择录像文件。');
     }
+    if (recording.valid === false) {
+      throw new Error('这个录像文件被标记为无效，请换一个源文件。');
+    }
     const startTime = parseTimeInput(options.startTime ?? options.start);
     const endTime = parseTimeInput(options.endTime ?? options.end);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
@@ -1455,6 +1780,9 @@ class LiveRecordService {
     const recording = this.normalizeRecording(options.recording || options);
     if (!recording) {
       throw new Error('请选择录像文件。');
+    }
+    if (recording.valid === false) {
+      throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
     if (!fs.existsSync(recording.cleanPath)) {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
@@ -1799,14 +2127,14 @@ Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
     for (const room of this.rooms.values()) {
       const session = this.recordingSessions.get(room.id);
       clearTimeout(session?.rotateTimer);
+      clearTimeout(session?.mediaWatchTimer);
       session?.danmakuClient?.close('服务退出');
-      if (session?.ffmpeg && !session.ffmpeg.killed) {
-        try {
-          session.ffmpeg.stdin?.write('q');
-        } catch {
-          session.ffmpeg.kill();
-        }
+      if (session?.ffmpeg) {
+        requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 1500 });
       }
+    }
+    for (const ffmpeg of this.burnSessions.values()) {
+      requestFfmpegStop(ffmpeg, { graceful: false, timeoutMs: 1500 });
     }
   }
 }
@@ -2002,6 +2330,11 @@ async function handleApi(service, parsed, request, response) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/media') {
+    await service.serveMedia(parsed.searchParams.get('path'), request, response);
+    return;
+  }
+
   if (request.method === 'GET' && pathname === '/api/tray/state') {
     const afterSeq = Number(parsed.searchParams.get('after') || 0);
     writeText(response, 200, service.getTrayStateText(afterSeq));
@@ -2040,6 +2373,7 @@ async function handleApi(service, parsed, request, response) {
     '/api/rooms/subtitles': () => service.prepareDanmakuForRoom(body.roomId, body.options || {}),
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
     '/api/export/clip': () => service.exportClip(body),
+    '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
     '/api/shell/open-config': () => service.openConfigDir(),
@@ -2604,11 +2938,17 @@ function createRecordingArgs({ streamUrl, headers, outputPath, container, stream
     '-stats',
     '-y',
     '-rw_timeout',
-    '15000000',
+    '30000000',
     '-reconnect',
     '1',
     '-reconnect_streamed',
     '1',
+    '-reconnect_at_eof',
+    '1',
+    '-reconnect_on_network_error',
+    '1',
+    '-reconnect_on_http_error',
+    '4xx,5xx',
     '-reconnect_delay_max',
     '10',
     '-user_agent',
@@ -2632,6 +2972,15 @@ function createRecordingArgs({ streamUrl, headers, outputPath, container, stream
   }
 
   args.push('-f', 'matroska', outputPath);
+  return args;
+}
+
+function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
+  const args = ['-hide_banner', '-y', '-i', inputPath, '-map', '0', '-c', 'copy'];
+  if (isHevcCodec(streamCodec)) {
+    args.push('-tag:v', 'hvc1');
+  }
+  args.push('-movflags', '+faststart', outputPath);
   return args;
 }
 
@@ -2688,6 +3037,64 @@ function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, contai
   }
   args.push(outputPath);
   return args;
+}
+
+function createConcatCopyArgs({ concatPath, outputPath, container }) {
+  const args = ['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
+  if (container === 'mp4') {
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
+  return args;
+}
+
+async function writeConcatFile(concatPath, filePaths) {
+  const body = filePaths.map((filePath) => `file '${escapeConcatPath(filePath)}'`).join('\n');
+  await fsp.writeFile(concatPath, `${body}\n`, 'utf8');
+}
+
+function escapeConcatPath(filePath) {
+  return String(filePath).replace(/\\/g, '/').replace(/'/g, "'\\''");
+}
+
+async function mergeDanmakuFiles(segments, outputPath) {
+  const lines = [];
+  let offset = 0;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const events = await readDanmakuEvents(segment.danmakuPath);
+    for (const event of events) {
+      lines.push(JSON.stringify({ ...event, time: Math.max(0, Number(event.time || 0) + offset) }));
+    }
+    offset += getSegmentDurationForMerge(segment, segments[index + 1]);
+  }
+  await fsp.writeFile(outputPath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+}
+
+function getSegmentDurationForMerge(segment, nextSegment) {
+  const duration = Number(segment.durationSec || 0);
+  if (Number.isFinite(duration) && duration > 0) {
+    return duration;
+  }
+  if (nextSegment?.startedAt && segment.startedAt) {
+    return Math.max(0, (Number(nextSegment.startedAt) - Number(segment.startedAt)) / 1000);
+  }
+  return 0;
+}
+
+async function copyFirstExistingFile(candidates, outputPath, fallbackText) {
+  for (const candidate of candidates) {
+    try {
+      if (candidate && fs.existsSync(candidate)) {
+        await fsp.copyFile(candidate, outputPath);
+        return outputPath;
+      }
+    } catch {
+      // Keep looking.
+    }
+  }
+  await fsp.writeFile(outputPath, fallbackText, 'utf8');
+  return outputPath;
 }
 
 function drawRect(layer, start, end, x, y, width, height, color) {
@@ -2905,6 +3312,11 @@ function deriveClipPath(cleanPath, outputDir, mode, startTime, endTime) {
   return path.join(outputDir, `${base}.${suffix}.${container}`);
 }
 
+function replaceExtension(filePath, extension) {
+  const parsed = path.parse(filePath);
+  return path.join(parsed.dir, `${parsed.name}${extension}`);
+}
+
 function createClipSuffix(startTime, endTime, mode) {
   const start = safeTimeSlug(startTime);
   const end = Number.isFinite(Number(endTime)) ? safeTimeSlug(endTime) : 'end';
@@ -2984,6 +3396,20 @@ function formatTimestamp(date) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(
     date.getMinutes()
   )}${pad(date.getSeconds())}`;
+}
+
+function formatDurationSeconds(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return `${h}小时${m}分${s}秒`;
+  }
+  if (m > 0) {
+    return `${m}分${s}秒`;
+  }
+  return `${s}秒`;
 }
 
 function streamScore(stream, settings) {
@@ -3132,22 +3558,392 @@ function getAppVersion() {
   return '0.0.1';
 }
 
+function requestUrlBuffer(rawUrl, options = {}, redirectCount = 0) {
+  if (redirectCount > 8) {
+    return Promise.reject(new Error('请求重定向次数过多。'));
+  }
+  const target = new URL(rawUrl);
+  const proxy = getProxyForUrl(target);
+  return proxy
+    ? requestUrlViaHttpProxy(target, proxy, options, redirectCount)
+    : requestUrlDirect(target, options, redirectCount);
+}
+
+function requestUrlDirect(target, options, redirectCount) {
+  return new Promise((resolve, reject) => {
+    const transport = target.protocol === 'https:' ? https : http;
+    const request = transport.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method: options.method || 'GET',
+        headers: options.headers || {}
+      },
+      (response) => collectUrlResponse(response, target, options, redirectCount, resolve, reject)
+    );
+    request.setTimeout(45000, () => request.destroy(new Error('请求超时。')));
+    request.on('error', reject);
+    request.end(options.body);
+  });
+}
+
+function requestFfmpegStop(child, options = {}) {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return;
+  }
+  const graceful = options.graceful !== false;
+  if (graceful && child.stdin && !child.stdin.destroyed) {
+    try {
+      child.stdin.write('q');
+    } catch {
+      forceKillProcess(child);
+    }
+  } else {
+    forceKillProcess(child);
+  }
+  const timer = setTimeout(() => forceKillProcess(child), Number(options.timeoutMs || 5000));
+  timer.unref?.();
+}
+
+function forceKillProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode) {
+    return;
+  }
+  if (process.platform === 'win32' && child.pid) {
+    const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore'
+    });
+    killer.on('error', () => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        try {
+          child.kill();
+        } catch {}
+      }
+    });
+    return;
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    try {
+      child.kill();
+    } catch {}
+  }
+}
+
+async function getFileSize(filePath) {
+  try {
+    const stat = await fsp.stat(filePath);
+    return stat.isFile() ? stat.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isRecordingFileLikelyPlayable({ fileSize, elapsedSec, videoInfo }) {
+  const size = Number(fileSize || 0);
+  if (size <= 0) {
+    return false;
+  }
+  if (videoInfo && size >= 32 * 1024) {
+    return true;
+  }
+  if (Number(elapsedSec || 0) <= 20 && size >= 32 * 1024) {
+    return true;
+  }
+  return size >= MIN_PLAYABLE_BYTES && Boolean(videoInfo);
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${Math.round(value / 1024)} KB`;
+  }
+  return `${Math.round(value)} B`;
+}
+
+async function discoverRecordingFiles(outputDir) {
+  let entries;
+  try {
+    entries = await fsp.readdir(outputDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const recordings = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const name = entry.name;
+    if (!/\.(?:clean|merged)\.(?:mp4|mkv)$/i.test(name)) {
+      continue;
+    }
+    if (/\.tmp\.|\.finalizing\.|\.clip_/i.test(name)) {
+      continue;
+    }
+    const cleanPath = path.join(outputDir, name);
+    const stat = await fsp.stat(cleanPath).catch(() => null);
+    if (!stat?.isFile()) {
+      continue;
+    }
+    const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
+    recordings.push({
+      id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
+      startedAt: stat.mtimeMs,
+      cleanPath,
+      danmakuPath,
+      cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
+      assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
+      burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
+      fileSize: stat.size,
+      valid: stat.size >= 32 * 1024,
+      eventCount: await countDanmakuLines(danmakuPath)
+    });
+  }
+  return recordings;
+}
+
+async function countDanmakuLines(filePath) {
+  try {
+    const text = await fsp.readFile(filePath, 'utf8');
+    return text.split(/\r?\n/).filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+function requestUrlViaHttpProxy(target, proxy, options, redirectCount) {
+  if (target.protocol === 'http:') {
+    return new Promise((resolve, reject) => {
+      const request = http.request(
+        {
+          hostname: proxy.hostname,
+          port: proxy.port || 80,
+          path: target.toString(),
+          method: options.method || 'GET',
+          headers: {
+            ...(options.headers || {}),
+            Host: target.host,
+            ...proxyAuthorizationHeader(proxy)
+          }
+        },
+        (response) => collectUrlResponse(response, target, options, redirectCount, resolve, reject)
+      );
+      request.setTimeout(45000, () => request.destroy(new Error('代理请求超时。')));
+      request.on('error', reject);
+      request.end(options.body);
+    });
+  }
+
+  return new Promise((resolve, reject) => {
+    const connect = http.request({
+      hostname: proxy.hostname,
+      port: proxy.port || 80,
+      method: 'CONNECT',
+      path: `${target.hostname}:${target.port || 443}`,
+      headers: {
+        Host: `${target.hostname}:${target.port || 443}`,
+        ...proxyAuthorizationHeader(proxy)
+      }
+    });
+    connect.setTimeout(45000, () => connect.destroy(new Error('代理 CONNECT 超时。')));
+    connect.on('connect', (response, socket) => {
+      if (response.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`代理 CONNECT 失败：HTTP ${response.statusCode}`));
+        return;
+      }
+      const secureSocket = tls.connect({ socket, servername: target.hostname });
+      secureSocket.on('error', reject);
+      secureSocket.once('secureConnect', () => {
+        const request = https.request(
+          {
+            hostname: target.hostname,
+            port: target.port || 443,
+            path: `${target.pathname}${target.search}`,
+            method: options.method || 'GET',
+            headers: options.headers || {},
+            createConnection: () => secureSocket,
+            agent: false
+          },
+          (res) => collectUrlResponse(res, target, options, redirectCount, resolve, reject)
+        );
+        request.setTimeout(45000, () => request.destroy(new Error('代理 HTTPS 请求超时。')));
+        request.on('error', reject);
+        request.end(options.body);
+      });
+    });
+    connect.on('error', reject);
+    connect.end();
+  });
+}
+
+function collectUrlResponse(response, target, options, redirectCount, resolve, reject) {
+  const statusCode = Number(response.statusCode || 0);
+  const location = response.headers.location;
+  if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
+    response.resume();
+    resolve(requestUrlBuffer(new URL(location, target).toString(), options, redirectCount + 1));
+    return;
+  }
+  const chunks = [];
+  response.on('data', (chunk) => chunks.push(chunk));
+  response.on('end', () => {
+    const body = Buffer.concat(chunks);
+    if (statusCode < 200 || statusCode >= 300) {
+      reject(new Error(`请求失败：HTTP ${statusCode} ${body.toString('utf8').slice(0, 180)}`.trim()));
+      return;
+    }
+    resolve(body);
+  });
+  response.on('error', reject);
+}
+
+function getProxyForUrl(target) {
+  if (shouldBypassProxy(target.hostname)) {
+    return null;
+  }
+  const envProxy =
+    target.protocol === 'https:'
+      ? process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+      : process.env.HTTP_PROXY || process.env.http_proxy;
+  const proxySource = envProxy || getWindowsProxyForUrl(target) || '';
+  return normalizeProxyUrl(proxySource);
+}
+
+function shouldBypassProxy(hostname) {
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy || '';
+  if (!noProxy.trim()) {
+    return false;
+  }
+  const host = String(hostname || '').toLowerCase();
+  return noProxy
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .some((rule) => rule === '*' || host === rule || (rule.startsWith('.') ? host.endsWith(rule) : host.endsWith(`.${rule}`)));
+}
+
+function getWindowsProxyForUrl(target) {
+  if (process.platform !== 'win32') {
+    return '';
+  }
+  const winInetProxy = getWinInetProxyServer();
+  if (winInetProxy) {
+    return selectProxyServer(winInetProxy, target.protocol);
+  }
+  const winHttpProxy = getWinHttpProxyServer();
+  return winHttpProxy ? selectProxyServer(winHttpProxy, target.protocol) : '';
+}
+
+function getWinInetProxyServer() {
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+  const enabled = spawnSync('reg.exe', ['query', key, '/v', 'ProxyEnable'], {
+    encoding: 'utf8',
+    windowsHide: true
+  });
+  if (enabled.status !== 0 || !/ProxyEnable\s+REG_DWORD\s+0x1/i.test(enabled.stdout || '')) {
+    return '';
+  }
+  const server = spawnSync('reg.exe', ['query', key, '/v', 'ProxyServer'], {
+    encoding: 'utf8',
+    windowsHide: true
+  });
+  if (server.status !== 0) {
+    return '';
+  }
+  return parseRegistryValue(server.stdout, 'ProxyServer');
+}
+
+function getWinHttpProxyServer() {
+  const result = spawnSync('netsh.exe', ['winhttp', 'show', 'proxy'], {
+    encoding: 'utf8',
+    windowsHide: true
+  });
+  if (result.status !== 0 || /Direct access|直接访问|无代理/i.test(result.stdout || '')) {
+    return '';
+  }
+  const line = String(result.stdout || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => /Proxy Server|代理服务器|代理服务器\(s\)/i.test(item));
+  return line?.split(':').slice(1).join(':').trim() || '';
+}
+
+function parseRegistryValue(text, name) {
+  const line = String(text || '')
+    .split(/\r?\n/)
+    .find((item) => new RegExp(`\\b${name}\\b`, 'i').test(item));
+  return line?.match(/\sREG_\w+\s+(.+)$/i)?.[1]?.trim() || '';
+}
+
+function selectProxyServer(proxyConfig, protocol) {
+  const text = String(proxyConfig || '').trim();
+  if (!text) {
+    return '';
+  }
+  if (!text.includes('=')) {
+    return text;
+  }
+  const desired = protocol === 'https:' ? 'https' : 'http';
+  const map = new Map();
+  for (const entry of text.split(';')) {
+    const [key, ...rest] = entry.split('=');
+    if (key && rest.length) {
+      map.set(key.trim().toLowerCase(), rest.join('=').trim());
+    }
+  }
+  return map.get(desired) || map.get('http') || '';
+}
+
+function normalizeProxyUrl(value) {
+  const text = String(value || '').trim();
+  if (!text || /^socks/i.test(text)) {
+    return null;
+  }
+  try {
+    const url = new URL(/^[a-z]+:\/\//i.test(text) ? text : `http://${text}`);
+    if (url.protocol !== 'http:') {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function proxyAuthorizationHeader(proxy) {
+  if (!proxy.username) {
+    return {};
+  }
+  const token = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password || '')}`).toString('base64');
+  return { 'Proxy-Authorization': `Basic ${token}` };
+}
+
 async function readTextSource(source) {
   const value = String(source || '').trim();
   if (!value) {
     throw new Error('更新源为空。');
   }
   if (/^https?:\/\//i.test(value)) {
-    const response = await fetch(value, {
+    const body = await requestUrlBuffer(value, {
       headers: {
         Accept: 'application/json, text/plain, */*',
         'User-Agent': `${APP_NAME}/${APP_VERSION}`
       }
     });
-    if (!response.ok) {
-      throw new Error(`更新源请求失败：HTTP ${response.status}`);
-    }
-    return response.text();
+    return body.toString('utf8');
   }
   const filePath = value.startsWith('file://') ? new URL(value) : path.resolve(APP_ROOT, value);
   return fsp.readFile(filePath, 'utf8');
@@ -3201,16 +3997,12 @@ async function downloadFile(url, targetPath) {
   if (!/^https?:\/\//i.test(String(url || ''))) {
     throw new Error('更新包下载地址无效。');
   }
-  const response = await fetch(url, {
+  const body = await requestUrlBuffer(url, {
     headers: {
       Accept: 'application/zip, application/octet-stream, */*',
       'User-Agent': `${APP_NAME}/${APP_VERSION}`
     }
   });
-  if (!response.ok) {
-    throw new Error(`更新包下载失败：HTTP ${response.status}`);
-  }
-  const body = Buffer.from(await response.arrayBuffer());
   await fsp.writeFile(targetPath, body);
 }
 
@@ -3331,7 +4123,9 @@ function mimeType(filePath) {
       '.svg': 'image/svg+xml',
       '.png': 'image/png',
       '.ico': 'image/x-icon',
-      '.webp': 'image/webp'
+      '.webp': 'image/webp',
+      '.mp4': 'video/mp4',
+      '.mkv': 'video/x-matroska'
     }[ext] || 'application/octet-stream'
   );
 }
