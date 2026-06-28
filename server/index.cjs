@@ -4,6 +4,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const zlib = require('node:zlib');
+const crypto = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 const WebSocket = require('ws');
 const QRCode = require('qrcode');
@@ -21,19 +22,31 @@ const USER_AGENT =
 
 const DANMAKU_OP = {
   HEARTBEAT: 2,
+  HEARTBEAT_REPLY: 3,
   MESSAGE: 5,
-  AUTH: 7
+  AUTH: 7,
+  AUTH_REPLY: 8
 };
 
 const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
 const DEFAULT_PORT = 3263;
+const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
+const WBI_MIXIN_KEY_TABLE = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14,
+  39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59,
+  6, 63, 57, 62, 11, 36, 20, 34, 44, 52
+];
 const HOST = process.env.HOST || '127.0.0.1';
 const PROD_MODE = process.argv.includes('--prod');
 const DEV_MODE = process.argv.includes('--dev') || !PROD_MODE;
 const OPEN_BROWSER = !process.argv.includes('--no-open') && process.env.BILI_RECORD_NO_OPEN !== '1';
 const APP_ROOT = getAppRoot();
 const DIST_ROOT = path.join(APP_ROOT, 'dist');
+const APP_VERSION = getAppVersion();
+const DEFAULT_UPDATE_MANIFEST_URL =
+  process.env.BILI_RECORD_UPDATE_URL ||
+  'https://github.com/Metahumanz/LiveRecord2k/releases/latest/download/update.json';
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
 class LiveRecordService {
@@ -50,6 +63,17 @@ class LiveRecordService {
     this.notifications = [];
     this.notificationSeq = 0;
     this.loginSession = null;
+    this.wbiCache = null;
+    this.updateState = {
+      status: 'idle',
+      currentVersion: APP_VERSION,
+      latestVersion: '',
+      message: '尚未检查更新',
+      checkedAt: 0,
+      queued: false,
+      manifest: null
+    };
+    this.queuedUpdateTimer = null;
     this.ffmpegPath = findFfmpegPath();
   }
 
@@ -60,7 +84,9 @@ class LiveRecordService {
       pollIntervalSec: 15,
       targetQn: 15000,
       preferHevc: true,
+      roomImageMode: 'keyframe',
       outputContainer: 'mp4',
+      segmentMinutes: 60,
       autoBurnDanmaku: true,
       burnCodec: 'libx265',
       burnCrf: 24,
@@ -71,6 +97,7 @@ class LiveRecordService {
       notifyBurnStarted: true,
       notifyBurnEnded: true,
       openBrowserOnStart: true,
+      updateManifestUrl: DEFAULT_UPDATE_MANIFEST_URL,
       serverPort: DEFAULT_PORT
     };
   }
@@ -111,6 +138,7 @@ class LiveRecordService {
       title: room.title,
       anchor: room.anchor,
       cover: room.cover,
+      keyframe: room.keyframe,
       liveStatus: room.liveStatus,
       monitoring: room.monitoring
     }));
@@ -128,9 +156,11 @@ class LiveRecordService {
       outputContainer: normalizeContainer(settings.outputContainer),
       burnCodec: normalizeBurnCodec(settings.burnCodec),
       pollIntervalSec: clamp(Number(settings.pollIntervalSec || 15), 5, 300),
-      targetQn: Number(settings.targetQn || 15000),
+      segmentMinutes: clamp(Number(settings.segmentMinutes || 60), 0.05, 1440),
+      targetQn: normalizeTargetQn(settings.targetQn),
       burnCrf: clamp(Number(settings.burnCrf || 24), 16, 35),
       preferHevc: Boolean(settings.preferHevc),
+      roomImageMode: normalizeRoomImageMode(settings.roomImageMode),
       autoBurnDanmaku: Boolean(settings.autoBurnDanmaku),
       notifyLiveStarted: settings.notifyLiveStarted !== false,
       notifyLiveEnded: settings.notifyLiveEnded !== false,
@@ -139,6 +169,7 @@ class LiveRecordService {
       notifyBurnStarted: settings.notifyBurnStarted !== false,
       notifyBurnEnded: settings.notifyBurnEnded !== false,
       openBrowserOnStart: settings.openBrowserOnStart !== false,
+      updateManifestUrl: String(settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL).trim(),
       serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535)
     };
   }
@@ -151,6 +182,7 @@ class LiveRecordService {
       title: room.title,
       anchor: room.anchor,
       cover: room.cover,
+      keyframe: room.keyframe,
       liveStatus: room.liveStatus,
       monitoring: Boolean(room.monitoring),
       recording: false,
@@ -171,11 +203,22 @@ class LiveRecordService {
       })),
       logs: this.logs,
       login: this.getPublicLoginState(),
+      version: APP_VERSION,
+      update: this.getPublicUpdateState(),
       ffmpegPath: this.ffmpegPath,
       startupEnabled: isStartupEnabled(),
       currentPort: this.currentPort || DEFAULT_PORT,
+      storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT
+    };
+  }
+
+  getPublicUpdateState() {
+    return {
+      ...this.updateState,
+      currentVersion: APP_VERSION,
+      activeJobs: this.hasActiveJobs()
     };
   }
 
@@ -563,25 +606,147 @@ class LiveRecordService {
       `https://api.live.bilibili.com/room/v1/Room/room_init?id=${encodeURIComponent(roomId)}`
     );
     if (roomInit.code !== 0) {
-      throw new Error(roomInit.message || `房间初始化接口返回状态码 ${roomInit.code}`);
+      throw createBiliError('房间初始化', roomInit);
     }
 
     const realRoomId = Number(roomInit.data.room_id);
-    const info = await this.fetchBiliJson(
-      `https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id=${realRoomId}`
+    const roomInfo = await this.fetchBiliJson(
+      `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${realRoomId}`
     );
-    if (info.code !== 0) {
-      throw new Error(info.message || `房间信息接口返回状态码 ${info.code}`);
+    if (roomInfo.code !== 0) {
+      throw createBiliError('房间信息', roomInfo);
     }
 
+    let detailInfo = null;
+    try {
+      const detail = await this.fetchBiliJson(
+        `https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id=${realRoomId}`
+      );
+      if (detail.code === 0) {
+        detailInfo = detail.data || null;
+      }
+    } catch {
+      detailInfo = null;
+    }
+
+    let masterInfo = null;
+    const uid = Number(roomInfo.data?.uid || roomInit.data?.uid || 0);
+    if (uid) {
+      try {
+        const master = await this.fetchBiliJson(
+          `https://api.live.bilibili.com/live_user/v1/Master/info?uid=${uid}`
+        );
+        if (master.code === 0) {
+          masterInfo = master.data?.info || null;
+        }
+      } catch (error) {
+        this.log('warn', `主播信息接口失败，继续使用房间信息：${error.message}`);
+      }
+    }
+
+    const detailRoom = detailInfo?.room_info || {};
+    const detailAnchor = detailInfo?.anchor_info?.base_info || {};
     return {
       realRoomId,
       shortId: Number(roomInit.data.short_id || 0),
-      liveStatus: Number(roomInit.data.live_status ?? info.data?.room_info?.live_status ?? 0),
-      title: info.data?.room_info?.title || roomInit.data.title || `直播间 ${realRoomId}`,
-      anchor: info.data?.anchor_info?.base_info?.uname || '',
-      cover: info.data?.room_info?.cover || info.data?.room_info?.keyframe || ''
+      liveStatus: Number(detailRoom.live_status ?? roomInfo.data?.live_status ?? roomInit.data.live_status ?? 0),
+      title: detailRoom.title || roomInfo.data?.title || roomInit.data.title || `直播间 ${realRoomId}`,
+      anchor: detailAnchor.uname || masterInfo?.uname || roomInfo.data?.description || '',
+      cover:
+        detailRoom.cover ||
+        detailRoom.user_cover ||
+        roomInfo.data?.user_cover ||
+        roomInfo.data?.cover ||
+        roomInfo.data?.background ||
+        '',
+      keyframe:
+        detailRoom.keyframe ||
+        roomInfo.data?.keyframe ||
+        detailRoom.cover ||
+        roomInfo.data?.user_cover ||
+        roomInfo.data?.cover ||
+        ''
     };
+  }
+
+  async proxyImage(rawUrl, response) {
+    let target;
+    try {
+      target = new URL(String(rawUrl || ''));
+    } catch {
+      writeJson(response, 400, { error: '图片地址无效' });
+      return;
+    }
+    if (!['http:', 'https:'].includes(target.protocol)) {
+      writeJson(response, 400, { error: '图片地址协议无效' });
+      return;
+    }
+
+    const assetResponse = await fetch(target.toString(), {
+      headers: {
+        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        Referer: 'https://live.bilibili.com/',
+        'User-Agent': USER_AGENT,
+        Cookie: sanitizeHeaderValue(this.settings.cookie)
+      }
+    });
+    if (!assetResponse.ok) {
+      writeJson(response, 502, { error: `图片获取失败：HTTP ${assetResponse.status}` });
+      return;
+    }
+    const contentType = assetResponse.headers.get('content-type') || 'image/jpeg';
+    if (!contentType.toLowerCase().startsWith('image/')) {
+      writeJson(response, 502, { error: '远端返回的不是图片' });
+      return;
+    }
+    const body = Buffer.from(await assetResponse.arrayBuffer());
+    response.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Length': String(body.length),
+      'Cache-Control': 'no-store'
+    });
+    response.end(body);
+  }
+
+  async fetchDanmuInfo(roomId) {
+    const query = await this.createWbiQuery({ id: Number(roomId), type: 0 });
+    return this.fetchBiliJson(`https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?${query}`);
+  }
+
+  async createWbiQuery(params) {
+    const mixinKey = await this.getWbiMixinKey();
+    const signedParams = {
+      ...params,
+      wts: Math.floor(Date.now() / 1000)
+    };
+    const query = Object.keys(signedParams)
+      .sort()
+      .map((key) => {
+        const value = String(signedParams[key] ?? '').replace(/[!'()*]/g, '');
+        return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+      })
+      .join('&');
+    const wRid = crypto.createHash('md5').update(`${query}${mixinKey}`).digest('hex');
+    return `${query}&w_rid=${wRid}`;
+  }
+
+  async getWbiMixinKey() {
+    if (this.wbiCache && this.wbiCache.expiresAt > Date.now()) {
+      return this.wbiCache.mixinKey;
+    }
+    const nav = await this.fetchBiliJson('https://api.bilibili.com/x/web-interface/nav');
+    const imgKey = basenameWithoutExt(nav.data?.wbi_img?.img_url);
+    const subKey = basenameWithoutExt(nav.data?.wbi_img?.sub_url);
+    if (!imgKey || !subKey) {
+      throw new Error('获取 WBI 签名密钥失败。');
+    }
+    const rawKey = `${imgKey}${subKey}`;
+    const mixinKey = WBI_MIXIN_KEY_TABLE.map((index) => rawKey[index] || '').join('').slice(0, 32);
+    this.wbiCache = {
+      mixinKey,
+      expiresAt: Date.now() + 12 * 60 * 60 * 1000
+    };
+    return mixinKey;
   }
 
   async fetchBiliJson(url) {
@@ -609,63 +774,91 @@ class LiveRecordService {
       Object.assign(room, await this.fetchRoomInfo(room.id));
     }
 
-    const params = new URLSearchParams({
-      room_id: String(room.realRoomId),
-      protocol: '0,1',
-      format: '0,1,2',
-      codec: '0,1',
-      qn: String(this.settings.targetQn),
-      platform: 'web',
-      ptype: '8',
-      dolby: '5',
-      panorama: '1'
-    });
-    const playInfo = await this.fetchBiliJson(
-      `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${params.toString()}`
-    );
-    if (playInfo.code !== 0) {
-      throw new Error(playInfo.message || `直播流接口返回状态码 ${playInfo.code}`);
-    }
-
-    const streams = playInfo.data?.playurl_info?.playurl?.stream || [];
+    const qnProbes = createQnProbeList(this.settings.targetQn);
     const candidates = [];
-    for (const stream of streams) {
-      for (const format of stream.format || []) {
-        for (const codec of format.codec || []) {
-          const baseUrl = codec.base_url || codec.baseUrl || '';
-          for (const urlInfo of codec.url_info || []) {
-            const host = urlInfo.host || '';
-            const extra = urlInfo.extra || '';
-            if (!host || !baseUrl) {
-              continue;
+    const seenUrls = new Set();
+    let lastPlayError = null;
+    for (const requestedQn of qnProbes) {
+      const params = new URLSearchParams({
+        room_id: String(room.realRoomId),
+        protocol: '0,1',
+        format: '0,1,2',
+        codec: '0,1',
+        qn: String(requestedQn),
+        platform: 'web',
+        ptype: '8',
+        dolby: '5',
+        panorama: '1'
+      });
+      const playInfo = await this.fetchBiliJson(
+        `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${params.toString()}`
+      );
+      if (playInfo.code !== 0) {
+        lastPlayError = createBiliError(`直播流(qn ${requestedQn})`, playInfo);
+        if ([-352, -101].includes(Number(playInfo.code))) {
+          throw lastPlayError;
+        }
+        continue;
+      }
+
+      const streams = playInfo.data?.playurl_info?.playurl?.stream || [];
+      for (const stream of streams) {
+        for (const format of stream.format || []) {
+          for (const codec of format.codec || []) {
+            const baseUrl = codec.base_url || codec.baseUrl || '';
+            for (const urlInfo of codec.url_info || []) {
+              const host = urlInfo.host || '';
+              const extra = urlInfo.extra || '';
+              if (!host || !baseUrl) {
+                continue;
+              }
+              const url = `${host}${baseUrl}${extra}`;
+              if (seenUrls.has(url)) {
+                continue;
+              }
+              seenUrls.add(url);
+              candidates.push({
+                url,
+                codec: String(codec.codec_name || codec.codec || 'unknown').toLowerCase(),
+                qn: Number(codec.current_qn || codec.qn || 0),
+                requestedQn,
+                acceptQn: Array.isArray(codec.accept_qn) ? codec.accept_qn.map(Number).filter(Boolean) : [],
+                protocol: String(stream.protocol_name || 'unknown'),
+                format: String(format.format_name || 'unknown'),
+                host
+              });
             }
-            candidates.push({
-              url: `${host}${baseUrl}${extra}`,
-              codec: String(codec.codec_name || codec.codec || 'unknown').toLowerCase(),
-              qn: Number(codec.current_qn || codec.qn || 0),
-              protocol: String(stream.protocol_name || 'unknown'),
-              format: String(format.format_name || 'unknown'),
-              host
-            });
           }
         }
       }
     }
 
     if (candidates.length === 0) {
+      if (lastPlayError) {
+        throw lastPlayError;
+      }
       throw new Error('没有拿到可用直播流，可能未登录、未开播或清晰度受限。');
     }
 
     candidates.sort((a, b) => streamScore(b, this.settings) - streamScore(a, this.settings));
     room.stream = candidates[0];
+    const availableQn = Array.from(
+      new Set(candidates.flatMap((candidate) => [candidate.qn, ...(candidate.acceptQn || [])]).filter(Boolean))
+    ).sort((a, b) => b - a);
+    if (Number(this.settings.targetQn || 0) >= 10000 && Number(room.stream.qn || 0) < Number(this.settings.targetQn)) {
+      this.log(
+        'warn',
+        `${roomLabel(room)} 未拿到请求的高画质清晰度 ${this.settings.targetQn}，实际选中 ${room.stream.qn}，接口可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先到设置页扫码登录，或重新扫码刷新 Cookie 后再试。`
+      );
+    }
     this.log(
       'success',
-      `${roomLabel(room)} 选中直播流：编码 ${displayCodecName(room.stream.codec)}，清晰度码 ${room.stream.qn}，协议 ${room.stream.protocol}/${room.stream.format}`
+      `${roomLabel(room)} 选中直播流：编码 ${displayCodecName(room.stream.codec)}，清晰度码 ${room.stream.qn}，请求 ${qnProbes.join('/')}, 协议 ${room.stream.protocol}/${room.stream.format}，接口可选 ${availableQn.join('/') || '未知'}`
     );
     return room.stream;
   }
 
-  async startRecording(roomId, autoStart = false) {
+  async startRecording(roomId, autoStart = false, options = {}) {
     const room = this.getRoom(roomId);
     if (room.recording) {
       return this.getState();
@@ -719,6 +912,18 @@ class LiveRecordService {
         assPath,
         burnedPath,
         eventCount: 0,
+        lastEventEmitAt: 0,
+        danmakuStatus: 'connecting',
+        danmakuMessage: '弹幕通道连接中',
+        danmakuPopularity: 0,
+        ignoredCommandCount: 0,
+        lastIgnoredEmitAt: 0,
+        ffmpegProbeBuffer: '',
+        videoInfo: null,
+        rotateTimer: null,
+        rotating: false,
+        segmentMinutes: this.settings.segmentMinutes,
+        finished: false,
         stopping: false
       };
 
@@ -729,20 +934,43 @@ class LiveRecordService {
         danmakuPath,
         assPath,
         burnedPath,
-        eventCount: 0
+        eventCount: 0,
+        danmakuStatus: 'connecting',
+        danmakuMessage: '弹幕通道连接中',
+        danmakuPopularity: 0,
+        ignoredDanmakuCount: 0,
+        videoInfo: null
       };
       this.recordingSessions.set(room.id, session);
+      this.armRecordingRotation(room, session);
       this.log(
         'success',
-        `${roomLabel(room)} ${autoStart ? '开播自动' : '手动'}开始录制：${path.basename(cleanPath)}`
+        `${roomLabel(room)} ${options.segmentContinue ? '分段继续' : autoStart ? '开播自动' : '手动'}开始录制：${path.basename(cleanPath)}`
       );
-      if (this.settings.notifyRecordingStarted) {
+      if (this.settings.notifyRecordingStarted && !options.silentNotify) {
         this.notify('开始录制', `${roomLabel(room)} 正在写入 ${path.basename(cleanPath)}`);
       }
 
       ffmpeg.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8');
-        if (/error|failed|invalid|403|404/i.test(text)) {
+        if (!session.videoInfo) {
+          session.ffmpegProbeBuffer = `${session.ffmpegProbeBuffer}${text}`.slice(-6000);
+          const videoInfo = parseFfmpegVideoInfo(session.ffmpegProbeBuffer);
+          if (videoInfo) {
+            session.videoInfo = videoInfo;
+            if (room.currentRecording) {
+              room.currentRecording.videoInfo = videoInfo;
+            }
+            this.log(
+              'success',
+              `${roomLabel(room)} 实际写入视频：${videoInfo.width}x${videoInfo.height}${
+                videoInfo.fps ? ` @ ${videoInfo.fps}fps` : ''
+              }`
+            );
+            this.emitState();
+          }
+        }
+        if (/(error|failed|invalid|HTTP\s+(?:403|404)|server returned\s+(?:403|404))/i.test(text)) {
           this.log('warn', `${roomLabel(room)} 录制进程：${compactLogLine(text)}`);
         }
       });
@@ -756,7 +984,17 @@ class LiveRecordService {
       });
 
       this.startDanmakuCapture(room, session).catch((error) => {
+        if (session.finished || this.recordingSessions.get(room.id) !== session) {
+          return;
+        }
+        session.danmakuStatus = 'error';
+        session.danmakuMessage = `弹幕连接失败：${error.message}`;
+        if (room.currentRecording) {
+          room.currentRecording.danmakuStatus = session.danmakuStatus;
+          room.currentRecording.danmakuMessage = session.danmakuMessage;
+        }
         this.log('warn', `${roomLabel(room)} 弹幕连接失败：${error.message}`);
+        this.emitState();
       });
 
       this.emitState();
@@ -770,34 +1008,146 @@ class LiveRecordService {
   }
 
   async startDanmakuCapture(room, session) {
-    const info = await this.fetchBiliJson(
-      `https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=${room.realRoomId}&type=0`
-    );
+    const info = await this.fetchDanmuInfo(room.realRoomId);
     if (info.code !== 0) {
-      throw new Error(info.message || `弹幕服务器接口返回状态码 ${info.code}`);
+      throw createBiliError('弹幕服务器', info);
+    }
+    if (session.finished || this.recordingSessions.get(room.id) !== session) {
+      return;
     }
     const client = new DanmakuClient({
       roomId: room.realRoomId,
+      uid: Number(getCookieValue(this.settings.cookie, 'DedeUserID') || 0),
+      buvid: getCookieValue(this.settings.cookie, 'buvid3') || getCookieValue(this.settings.cookie, 'buvid4') || '',
       token: info.data?.token || '',
       hosts: info.data?.host_list || [],
-      onOpen: () => this.log('success', `${roomLabel(room)} 弹幕通道已连接。`),
-      onClose: (reason) => this.log('warn', `${roomLabel(room)} 弹幕通道已断开：${reason}`),
-      onError: (error) => this.log('warn', `${roomLabel(room)} 弹幕通道错误：${error.message}`),
+      onOpen: () => {
+        if (!session.finished) {
+          this.updateDanmakuStatus(room, session, 'connecting', '弹幕通道已连接，正在认证');
+        }
+      },
+      onAuthReply: (reply) => {
+        if (session.finished) {
+          return;
+        }
+        if (Number(reply?.code || 0) === 0) {
+          this.updateDanmakuStatus(room, session, 'connected', '弹幕通道已认证，等待事件');
+          return;
+        }
+        this.updateDanmakuStatus(room, session, 'error', `弹幕认证失败：${reply?.message || reply?.code || '未知错误'}`, 'warn');
+      },
+      onHeartbeat: (popularity) => {
+        if (session.finished) {
+          return;
+        }
+        session.danmakuPopularity = popularity;
+        if (room.currentRecording) {
+          room.currentRecording.danmakuPopularity = popularity;
+        }
+        this.emitState();
+      },
+      onClose: (reason) => {
+        if (!session.finished) {
+          this.updateDanmakuStatus(room, session, 'disconnected', `弹幕通道已断开：${reason}`, 'warn');
+        }
+      },
+      onError: (error) => {
+        if (!session.finished) {
+          this.updateDanmakuStatus(room, session, 'error', `弹幕通道错误：${error.message}`, 'warn');
+        }
+      },
       onCommand: (command) => {
+        if (session.finished || this.recordingSessions.get(room.id) !== session) {
+          return;
+        }
         const event = normalizeDanmakuEvent(command, session.startedAt);
         if (!event) {
+          session.ignoredCommandCount = (session.ignoredCommandCount || 0) + 1;
+          if (room.currentRecording) {
+            room.currentRecording.ignoredDanmakuCount = session.ignoredCommandCount;
+          }
+          const now = Date.now();
+          if (session.ignoredCommandCount === 1 || now - session.lastIgnoredEmitAt > 5000) {
+            session.lastIgnoredEmitAt = now;
+            session.danmakuStatus = 'connected';
+            session.danmakuMessage = `弹幕通道正常，收到互动事件 ${session.ignoredCommandCount} 条`;
+            if (room.currentRecording) {
+              room.currentRecording.danmakuStatus = session.danmakuStatus;
+              room.currentRecording.danmakuMessage = session.danmakuMessage;
+            }
+            if (session.ignoredCommandCount === 1) {
+              this.log('info', `${roomLabel(room)} ${session.danmakuMessage}`);
+            }
+            this.emitState();
+          }
           return;
         }
         session.eventCount += 1;
-        room.currentRecording.eventCount = session.eventCount;
+        if (room.currentRecording) {
+          room.currentRecording.eventCount = session.eventCount;
+          room.currentRecording.danmakuStatus = 'connected';
+          room.currentRecording.danmakuMessage = `已捕获 ${session.eventCount} 条弹幕事件`;
+        }
         session.eventStream.write(`${JSON.stringify(event)}\n`);
-        if (session.eventCount % 50 === 0) {
+        const now = Date.now();
+        if (session.eventCount === 1 || now - session.lastEventEmitAt > 2000) {
+          session.lastEventEmitAt = now;
           this.emitState();
         }
       }
     });
     session.danmakuClient = client;
     client.connect();
+  }
+
+  updateDanmakuStatus(room, session, status, message, level = 'info') {
+    session.danmakuStatus = status;
+    session.danmakuMessage = message;
+    if (room.currentRecording) {
+      room.currentRecording.danmakuStatus = status;
+      room.currentRecording.danmakuMessage = message;
+    }
+    this.log(level, `${roomLabel(room)} ${message}`);
+    this.emitState();
+  }
+
+  armRecordingRotation(room, session) {
+    const minutes = Number(session.segmentMinutes || this.settings.segmentMinutes || 60);
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+      return;
+    }
+    session.rotateTimer = setTimeout(() => {
+      this.rotateRecordingSegment(room.id).catch((error) => {
+        this.log('error', `${roomLabel(room)} 分段切换失败：${error.message}`);
+      });
+    }, minutes * 60 * 1000);
+    session.rotateTimer.unref?.();
+  }
+
+  async rotateRecordingSegment(roomId) {
+    const room = this.getRoom(roomId);
+    const session = this.recordingSessions.get(room.id);
+    if (!session || session.stopping || session.rotating) {
+      return this.getState();
+    }
+    session.rotating = true;
+    this.log('info', `${roomLabel(room)} 已达到 ${session.segmentMinutes} 分钟分段时长，正在切换到新文件。`);
+    if (session.ffmpeg.stdin && !session.ffmpeg.stdin.destroyed) {
+      try {
+        session.ffmpeg.stdin.write('q');
+      } catch {
+        session.ffmpeg.kill();
+      }
+    } else {
+      session.ffmpeg.kill();
+    }
+    setTimeout(() => {
+      if (!session.ffmpeg.killed && room.recording) {
+        session.ffmpeg.kill();
+      }
+    }, 5000);
+    this.emitState();
+    return this.getState();
   }
 
   async stopRecording(roomId) {
@@ -807,6 +1157,7 @@ class LiveRecordService {
       return this.getState();
     }
     session.stopping = true;
+    clearTimeout(session.rotateTimer);
     session.danmakuClient?.close('手动停止');
     if (session.ffmpeg.stdin && !session.ffmpeg.stdin.destroyed) {
       try {
@@ -834,15 +1185,36 @@ class LiveRecordService {
       return;
     }
 
+    clearTimeout(session.rotateTimer);
+    session.finished = true;
     session.danmakuClient?.close('录制结束');
     await new Promise((resolve) => session.eventStream.end(resolve));
     room.recording = false;
+    const finishedRecording = {
+      startedAt: session.startedAt,
+      cleanPath: session.cleanPath,
+      danmakuPath: session.danmakuPath,
+      assPath: session.assPath,
+      burnedPath: session.burnedPath,
+      eventCount: session.eventCount,
+      danmakuStatus: session.danmakuStatus,
+      danmakuMessage: session.danmakuMessage,
+      danmakuPopularity: session.danmakuPopularity,
+      ignoredDanmakuCount: session.ignoredCommandCount,
+      videoInfo: session.videoInfo
+    };
     if (room.currentRecording) {
-      room.currentRecording.eventCount = session.eventCount;
+      Object.assign(room.currentRecording, finishedRecording);
     }
     this.recordingSessions.delete(roomId);
+    const shouldContinueSegment = session.rotating && !session.stopping;
 
-    if (code === 0 || session.stopping) {
+    if (shouldContinueSegment) {
+      this.log(
+        'success',
+        `${roomLabel(room)} 分段文件完成：${path.basename(session.cleanPath)}，弹幕事件 ${session.eventCount} 条。`
+      );
+    } else if (code === 0 || session.stopping) {
       this.log(
         'success',
         `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，弹幕事件 ${session.eventCount} 条。`
@@ -861,10 +1233,24 @@ class LiveRecordService {
 
     if (this.settings.autoBurnDanmaku && session.eventCount > 0) {
       setTimeout(() => {
-        this.startBurnDanmaku(roomId).catch((error) => {
+        this.startBurnRecording(room, finishedRecording).catch((error) => {
           this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
         });
       }, 500);
+    }
+
+    if (shouldContinueSegment) {
+      setTimeout(() => {
+        const currentRoom = this.rooms.get(roomId);
+        if (!currentRoom || currentRoom.recording) {
+          return;
+        }
+        this.startRecording(roomId, true, { segmentContinue: true, silentNotify: true }).catch((error) => {
+          this.log('error', `${roomLabel(currentRoom)} 分段继续录制失败：${error.message}`);
+        });
+      }, 300);
+    } else {
+      this.scheduleQueuedUpdateCheck();
     }
   }
 
@@ -877,6 +1263,20 @@ class LiveRecordService {
     if (!recording?.cleanPath || !recording?.danmakuPath) {
       this.log('warn', `${roomLabel(room)} 没有可烧录的最近录像。`);
       return this.getState();
+    }
+
+    await this.startBurnRecording(room, recording);
+    return this.getState();
+  }
+
+  async startBurnRecording(room, recording) {
+    if (room.burning) {
+      this.log('warn', `${roomLabel(room)} 已有弹幕版正在生成，跳过 ${path.basename(recording.cleanPath)}。`);
+      return false;
+    }
+    if (!recording?.cleanPath || !recording?.danmakuPath) {
+      this.log('warn', `${roomLabel(room)} 没有可烧录的最近录像。`);
+      return false;
     }
 
     try {
@@ -927,13 +1327,15 @@ class LiveRecordService {
           }
         }
         this.emitState();
+        this.scheduleQueuedUpdateCheck();
       });
     } catch (error) {
       room.burning = false;
       this.log('error', `${roomLabel(room)} 生成弹幕版失败：${error.message}`);
+      return false;
     }
     this.emitState();
-    return this.getState();
+    return true;
   }
 
   async generateAss(recording) {
@@ -978,6 +1380,215 @@ class LiveRecordService {
     return this.getState();
   }
 
+  async openConfigDir() {
+    const configDir = path.dirname(this.storePath);
+    await fsp.mkdir(configDir, { recursive: true });
+    openPath(configDir);
+    this.log('info', `已打开配置目录：${configDir}`);
+    this.emitState();
+    return this.getState();
+  }
+
+  async checkUpdate() {
+    this.updateState = {
+      ...this.updateState,
+      status: 'checking',
+      currentVersion: APP_VERSION,
+      message: '正在检查更新...',
+      checkedAt: Date.now()
+    };
+    this.emitState();
+    try {
+      const manifest = await this.fetchUpdateManifest();
+      const latestVersion = manifest.version || manifest.tagName || '';
+      const hasUpdate = compareVersions(latestVersion, APP_VERSION) > 0;
+      this.updateState = {
+        ...this.updateState,
+        status: hasUpdate ? 'available' : 'up-to-date',
+        currentVersion: APP_VERSION,
+        latestVersion,
+        message: hasUpdate ? `发现新版本 ${latestVersion}` : `当前已是最新版本 ${APP_VERSION}`,
+        checkedAt: Date.now(),
+        manifest
+      };
+      this.log(hasUpdate ? 'success' : 'info', this.updateState.message);
+      this.emitState();
+      return this.getState();
+    } catch (error) {
+      this.updateState = {
+        ...this.updateState,
+        status: 'error',
+        message: `检查更新失败：${error.message}`,
+        checkedAt: Date.now()
+      };
+      this.log('error', this.updateState.message);
+      this.emitState();
+      return this.getState();
+    }
+  }
+
+  async queueUpdateAfterJobs() {
+    if (!this.updateState.manifest || this.updateState.status === 'idle' || this.updateState.status === 'up-to-date') {
+      await this.checkUpdate();
+    }
+    if (!this.updateState.manifest || compareVersions(this.updateState.latestVersion, APP_VERSION) <= 0) {
+      return this.getState();
+    }
+    if (!this.hasActiveJobs()) {
+      return this.applyUpdate();
+    }
+    this.updateState = {
+      ...this.updateState,
+      status: 'queued',
+      queued: true,
+      message: `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动安装。`
+    };
+    this.log('info', this.updateState.message);
+    this.emitState();
+    return this.getState();
+  }
+
+  async applyUpdate() {
+    if (this.hasActiveJobs()) {
+      this.updateState = {
+        ...this.updateState,
+        status: 'blocked',
+        queued: false,
+        message: '当前仍有录制或烧录任务，暂不更新。'
+      };
+      this.emitState();
+      return this.getState();
+    }
+
+    if (!this.updateState.manifest || compareVersions(this.updateState.latestVersion, APP_VERSION) <= 0) {
+      await this.checkUpdate();
+    }
+    const manifest = this.updateState.manifest;
+    if (!manifest || compareVersions(manifest.version, APP_VERSION) <= 0) {
+      return this.getState();
+    }
+
+    try {
+      this.updateState = {
+        ...this.updateState,
+        status: 'downloading',
+        queued: false,
+        message: `正在下载 ${manifest.version} 更新包...`
+      };
+      this.emitState();
+
+      const packagePath = await this.downloadUpdatePackage(manifest);
+      this.updateState = {
+        ...this.updateState,
+        status: 'ready',
+        message: `更新包已准备好，正在应用 ${manifest.version}...`
+      };
+      this.emitState();
+
+      const scriptPath = await this.createUpdaterScript(packagePath, manifest);
+      this.updateState = {
+        ...this.updateState,
+        status: 'applying',
+        message: '正在重启并应用更新...'
+      };
+      this.log('success', `正在应用更新 ${manifest.version}，应用会自动重启。`);
+      this.emitState();
+      spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true
+      }).unref();
+    } catch (error) {
+      this.updateState = {
+        ...this.updateState,
+        status: 'error',
+        queued: false,
+        message: `更新失败：${error.message}`
+      };
+      this.log('error', this.updateState.message);
+      this.emitState();
+    }
+    return this.getState();
+  }
+
+  async fetchUpdateManifest() {
+    const source = this.settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL;
+    const raw = await readTextSource(source);
+    const payload = JSON.parse(raw);
+    const manifest = normalizeUpdateManifest(payload);
+    if (!manifest.version || !manifest.packageUrl) {
+      throw new Error('更新源缺少 version 或 packageUrl。');
+    }
+    return manifest;
+  }
+
+  async downloadUpdatePackage(manifest) {
+    const updateDir = path.join(path.dirname(this.storePath), 'updates');
+    await fsp.mkdir(updateDir, { recursive: true });
+    const packagePath = path.join(updateDir, `bili-record-2k-${sanitizeFilename(manifest.version)}.zip`);
+    await downloadFile(manifest.packageUrl, packagePath);
+    if (manifest.sha256) {
+      const actual = await fileSha256(packagePath);
+      if (actual.toLowerCase() !== String(manifest.sha256).toLowerCase()) {
+        await fsp.rm(packagePath, { force: true });
+        throw new Error('更新包 SHA256 校验失败，已放弃更新。');
+      }
+    }
+    return packagePath;
+  }
+
+  async createUpdaterScript(packagePath, manifest) {
+    const updateDir = path.join(path.dirname(this.storePath), 'updates');
+    const scriptPath = path.join(updateDir, 'apply-update.ps1');
+    const launcherPath = path.join(APP_ROOT, 'BiliRecord2K.exe');
+    const script = `
+$ErrorActionPreference = 'Stop'
+$zipPath = ${psLiteral(packagePath)}
+$appRoot = ${psLiteral(APP_ROOT)}
+$extractPath = Join-Path ${psLiteral(updateDir)} 'extract'
+$launcherPath = ${psLiteral(launcherPath)}
+Start-Sleep -Milliseconds 1200
+Get-Process -Name 'BiliRecord2K','BiliRecord2K.Service' -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 800
+Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
+Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
+Copy-Item -Path (Join-Path $extractPath '*') -Destination $appRoot -Recurse -Force
+Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
+`;
+    await fsp.writeFile(scriptPath, script.trimStart(), 'utf8');
+    await fsp.writeFile(path.join(updateDir, 'last-update.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    return scriptPath;
+  }
+
+  scheduleQueuedUpdateCheck(delayMs = 1500) {
+    if (!this.updateState.queued) {
+      return;
+    }
+    clearTimeout(this.queuedUpdateTimer);
+    this.queuedUpdateTimer = setTimeout(() => {
+      if (!this.updateState.queued || this.hasActiveJobs()) {
+        return;
+      }
+      this.applyUpdate().catch((error) => {
+        this.updateState = {
+          ...this.updateState,
+          status: 'error',
+          queued: false,
+          message: `自动更新失败：${error.message}`
+        };
+        this.log('error', this.updateState.message);
+        this.emitState();
+      });
+    }, delayMs);
+    this.queuedUpdateTimer.unref?.();
+  }
+
+  hasActiveJobs() {
+    return Array.from(this.rooms.values()).some((room) => room.recording || room.burning);
+  }
+
   async setStartup(enabled) {
     if (process.platform !== 'win32') {
       throw new Error('开机自启目前只支持 Windows。');
@@ -1015,12 +1626,14 @@ class LiveRecordService {
 
   shutdown() {
     this.clearLoginTimer();
+    clearTimeout(this.queuedUpdateTimer);
     for (const timer of this.monitorTimers.values()) {
       clearInterval(timer);
     }
     this.monitorTimers.clear();
     for (const room of this.rooms.values()) {
       const session = this.recordingSessions.get(room.id);
+      clearTimeout(session?.rotateTimer);
       session?.danmakuClient?.close('服务退出');
       if (session?.ffmpeg && !session.ffmpeg.killed) {
         try {
@@ -1036,9 +1649,13 @@ class LiveRecordService {
 class DanmakuClient {
   constructor(options) {
     this.roomId = options.roomId;
+    this.uid = options.uid || 0;
+    this.buvid = options.buvid || '';
     this.token = options.token;
     this.hosts = options.hosts;
     this.onOpen = options.onOpen;
+    this.onAuthReply = options.onAuthReply;
+    this.onHeartbeat = options.onHeartbeat;
     this.onClose = options.onClose;
     this.onError = options.onError;
     this.onCommand = options.onCommand;
@@ -1077,12 +1694,13 @@ class DanmakuClient {
     this.sendPacket(
       DANMAKU_OP.AUTH,
       JSON.stringify({
-        uid: 0,
+        uid: this.uid,
         roomid: this.roomId,
-        protover: 3,
+        protover: 2,
         platform: 'web',
         type: 2,
-        key: this.token
+        key: this.token,
+        buvid: this.buvid
       })
     );
   }
@@ -1108,10 +1726,20 @@ class DanmakuClient {
 
   handleMessage(buffer) {
     for (const packet of unpackDanmakuPackets(buffer)) {
+      if (packet.operation === DANMAKU_OP.AUTH_REPLY) {
+        this.onAuthReply?.(decodeAuthReply(packet));
+        continue;
+      }
+      if (packet.operation === DANMAKU_OP.HEARTBEAT_REPLY) {
+        if (packet.body.length >= 4) {
+          this.onHeartbeat?.(packet.body.readUInt32BE(0));
+        }
+        continue;
+      }
       if (packet.operation !== DANMAKU_OP.MESSAGE) {
         continue;
       }
-      for (const body of decodeDanmakuPacket(packet)) {
+      for (const body of safeDecodeDanmakuPacket(packet)) {
         try {
           const command = JSON.parse(body);
           this.onCommand?.(command);
@@ -1204,6 +1832,11 @@ async function handleApi(service, parsed, request, response) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/image') {
+    await service.proxyImage(parsed.searchParams.get('url'), response);
+    return;
+  }
+
   if (request.method === 'GET' && pathname === '/api/tray/state') {
     const afterSeq = Number(parsed.searchParams.get('after') || 0);
     writeText(response, 200, service.getTrayStateText(afterSeq));
@@ -1241,6 +1874,10 @@ async function handleApi(service, parsed, request, response) {
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
+    '/api/shell/open-config': () => service.openConfigDir(),
+    '/api/update/check': () => service.checkUpdate(),
+    '/api/update/apply': () => service.applyUpdate(),
+    '/api/update/queue': () => service.queueUpdateAfterJobs(),
     '/api/system/startup': () => service.setStartup(body.enabled),
     '/api/system/test-notification': () => service.testNotification(),
     '/api/system/shutdown': () => service.requestShutdown()
@@ -1393,6 +2030,29 @@ function decodeDanmakuPacket(packet) {
     return unpackDanmakuPackets(decompressed).flatMap(decodeDanmakuPacket);
   }
   return [];
+}
+
+function safeDecodeDanmakuPacket(packet) {
+  try {
+    return decodeDanmakuPacket(packet);
+  } catch {
+    return [];
+  }
+}
+
+function decodeAuthReply(packet) {
+  const text = packet.body.toString('utf8').trim();
+  if (text) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { code: text };
+    }
+  }
+  if (packet.body.length >= 4) {
+    return { code: packet.body.readUInt32BE(0) };
+  }
+  return { code: 0 };
 }
 
 async function requestBiliJsonWithCookies(url) {
@@ -1789,6 +2449,31 @@ function sanitizeHeaderValue(value) {
   return String(value || '').replace(/[\r\n]/g, '').trim();
 }
 
+function getCookieValue(cookie, key) {
+  for (const part of String(cookie || '').split(';')) {
+    const trimmed = part.trim();
+    const index = trimmed.indexOf('=');
+    if (index > 0 && trimmed.slice(0, index) === key) {
+      return trimmed.slice(index + 1);
+    }
+  }
+  return '';
+}
+
+function createBiliError(label, payload) {
+  const code = Number(payload?.code);
+  const message = String(payload?.message || payload?.msg || code || '未知错误');
+  if (code === -352) {
+    return new Error(
+      `${label}接口返回 -352：疑似 B 站风控或登录态不足。请到设置页扫码登录；如果已登录，重新扫码刷新 Cookie 后再试。`
+    );
+  }
+  if (code === -101) {
+    return new Error(`${label}接口提示账号未登录：请到设置页扫码登录后再试。`);
+  }
+  return new Error(`${label}接口返回 ${Number.isNaN(code) ? message : code}：${message}`);
+}
+
 function normalizeContainer(value) {
   return value === 'mkv' ? 'mkv' : 'mp4';
 }
@@ -1797,6 +2482,37 @@ function normalizeBurnCodec(value) {
   const codec = String(value || '').trim();
   const supported = new Set(['libx265', 'libx264', 'hevc_nvenc', 'hevc_qsv', 'hevc_amf']);
   return supported.has(codec) ? codec : 'libx265';
+}
+
+function normalizeRoomImageMode(value) {
+  return value === 'cover' ? 'cover' : 'keyframe';
+}
+
+function basenameWithoutExt(url) {
+  const value = String(url || '').trim();
+  if (!value) {
+    return '';
+  }
+  return value.split('/').pop()?.split('.')[0] || '';
+}
+
+function normalizeTargetQn(value) {
+  const qn = Number(value || 15000);
+  if (!Number.isFinite(qn) || qn <= 0) {
+    return 15000;
+  }
+  return qn === 20000 ? 25000 : qn;
+}
+
+function createQnProbeList(value) {
+  const targetQn = normalizeTargetQn(value);
+  const probes = [targetQn];
+  for (const qn of STREAM_QN_PROBES) {
+    if (qn <= targetQn) {
+      probes.push(qn);
+    }
+  }
+  return Array.from(new Set(probes.filter((qn) => Number.isFinite(qn) && qn > 0)));
 }
 
 function getContainerFromPath(filePath) {
@@ -1826,10 +2542,11 @@ function streamScore(stream, settings) {
   const codec = String(stream.codec || '').toLowerCase();
   const hevc = codec.includes('hevc') || codec.includes('h265');
   const avc = codec.includes('avc') || codec.includes('h264');
-  const codecScore = settings.preferHevc ? (hevc ? 1_000_000 : avc ? 100_000 : 0) : avc ? 1_000_000 : 0;
-  const protocolScore = stream.protocol.includes('hls') ? 10_000 : 5_000;
-  const formatScore = stream.format.includes('fmp4') ? 2_000 : stream.format.includes('flv') ? 1_000 : 0;
-  return codecScore + protocolScore + formatScore + Number(stream.qn || 0);
+  const qualityScore = Number(stream.qn || 0) * 1_000_000;
+  const codecScore = settings.preferHevc ? (hevc ? 10_000 : avc ? 1_000 : 0) : avc ? 10_000 : hevc ? 1_000 : 0;
+  const protocolScore = stream.protocol.includes('hls') ? 500 : 250;
+  const formatScore = stream.format.includes('fmp4') ? 200 : stream.format.includes('flv') ? 100 : 0;
+  return qualityScore + codecScore + protocolScore + formatScore;
 }
 
 function displayCodecName(codec) {
@@ -1849,6 +2566,28 @@ function escapeFilterPath(filePath) {
 
 function compactLogLine(text) {
   return String(text).replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+function parseFfmpegVideoInfo(text) {
+  const line = String(text || '')
+    .split(/\r?\n/)
+    .find((item) => /Video:/i.test(item) && /\d{3,5}x\d{3,5}/.test(item));
+  if (!line) {
+    return null;
+  }
+  const sizeMatch = line.match(/,\s*(\d{3,5})x(\d{3,5})(?:[\s,\[]|$)/);
+  if (!sizeMatch) {
+    return null;
+  }
+  const codecMatch = line.match(/Video:\s*([^,\r\n]+)/i);
+  const fpsMatch = line.match(/,\s*([0-9]+(?:\.[0-9]+)?)\s*fps/i);
+  const fps = fpsMatch ? Number(fpsMatch[1]) : 0;
+  return {
+    codec: codecMatch ? codecMatch[1].trim() : '',
+    width: Number(sizeMatch[1]),
+    height: Number(sizeMatch[2]),
+    fps: Number.isFinite(fps) && fps > 0 ? fps : undefined
+  };
 }
 
 function clamp(value, min, max) {
@@ -1920,6 +2659,121 @@ function findFfmpegPath() {
     }
   }
   return 'ffmpeg';
+}
+
+function getAppVersion() {
+  const candidates = [
+    path.join(APP_ROOT, 'version.json'),
+    path.join(APP_ROOT, 'package.json'),
+    path.join(process.cwd(), 'package.json'),
+    path.resolve(__dirname, '..', 'package.json')
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) {
+        continue;
+      }
+      const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      if (data.version) {
+        return String(data.version);
+      }
+    } catch {
+      // Keep looking.
+    }
+  }
+  return '0.0.1';
+}
+
+async function readTextSource(source) {
+  const value = String(source || '').trim();
+  if (!value) {
+    throw new Error('更新源为空。');
+  }
+  if (/^https?:\/\//i.test(value)) {
+    const response = await fetch(value, {
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        'User-Agent': `${APP_NAME}/${APP_VERSION}`
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`更新源请求失败：HTTP ${response.status}`);
+    }
+    return response.text();
+  }
+  const filePath = value.startsWith('file://') ? new URL(value) : path.resolve(APP_ROOT, value);
+  return fsp.readFile(filePath, 'utf8');
+}
+
+function normalizeUpdateManifest(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('更新源不是有效 JSON。');
+  }
+  if (Array.isArray(payload.assets)) {
+    const zipAsset = payload.assets.find((asset) => /\.zip$/i.test(asset.name || asset.browser_download_url || ''));
+    return {
+      version: normalizeVersion(payload.version || payload.tag_name || ''),
+      tagName: payload.tag_name || '',
+      packageUrl: zipAsset?.browser_download_url || zipAsset?.url || '',
+      sha256: payload.sha256 || '',
+      releaseUrl: payload.html_url || '',
+      notes: payload.body || ''
+    };
+  }
+  const files = Array.isArray(payload.files) ? payload.files : [];
+  const zipFile = files.find((file) => /\.zip$/i.test(file.name || file.url || ''));
+  return {
+    version: normalizeVersion(payload.version || payload.tagName || ''),
+    tagName: payload.tagName || payload.tag_name || '',
+    packageUrl: payload.packageUrl || payload.url || payload.downloadUrl || zipFile?.url || '',
+    sha256: payload.sha256 || zipFile?.sha256 || '',
+    releaseUrl: payload.releaseUrl || payload.htmlUrl || '',
+    notes: payload.notes || payload.body || ''
+  };
+}
+
+function normalizeVersion(value) {
+  return String(value || '').trim().replace(/^v/i, '');
+}
+
+function compareVersions(a, b) {
+  const left = normalizeVersion(a).split(/[.-]/).map((part) => Number(part) || 0);
+  const right = normalizeVersion(b).split(/[.-]/).map((part) => Number(part) || 0);
+  const length = Math.max(left.length, right.length, 3);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (left[index] || 0) - (right[index] || 0);
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+  return 0;
+}
+
+async function downloadFile(url, targetPath) {
+  if (!/^https?:\/\//i.test(String(url || ''))) {
+    throw new Error('更新包下载地址无效。');
+  }
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/zip, application/octet-stream, */*',
+      'User-Agent': `${APP_NAME}/${APP_VERSION}`
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`更新包下载失败：HTTP ${response.status}`);
+  }
+  const body = Buffer.from(await response.arrayBuffer());
+  await fsp.writeFile(targetPath, body);
+}
+
+async function fileSha256(filePath) {
+  const hash = crypto.createHash('sha256');
+  hash.update(await fsp.readFile(filePath));
+  return hash.digest('hex');
+}
+
+function psLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
 function isStartupEnabled() {
