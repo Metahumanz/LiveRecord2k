@@ -34,6 +34,7 @@ export const recorder: RecorderApi = {
   openPathDir: (path) => api<AppState>('/api/shell/open-path-dir', { path }),
   openConfigDir: () => api<AppState>('/api/shell/open-config', {}),
   checkUpdate: () => api<AppState>('/api/update/check', {}, { timeoutMs: 52000 }),
+  downloadUpdate: () => api<AppState>('/api/update/download', {}),
   applyUpdate: () => api<AppState>('/api/update/apply', {}),
   queueUpdate: () => api<AppState>('/api/update/queue', {}),
   setStartup: (enabled) => api<AppState>('/api/system/startup', { enabled }),

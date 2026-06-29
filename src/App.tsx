@@ -454,6 +454,16 @@ function UpdateNotice({
             录制结束后更新
           </button>
         ) : null}
+        {canInstall ? (
+          <button
+            className="wide-button"
+            disabled={busy === 'update-download' || update.status === 'downloading'}
+            onClick={() => run('update-download', recorder.downloadUpdate)}
+          >
+            <Download size={18} />
+            仅下载
+          </button>
+        ) : null}
         {canInstall && !activeJobs ? (
           <button
             className="wide-button primary"
@@ -1293,6 +1303,18 @@ function SettingsPage({
               <RefreshCw size={18} />
               检查更新
             </button>
+            <button
+              className="wide-button fill"
+              type="button"
+              disabled={
+                busy === 'update-download' ||
+                ['checking', 'queued', 'downloading', 'ready', 'applying'].includes(state.update.status)
+              }
+              onClick={() => run('update-download', recorder.downloadUpdate)}
+            >
+              <Download size={18} />
+              仅下载更新包
+            </button>
             {state.update.status === 'available' || state.update.status === 'blocked' ? (
               hasActiveJobs ? (
                 <button
@@ -1317,6 +1339,16 @@ function SettingsPage({
               )
             ) : null}
           </div>
+          {state.update.packagePath ? (
+            <button
+              className="wide-button fill"
+              type="button"
+              onClick={() => run('open-update-package', () => recorder.openPathDir(state.update.packagePath || ''))}
+            >
+              <FolderOpen size={18} />
+              打开下载目录
+            </button>
+          ) : null}
           <details className="changelog-box">
             <summary>更新日志</summary>
             <div className="changelog-list">
