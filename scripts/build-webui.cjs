@@ -8,11 +8,13 @@ const releaseRoot = path.join(root, 'release');
 const releaseDir = path.join(releaseRoot, 'webui');
 const buildDir = path.join(root, 'build');
 const zipPath = path.join(releaseRoot, 'bili-record-2k-webui.zip');
+const setupPath = path.join(releaseRoot, 'bili-record-2k-setup.exe');
 const launcherExePath = path.join(releaseDir, 'BiliRecord2K.exe');
 const serviceExePath = path.join(releaseDir, 'BiliRecord2K.Service.exe');
 const serverBundlePath = path.join(buildDir, 'server.bundle.cjs');
 const seaConfigPath = path.join(buildDir, 'sea-config.json');
 const seaBlobPath = path.join(buildDir, 'sea-prep.blob');
+const installerScriptPath = path.join(root, 'scripts', 'installer.nsi');
 const launcherTemplatePath = path.join(root, 'scripts', 'win-tray-launcher.c');
 const launcherSourcePath = path.join(buildDir, 'launcher.c');
 const launcherRcPath = path.join(buildDir, 'launcher.rc');
@@ -40,7 +42,9 @@ async function main() {
   await buildLauncherExe();
   await copyFfmpegBinary();
   await fsp.rm(zipPath, { force: true });
+  await fsp.rm(setupPath, { force: true });
   zipRelease();
+  await buildInstaller();
 
   console.log('Build OK');
   console.log(`  dist:     ${path.join(root, 'dist')}`);
@@ -48,10 +52,13 @@ async function main() {
   console.log(`  launcher: ${launcherExePath}`);
   console.log(`  service:  ${serviceExePath}`);
   console.log(`  zip:      ${zipPath}`);
+  if (fs.existsSync(setupPath)) {
+    console.log(`  setup:    ${setupPath}`);
+  }
 }
 
 async function writeVersionFile() {
-  const packageJson = JSON.parse(await fsp.readFile(path.join(root, 'package.json'), 'utf8'));
+  const packageJson = await readPackageJson();
   await fsp.writeFile(
     path.join(releaseDir, 'version.json'),
     `${JSON.stringify(
@@ -65,6 +72,10 @@ async function writeVersionFile() {
     )}\n`,
     'utf8'
   );
+}
+
+async function readPackageJson() {
+  return JSON.parse(await fsp.readFile(path.join(root, 'package.json'), 'utf8'));
 }
 
 async function bundleServer() {
@@ -171,6 +182,68 @@ function zipRelease() {
   }
 }
 
+async function buildInstaller() {
+  if (process.platform !== 'win32') {
+    console.log('Installer skipped: NSIS installer is only built on Windows.');
+    return;
+  }
+  const makensis = findMakensis();
+  if (!makensis) {
+    const message = 'Installer skipped: makensis.exe was not found. Install NSIS or set MAKENSIS_PATH.';
+    if (isTruthy(process.env.BUILD_INSTALLER_REQUIRED)) {
+      throw new Error(message);
+    }
+    console.log(message);
+    return;
+  }
+
+  const packageJson = await readPackageJson();
+  const version = String(packageJson.version || '0.0.0');
+  runCommand(makensis, [
+    `/DAPP_VERSION=${version}`,
+    `/DAPP_VERSION_QUAD=${toVersionQuad(version)}`,
+    `/DRELEASE_DIR=${releaseDir}`,
+    `/DOUT_FILE=${setupPath}`,
+    `/DICON_PATH=${path.join(root, 'assets', 'app-icon.ico')}`,
+    installerScriptPath
+  ]);
+}
+
+function findMakensis() {
+  const configured = String(process.env.MAKENSIS_PATH || '').trim();
+  if (configured && fs.existsSync(configured)) {
+    return configured;
+  }
+  const fromPath = findCommandOnPath('makensis.exe');
+  if (fromPath) {
+    return fromPath;
+  }
+  const candidates = [
+    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'NSIS', 'makensis.exe'),
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'NSIS', 'makensis.exe')
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || '';
+}
+
+function findCommandOnPath(command) {
+  const result = spawnSync(process.platform === 'win32' ? 'where.exe' : 'which', [command], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return '';
+  }
+  return String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean) || '';
+}
+
+function toVersionQuad(version) {
+  const parts = String(version || '0.0.0')
+    .split(/[.-]/)
+    .map((part) => Number(part) || 0)
+    .slice(0, 4);
+  while (parts.length < 4) {
+    parts.push(0);
+  }
+  return parts.join('.');
+}
+
 function runNodeScript(scriptPath, args) {
   const result = spawnSync(process.execPath, [scriptPath, ...args], { stdio: 'inherit' });
   if (result.status !== 0) {
@@ -187,6 +260,9 @@ function runNode(args) {
 
 function runCommand(command, args) {
   const result = spawnSync(command, args, { stdio: 'inherit' });
+  if (result.error) {
+    throw new Error(`${command} failed: ${result.error.message}`);
+  }
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(' ')} failed with code ${result.status}`);
   }
@@ -194,4 +270,8 @@ function runCommand(command, args) {
 
 function escapePowerShellPath(value) {
   return String(value).replace(/'/g, "''");
+}
+
+function isTruthy(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
