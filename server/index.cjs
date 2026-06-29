@@ -56,6 +56,7 @@ const UPDATE_CHECK_TIMEOUT_MS = 12000;
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
+const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 
 class LiveRecordService {
   constructor() {
@@ -592,8 +593,9 @@ class LiveRecordService {
     return this.getState();
   }
 
-  async refreshRoom(roomId) {
+  async refreshRoom(roomId, options = {}) {
     const room = this.getRoom(roomId);
+    const silent = Boolean(options.silent);
     try {
       const previousLiveStatus = room.liveStatus;
       const info = await this.fetchRoomInfo(room.id);
@@ -613,7 +615,7 @@ class LiveRecordService {
         if (previousLiveStatus === 1 && room.liveStatus !== 1 && this.settings.notifyLiveEnded) {
           this.notify('下播提醒', `${roomLabel(room)} 已下播`);
         }
-      } else {
+      } else if (!silent) {
         this.log(
           info.liveStatus === 1 ? 'success' : 'info',
           `${roomLabel(room)}：${info.liveStatus === 1 ? '正在直播' : '未开播'}`
@@ -622,7 +624,9 @@ class LiveRecordService {
     } catch (error) {
       room.lastCheckedAt = Date.now();
       room.lastError = error.message;
-      this.log('error', `${roomLabel(room)} 刷新失败：${error.message}`);
+      if (!silent) {
+        this.log('error', `${roomLabel(room)} 刷新失败：${error.message}`);
+      }
     }
     this.emitState();
     return this.getState();
@@ -1034,10 +1038,13 @@ class LiveRecordService {
       const mergeOutputPath =
         options.mergeOutputPath || path.join(this.settings.outputDir, `${sanitizeFilename(mergeGroup)}.merged.${container}`);
 
+      const segmentMinutes = Number(this.settings.segmentMinutes || 0);
+      const segmentDurationSec = Number.isFinite(segmentMinutes) && segmentMinutes > 0 ? segmentMinutes * 60 : 0;
       const args = createRecordingArgs({
         streamUrl: stream.url,
         headers: this.createFfmpegHeaders(room),
-        outputPath: capturePath
+        outputPath: capturePath,
+        maxDurationSec: segmentDurationSec
       });
 
       const ffmpeg = spawn(this.ffmpegPath, args, {
@@ -1080,7 +1087,8 @@ class LiveRecordService {
         rotateTimer: null,
         mediaWatchTimer: null,
         rotating: false,
-        segmentMinutes: this.settings.segmentMinutes,
+        segmentMinutes,
+        segmentDurationSec,
         finished: false,
         stopping: false
       };
@@ -1323,7 +1331,7 @@ class LiveRecordService {
       this.rotateRecordingSegment(room.id).catch((error) => {
         this.log('error', `${roomLabel(room)} 分段切换失败：${error.message}`);
       });
-    }, minutes * 60 * 1000);
+    }, minutes * 60 * 1000 + SEGMENT_ROTATION_GRACE_MS);
     session.rotateTimer.unref?.();
   }
 
@@ -1472,7 +1480,7 @@ class LiveRecordService {
       );
     }
     this.recordingSessions.delete(roomId);
-    const shouldContinueSegment = session.rotating && !session.stopping;
+    const shouldContinueSegment = (session.rotating || hasReachedSegmentLimit(session, elapsedSec)) && !session.stopping;
     const unexpectedStreamEnd = !session.stopping && !shouldContinueSegment;
     const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
     const elapsedText = formatDurationSeconds(elapsedSec);
@@ -2129,7 +2137,7 @@ class LiveRecordService {
       ...this.updateState,
       status: 'queued',
       queued: true,
-      message: `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动安装。`
+      message: `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动启动安装器。`
     };
     this.log('info', this.updateState.message);
     this.emitState();
@@ -2155,8 +2163,8 @@ class LiveRecordService {
         status: usablePackagePath ? 'available' : 'downloading',
         queued: false,
         message: usablePackagePath
-          ? `更新包已下载：${usablePackagePath}`
-          : `正在手动下载 ${manifest.version} 更新包...`,
+          ? `${updatePackageLabel(manifest)}已下载：${usablePackagePath}`
+          : `正在下载 ${manifest.version} ${updatePackageLabel(manifest)}...`,
         downloadReceivedBytes: usablePackagePath ? this.updateState.downloadReceivedBytes : 0,
         downloadTotalBytes: usablePackagePath ? this.updateState.downloadTotalBytes : 0,
         downloadProgress: usablePackagePath ? 100 : 0,
@@ -2171,11 +2179,11 @@ class LiveRecordService {
         ...this.updateState,
         status: 'available',
         queued: false,
-        message: `更新包已下载：${packagePath}`,
+        message: `${updatePackageLabel(manifest)}已下载：${packagePath}`,
         downloadProgress: 100,
         packagePath
       };
-      this.log('success', `更新包已手动下载：${packagePath}`);
+      this.log('success', `${updatePackageLabel(manifest)}已下载：${packagePath}`);
       this.emitState();
     } catch (error) {
       this.updateState = {
@@ -2219,7 +2227,9 @@ class LiveRecordService {
         ...this.updateState,
         status: 'downloading',
         queued: false,
-        message: usablePackagePath ? `正在使用已下载的 ${manifest.version} 更新包...` : `正在下载 ${manifest.version} 更新包...`,
+        message: usablePackagePath
+          ? `正在使用已下载的 ${manifest.version} ${updatePackageLabel(manifest)}...`
+          : `正在下载 ${manifest.version} ${updatePackageLabel(manifest)}...`,
         downloadReceivedBytes: usablePackagePath ? this.updateState.downloadReceivedBytes : 0,
         downloadTotalBytes: usablePackagePath ? this.updateState.downloadTotalBytes : 0,
         downloadProgress: usablePackagePath ? 100 : 0,
@@ -2233,26 +2243,33 @@ class LiveRecordService {
       this.updateState = {
         ...this.updateState,
         status: 'ready',
-        message: `更新包已准备好，正在应用 ${manifest.version}...`,
+        message: `${updatePackageLabel(manifest)}已准备好，正在启动安装器...`,
         downloadProgress: 100,
         packagePath
       };
       this.emitState();
 
-      const scriptPath = await this.createUpdaterScript(packagePath, manifest);
+      const launched = this.launchUpdateInstaller(packagePath, manifest);
+      if (!launched) {
+        this.updateState = {
+          ...this.updateState,
+          status: 'available',
+          queued: false,
+          message: `更新包已下载，但当前更新源没有提供安装器。请打开下载目录后手动更新：${packagePath}`,
+          downloadProgress: 100,
+          packagePath
+        };
+        this.log('warn', this.updateState.message);
+        this.emitState();
+        return this.getState();
+      }
       this.updateState = {
         ...this.updateState,
         status: 'applying',
-        message: '正在重启并应用更新...'
+        message: '安装器已启动，应用会在安装过程中自动重启。'
       };
-      this.log('success', `正在应用更新 ${manifest.version}，应用会自动重启。`);
+      this.log('success', `已启动 ${manifest.version} 安装器：${packagePath}`);
       this.emitState();
-      spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
-      }).unref();
-      this.armUpdateApplyWatchdog(manifest);
     } catch (error) {
       this.updateState = {
         ...this.updateState,
@@ -2287,6 +2304,20 @@ class LiveRecordService {
       }
     }
     return packagePath;
+  }
+
+  launchUpdateInstaller(packagePath, manifest) {
+    if (!isInstallerUpdatePackage(manifest, packagePath)) {
+      return false;
+    }
+    const args = normalizeInstallerArgs(manifest);
+    const child = spawn(packagePath, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false
+    });
+    child.unref();
+    return true;
   }
 
   async fetchUpdateManifest(onStatus) {
@@ -2333,7 +2364,7 @@ class LiveRecordService {
   async downloadUpdatePackage(manifest) {
     const updateDir = this.getUpdateDir();
     await fsp.mkdir(updateDir, { recursive: true });
-    const packagePath = path.join(updateDir, `bili-record-2k-${sanitizeFilename(manifest.version)}.zip`);
+    const packagePath = path.join(updateDir, updatePackageFileName(manifest));
     this.updateState = {
       ...this.updateState,
       packagePath
@@ -2361,8 +2392,8 @@ class LiveRecordService {
         status: 'downloading',
         message:
           percent === null
-            ? `正在下载 ${manifest.version} 更新包：已下载 ${formatBytes(receivedBytes)}`
-            : `正在下载 ${manifest.version} 更新包：${percent}%（${formatBytes(receivedBytes)} / ${formatBytes(totalBytes)}）`,
+            ? `正在下载 ${manifest.version} ${updatePackageLabel(manifest)}：已下载 ${formatBytes(receivedBytes)}`
+            : `正在下载 ${manifest.version} ${updatePackageLabel(manifest)}：${percent}%（${formatBytes(receivedBytes)} / ${formatBytes(totalBytes)}）`,
         downloadReceivedBytes: receivedBytes,
         downloadTotalBytes: totalBytes,
         downloadProgress: percent
@@ -2374,7 +2405,7 @@ class LiveRecordService {
     });
     this.updateState = {
       ...this.updateState,
-      message: manifest.sha256 ? '更新包下载完成，正在校验...' : '更新包下载完成。',
+      message: manifest.sha256 ? `${updatePackageLabel(manifest)}下载完成，正在校验...` : `${updatePackageLabel(manifest)}下载完成。`,
       downloadProgress: 100
     };
     this.emitState();
@@ -2386,99 +2417,6 @@ class LiveRecordService {
       }
     }
     return packagePath;
-  }
-
-  async createUpdaterScript(packagePath, manifest) {
-    const updateDir = this.getUpdateDir();
-    const scriptPath = path.join(updateDir, 'apply-update.ps1');
-    const statusPath = this.getUpdateStatusPath();
-    const logPath = this.getUpdateLogPath();
-    const launcherPath = path.join(APP_ROOT, 'BiliRecord2K.exe');
-    const script = `
-$ErrorActionPreference = 'Stop'
-$zipPath = ${psLiteral(packagePath)}
-$appRoot = ${psLiteral(APP_ROOT)}
-$extractPath = Join-Path ${psLiteral(updateDir)} 'extract'
-$launcherPath = ${psLiteral(launcherPath)}
-$statusPath = ${psLiteral(statusPath)}
-$logPath = ${psLiteral(logPath)}
-$targetVersion = ${psLiteral(manifest.version)}
-$currentPid = ${process.pid}
-
-function Write-UpdateLog([string]$message) {
-  $line = "$(Get-Date -Format o) $message"
-  Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
-}
-
-function Write-UpdateStatus([string]$status, [string]$message) {
-  $payload = [ordered]@{
-    status = $status
-    message = $message
-    version = $targetVersion
-    time = (Get-Date).ToString('o')
-    logPath = $logPath
-  }
-  $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statusPath -Encoding UTF8
-}
-
-try {
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $statusPath) | Out-Null
-  Write-UpdateStatus 'applying' "正在应用 $targetVersion"
-  Write-UpdateLog "开始应用 $targetVersion，zip=$zipPath，appRoot=$appRoot，currentPid=$currentPid"
-  Start-Sleep -Milliseconds 900
-
-  Get-Process -Name 'BiliRecord2K','BiliRecord2K.Service' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Id -ne $PID } |
-    Stop-Process -Force -ErrorAction SilentlyContinue
-  if ($currentPid -gt 0 -and $currentPid -ne $PID) {
-    Stop-Process -Id $currentPid -Force -ErrorAction SilentlyContinue
-  }
-  Start-Sleep -Milliseconds 1400
-
-  Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $extractPath | Out-Null
-  Write-UpdateLog '正在解压更新包'
-  Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
-
-  $sourceRoot = $extractPath
-  if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'BiliRecord2K.exe'))) {
-    $candidate = Get-ChildItem -LiteralPath $extractPath -Directory -ErrorAction SilentlyContinue |
-      Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'BiliRecord2K.exe') } |
-      Select-Object -First 1
-    if ($candidate) {
-      $sourceRoot = $candidate.FullName
-    }
-  }
-  if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'BiliRecord2K.exe'))) {
-    throw "更新包结构无效：找不到 BiliRecord2K.exe"
-  }
-
-  Write-UpdateLog "正在复制文件：$sourceRoot -> $appRoot"
-  Copy-Item -Path (Join-Path $sourceRoot '*') -Destination $appRoot -Recurse -Force
-  Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-  if (-not (Test-Path -LiteralPath $launcherPath)) {
-    throw "更新后找不到启动器：$launcherPath"
-  }
-  Write-UpdateStatus 'success' "已更新到 $targetVersion"
-  Write-UpdateLog '正在重启应用'
-  Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
-} catch {
-  $message = $_.Exception.Message
-  Write-UpdateStatus 'error' $message
-  Write-UpdateLog "更新失败：$message"
-  try {
-    if (Test-Path -LiteralPath $launcherPath) {
-      Start-Process -FilePath $launcherPath -ArgumentList '--prod' -WindowStyle Hidden
-    }
-  } catch {
-    Write-UpdateLog "回滚启动失败：$($_.Exception.Message)"
-  }
-  exit 1
-}
-`;
-    await fsp.writeFile(scriptPath, script.trimStart(), 'utf8');
-    await fsp.writeFile(path.join(updateDir, 'last-update.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    return scriptPath;
   }
 
   async loadLastUpdateStatus() {
@@ -2495,7 +2433,7 @@ try {
           latestVersion: version,
           message:
             updateStatus === 'applying'
-              ? `上次更新停在应用阶段，可能被文件占用或安全软件拦截。${status.logPath ? `日志：${status.logPath}` : ''}`
+              ? `上次旧版更新停在应用阶段，可能被文件占用或安全软件拦截。${status.logPath ? `日志：${status.logPath}` : ''}`
               : `上次更新失败：${message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`,
           checkedAt: Date.now(),
           statusPath,
@@ -2508,7 +2446,7 @@ try {
             ...this.updateState,
             status: 'error',
             latestVersion: version,
-            message: `更新脚本完成到 ${version}，但当前仍是 ${APP_VERSION}。可能是旧进程没有退出，或更新包被复制到了错误目录。${
+            message: `旧版更新流程完成到 ${version}，但当前仍是 ${APP_VERSION}。可能是旧进程没有退出，或更新包被复制到了错误目录。${
               status.logPath ? `日志：${status.logPath}` : ''
             }`,
             checkedAt: Date.now(),
@@ -2538,43 +2476,6 @@ try {
 
   getUpdateDir() {
     return path.join(path.dirname(this.storePath), 'updates');
-  }
-
-  armUpdateApplyWatchdog(manifest) {
-    const statusPath = this.getUpdateStatusPath();
-    const timer = setTimeout(async () => {
-      if (this.updateState.status !== 'applying') {
-        return;
-      }
-      let status = null;
-      try {
-        status = JSON.parse(await fsp.readFile(statusPath, 'utf8'));
-      } catch {
-        // The updater may have failed before it could write status.
-      }
-      if (status?.status === 'error') {
-        this.updateState = {
-          ...this.updateState,
-          status: 'error',
-          queued: false,
-          message: `更新脚本失败：${status.message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`,
-          statusPath,
-          updateLogPath: status.logPath || this.getUpdateLogPath()
-        };
-      } else {
-        this.updateState = {
-          ...this.updateState,
-          status: 'error',
-          queued: false,
-          message: `更新脚本没有结束当前服务，可能被安全软件或文件占用拦截。请查看 ${statusPath} 或手动重启后再试。`,
-          statusPath,
-          updateLogPath: this.getUpdateLogPath()
-        };
-      }
-      this.log('error', this.updateState.message);
-      this.emitState();
-    }, 45000);
-    timer.unref?.();
   }
 
   scheduleQueuedUpdateCheck(delayMs = 1500) {
@@ -2891,7 +2792,7 @@ async function handleApi(service, parsed, port, request, response) {
     '/api/settings/save': () => service.saveSettings(body.settings || body),
     '/api/rooms/add': () => service.addRoom(body.roomId),
     '/api/rooms/remove': () => service.removeRoom(body.roomId),
-    '/api/rooms/refresh': () => service.refreshRoom(body.roomId),
+    '/api/rooms/refresh': () => service.refreshRoom(body.roomId, { silent: Boolean(body.silent) }),
     '/api/rooms/monitor': () => service.setMonitoring(body.roomId, body.enabled),
     '/api/rooms/record/start': () => service.startRecording(body.roomId, false),
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
@@ -3533,7 +3434,7 @@ function createAss(events, options = {}) {
   return `${lines.join('\n')}\n`;
 }
 
-function createRecordingArgs({ streamUrl, headers, outputPath }) {
+function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec }) {
   const args = [
     '-hide_banner',
     '-stats',
@@ -3557,7 +3458,12 @@ function createRecordingArgs({ streamUrl, headers, outputPath }) {
     '-headers',
     headers,
     '-i',
-    streamUrl,
+    streamUrl
+  ];
+  if (Number.isFinite(Number(maxDurationSec)) && Number(maxDurationSec) > 0) {
+    args.push('-t', formatFfmpegSeconds(maxDurationSec));
+  }
+  args.push(
     '-ignore_unknown',
     '-map',
     '0:v:0',
@@ -3570,7 +3476,7 @@ function createRecordingArgs({ streamUrl, headers, outputPath }) {
     '-f',
     'matroska',
     outputPath
-  ];
+  );
   return args;
 }
 
@@ -4336,7 +4242,8 @@ function requestFfmpegStop(child, options = {}) {
   const graceful = options.graceful !== false;
   if (graceful && child.stdin && !child.stdin.destroyed) {
     try {
-      child.stdin.write('q');
+      child.stdin.write('q\n');
+      child.stdin.end();
     } catch {
       forceKillProcess(child);
     }
@@ -4345,6 +4252,7 @@ function requestFfmpegStop(child, options = {}) {
   }
   const timer = setTimeout(() => forceKillProcess(child), Number(options.timeoutMs || 5000));
   timer.unref?.();
+  child.once?.('close', () => clearTimeout(timer));
 }
 
 function forceKillProcess(child) {
@@ -4352,19 +4260,29 @@ function forceKillProcess(child) {
     return;
   }
   if (process.platform === 'win32' && child.pid) {
+    const fallback = setTimeout(() => killChildDirectly(child), 1200);
+    fallback.unref?.();
     const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore'
     });
     killer.on('error', () => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        try {
-          child.kill();
-        } catch {}
+      clearTimeout(fallback);
+      killChildDirectly(child);
+    });
+    killer.on('close', (code) => {
+      clearTimeout(fallback);
+      if (code !== 0) {
+        killChildDirectly(child);
       }
     });
+    return;
+  }
+  killChildDirectly(child);
+}
+
+function killChildDirectly(child) {
+  if (!child || child.exitCode !== null || child.signalCode) {
     return;
   }
   try {
@@ -4397,6 +4315,15 @@ function isRecordingFileLikelyPlayable({ fileSize, elapsedSec, videoInfo }) {
     return true;
   }
   return size >= MIN_PLAYABLE_BYTES && Boolean(videoInfo);
+}
+
+function hasReachedSegmentLimit(session, elapsedSec) {
+  const targetSec = Number(session?.segmentDurationSec || 0);
+  if (!Number.isFinite(targetSec) || targetSec <= 0) {
+    return false;
+  }
+  const toleranceSec = Math.min(5, Math.max(1, targetSec * 0.02));
+  return Number(elapsedSec || 0) >= targetSec - toleranceSec;
 }
 
 function formatBytes(bytes) {
@@ -4720,23 +4647,46 @@ function normalizeUpdateManifest(payload) {
     throw new Error('更新源不是有效 JSON。');
   }
   if (Array.isArray(payload.assets)) {
+    const installerAsset = payload.assets.find((asset) => isInstallerFileName(asset.name || asset.browser_download_url || ''));
     const zipAsset = payload.assets.find((asset) => /\.zip$/i.test(asset.name || asset.browser_download_url || ''));
+    const packageAsset = installerAsset || zipAsset;
     return {
       version: normalizeVersion(payload.version || payload.tag_name || ''),
       tagName: payload.tag_name || '',
-      packageUrl: zipAsset?.browser_download_url || zipAsset?.url || '',
+      packageType: installerAsset ? 'installer' : 'portable',
+      packageUrl: packageAsset?.browser_download_url || packageAsset?.url || '',
       sha256: payload.sha256 || '',
       releaseUrl: payload.html_url || '',
       notes: payload.body || ''
     };
   }
   const files = Array.isArray(payload.files) ? payload.files : [];
-  const zipFile = files.find((file) => /\.zip$/i.test(file.name || file.url || ''));
+  const installerFile =
+    files.find((file) => String(file.kind || file.type || '').toLowerCase() === 'installer') ||
+    files.find((file) => isInstallerFileName(file.name || file.url || ''));
+  const zipFile =
+    files.find((file) => String(file.kind || file.type || '').toLowerCase() === 'portable') ||
+    files.find((file) => /\.zip$/i.test(file.name || file.url || ''));
+  const packageFile = installerFile || zipFile;
+  const packageUrl =
+    payload.installerUrl ||
+    payload.packageUrl ||
+    payload.url ||
+    payload.downloadUrl ||
+    packageFile?.url ||
+    '';
+  const packageType = normalizeUpdatePackageType(payload.packageType || packageFile?.kind || packageFile?.type || packageUrl);
   return {
     version: normalizeVersion(payload.version || payload.tagName || ''),
     tagName: payload.tagName || payload.tag_name || '',
-    packageUrl: payload.packageUrl || payload.url || payload.downloadUrl || zipFile?.url || '',
-    sha256: payload.sha256 || zipFile?.sha256 || '',
+    packageType,
+    packageUrl,
+    sha256:
+      payload.sha256 ||
+      (packageType === 'installer' ? payload.installerSha256 : payload.portableSha256) ||
+      packageFile?.sha256 ||
+      '',
+    installerArgs: payload.installerArgs,
     releaseUrl: payload.releaseUrl || payload.htmlUrl || '',
     notes: payload.notes || payload.body || ''
   };
@@ -4744,6 +4694,85 @@ function normalizeUpdateManifest(payload) {
 
 function normalizeVersion(value) {
   return String(value || '').trim().replace(/^v/i, '');
+}
+
+function normalizeUpdatePackageType(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'installer' || isInstallerFileName(text)) {
+    return 'installer';
+  }
+  return 'portable';
+}
+
+function isInstallerFileName(value) {
+  const text = String(value || '').toLowerCase();
+  return /\.(?:exe|msi|msix|appinstaller)(?:$|[?#])/i.test(text) && /(setup|install|installer)/i.test(text);
+}
+
+function isInstallerUpdatePackage(manifest, packagePath) {
+  return normalizeUpdatePackageType(manifest?.packageType || manifest?.packageUrl || packagePath) === 'installer';
+}
+
+function normalizeInstallerArgs(manifest) {
+  if (Array.isArray(manifest?.installerArgs)) {
+    return manifest.installerArgs.map(String);
+  }
+  if (typeof manifest?.installerArgs === 'string') {
+    return splitCommandLineArgs(manifest.installerArgs);
+  }
+  return ['/S'];
+}
+
+function splitCommandLineArgs(value) {
+  const args = [];
+  const text = String(value || '');
+  let current = '';
+  let quote = '';
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if ((char === '"' || char === "'") && !quote) {
+      quote = char;
+      continue;
+    }
+    if (char === quote) {
+      quote = '';
+      continue;
+    }
+    if (/\s/.test(char) && !quote) {
+      if (current) {
+        args.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current) {
+    args.push(current);
+  }
+  return args;
+}
+
+function updatePackageLabel(manifest) {
+  return isInstallerUpdatePackage(manifest, manifest?.packageUrl) ? '安装器' : '更新包';
+}
+
+function updatePackageFileName(manifest) {
+  const version = sanitizeFilename(manifest?.version || 'latest');
+  const urlName = packageFileNameFromUrl(manifest?.packageUrl || '');
+  const extension = path.extname(urlName).toLowerCase();
+  if (extension) {
+    return `bili-record-2k-${version}${extension}`;
+  }
+  return isInstallerUpdatePackage(manifest, '') ? `bili-record-2k-${version}-setup.exe` : `bili-record-2k-${version}.zip`;
+}
+
+function packageFileNameFromUrl(value) {
+  try {
+    return path.basename(new URL(String(value || '')).pathname);
+  } catch {
+    return path.basename(String(value || ''));
+  }
 }
 
 function compareVersions(a, b) {
@@ -4767,7 +4796,7 @@ async function downloadFile(url, targetPath, onProgress) {
   await fsp.rm(tmpPath, { force: true });
   const body = await requestUrlBuffer(url, {
     headers: {
-      Accept: 'application/zip, application/octet-stream, */*',
+      Accept: 'application/x-msdownload, application/vnd.microsoft.portable-executable, application/zip, application/octet-stream, */*',
       'User-Agent': `${APP_NAME}/${APP_VERSION}`
     },
     onProgress,
@@ -4792,10 +4821,6 @@ async function fileSha256(filePath) {
   const hash = crypto.createHash('sha256');
   hash.update(await fsp.readFile(filePath));
   return hash.digest('hex');
-}
-
-function psLiteral(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
 function isStartupEnabled() {

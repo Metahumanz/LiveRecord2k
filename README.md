@@ -31,10 +31,13 @@ dist/
 release/webui/
 release/webui/BiliRecord2K.exe
 release/webui/BiliRecord2K.Service.exe
+release/bili-record-2k-setup.exe
 release/bili-record-2k-webui.zip
 ```
 
 `release/webui` 是生产运行包，双击 `BiliRecord2K.exe` 即可启动并自动打开浏览器。这个入口是无窗口托盘程序，后台服务进程是 `BiliRecord2K.Service.exe`，正常使用时不需要手动打开它。
+
+Windows 发布流程会额外生成 `release/bili-record-2k-setup.exe` 安装器。应用内更新会优先下载安装器并启动它，由安装器停止旧进程、覆盖安装目录并重启应用；便携 zip 仍保留给手动下载使用。本地没有安装 NSIS 时会跳过安装器构建，GitHub Actions 发布会强制安装 NSIS 并生成安装器。
 
 托盘图标支持：
 

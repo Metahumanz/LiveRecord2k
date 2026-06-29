@@ -118,8 +118,10 @@ export type UpdateState = {
   manifest?: {
     version: string;
     tagName?: string;
+    packageType?: 'installer' | 'portable';
     packageUrl: string;
     sha256?: string;
+    installerArgs?: string[] | string;
     releaseUrl?: string;
     notes?: string;
   } | null;
@@ -189,7 +191,7 @@ export type RecorderApi = {
   saveSettings: (settings: Partial<AppSettings>) => Promise<AppState>;
   addRoom: (roomId: string) => Promise<AppState>;
   removeRoom: (roomId: string) => Promise<AppState>;
-  refreshRoom: (roomId: string) => Promise<AppState>;
+  refreshRoom: (roomId: string, options?: { silent?: boolean }) => Promise<AppState>;
   setMonitoring: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;

@@ -80,6 +80,9 @@ const containerOptions = [
   { label: 'MKV', value: 'mkv' }
 ] as const;
 
+const KEYFRAME_IMAGE_REFRESH_MS = 5000;
+const KEYFRAME_INFO_REFRESH_MS = 15000;
+
 const overlayModeOptions = [
   { label: '仅弹幕', value: 'danmaku' },
   { label: '弹幕和礼物', value: 'danmaku-gift' }
@@ -451,7 +454,7 @@ function UpdateNotice({
             onClick={() => run('update-queue', recorder.queueUpdate)}
           >
             <Clock3 size={18} />
-            录制结束后更新
+            录制结束后安装
           </button>
         ) : null}
         {canInstall ? (
@@ -461,7 +464,7 @@ function UpdateNotice({
             onClick={() => run('update-download', recorder.downloadUpdate)}
           >
             <Download size={18} />
-            仅下载
+            下载安装器
           </button>
         ) : null}
         {canInstall && !activeJobs ? (
@@ -471,7 +474,7 @@ function UpdateNotice({
             onClick={() => run('update-apply', recorder.applyUpdate)}
           >
             <Download size={18} />
-            立即更新
+            启动安装器
           </button>
         ) : null}
         {update.status === 'error' ? (
@@ -525,7 +528,8 @@ function updateTitle(status: AppState['update']['status']) {
   if (status === 'queued') return '更新已排队';
   if (status === 'checking') return '正在检查更新';
   if (status === 'downloading') return '正在下载更新';
-  if (status === 'ready' || status === 'applying') return '正在应用更新';
+  if (status === 'ready') return '安装器已就绪';
+  if (status === 'applying') return '安装器已启动';
   if (status === 'up-to-date') return '已是最新';
   if (status === 'blocked') return '暂不更新';
   if (status === 'error') return '更新失败';
@@ -1291,7 +1295,7 @@ function SettingsPage({
           <PathLine label="更新状态" value={state.update.message || '尚未检查更新'} />
           <PathLine label="更新日志" value={state.update.updateLogPath || ''} />
           <PathLine label="状态文件" value={state.update.statusPath || ''} />
-          <PathLine label="下载包" value={state.update.packagePath || ''} />
+          <PathLine label="下载文件" value={state.update.packagePath || ''} />
           <UpdateProgress update={state.update} />
           <div className="split-buttons">
             <button
@@ -1313,7 +1317,7 @@ function SettingsPage({
               onClick={() => run('update-download', recorder.downloadUpdate)}
             >
               <Download size={18} />
-              仅下载更新包
+              下载安装器
             </button>
             {state.update.status === 'available' || state.update.status === 'blocked' ? (
               hasActiveJobs ? (
@@ -1324,7 +1328,7 @@ function SettingsPage({
                   onClick={() => run('update-queue', recorder.queueUpdate)}
                 >
                   <Clock3 size={18} />
-                  录制结束后更新
+                  录制结束后安装
                 </button>
               ) : (
                 <button
@@ -1334,7 +1338,7 @@ function SettingsPage({
                   onClick={() => run('update-apply', recorder.applyUpdate)}
                 >
                   <Download size={18} />
-                  立即更新
+                  启动安装器
                 </button>
               )
             ) : null}
@@ -1536,14 +1540,32 @@ function RoomPreview({
 }) {
   const rawImageUrl = roomImageMode === 'cover' ? room.cover : room.keyframe;
   const [previewVersion, setPreviewVersion] = useState(Date.now());
+  const shouldRefreshRoomInfo = roomImageMode === 'keyframe' && (room.liveStatus === 1 || room.recording);
   useEffect(() => {
     if (roomImageMode !== 'keyframe') {
       return;
     }
     setPreviewVersion(Date.now());
-    const timer = window.setInterval(() => setPreviewVersion(Date.now()), 5000);
+    const timer = window.setInterval(() => setPreviewVersion(Date.now()), KEYFRAME_IMAGE_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [rawImageUrl, roomImageMode]);
+  useEffect(() => {
+    if (!shouldRefreshRoomInfo) {
+      return;
+    }
+    let cancelled = false;
+    const refresh = () => {
+      if (!cancelled) {
+        recorder.refreshRoom(room.id, { silent: true }).catch(() => {});
+      }
+    };
+    refresh();
+    const timer = window.setInterval(refresh, KEYFRAME_INFO_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [room.id, shouldRefreshRoomInfo]);
   const imageVersion = roomImageMode === 'keyframe' ? previewVersion : room.lastCheckedAt;
   const imageUrl = rawImageUrl ? imageProxyUrl(rawImageUrl, imageVersion) : '';
   const imageKey = rawImageUrl ? `${rawImageUrl}:${imageVersion || 0}` : '';
