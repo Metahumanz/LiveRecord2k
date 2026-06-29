@@ -30,6 +30,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Upload,
   Video,
   X
 } from 'lucide-react';
@@ -79,6 +80,30 @@ const containerOptions = [
   { label: 'MP4', value: 'mp4' },
   { label: 'MKV', value: 'mkv' }
 ] as const;
+
+const settingsExportKeys: Array<keyof AppSettings> = [
+  'outputDir',
+  'cookie',
+  'pollIntervalSec',
+  'targetQn',
+  'preferHevc',
+  'roomImageMode',
+  'outputContainer',
+  'segmentMinutes',
+  'autoBurnDanmaku',
+  'burnOverlayMode',
+  'burnCodec',
+  'burnCrf',
+  'notifyLiveStarted',
+  'notifyLiveEnded',
+  'notifyRecordingStarted',
+  'notifyRecordingEnded',
+  'notifyBurnStarted',
+  'notifyBurnEnded',
+  'openBrowserOnStart',
+  'updateManifestUrl',
+  'serverPort'
+];
 
 const KEYFRAME_IMAGE_REFRESH_MS = 5000;
 const KEYFRAME_INFO_REFRESH_MS = 15000;
@@ -675,7 +700,10 @@ function ExportPage({
   const validRecordingCount = recordings.filter((recording) => recording.valid !== false).length;
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mediaDuration, setMediaDuration] = useState(0);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
   const draftStart = parseTimelineInput(draft.startTime);
   const draftEnd = parseTimelineInput(draft.endTime);
   const timelineDuration = Math.max(mediaDuration, Number(selectedRecording?.durationSec || 0));
@@ -694,9 +722,12 @@ function ExportPage({
   const selectionWidth = canUseTimeline
     ? clampNumber(((timelineEnd - timelineStart) / timelineDuration) * 100, 0, 100 - selectionLeft)
     : 0;
+  const playheadTime = canUseTimeline ? clampNumber(playbackTime, 0, timelineDuration) : 0;
+  const playheadLeft = canUseTimeline ? clampNumber((playheadTime / timelineDuration) * 100, 0, 100) : 0;
 
   useEffect(() => {
     setMediaDuration(0);
+    setPlaybackTime(0);
   }, [draft.cleanPath]);
 
   function updateTimelineStart(value: number) {
@@ -709,16 +740,69 @@ function ExportPage({
     setDraft({ ...draft, endTime: formatTimelineTime(next) });
   }
 
-  function setTimelineFromPlayback(kind: 'start' | 'end') {
-    const currentTime = videoRef.current?.currentTime ?? Number.NaN;
-    if (!Number.isFinite(currentTime)) {
+  function seekTimeline(value: number) {
+    if (!canUseTimeline) {
       return;
     }
-    if (kind === 'start') {
-      updateTimelineStart(currentTime);
-    } else {
-      updateTimelineEnd(currentTime);
+    const next = clampNumber(value, 0, timelineDuration);
+    setPlaybackTime(next);
+    if (videoRef.current) {
+      videoRef.current.currentTime = next;
     }
+  }
+
+  function timelineValueFromPointer(clientX: number) {
+    const rect = timelineRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || !canUseTimeline) {
+      return 0;
+    }
+    return clampNumber(((clientX - rect.left) / rect.width) * timelineDuration, 0, timelineDuration);
+  }
+
+  function closestTimelineMarker(value: number): 'start' | 'playhead' | 'end' {
+    const distances = [
+      ['start', Math.abs(value - timelineStart)],
+      ['playhead', Math.abs(value - playheadTime)],
+      ['end', Math.abs(value - timelineEnd)]
+    ] as const;
+    return distances.reduce((best, item) => (item[1] < best[1] ? item : best))[0];
+  }
+
+  function updateTimelineMarker(marker: 'start' | 'playhead' | 'end', value: number) {
+    if (marker === 'start') {
+      updateTimelineStart(value);
+      return;
+    }
+    if (marker === 'end') {
+      updateTimelineEnd(value);
+      return;
+    }
+    seekTimeline(value);
+  }
+
+  function startTimelineDrag(event: React.PointerEvent<HTMLElement>, marker?: 'start' | 'playhead' | 'end') {
+    if (!canUseTimeline) {
+      return;
+    }
+    const value = timelineValueFromPointer(event.clientX);
+    const nextMarker = marker || closestTimelineMarker(value);
+    timelineRef.current?.setPointerCapture(event.pointerId);
+    setTimelineDrag(nextMarker);
+    updateTimelineMarker(nextMarker, value);
+  }
+
+  function dragTimeline(event: React.PointerEvent<HTMLDivElement>) {
+    if (!timelineDrag) {
+      return;
+    }
+    updateTimelineMarker(timelineDrag, timelineValueFromPointer(event.clientX));
+  }
+
+  function endTimelineDrag(event: React.PointerEvent<HTMLDivElement>) {
+    if (timelineDrag) {
+      timelineRef.current?.releasePointerCapture(event.pointerId);
+    }
+    setTimelineDrag(null);
   }
 
   return (
@@ -828,18 +912,21 @@ function ExportPage({
                 src={mediaSource}
                 controls
                 preload="metadata"
-                onLoadedMetadata={(event) => {
-                  const duration = event.currentTarget.duration;
-                  if (!Number.isFinite(duration) || duration <= 0) {
-                    return;
-                  }
-                  setMediaDuration(duration);
-                  if (!draft.endTime || !Number.isFinite(parseTimelineInput(draft.endTime))) {
-                    setDraft({ ...draft, endTime: formatTimelineTime(duration) });
-                  }
-                }}
-              />
-            ) : (
+                  onLoadedMetadata={(event) => {
+                    const duration = event.currentTarget.duration;
+                    if (!Number.isFinite(duration) || duration <= 0) {
+                      return;
+                    }
+                    setMediaDuration(duration);
+                    setPlaybackTime(event.currentTarget.currentTime || 0);
+                    if (!draft.endTime || !Number.isFinite(parseTimelineInput(draft.endTime))) {
+                      setDraft({ ...draft, endTime: formatTimelineTime(duration) });
+                    }
+                  }}
+                  onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
+                  onSeeking={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
+                />
+              ) : (
               <div className="clip-preview-empty">
                 <FileVideo size={38} />
                 <span>选择录像后预览</span>
@@ -848,61 +935,82 @@ function ExportPage({
           </div>
 
           <div className="timeline-editor">
-            <div className="timeline-labels">
-              <span>{formatTimelineTime(timelineStart)}</span>
+            <div className="timeline-summary">
+              <span>{formatTimelineTime(0)}</span>
               <strong>{formatTimelineTime(Math.max(0, timelineEnd - timelineStart))}</strong>
-              <span>{formatTimelineTime(timelineEnd)}</span>
+              <span>{formatTimelineTime(timelineDuration)}</span>
             </div>
-            <div className="timeline-rail" aria-hidden="true">
-              <span style={{ left: `${selectionLeft}%`, width: `${selectionWidth}%` }} />
-            </div>
-            <div className="range-stack">
-              <input
-                type="range"
-                min={0}
-                max={Math.max(1, timelineDuration)}
-                step={0.1}
-                value={Math.min(timelineStart, Math.max(1, timelineDuration))}
+            <div
+              ref={timelineRef}
+              className={`cut-timeline ${canUseTimeline ? '' : 'disabled'}`}
+              onPointerDown={(event) => startTimelineDrag(event)}
+              onPointerMove={dragTimeline}
+              onPointerUp={endTimelineDrag}
+              onPointerCancel={endTimelineDrag}
+            >
+              <div className="cut-selection" style={{ left: `${selectionLeft}%`, width: `${selectionWidth}%` }} />
+              <button
+                className="cut-marker start"
+                type="button"
+                style={{ left: `${selectionLeft}%` }}
                 disabled={!canUseTimeline}
-                onChange={(event) => updateTimelineStart(Number(event.target.value))}
-              />
-              <input
-                type="range"
-                min={0}
-                max={Math.max(1, timelineDuration)}
-                step={0.1}
-                value={Math.min(timelineEnd || timelineDuration, Math.max(1, timelineDuration))}
+                title="入点"
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  startTimelineDrag(event, 'start');
+                }}
+              >
+                <span>入</span>
+              </button>
+              <button
+                className="cut-marker playhead"
+                type="button"
+                style={{ left: `${playheadLeft}%` }}
                 disabled={!canUseTimeline}
-                onChange={(event) => updateTimelineEnd(Number(event.target.value))}
-              />
-            </div>
-            <div className="timeline-tools">
-              <button className="text-button" type="button" disabled={!mediaSource} onClick={() => setTimelineFromPlayback('start')}>
-                用播放点设起点
+                title="播放点"
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  startTimelineDrag(event, 'playhead');
+                }}
+              >
+                <span>播</span>
               </button>
-              <button className="text-button" type="button" disabled={!mediaSource} onClick={() => setTimelineFromPlayback('end')}>
-                用播放点设终点
+              <button
+                className="cut-marker end"
+                type="button"
+                style={{ left: `${selectionLeft + selectionWidth}%` }}
+                disabled={!canUseTimeline}
+                title="出点"
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  startTimelineDrag(event, 'end');
+                }}
+              >
+                <span>出</span>
               </button>
             </div>
-          </div>
-
-          <div className="time-grid">
-            <label className="field">
-              <span>开始时间</span>
-              <input
-                value={draft.startTime}
-                onChange={(event) => setDraft({ ...draft, startTime: event.target.value })}
-                placeholder="00:12:30.5"
-              />
-            </label>
-            <label className="field">
-              <span>结束时间</span>
-              <input
-                value={draft.endTime}
-                onChange={(event) => setDraft({ ...draft, endTime: event.target.value })}
-                placeholder="00:18:00"
-              />
-            </label>
+            <div className="cut-time-row">
+              <label>
+                <span>入点</span>
+                <input
+                  value={draft.startTime}
+                  onChange={(event) => setDraft({ ...draft, startTime: event.target.value })}
+                  placeholder="00:12:30.5"
+                />
+              </label>
+              <label>
+                <span>播放</span>
+                <input value={formatTimelineTime(playheadTime)} readOnly />
+              </label>
+              <label>
+                <span>出点</span>
+                <input
+                  value={draft.endTime}
+                  onChange={(event) => setDraft({ ...draft, endTime: event.target.value })}
+                  placeholder="00:18:00"
+                />
+              </label>
+            </div>
           </div>
 
           <label className="field">
@@ -1020,6 +1128,44 @@ function SettingsPage({
 }) {
   const loggedIn = settingsDraft.cookie.includes('SESSDATA=');
   const hasActiveJobs = state.rooms.some((room) => room.recording || room.burning);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+
+  function exportSettings() {
+    if (
+      settingsDraft.cookie.trim() &&
+      !window.confirm('导出的设置包含登录凭证 Cookie，请妥善保管。继续导出？')
+    ) {
+      return;
+    }
+    const payload = {
+      app: 'BiliRecord2K',
+      type: 'settings',
+      version: state.version,
+      exportedAt: new Date().toISOString(),
+      settings: pickSettings(settingsDraft)
+    };
+    const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: 'application/json;charset=utf-8' });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `bili-record-2k-settings-${settingsExportStamp()}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+  }
+
+  async function importSettings(file?: File) {
+    if (!file) {
+      return;
+    }
+    try {
+      const importedSettings = parseSettingsImport(await file.text());
+      await run('import-settings', () => recorder.saveSettings(importedSettings));
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '导入设置失败。');
+    }
+  }
 
   return (
     <>
@@ -1039,6 +1185,35 @@ function SettingsPage({
       />
 
       <section className="settings-page-grid">
+        <SettingPanel title="设置备份" icon={<FileCode2 size={18} />}>
+          <input
+            ref={importInputRef}
+            className="file-input-hidden"
+            type="file"
+            accept="application/json,.json"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.currentTarget.value = '';
+              void importSettings(file);
+            }}
+          />
+          <div className="split-buttons">
+            <button className="wide-button fill" type="button" onClick={exportSettings}>
+              <Download size={18} />
+              导出设置
+            </button>
+            <button
+              className="wide-button fill primary"
+              type="button"
+              disabled={busy === 'import-settings'}
+              onClick={() => importInputRef.current?.click()}
+            >
+              <Upload size={18} />
+              导入设置
+            </button>
+          </div>
+        </SettingPanel>
+
         <SettingPanel title="账号登录" icon={<LogIn size={18} />}>
           <div className="setting-row">
             <span className={loggedIn ? 'badge on' : 'badge'}>{loggedIn ? '已登录' : '未登录'}</span>
@@ -1890,17 +2065,27 @@ function getStats(rooms: RoomState[]) {
 }
 
 function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft {
-  if (current.cleanPath) {
+  const recordings = state.recordings.filter((recording) => recording.cleanPath);
+  const currentRecording = current.cleanPath
+    ? recordings.find((recording) => recording.cleanPath === current.cleanPath)
+    : undefined;
+  if (current.cleanPath && currentRecording) {
     return {
       ...current,
+      danmakuPath: current.danmakuPath || currentRecording.danmakuPath || '',
+      cssPath: current.cssPath || currentRecording.cssPath || '',
       overlayMode: current.overlayMode || state.settings.burnOverlayMode,
       outputDir: current.outputDir || state.settings.outputDir
     };
   }
-  const recording = state.recordings.find((item) => item.valid !== false) || state.recordings[0];
+  const recording = recordings.find((item) => item.valid !== false) || recordings[0];
   if (!recording) {
     return {
       ...current,
+      cleanPath: '',
+      danmakuPath: '',
+      cssPath: '',
+      endTime: '',
       overlayMode: state.settings.burnOverlayMode,
       outputDir: current.outputDir || state.settings.outputDir
     };
@@ -1913,6 +2098,48 @@ function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft 
     overlayMode: state.settings.burnOverlayMode,
     outputDir: current.outputDir || state.settings.outputDir
   };
+}
+
+function pickSettings(source: Partial<AppSettings> | Record<string, unknown>): Partial<AppSettings> {
+  const sourceRecord = source as Record<string, unknown>;
+  const picked: Partial<AppSettings> = {};
+  const pickedRecord = picked as Record<string, unknown>;
+  for (const key of settingsExportKeys) {
+    if (Object.prototype.hasOwnProperty.call(sourceRecord, key)) {
+      pickedRecord[key] = sourceRecord[key];
+    }
+  }
+  return picked;
+}
+
+function parseSettingsImport(text: string): Partial<AppSettings> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('设置文件不是有效 JSON。');
+  }
+  const source = isRecord(parsed) && isRecord(parsed.settings) ? parsed.settings : parsed;
+  if (!isRecord(source)) {
+    throw new Error('设置文件格式不正确。');
+  }
+  const importedSettings = pickSettings(source);
+  if (Object.keys(importedSettings).length === 0) {
+    throw new Error('设置文件里没有可导入的设置项。');
+  }
+  return importedSettings;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function settingsExportStamp() {
+  const date = new Date();
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(
+    date.getMinutes()
+  )}${pad(date.getSeconds())}`;
 }
 
 function recordingLabel(recording: RecordingState) {
