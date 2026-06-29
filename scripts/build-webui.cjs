@@ -219,10 +219,30 @@ function findMakensis() {
     return fromPath;
   }
   const candidates = [
+    ...localNsisCandidates(),
     path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'NSIS', 'makensis.exe'),
     path.join(process.env.ProgramFiles || 'C:\\Program Files', 'NSIS', 'makensis.exe')
   ];
   return candidates.find((candidate) => fs.existsSync(candidate)) || '';
+}
+
+function localNsisCandidates() {
+  const localAppData = process.env.LOCALAPPDATA || '';
+  if (!localAppData) {
+    return [];
+  }
+  const root = path.join(localAppData, 'Programs', 'NSIS');
+  const candidates = [path.join(root, 'makensis.exe')];
+  if (!fs.existsSync(root)) {
+    return candidates;
+  }
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      candidates.push(path.join(root, entry.name, 'makensis.exe'));
+    }
+  }
+  candidates.sort((left, right) => right.localeCompare(left, undefined, { numeric: true }));
+  return candidates;
 }
 
 function findCommandOnPath(command) {

@@ -35,6 +35,7 @@ ShowUninstDetails show
 VIProductVersion "${APP_VERSION_QUAD}"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "CompanyName" "${COMPANY_NAME}"
+VIAddVersionKey "LegalCopyright" "${COMPANY_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} Installer"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"
 VIAddVersionKey "ProductVersion" "${APP_VERSION}"
@@ -57,7 +58,7 @@ VIAddVersionKey "OriginalFilename" "bili-record-2k-setup.exe"
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 Function StopRunningApp
-  DetailPrint "正在停止运行中的 ${APP_NAME}..."
+  DetailPrint "Stopping running ${APP_NAME} processes..."
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
   Sleep 1200
@@ -74,7 +75,7 @@ Section "Install"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\BiliRecord2K.exe" "--prod" "$INSTDIR\assets\app-icon.ico"
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe"
 
   IfSilent 0 +2
   ExecShell "open" "$INSTDIR\BiliRecord2K.exe" "--prod"
@@ -92,7 +93,7 @@ Section "Uninstall"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk"
-  Delete "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk"
+  Delete "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
 
   DeleteRegValue HKCU "${RUN_KEY}" "${APP_NAME}"
@@ -100,7 +101,7 @@ Section "Uninstall"
 SectionEnd
 
 Function un.StopRunningApp
-  DetailPrint "正在停止运行中的 ${APP_NAME}..."
+  DetailPrint "Stopping running ${APP_NAME} processes..."
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
   Sleep 1200
