@@ -580,6 +580,19 @@ button:disabled {
   font-weight: 900;
 }
 
+.update-diagnostic {
+  display: block;
+  max-width: min(640px, 58vw);
+  margin-top: 7px;
+  overflow: hidden;
+  color: #c3d1ce;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @keyframes progress-slide {
   0% {
     transform: translateX(-110%);
@@ -861,13 +874,26 @@ button:disabled {
   color: #89a09a;
 }
 
+.warning-line,
 .error-line {
   display: flex;
   align-items: center;
   gap: 7px;
   min-height: 30px;
-  color: #ffabb1;
+  color: #e6cf79;
   font-size: 13px;
+}
+
+.warning-line span,
+.error-line span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error-line {
+  color: #ffabb1;
 }
 
 .action-row {
@@ -949,6 +975,12 @@ button:disabled {
   gap: 2px;
 }
 
+.panel-count {
+  color: #93a49f;
+  font-size: 12px;
+  font-weight: 900;
+}
+
 .recording-list {
   max-height: 300px;
   overflow: auto;
@@ -976,6 +1008,16 @@ button:disabled {
 .recording-row.active {
   border-color: rgba(121, 222, 213, 0.48);
   background: rgba(121, 222, 213, 0.11);
+}
+
+.recording-row.invalid {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.recording-row.invalid:hover {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.045);
 }
 
 .recording-row span,
@@ -1053,6 +1095,22 @@ button:disabled {
   text-align: right;
 }
 
+.timeline-rail {
+  position: relative;
+  height: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.timeline-rail span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  min-width: 3px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #79ded5, #d8c36e);
+}
+
 .range-stack {
   display: grid;
   gap: 4px;
@@ -1061,6 +1119,12 @@ button:disabled {
 .range-stack input {
   width: 100%;
   accent-color: #79ded5;
+}
+
+.timeline-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .changelog-box {

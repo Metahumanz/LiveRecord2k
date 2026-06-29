@@ -31,8 +31,9 @@ export const recorder: RecorderApi = {
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}),
   clearLogs: () => api<AppState>('/api/logs/clear', {}),
   openOutputDir: () => api<AppState>('/api/shell/open-output', {}),
+  openPathDir: (path) => api<AppState>('/api/shell/open-path-dir', { path }),
   openConfigDir: () => api<AppState>('/api/shell/open-config', {}),
-  checkUpdate: () => api<AppState>('/api/update/check', {}),
+  checkUpdate: () => api<AppState>('/api/update/check', {}, { timeoutMs: 52000 }),
   applyUpdate: () => api<AppState>('/api/update/apply', {}),
   queueUpdate: () => api<AppState>('/api/update/queue', {}),
   setStartup: (enabled) => api<AppState>('/api/system/startup', { enabled }),
@@ -51,12 +52,29 @@ export const recorder: RecorderApi = {
   }
 };
 
-async function api<T = unknown>(url: string, body?: unknown): Promise<T> {
-  const response = await fetch(url, {
-    method: body === undefined ? 'GET' : 'POST',
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
+async function api<T = unknown>(url: string, body?: unknown, options: { timeoutMs?: number } = {}): Promise<T> {
+  const controller = options.timeoutMs ? new AbortController() : null;
+  const timer = options.timeoutMs
+    ? window.setTimeout(() => controller?.abort(), options.timeoutMs)
+    : 0;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller?.signal
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('请求超时，请稍后重试。');
+    }
+    throw error;
+  } finally {
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+  }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     throw new Error(payload?.error || `请求失败：HTTP ${response.status}`);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Bell,
@@ -335,7 +335,7 @@ function OverviewPage({
         title="总览"
         subtitle={`${state.settings.outputContainer.toUpperCase()} · ${
           state.settings.preferHevc ? 'H.265 优先' : 'H.264 优先'
-        } · 清晰度 ${state.settings.targetQn} · ${state.settings.segmentMinutes} 分钟分段`}
+        } · ${qnLabel(state.settings.targetQn)} · ${state.settings.segmentMinutes} 分钟分段`}
         actions={
           <>
             <button
@@ -362,7 +362,7 @@ function OverviewPage({
         <BigMetric icon={<ListVideo size={22} />} label="直播间" value={stats.rooms} />
         <BigMetric icon={<Radio size={22} />} label="直播中" value={stats.live} />
         <BigMetric icon={<Video size={22} />} label="录制中" value={stats.recording} />
-        <BigMetric icon={<MessageSquareText size={22} />} label="弹幕事件" value={stats.events} />
+        <BigMetric icon={<MessageSquareText size={22} />} label="可烧录事件" value={stats.events} />
       </section>
 
       <UpdateNotice state={state} stats={stats} busy={busy} run={run} />
@@ -435,6 +435,12 @@ function UpdateNotice({
             {update.latestVersion ? ` · 当前 ${update.currentVersion}` : ''}
           </p>
           <UpdateProgress update={update} />
+          {update.status === 'error' && (update.updateLogPath || update.statusPath) ? (
+            <small className="update-diagnostic">
+              {update.updateLogPath ? `日志 ${update.updateLogPath}` : ''}
+              {update.statusPath ? `${update.updateLogPath ? ' · ' : ''}状态 ${update.statusPath}` : ''}
+            </small>
+          ) : null}
         </div>
       </div>
       <div className="update-actions">
@@ -466,6 +472,12 @@ function UpdateNotice({
           >
             <RefreshCw size={18} />
             重试
+          </button>
+        ) : null}
+        {update.status === 'error' ? (
+          <button className="wide-button" onClick={() => run('open-config', recorder.openConfigDir)}>
+            <FolderOpen size={18} />
+            配置目录
           </button>
         ) : null}
         {update.status === 'queued' ? <span className="update-waiting">等待任务结束</span> : null}
@@ -645,9 +657,11 @@ function ExportPage({
   exportClip: () => Promise<void>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
 }) {
-  const recordings = state.recordings.filter((recording) => recording.valid !== false && recording.cleanPath);
+  const recordings = state.recordings.filter((recording) => recording.cleanPath);
+  const validRecordingCount = recordings.filter((recording) => recording.valid !== false).length;
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mediaDuration, setMediaDuration] = useState(0);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const draftStart = parseTimelineInput(draft.startTime);
   const draftEnd = parseTimelineInput(draft.endTime);
   const timelineDuration = Math.max(mediaDuration, Number(selectedRecording?.durationSec || 0));
@@ -656,9 +670,16 @@ function ExportPage({
     ? clampNumber(draftEnd, 0, Math.max(timelineDuration, draftEnd))
     : timelineDuration;
   const canUseTimeline = timelineDuration > 0;
-  const canExport = Boolean(draft.cleanPath && Number.isFinite(draftStart) && Number.isFinite(draftEnd) && draftEnd > draftStart);
-  const canPrepare = Boolean(draft.cleanPath && draft.danmakuPath);
+  const selectedValid = selectedRecording?.valid !== false;
+  const canExport = Boolean(
+    selectedValid && draft.cleanPath && Number.isFinite(draftStart) && Number.isFinite(draftEnd) && draftEnd > draftStart
+  );
+  const canPrepare = Boolean(selectedValid && draft.cleanPath && draft.danmakuPath);
   const mediaSource = draft.cleanPath ? mediaUrl(draft.cleanPath) : '';
+  const selectionLeft = canUseTimeline ? clampNumber((timelineStart / timelineDuration) * 100, 0, 100) : 0;
+  const selectionWidth = canUseTimeline
+    ? clampNumber(((timelineEnd - timelineStart) / timelineDuration) * 100, 0, 100 - selectionLeft)
+    : 0;
 
   useEffect(() => {
     setMediaDuration(0);
@@ -672,6 +693,18 @@ function ExportPage({
   function updateTimelineEnd(value: number) {
     const next = clampNumber(value, Math.min(timelineStart + 0.1, timelineDuration || value), timelineDuration || value);
     setDraft({ ...draft, endTime: formatTimelineTime(next) });
+  }
+
+  function setTimelineFromPlayback(kind: 'start' | 'end') {
+    const currentTime = videoRef.current?.currentTime ?? Number.NaN;
+    if (!Number.isFinite(currentTime)) {
+      return;
+    }
+    if (kind === 'start') {
+      updateTimelineStart(currentTime);
+    } else {
+      updateTimelineEnd(currentTime);
+    }
   }
 
   return (
@@ -704,6 +737,7 @@ function ExportPage({
               <FileVideo size={18} />
               <span>源文件</span>
             </div>
+            <span className="panel-count">共 {recordings.length} 个 · 可用 {validRecordingCount} 个</span>
           </div>
 
           <div className="recording-list">
@@ -713,14 +747,23 @@ function ExportPage({
               recordings.map((recording) => (
                 <button
                   key={recording.id || recording.cleanPath}
-                  className={recording.cleanPath === draft.cleanPath ? 'recording-row active' : 'recording-row'}
+                  className={[
+                    'recording-row',
+                    recording.cleanPath === draft.cleanPath ? 'active' : '',
+                    recording.valid === false ? 'invalid' : ''
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
                   type="button"
+                  disabled={recording.valid === false}
+                  title={recording.valid === false ? recording.validReason || '文件不可用' : recording.cleanPath}
                   onClick={() => selectRecording(recording)}
                 >
                   <span>{recordingLabel(recording)}</span>
                   <small>
                     {filename(recording.cleanPath)}
                     {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
+                    {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
                   </small>
                 </button>
               ))
@@ -737,7 +780,7 @@ function ExportPage({
           </label>
 
           <label className="field">
-            <span>弹幕事件</span>
+            <span>弹幕 JSONL</span>
             <input
               value={draft.danmakuPath}
               onChange={(event) => setDraft({ ...draft, danmakuPath: event.target.value })}
@@ -766,6 +809,7 @@ function ExportPage({
           <div className="clip-preview">
             {mediaSource ? (
               <video
+                ref={videoRef}
                 key={draft.cleanPath}
                 src={mediaSource}
                 controls
@@ -795,6 +839,9 @@ function ExportPage({
               <strong>{formatTimelineTime(Math.max(0, timelineEnd - timelineStart))}</strong>
               <span>{formatTimelineTime(timelineEnd)}</span>
             </div>
+            <div className="timeline-rail" aria-hidden="true">
+              <span style={{ left: `${selectionLeft}%`, width: `${selectionWidth}%` }} />
+            </div>
             <div className="range-stack">
               <input
                 type="range"
@@ -814,6 +861,14 @@ function ExportPage({
                 disabled={!canUseTimeline}
                 onChange={(event) => updateTimelineEnd(Number(event.target.value))}
               />
+            </div>
+            <div className="timeline-tools">
+              <button className="text-button" type="button" disabled={!mediaSource} onClick={() => setTimelineFromPlayback('start')}>
+                用播放点设起点
+              </button>
+              <button className="text-button" type="button" disabled={!mediaSource} onClick={() => setTimelineFromPlayback('end')}>
+                用播放点设终点
+              </button>
             </div>
           </div>
 
@@ -912,6 +967,15 @@ function ExportPage({
               {typeof result.eventCount === 'number' ? (
                 <PathLine label="事件数量" value={String(result.eventCount)} />
               ) : null}
+              <button
+                className="wide-button fill"
+                type="button"
+                disabled={!result.outputPath}
+                onClick={() => run('open-result-dir', () => recorder.openPathDir(result.outputPath || ''))}
+              >
+                <FolderOpen size={18} />
+                打开所在目录
+              </button>
             </div>
           ) : (
             <div className="empty-state compact-empty">
@@ -1004,7 +1068,7 @@ function SettingsPage({
 
           <div className="settings-grid">
             <label className="field">
-              <span>源流清晰度</span>
+              <span>源流清晰度优先级</span>
               <select
                 value={settingsDraft.targetQn}
                 onChange={(event) =>
@@ -1020,7 +1084,7 @@ function SettingsPage({
             </label>
 
             <label className="field">
-              <span>录像容器</span>
+              <span>最终输出容器</span>
               <select
                 value={settingsDraft.outputContainer}
                 onChange={(event) =>
@@ -1215,6 +1279,9 @@ function SettingsPage({
           <PathLine label="当前版本" value={state.version || '-'} />
           <PathLine label="最新版本" value={state.update.latestVersion || '尚未检查'} />
           <PathLine label="更新状态" value={state.update.message || '尚未检查更新'} />
+          <PathLine label="更新日志" value={state.update.updateLogPath || ''} />
+          <PathLine label="状态文件" value={state.update.statusPath || ''} />
+          <PathLine label="下载包" value={state.update.packagePath || ''} />
           <UpdateProgress update={state.update} />
           <div className="split-buttons">
             <button
@@ -1482,11 +1549,14 @@ function RoomCard({
 }) {
   const status = getRoomStatus(room);
   const roomKey = room.id;
-  const streamText = room.currentRecording?.videoInfo
+  const requestedText = room.stream?.requestedQn ? qnLabel(room.stream.requestedQn) : '未请求';
+  const selectedText = room.stream ? `${displayCodec(room.stream.codec)} · qn ${room.stream.qn}` : '未选流';
+  const actualText = room.currentRecording?.videoInfo
     ? formatVideoInfo(room.currentRecording.videoInfo, room.stream?.codec)
-    : room.stream
-      ? `${displayCodec(room.stream.codec)} · 清晰度 ${room.stream.qn}`
-      : '未选流';
+    : room.recording
+      ? '正在探测实际分辨率'
+      : '尚未写入';
+  const danmakuCommandSummary = commandCountsSummary(room.currentRecording?.danmakuCommandCounts);
   const [cardOverlayMode, setCardOverlayMode] = useState<AppSettings['burnOverlayMode']>(burnOverlayMode);
 
   useEffect(() => {
@@ -1526,15 +1596,27 @@ function RoomCard({
           </span>
           <span>
             <Cpu size={15} />
-            {streamText}
+            请求 {requestedText}
+          </span>
+          <span>
+            <Gauge size={15} />
+            接口 {selectedText}
+          </span>
+          <span>
+            <Video size={15} />
+            实际 {actualText}
           </span>
         </div>
 
         {room.currentRecording ? (
           <div className="recording-info">
             <span>
+              <HardDrive size={15} />
+              {containerStageLabel(room.currentRecording)}
+            </span>
+            <span>
               <MessageSquareText size={15} />
-              弹幕事件 {room.currentRecording.eventCount}
+              可烧录事件 {room.currentRecording.capturedDanmakuCount ?? room.currentRecording.eventCount}
             </span>
             <span>
               <Radio size={15} />
@@ -1542,12 +1624,38 @@ function RoomCard({
             </span>
             <span>
               <Activity size={15} />
-              热度 {room.currentRecording.danmakuPopularity ?? 0} · 互动 {room.currentRecording.ignoredDanmakuCount ?? 0}
+              互动包 {room.currentRecording.rawDanmakuCount ?? 0} · 未烧录 {room.currentRecording.ignoredDanmakuCount ?? 0} · 热度{' '}
+              {room.currentRecording.danmakuPopularity ?? 0}
             </span>
+            {danmakuCommandSummary ? (
+              <span title={danmakuCommandSummary}>
+                <ListVideo size={15} />
+                命令 {danmakuCommandSummary}
+              </span>
+            ) : null}
+            {room.currentRecording.validReason ? (
+              <span title={room.currentRecording.validReason}>
+                <CircleAlert size={15} />
+                {room.currentRecording.validReason}
+              </span>
+            ) : null}
+            {room.currentRecording.capturePath ? (
+              <span title={room.currentRecording.capturePath}>
+                <FileVideo size={15} />
+                临时 {filename(room.currentRecording.capturePath)}
+              </span>
+            ) : null}
             <span title={room.currentRecording.cleanPath}>
               <FileVideo size={15} />
-              {filename(room.currentRecording.cleanPath)}
+              最终 {filename(room.currentRecording.cleanPath)}
             </span>
+          </div>
+        ) : null}
+
+        {room.qualityWarning ? (
+          <div className="warning-line">
+            <CircleAlert size={16} />
+            <span>{room.qualityWarning}</span>
           </div>
         ) : null}
 
@@ -1720,7 +1828,10 @@ function getStats(rooms: RoomState[]) {
     monitoring: rooms.filter((room) => room.monitoring).length,
     recording: rooms.filter((room) => room.recording).length,
     burning: rooms.filter((room) => room.burning).length,
-    events: rooms.reduce((sum, room) => sum + (room.currentRecording?.eventCount ?? 0), 0)
+    events: rooms.reduce(
+      (sum, room) => sum + (room.currentRecording?.capturedDanmakuCount ?? room.currentRecording?.eventCount ?? 0),
+      0
+    )
   };
 }
 
@@ -1732,7 +1843,7 @@ function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft 
       outputDir: current.outputDir || state.settings.outputDir
     };
   }
-  const recording = state.recordings[0];
+  const recording = state.recordings.find((item) => item.valid !== false) || state.recordings[0];
   if (!recording) {
     return {
       ...current,
@@ -1754,6 +1865,35 @@ function recordingLabel(recording: RecordingState) {
   const title = recording.roomTitle || recording.anchor || filename(recording.cleanPath);
   const merged = recording.mergedFrom?.length ? '合并' : '源流';
   return `${formatDateTime(recording.startedAt)} · ${merged} · ${title}`;
+}
+
+function qnLabel(qn: number) {
+  const option = qnOptions.find((item) => item.value === Number(qn));
+  return option ? `${option.label}(${option.value})` : `清晰度 ${qn}`;
+}
+
+function containerStageLabel(recording: RecordingState) {
+  if (recording.containerStage === 'finalizing') {
+    return '正在封装 MP4';
+  }
+  if (recording.containerStage === 'ready') {
+    return '已生成最终文件';
+  }
+  if (recording.containerStage === 'failed') {
+    return '封装失败，已保留可诊断文件';
+  }
+  if (recording.capturePath && recording.capturePath !== recording.cleanPath) {
+    return `写入临时 MKV：${filename(recording.capturePath)}`;
+  }
+  return '正在写入源流文件';
+}
+
+function commandCountsSummary(counts?: Record<string, number>) {
+  const entries = Object.entries(counts || {})
+    .filter(([, count]) => Number(count) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 3);
+  return entries.map(([name, count]) => `${name} ${count}`).join(' · ');
 }
 
 function overlayModeLabel(mode: AppSettings['burnOverlayMode']) {

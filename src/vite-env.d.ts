@@ -14,6 +14,7 @@ export type RoomState = {
   burning: boolean;
   lastCheckedAt?: number;
   lastError?: string;
+  qualityWarning?: string;
   stream?: StreamChoice;
   currentRecording?: RecordingState;
 };
@@ -36,10 +37,13 @@ export type RecordingState = {
   anchor?: string;
   startedAt: number;
   cleanPath: string;
+  capturePath?: string;
   danmakuPath: string;
   cssPath?: string;
   assPath?: string;
   burnedPath?: string;
+  containerStage?: 'capturing' | 'finalizing' | 'ready' | 'failed';
+  validReason?: string;
   mergeGroup?: string;
   mergeSequence?: number;
   mergeOutputPath?: string;
@@ -48,10 +52,13 @@ export type RecordingState = {
   fileSize?: number;
   valid?: boolean;
   eventCount: number;
+  rawDanmakuCount?: number;
+  capturedDanmakuCount?: number;
+  ignoredDanmakuCount?: number;
+  danmakuCommandCounts?: Record<string, number>;
   danmakuStatus?: 'connecting' | 'connected' | 'disconnected' | 'error';
   danmakuMessage?: string;
   danmakuPopularity?: number;
-  ignoredDanmakuCount?: number;
   videoInfo?: {
     codec?: string;
     width: number;
@@ -103,6 +110,9 @@ export type UpdateState = {
   downloadReceivedBytes?: number;
   downloadTotalBytes?: number;
   downloadProgress?: number | null;
+  updateLogPath?: string;
+  statusPath?: string;
+  packagePath?: string;
   queued?: boolean;
   activeJobs?: boolean;
   manifest?: {
@@ -190,6 +200,7 @@ export type RecorderApi = {
   scanRecordings: () => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
+  openPathDir: (path: string) => Promise<AppState>;
   openConfigDir: () => Promise<AppState>;
   checkUpdate: () => Promise<AppState>;
   applyUpdate: () => Promise<AppState>;
