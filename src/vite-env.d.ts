@@ -203,6 +203,7 @@ export type RecorderApi = {
   openPathDir: (path: string) => Promise<AppState>;
   openConfigDir: () => Promise<AppState>;
   checkUpdate: () => Promise<AppState>;
+  downloadUpdate: () => Promise<AppState>;
   applyUpdate: () => Promise<AppState>;
   queueUpdate: () => Promise<AppState>;
   setStartup: (enabled: boolean) => Promise<AppState>;

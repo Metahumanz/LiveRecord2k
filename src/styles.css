@@ -1446,3 +1446,36 @@ button:disabled {
     flex-direction: column;
   }
 }
+
+@media (max-width: 760px) {
+  body {
+    min-width: 0;
+    min-height: 100vh;
+  }
+
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .nav-panel {
+    padding: 18px;
+  }
+
+  .workspace-panel {
+    padding: 20px 16px;
+    overflow: visible;
+  }
+
+  .settings-grid,
+  .settings-page-grid,
+  .export-layout,
+  .time-grid,
+  .overview-grid,
+  .room-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .compact-field {
+    max-width: none;
+  }
+}
