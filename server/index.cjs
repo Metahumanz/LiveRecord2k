@@ -51,6 +51,8 @@ const APP_VERSION = getAppVersion();
 const DEFAULT_UPDATE_MANIFEST_URL =
   process.env.BILI_RECORD_UPDATE_URL ||
   'https://github.com/Metahumanz/LiveRecord2k/releases/latest/download/update.json';
+const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/Metahumanz/LiveRecord2k/releases/latest';
+const UPDATE_CHECK_TIMEOUT_MS = 12000;
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
 class LiveRecordService {
@@ -78,6 +80,9 @@ class LiveRecordService {
       downloadReceivedBytes: 0,
       downloadTotalBytes: 0,
       downloadProgress: null,
+      updateLogPath: '',
+      statusPath: '',
+      packagePath: '',
       queued: false,
       manifest: null
     };
@@ -198,6 +203,7 @@ class LiveRecordService {
       burning: false,
       lastCheckedAt: room.lastCheckedAt,
       lastError: undefined,
+      qualityWarning: undefined,
       stream: undefined,
       currentRecording: undefined
     };
@@ -219,6 +225,9 @@ class LiveRecordService {
       cssPath: String(recording.cssPath || deriveSiblingPath(cleanPath, 'danmaku', 'css')),
       assPath: String(recording.assPath || deriveSiblingPath(cleanPath, 'danmaku', 'ass')),
       burnedPath: String(recording.burnedPath || deriveBurnedPath(cleanPath, 'danmaku-gift')),
+      capturePath: String(recording.capturePath || ''),
+      containerStage: normalizeContainerStage(recording.containerStage),
+      validReason: String(recording.validReason || ''),
       mergeGroup: String(recording.mergeGroup || ''),
       mergeSequence: Number(recording.mergeSequence || 0),
       mergeOutputPath: String(recording.mergeOutputPath || ''),
@@ -227,6 +236,13 @@ class LiveRecordService {
       fileSize: Number(recording.fileSize || 0),
       valid: recording.valid !== false,
       eventCount: Number(recording.eventCount || 0),
+      rawDanmakuCount: Number(recording.rawDanmakuCount || 0),
+      capturedDanmakuCount: Number(recording.capturedDanmakuCount ?? recording.eventCount ?? 0),
+      ignoredDanmakuCount: Number(recording.ignoredDanmakuCount || 0),
+      danmakuCommandCounts: normalizeCommandCounts(recording.danmakuCommandCounts),
+      danmakuStatus: recording.danmakuStatus,
+      danmakuMessage: recording.danmakuMessage,
+      danmakuPopularity: Number(recording.danmakuPopularity || 0),
       videoInfo: recording.videoInfo || null
     };
   }
@@ -355,6 +371,20 @@ class LiveRecordService {
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
     openPath(this.settings.outputDir);
     this.log('info', `已打开输出目录：${this.settings.outputDir}`);
+    return this.getState();
+  }
+
+  async openPathDir(filePath) {
+    const targetPath = String(filePath || '').trim();
+    if (!targetPath) {
+      throw new Error('路径为空。');
+    }
+    const resolved = path.resolve(targetPath);
+    const stat = await fsp.stat(resolved).catch(() => null);
+    const dir = stat?.isDirectory() ? resolved : path.dirname(resolved);
+    await fsp.mkdir(dir, { recursive: true });
+    openPath(dir);
+    this.log('info', `已打开所在目录：${dir}`);
     return this.getState();
   }
 
@@ -878,6 +908,7 @@ class LiveRecordService {
     if (!room.realRoomId) {
       Object.assign(room, await this.fetchRoomInfo(room.id));
     }
+    room.qualityWarning = undefined;
 
     const qnProbes = createQnProbeList(this.settings.targetQn);
     const candidates = [];
@@ -951,6 +982,7 @@ class LiveRecordService {
       new Set(candidates.flatMap((candidate) => [candidate.qn, ...(candidate.acceptQn || [])]).filter(Boolean))
     ).sort((a, b) => b - a);
     if (Number(this.settings.targetQn || 0) >= 10000 && Number(room.stream.qn || 0) < Number(this.settings.targetQn)) {
+      room.qualityWarning = `请求 ${this.settings.targetQn}，接口实际选中 ${room.stream.qn}，可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先扫码登录或刷新 Cookie。`;
       this.log(
         'warn',
         `${roomLabel(room)} 未拿到请求的高画质清晰度 ${this.settings.targetQn}，实际选中 ${room.stream.qn}，接口可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先到设置页扫码登录，或重新扫码刷新 Cookie 后再试。`
@@ -1016,16 +1048,22 @@ class LiveRecordService {
         eventStream,
         danmakuClient: null,
         startedAt: Date.now(),
+        outputContainer: container,
         cleanPath,
         capturePath,
         danmakuPath,
         cssPath,
         assPath,
         burnedPath,
+        containerStage: 'capturing',
+        validReason: '',
         mergeGroup,
         mergeSequence,
         mergeOutputPath,
         eventCount: 0,
+        rawDanmakuCount: 0,
+        capturedDanmakuCount: 0,
+        danmakuCommandCounts: {},
         lastEventEmitAt: 0,
         danmakuStatus: 'connecting',
         danmakuMessage: '弹幕通道连接中',
@@ -1051,14 +1089,20 @@ class LiveRecordService {
         cssPath,
         assPath,
         burnedPath,
+        capturePath,
+        containerStage: 'capturing',
+        validReason: '',
         mergeGroup,
         mergeSequence,
         mergeOutputPath,
         eventCount: 0,
+        rawDanmakuCount: 0,
+        capturedDanmakuCount: 0,
         danmakuStatus: 'connecting',
         danmakuMessage: '弹幕通道连接中',
         danmakuPopularity: 0,
         ignoredDanmakuCount: 0,
+        danmakuCommandCounts: {},
         videoInfo: null
       };
       this.recordingSessions.set(room.id, session);
@@ -1092,6 +1136,12 @@ class LiveRecordService {
             session.videoInfo = videoInfo;
             if (room.currentRecording) {
               room.currentRecording.videoInfo = videoInfo;
+            }
+            const actualQualityWarning = buildActualQualityWarning(this.settings, room.stream, videoInfo);
+            if (actualQualityWarning) {
+              room.qualityWarning = room.qualityWarning
+                ? `${room.qualityWarning} 实际写入 ${videoInfo.width}x${videoInfo.height}。`
+                : actualQualityWarning;
             }
             this.log(
               'success',
@@ -1200,6 +1250,13 @@ class LiveRecordService {
         if (session.finished || this.recordingSessions.get(room.id) !== session) {
           return;
         }
+        const commandType = danmakuCommandType(command);
+        session.rawDanmakuCount = (session.rawDanmakuCount || 0) + 1;
+        session.danmakuCommandCounts[commandType] = (session.danmakuCommandCounts[commandType] || 0) + 1;
+        if (room.currentRecording) {
+          room.currentRecording.rawDanmakuCount = session.rawDanmakuCount;
+          room.currentRecording.danmakuCommandCounts = { ...session.danmakuCommandCounts };
+        }
         const event = normalizeDanmakuEvent(command, session.startedAt);
         if (!event) {
           session.ignoredCommandCount = (session.ignoredCommandCount || 0) + 1;
@@ -1210,7 +1267,7 @@ class LiveRecordService {
           if (session.ignoredCommandCount === 1 || now - session.lastIgnoredEmitAt > 5000) {
             session.lastIgnoredEmitAt = now;
             session.danmakuStatus = 'connected';
-            session.danmakuMessage = `弹幕通道正常，收到互动事件 ${session.ignoredCommandCount} 条`;
+            session.danmakuMessage = `弹幕通道正常，收到互动包 ${session.rawDanmakuCount} 条，可烧录 ${session.eventCount} 条`;
             if (room.currentRecording) {
               room.currentRecording.danmakuStatus = session.danmakuStatus;
               room.currentRecording.danmakuMessage = session.danmakuMessage;
@@ -1223,10 +1280,12 @@ class LiveRecordService {
           return;
         }
         session.eventCount += 1;
+        session.capturedDanmakuCount = session.eventCount;
         if (room.currentRecording) {
           room.currentRecording.eventCount = session.eventCount;
+          room.currentRecording.capturedDanmakuCount = session.capturedDanmakuCount;
           room.currentRecording.danmakuStatus = 'connected';
-          room.currentRecording.danmakuMessage = `已捕获 ${session.eventCount} 条弹幕事件`;
+          room.currentRecording.danmakuMessage = `已捕获 ${session.eventCount} 条可烧录事件`;
         }
         session.eventStream.write(`${JSON.stringify(event)}\n`);
         const now = Date.now();
@@ -1339,7 +1398,18 @@ class LiveRecordService {
       elapsedSec,
       videoInfo: session.videoInfo
     });
-    let finalized = normalizeContainer(this.settings.outputContainer) !== 'mp4';
+    if (!validBeforeFinalize) {
+      session.containerStage = 'failed';
+      session.validReason = `临时文件过小或没有解析到视频流：${formatBytes(fileSizeBeforeFinalize)}`;
+      if (room.currentRecording) {
+        room.currentRecording.containerStage = session.containerStage;
+        room.currentRecording.validReason = session.validReason;
+      }
+    }
+    let finalized = normalizeContainer(session.outputContainer) !== 'mp4';
+    if (finalized && validBeforeFinalize) {
+      session.containerStage = 'ready';
+    }
     if (validBeforeFinalize) {
       finalized = await this.finalizeRecordingContainer(room, session);
     }
@@ -1349,6 +1419,12 @@ class LiveRecordService {
       elapsedSec,
       videoInfo: session.videoInfo
     }) && finalized;
+    if (!valid && !session.validReason) {
+      session.containerStage = 'failed';
+      session.validReason = finalized
+        ? `最终文件过小或没有视频流：${formatBytes(fileSize)}`
+        : '最终 MP4 封装失败，已保留临时文件。';
+    }
     const finishedRecording = {
       startedAt: session.startedAt,
       cleanPath: session.cleanPath,
@@ -1356,6 +1432,9 @@ class LiveRecordService {
       cssPath: session.cssPath,
       assPath: session.assPath,
       burnedPath: session.burnedPath,
+      capturePath: session.capturePath,
+      containerStage: valid ? 'ready' : session.containerStage || 'failed',
+      validReason: valid ? '' : session.validReason,
       mergeGroup: session.mergeGroup,
       mergeSequence: session.mergeSequence,
       mergeOutputPath: session.mergeOutputPath,
@@ -1363,10 +1442,13 @@ class LiveRecordService {
       fileSize,
       valid,
       eventCount: session.eventCount,
+      rawDanmakuCount: session.rawDanmakuCount,
+      capturedDanmakuCount: session.capturedDanmakuCount || session.eventCount,
       danmakuStatus: session.danmakuStatus,
       danmakuMessage: session.danmakuMessage,
       danmakuPopularity: session.danmakuPopularity,
       ignoredDanmakuCount: session.ignoredCommandCount,
+      danmakuCommandCounts: session.danmakuCommandCounts,
       videoInfo: session.videoInfo
     };
     if (room.currentRecording) {
@@ -1382,7 +1464,7 @@ class LiveRecordService {
           session.cleanPath
         )}（最终 ${formatBytes(fileSize)}，临时 ${formatBytes(fileSizeBeforeFinalize)}）。${
           capturePath !== session.cleanPath && fs.existsSync(capturePath) ? `可检查临时文件：${capturePath}` : ''
-        }`
+        }${session.validReason ? `原因：${session.validReason}` : ''}`
       );
     }
     this.recordingSessions.delete(roomId);
@@ -1394,20 +1476,20 @@ class LiveRecordService {
     if (shouldContinueSegment) {
       this.log(
         'success',
-        `${roomLabel(room)} 分段文件完成：${path.basename(session.cleanPath)}，时长 ${elapsedText}，弹幕事件 ${session.eventCount} 条。`
+        `${roomLabel(room)} 分段文件完成：${path.basename(session.cleanPath)}，时长 ${elapsedText}，可烧录事件 ${session.eventCount} 条。`
       );
     } else if (session.stopping) {
       this.log(
         'success',
-        `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，时长 ${elapsedText}，弹幕事件 ${session.eventCount} 条。`
+        `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，时长 ${elapsedText}，可烧录事件 ${session.eventCount} 条。`
       );
       if (this.settings.notifyRecordingEnded) {
-        this.notify('录制结束', `${roomLabel(room)} 弹幕事件 ${session.eventCount} 条`);
+        this.notify('录制结束', `${roomLabel(room)} 可烧录事件 ${session.eventCount} 条`);
       }
     } else if (code === 0) {
       this.log(
         'warn',
-        `${roomLabel(room)} 直播流提前结束，已保存当前文件：${path.basename(session.cleanPath)}，时长 ${elapsedText}，弹幕事件 ${session.eventCount} 条。${
+        `${roomLabel(room)} 直播流提前结束，已保存当前文件：${path.basename(session.cleanPath)}，时长 ${elapsedText}，可烧录事件 ${session.eventCount} 条。${
           shouldReconnectLiveStream ? '正在尝试续录。' : ''
         }`
       );
@@ -1470,16 +1552,29 @@ class LiveRecordService {
   }
 
   async finalizeRecordingContainer(room, session) {
-    if (normalizeContainer(this.settings.outputContainer) !== 'mp4') {
+    if (normalizeContainer(session.outputContainer) !== 'mp4') {
       return true;
     }
     const sourcePath = session.capturePath || session.cleanPath;
     if (!fs.existsSync(sourcePath)) {
+      session.containerStage = 'failed';
+      session.validReason = `临时录制文件不存在：${sourcePath}`;
+      if (room.currentRecording) {
+        room.currentRecording.containerStage = session.containerStage;
+        room.currentRecording.validReason = session.validReason;
+      }
       this.log('error', `${roomLabel(room)} 临时录制文件不存在，无法生成 MP4：${sourcePath}`);
       return false;
     }
     const tmpPath = replaceExtension(session.cleanPath, '.finalizing.mp4');
     try {
+      session.containerStage = 'finalizing';
+      session.validReason = '';
+      if (room.currentRecording) {
+        room.currentRecording.containerStage = session.containerStage;
+        room.currentRecording.validReason = session.validReason;
+      }
+      this.emitState();
       await fsp.rm(tmpPath, { force: true });
       await runFfmpegJob(
         this.ffmpegPath,
@@ -1497,6 +1592,12 @@ class LiveRecordService {
         if (sourcePath !== session.cleanPath) {
           await fsp.rm(sourcePath, { force: true }).catch(() => {});
         }
+        session.containerStage = 'ready';
+        session.validReason = '';
+        if (room.currentRecording) {
+          room.currentRecording.containerStage = session.containerStage;
+          room.currentRecording.validReason = session.validReason;
+        }
         this.log(
           'success',
           `${roomLabel(room)} MP4 封装完成：${path.basename(session.cleanPath)}（${formatBytes(finalizedSize)}）`
@@ -1504,6 +1605,12 @@ class LiveRecordService {
         return true;
       } else {
         await fsp.rm(tmpPath, { force: true });
+        session.containerStage = 'failed';
+        session.validReason = `MP4 封装结果过小：${formatBytes(finalizedSize)}`;
+        if (room.currentRecording) {
+          room.currentRecording.containerStage = session.containerStage;
+          room.currentRecording.validReason = session.validReason;
+        }
         this.log(
           'error',
           `${roomLabel(room)} MP4 封装结果过小：${path.basename(tmpPath)}（${formatBytes(finalizedSize)}）`
@@ -1512,6 +1619,12 @@ class LiveRecordService {
       }
     } catch (error) {
       await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      session.containerStage = 'failed';
+      session.validReason = `MP4 封装失败：${error.message}`;
+      if (room.currentRecording) {
+        room.currentRecording.containerStage = session.containerStage;
+        room.currentRecording.validReason = session.validReason;
+      }
       this.log('error', `${roomLabel(room)} MP4 封装失败，已保留临时文件 ${sourcePath}：${error.message}`);
       return false;
     }
@@ -1534,6 +1647,10 @@ class LiveRecordService {
   async refreshRecordingLibrary(options = {}) {
     const discovered = await discoverRecordingFiles(this.settings.outputDir);
     if (discovered.length === 0) {
+      if (!options.silent) {
+        this.log('warn', `录像库已刷新，输出目录没有找到 .clean/.merged 源文件：${this.settings.outputDir}`);
+        this.emitState();
+      }
       return this.getState();
     }
     const existing = new Map(this.recordings.map((recording) => [path.resolve(recording.cleanPath).toLowerCase(), recording]));
@@ -1554,12 +1671,12 @@ class LiveRecordService {
     }
     this.recordings = Array.from(existing.values())
       .filter(Boolean)
-      .filter((recording) => recording.valid !== false)
       .sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0))
       .slice(0, 160);
     await this.saveStore();
     if (!options.silent) {
-      this.log('success', `录像库已刷新，找到 ${discovered.length} 个源文件。`);
+      const validCount = discovered.filter((recording) => recording.valid !== false).length;
+      this.log('success', `录像库已刷新，找到 ${discovered.length} 个源文件，可用 ${validCount} 个。`);
       this.emitState();
     }
     return this.getState();
@@ -1643,6 +1760,13 @@ class LiveRecordService {
       fileSize: await getFileSize(outputPath),
       valid: true,
       eventCount: segments.reduce((sum, segment) => sum + Number(segment.eventCount || 0), 0),
+      rawDanmakuCount: segments.reduce((sum, segment) => sum + Number(segment.rawDanmakuCount || 0), 0),
+      capturedDanmakuCount: segments.reduce(
+        (sum, segment) => sum + Number(segment.capturedDanmakuCount ?? segment.eventCount ?? 0),
+        0
+      ),
+      ignoredDanmakuCount: segments.reduce((sum, segment) => sum + Number(segment.ignoredDanmakuCount || 0), 0),
+      danmakuCommandCounts: mergeCommandCounts(segments.map((segment) => segment.danmakuCommandCounts)),
       videoInfo: segments[0].videoInfo || null
     });
     this.recordings = [mergedRecording, ...this.recordings.filter((recording) => recording.cleanPath !== outputPath)].slice(0, 80);
@@ -1931,11 +2055,26 @@ class LiveRecordService {
       checkedAt: Date.now(),
       downloadReceivedBytes: 0,
       downloadTotalBytes: 0,
-      downloadProgress: null
+      downloadProgress: null,
+      updateLogPath: this.getUpdateLogPath(),
+      statusPath: this.getUpdateStatusPath()
     };
     this.emitState();
+    let acceptingStatus = true;
     try {
-      const manifest = await this.fetchUpdateManifest();
+      const manifest = await withTimeout(this.fetchUpdateManifest((message) => {
+        if (!acceptingStatus) {
+          return;
+        }
+        this.updateState = {
+          ...this.updateState,
+          status: 'checking',
+          message,
+          checkedAt: Date.now()
+        };
+        this.emitState();
+      }), 45000, '检查更新超时：45 秒内没有收到更新源响应。');
+      acceptingStatus = false;
       const latestVersion = manifest.version || manifest.tagName || '';
       const hasUpdate = compareVersions(latestVersion, APP_VERSION) > 0;
       this.updateState = {
@@ -1954,6 +2093,7 @@ class LiveRecordService {
       this.emitState();
       return this.getState();
     } catch (error) {
+      acceptingStatus = false;
       this.updateState = {
         ...this.updateState,
         status: 'error',
@@ -1961,7 +2101,9 @@ class LiveRecordService {
         checkedAt: Date.now(),
         downloadReceivedBytes: 0,
         downloadTotalBytes: 0,
-        downloadProgress: null
+        downloadProgress: null,
+        updateLogPath: this.getUpdateLogPath(),
+        statusPath: this.getUpdateStatusPath()
       };
       this.log('error', this.updateState.message);
       this.emitState();
@@ -2018,7 +2160,10 @@ class LiveRecordService {
         message: `正在下载 ${manifest.version} 更新包...`,
         downloadReceivedBytes: 0,
         downloadTotalBytes: 0,
-        downloadProgress: 0
+        downloadProgress: 0,
+        updateLogPath: this.getUpdateLogPath(),
+        statusPath: this.getUpdateStatusPath(),
+        packagePath: ''
       };
       this.emitState();
 
@@ -2027,7 +2172,8 @@ class LiveRecordService {
         ...this.updateState,
         status: 'ready',
         message: `更新包已准备好，正在应用 ${manifest.version}...`,
-        downloadProgress: 100
+        downloadProgress: 100,
+        packagePath
       };
       this.emitState();
 
@@ -2051,7 +2197,9 @@ class LiveRecordService {
         status: 'error',
         queued: false,
         message: `更新失败：${error.message}`,
-        downloadProgress: null
+        downloadProgress: null,
+        updateLogPath: this.getUpdateLogPath(),
+        statusPath: this.getUpdateStatusPath()
       };
       this.log('error', this.updateState.message);
       this.emitState();
@@ -2059,9 +2207,39 @@ class LiveRecordService {
     return this.getState();
   }
 
-  async fetchUpdateManifest() {
+  async fetchUpdateManifest(onStatus) {
     const source = this.settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL;
-    const raw = await readTextSource(source);
+    let raw;
+    try {
+      raw = await readTextSource(source, {
+        timeoutMs: UPDATE_CHECK_TIMEOUT_MS,
+        retries: 3,
+        onRetry: ({ attempt, maxAttempts, error }) => {
+          onStatus?.(
+            `检查更新连接中断，正在重试 ${attempt}/${Math.max(1, Number(maxAttempts || 1) - 1)}：${
+              error.message || error
+            }`
+          );
+        }
+      });
+    } catch (error) {
+      if (!isDefaultUpdateSource(source)) {
+        throw error;
+      }
+      onStatus?.('默认更新清单连接失败，正在改用 GitHub Release API...');
+      this.log('warn', `默认更新清单失败，改用 GitHub Release API：${error.message}`);
+      raw = await readTextSource(GITHUB_LATEST_RELEASE_API, {
+        timeoutMs: UPDATE_CHECK_TIMEOUT_MS,
+        retries: 3,
+        onRetry: ({ attempt, maxAttempts, error: retryError }) => {
+          onStatus?.(
+            `GitHub Release API 连接中断，正在重试 ${attempt}/${Math.max(1, Number(maxAttempts || 1) - 1)}：${
+              retryError.message || retryError
+            }`
+          );
+        }
+      });
+    }
     const payload = JSON.parse(raw);
     const manifest = normalizeUpdateManifest(payload);
     if (!manifest.version || !manifest.packageUrl) {
@@ -2071,9 +2249,14 @@ class LiveRecordService {
   }
 
   async downloadUpdatePackage(manifest) {
-    const updateDir = path.join(path.dirname(this.storePath), 'updates');
+    const updateDir = this.getUpdateDir();
     await fsp.mkdir(updateDir, { recursive: true });
     const packagePath = path.join(updateDir, `bili-record-2k-${sanitizeFilename(manifest.version)}.zip`);
+    this.updateState = {
+      ...this.updateState,
+      packagePath
+    };
+    this.emitState();
     let lastEmitAt = 0;
     await downloadFile(manifest.packageUrl, packagePath, (progress) => {
       if (progress.retrying) {
@@ -2124,10 +2307,10 @@ class LiveRecordService {
   }
 
   async createUpdaterScript(packagePath, manifest) {
-    const updateDir = path.join(path.dirname(this.storePath), 'updates');
+    const updateDir = this.getUpdateDir();
     const scriptPath = path.join(updateDir, 'apply-update.ps1');
-    const statusPath = path.join(updateDir, 'last-update-status.json');
-    const logPath = path.join(updateDir, 'apply-update.log');
+    const statusPath = this.getUpdateStatusPath();
+    const logPath = this.getUpdateLogPath();
     const launcherPath = path.join(APP_ROOT, 'BiliRecord2K.exe');
     const script = `
 $ErrorActionPreference = 'Stop'
@@ -2232,7 +2415,9 @@ try {
             updateStatus === 'applying'
               ? `上次更新停在应用阶段，可能被文件占用或安全软件拦截。${status.logPath ? `日志：${status.logPath}` : ''}`
               : `上次更新失败：${message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`,
-          checkedAt: Date.now()
+          checkedAt: Date.now(),
+          statusPath,
+          updateLogPath: status.logPath || this.getUpdateLogPath()
         };
         this.log('error', this.updateState.message);
       } else if (updateStatus === 'success') {
@@ -2244,7 +2429,9 @@ try {
             message: `更新脚本完成到 ${version}，但当前仍是 ${APP_VERSION}。可能是旧进程没有退出，或更新包被复制到了错误目录。${
               status.logPath ? `日志：${status.logPath}` : ''
             }`,
-            checkedAt: Date.now()
+            checkedAt: Date.now(),
+            statusPath,
+            updateLogPath: status.logPath || this.getUpdateLogPath()
           };
           this.log('error', this.updateState.message);
           return;
@@ -2260,7 +2447,15 @@ try {
   }
 
   getUpdateStatusPath() {
-    return path.join(path.dirname(this.storePath), 'updates', 'last-update-status.json');
+    return path.join(this.getUpdateDir(), 'last-update-status.json');
+  }
+
+  getUpdateLogPath() {
+    return path.join(this.getUpdateDir(), 'apply-update.log');
+  }
+
+  getUpdateDir() {
+    return path.join(path.dirname(this.storePath), 'updates');
   }
 
   armUpdateApplyWatchdog(manifest) {
@@ -2280,14 +2475,18 @@ try {
           ...this.updateState,
           status: 'error',
           queued: false,
-          message: `更新脚本失败：${status.message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`
+          message: `更新脚本失败：${status.message || '未知错误'}${status.logPath ? `，日志：${status.logPath}` : ''}`,
+          statusPath,
+          updateLogPath: status.logPath || this.getUpdateLogPath()
         };
       } else {
         this.updateState = {
           ...this.updateState,
           status: 'error',
           queued: false,
-          message: `更新脚本没有结束当前服务，可能被安全软件或文件占用拦截。请查看 ${statusPath} 或手动重启后再试。`
+          message: `更新脚本没有结束当前服务，可能被安全软件或文件占用拦截。请查看 ${statusPath} 或手动重启后再试。`,
+          statusPath,
+          updateLogPath: this.getUpdateLogPath()
         };
       }
       this.log('error', this.updateState.message);
@@ -2617,6 +2816,7 @@ async function handleApi(service, parsed, request, response) {
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
+    '/api/shell/open-path-dir': () => service.openPathDir(body.path),
     '/api/shell/open-config': () => service.openConfigDir(),
     '/api/update/check': () => service.checkUpdate(),
     '/api/update/apply': () => service.applyUpdate(),
@@ -2865,8 +3065,12 @@ function mergeCookieString(existingCookie, setCookieHeaders) {
     .join('; ');
 }
 
+function danmakuCommandType(command) {
+  return String(command?.cmd || 'UNKNOWN').split(':')[0] || 'UNKNOWN';
+}
+
 function normalizeDanmakuEvent(command, startedAt) {
-  const type = String(command.cmd || '').split(':')[0];
+  const type = danmakuCommandType(command);
   const time = Math.max(0, (Date.now() - startedAt) / 1000);
 
   if (type === 'DANMU_MSG') {
@@ -2880,19 +3084,19 @@ function normalizeDanmakuEvent(command, startedAt) {
     };
   }
 
-  if (type === 'SEND_GIFT') {
+  if (type === 'SEND_GIFT' || type === 'COMBO_SEND') {
     const data = command.data || {};
     return {
       type: 'gift',
       time,
-      user: String(data.uname || ''),
+      user: String(data.uname || data.username || ''),
       giftName: String(data.giftName || data.gift_name || '礼物'),
-      count: Number(data.num || 1),
+      count: Number(data.num || data.combo_num || data.combo_count || 1),
       price: Number(data.price || data.discount_price || 0) / 1000
     };
   }
 
-  if (type === 'SUPER_CHAT_MESSAGE') {
+  if (type === 'SUPER_CHAT_MESSAGE' || type === 'SUPER_CHAT_MESSAGE_JPN') {
     const data = command.data || {};
     return {
       type: 'superchat',
@@ -2904,13 +3108,13 @@ function normalizeDanmakuEvent(command, startedAt) {
     };
   }
 
-  if (type === 'GUARD_BUY') {
+  if (type === 'GUARD_BUY' || type === 'USER_TOAST_MSG') {
     const data = command.data || {};
     return {
       type: 'guard',
       time,
-      user: String(data.username || data.uname || ''),
-      giftName: String(data.gift_name || guardName(data.guard_level)),
+      user: String(data.username || data.uname || data.user_show_info?.uname || ''),
+      giftName: String(data.gift_name || data.role_name || guardName(data.guard_level)),
       count: Number(data.num || 1),
       price: Number(data.price || 0) / 1000
     };
@@ -3497,6 +3701,32 @@ function normalizeContainer(value) {
   return value === 'mkv' ? 'mkv' : 'mp4';
 }
 
+function normalizeContainerStage(value) {
+  const stage = String(value || '').trim();
+  return ['capturing', 'finalizing', 'ready', 'failed'].includes(stage) ? stage : undefined;
+}
+
+function normalizeCommandCounts(value) {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([key, count]) => [String(key), Number(count || 0)])
+      .filter(([key, count]) => key && Number.isFinite(count) && count > 0)
+  );
+}
+
+function mergeCommandCounts(items) {
+  const merged = {};
+  for (const item of items || []) {
+    for (const [key, count] of Object.entries(normalizeCommandCounts(item))) {
+      merged[key] = (merged[key] || 0) + count;
+    }
+  }
+  return merged;
+}
+
 function normalizeBurnCodec(value) {
   const codec = String(value || '').trim();
   const supported = new Set(['libx265', 'libx264', 'hevc_nvenc', 'hevc_qsv', 'hevc_amf']);
@@ -3721,6 +3951,21 @@ function parseFfmpegVideoInfo(text) {
   };
 }
 
+function buildActualQualityWarning(settings, stream, videoInfo) {
+  const targetQn = Number(settings?.targetQn || 0);
+  if (targetQn < 10000 || !videoInfo) {
+    return '';
+  }
+  const expectedMinHeight = targetQn >= 25000 ? 2000 : 1200;
+  if (Number(videoInfo.height || 0) >= expectedMinHeight) {
+    return '';
+  }
+  const acceptQn = Array.isArray(stream?.acceptQn) ? stream.acceptQn.filter(Boolean).join('/') : '';
+  return `请求 ${targetQn}，接口选中 ${stream?.qn || '未知'}，实际写入 ${videoInfo.width}x${videoInfo.height}。${
+    acceptQn ? `接口可选 ${acceptQn}。` : ''
+  }如果直播间确认有 2K/4K，请先扫码登录或刷新 Cookie。`;
+}
+
 function clamp(value, min, max) {
   const number = Number(value);
   if (Number.isNaN(number)) {
@@ -3861,7 +4106,7 @@ function requestUrlDirect(target, options, redirectCount) {
       },
       (response) => collectUrlResponse(response, target, options, redirectCount, resolve, reject)
     );
-    request.setTimeout(45000, () => request.destroy(new Error('请求超时。')));
+    request.setTimeout(Number(options.timeoutMs || 45000), () => request.destroy(new Error('请求超时。')));
     request.on('error', reject);
     request.end(options.body);
   });
@@ -3884,6 +4129,19 @@ function isTransientNetworkError(error) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message || '操作超时。')), timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
 }
 
 function requestFfmpegStop(child, options = {}) {
@@ -3995,6 +4253,8 @@ async function discoverRecordingFiles(outputDir) {
       continue;
     }
     const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
+    const eventCount = await countDanmakuLines(danmakuPath);
+    const valid = stat.size >= 32 * 1024;
     recordings.push({
       id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
       startedAt: stat.mtimeMs,
@@ -4003,9 +4263,16 @@ async function discoverRecordingFiles(outputDir) {
       cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
       assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
       burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
+      capturePath: '',
+      containerStage: valid ? 'ready' : 'failed',
+      validReason: valid ? '' : `文件过小：${formatBytes(stat.size)}`,
       fileSize: stat.size,
-      valid: stat.size >= 32 * 1024,
-      eventCount: await countDanmakuLines(danmakuPath)
+      valid,
+      eventCount,
+      capturedDanmakuCount: eventCount,
+      rawDanmakuCount: eventCount,
+      ignoredDanmakuCount: 0,
+      danmakuCommandCounts: {}
     });
   }
   return recordings;
@@ -4037,7 +4304,7 @@ function requestUrlViaHttpProxy(target, proxy, options, redirectCount) {
         },
         (response) => collectUrlResponse(response, target, options, redirectCount, resolve, reject)
       );
-      request.setTimeout(45000, () => request.destroy(new Error('代理请求超时。')));
+      request.setTimeout(Number(options.timeoutMs || 45000), () => request.destroy(new Error('代理请求超时。')));
       request.on('error', reject);
       request.end(options.body);
     });
@@ -4054,7 +4321,7 @@ function requestUrlViaHttpProxy(target, proxy, options, redirectCount) {
         ...proxyAuthorizationHeader(proxy)
       }
     });
-    connect.setTimeout(45000, () => connect.destroy(new Error('代理 CONNECT 超时。')));
+    connect.setTimeout(Number(options.timeoutMs || 45000), () => connect.destroy(new Error('代理 CONNECT 超时。')));
     connect.on('connect', (response, socket) => {
       if (response.statusCode !== 200) {
         socket.destroy();
@@ -4076,7 +4343,7 @@ function requestUrlViaHttpProxy(target, proxy, options, redirectCount) {
           },
           (res) => collectUrlResponse(res, target, options, redirectCount, resolve, reject)
         );
-        request.setTimeout(45000, () => request.destroy(new Error('代理 HTTPS 请求超时。')));
+        request.setTimeout(Number(options.timeoutMs || 45000), () => request.destroy(new Error('代理 HTTPS 请求超时。')));
         request.on('error', reject);
         request.end(options.body);
       });
@@ -4235,7 +4502,7 @@ function proxyAuthorizationHeader(proxy) {
   return { 'Proxy-Authorization': `Basic ${token}` };
 }
 
-async function readTextSource(source) {
+async function readTextSource(source, options = {}) {
   const value = String(source || '').trim();
   if (!value) {
     throw new Error('更新源为空。');
@@ -4244,16 +4511,23 @@ async function readTextSource(source) {
     const body = await requestUrlBuffer(value, {
       headers: {
         Accept: 'application/json, text/plain, */*',
-        'User-Agent': `${APP_NAME}/${APP_VERSION}`
+        'User-Agent': `${APP_NAME}/${APP_VERSION}`,
+        ...(options.headers || {})
       },
-      onRetry: ({ attempt, maxAttempts, error }) => {
-        console.warn(`更新源请求失败，正在重试 ${attempt}/${maxAttempts - 1}: ${error.message}`);
-      }
+      retries: options.retries,
+      timeoutMs: options.timeoutMs,
+      onRetry: options.onRetry
     });
     return body.toString('utf8');
   }
   const filePath = value.startsWith('file://') ? new URL(value) : path.resolve(APP_ROOT, value);
   return fsp.readFile(filePath, 'utf8');
+}
+
+function isDefaultUpdateSource(source) {
+  const normalized = String(source || '').trim().replace(/\/+$/, '');
+  const fallback = String(DEFAULT_UPDATE_MANIFEST_URL || '').trim().replace(/\/+$/, '');
+  return normalized === fallback || normalized.endsWith('/releases/latest/download/update.json');
 }
 
 function normalizeUpdateManifest(payload) {
