@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import Hls from 'hls.js';
 import {
   Activity,
   Bell,
@@ -34,7 +35,7 @@ import {
   Video,
   X
 } from 'lucide-react';
-import type { AppSettings, AppState, ExportResult, LogEntry, RecordingState, RoomState } from './vite-env';
+import type { AppSettings, AppState, ExportResult, LogEntry, PreviewStartResult, RecordingState, RoomState } from './vite-env';
 import { recorder } from './recorderClient';
 import changelogText from '../CHANGELOG.md?raw';
 
@@ -137,6 +138,7 @@ export default function App() {
     outputDir: ''
   });
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [previewRoomId, setPreviewRoomId] = useState<string | null>(null);
 
   useEffect(() => {
     recorder.getInitialState().then((nextState) => {
@@ -160,6 +162,7 @@ export default function App() {
   }, []);
 
   const stats = useMemo(() => getStats(state?.rooms ?? []), [state?.rooms]);
+  const previewRoom = previewRoomId ? state?.rooms.find((room) => room.id === previewRoomId) || null : null;
 
   async function run<T>(key: string, action: () => Promise<T>) {
     setBusy(key);
@@ -296,7 +299,7 @@ export default function App() {
 
       <section className="workspace-panel">
         {page === 'overview' ? (
-          <OverviewPage state={state} stats={stats} busy={busy} setPage={setPage} run={run} />
+          <OverviewPage state={state} stats={stats} busy={busy} setPage={setPage} run={run} openPreview={setPreviewRoomId} />
         ) : null}
         {page === 'rooms' ? (
           <RoomsPage
@@ -309,6 +312,7 @@ export default function App() {
             addRoom={addRoom}
             busy={busy}
             run={run}
+            openPreview={setPreviewRoomId}
           />
         ) : null}
         {page === 'export' ? (
@@ -338,6 +342,7 @@ export default function App() {
       </section>
 
       {state.login ? <QrLoginPanel login={state.login} busy={busy} run={run} /> : null}
+      {previewRoom ? <LivePreviewModal room={previewRoom} onClose={() => setPreviewRoomId(null)} /> : null}
     </main>
   );
 }
@@ -347,13 +352,15 @@ function OverviewPage({
   stats,
   busy,
   setPage,
-  run
+  run,
+  openPreview
 }: {
   state: AppState;
   stats: ReturnType<typeof getStats>;
   busy: string | null;
   setPage: (page: Page) => void;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  openPreview: (roomId: string) => void;
 }) {
   const activeRooms = state.rooms.filter((room) => room.liveStatus === 1 || room.recording);
 
@@ -414,6 +421,7 @@ function OverviewPage({
                 burnOverlayMode={state.settings.burnOverlayMode}
                 busy={null}
                 run={run}
+                openPreview={openPreview}
               />
             ))}
           </div>
@@ -570,7 +578,8 @@ function RoomsPage({
   setRoomInput,
   addRoom,
   busy,
-  run
+  run,
+  openPreview
 }: {
   rooms: RoomState[];
   roomImageMode: AppSettings['roomImageMode'];
@@ -581,6 +590,7 @@ function RoomsPage({
   addRoom: () => Promise<void>;
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  openPreview: (roomId: string) => void;
 }) {
   return (
     <>
@@ -634,6 +644,7 @@ function RoomsPage({
               burnOverlayMode={burnOverlayMode}
               busy={busy}
               run={run}
+              openPreview={openPreview}
             />
           ))
         )}
@@ -666,10 +677,10 @@ function ImageModeSwitch({
         className={value === 'keyframe' ? 'active' : ''}
         disabled={busy}
         onClick={() => onChange('keyframe')}
-        title="卡片显示 B 站实时关键帧"
+        title="卡片显示 B 站预览图"
       >
         <MonitorDot size={17} />
-        <span>实时画面</span>
+        <span>预览图</span>
       </button>
     </div>
   );
@@ -1373,7 +1384,7 @@ function SettingsPage({
                 onChange={(checked) => setSettingsDraft({ ...settingsDraft, preferHevc: checked })}
               />
               <Toggle
-                label="默认实时画面"
+                label="默认预览图"
                 checked={settingsDraft.roomImageMode === 'keyframe'}
                 onChange={(checked) =>
                   setSettingsDraft({ ...settingsDraft, roomImageMode: checked ? 'keyframe' : 'cover' })
@@ -1707,11 +1718,13 @@ function PathLine({ label, value }: { label: string; value: string }) {
 function RoomPreview({
   room,
   roomImageMode,
-  status
+  status,
+  onPreview
 }: {
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
   status: ReturnType<typeof getRoomStatus>;
+  onPreview: (roomId: string) => void;
 }) {
   const rawImageUrl = roomImageMode === 'cover' ? room.cover : room.keyframe;
   const [previewVersion, setPreviewVersion] = useState(Date.now());
@@ -1746,6 +1759,7 @@ function RoomPreview({
   const imageKey = rawImageUrl ? `${rawImageUrl}:${imageVersion || 0}` : '';
   const [failedSrc, setFailedSrc] = useState('');
   const canShowImage = Boolean(rawImageUrl && imageUrl && failedSrc !== imageKey);
+  const canPreview = room.liveStatus === 1 || room.recording;
 
   return (
     <div className="room-cover">
@@ -1754,11 +1768,19 @@ function RoomPreview({
       ) : (
         <div className="cover-fallback">
           <Radio size={32} />
-          <span>{roomImageMode === 'cover' ? '无封面' : '无实时画面'}</span>
+          <span>{roomImageMode === 'cover' ? '无封面' : '无预览图'}</span>
         </div>
       )}
       <span className={`status-pill ${status.kind}`}>{status.label}</span>
-      <span className="preview-mode">{roomImageMode === 'cover' ? '封面' : '实时'}</span>
+      <span className="preview-mode">{roomImageMode === 'cover' ? '封面' : '预览图'}</span>
+      <button
+        className="preview-open-button"
+        title={canPreview ? '打开实时预览' : '未开播，无法实时预览'}
+        disabled={!canPreview}
+        onClick={() => onPreview(room.id)}
+      >
+        <Video size={18} />
+      </button>
     </div>
   );
 }
@@ -1768,13 +1790,15 @@ function RoomCard({
   roomImageMode,
   burnOverlayMode,
   busy,
-  run
+  run,
+  openPreview
 }: {
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
   burnOverlayMode: AppSettings['burnOverlayMode'];
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  openPreview: (roomId: string) => void;
 }) {
   const status = getRoomStatus(room);
   const roomKey = room.id;
@@ -1794,7 +1818,7 @@ function RoomCard({
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
-      <RoomPreview room={room} roomImageMode={roomImageMode} status={status} />
+      <RoomPreview room={room} roomImageMode={roomImageMode} status={status} onPreview={openPreview} />
 
       <div className="room-content">
         <div className="room-heading">
@@ -1967,6 +1991,109 @@ function RoomCard({
         </div>
       </div>
     </article>
+  );
+}
+
+function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => void }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const [preview, setPreview] = useState<PreviewStartResult | null>(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+
+    async function start() {
+      setError('');
+      setPreview(null);
+      try {
+        const nextPreview = await recorder.startPreview(room.id);
+        if (cancelled || !video) {
+          return;
+        }
+        setPreview(nextPreview);
+        video.muted = true;
+        video.autoplay = true;
+        video.playsInline = true;
+
+        if (Hls.isSupported()) {
+          const hls = new Hls({
+            lowLatencyMode: true,
+            backBufferLength: 30,
+            liveSyncDurationCount: 3
+          });
+          hlsRef.current = hls;
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+            hls.loadSource(nextPreview.previewUrl);
+          });
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            video.play().catch(() => {});
+          });
+          hls.on(Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) {
+              setError(`实时预览播放失败：${data.details || data.type}`);
+            }
+          });
+          return;
+        }
+
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = nextPreview.previewUrl;
+          video.play().catch(() => {});
+          return;
+        }
+
+        setError('当前浏览器不支持 HLS 实时预览。');
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    start();
+    return () => {
+      cancelled = true;
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    };
+  }, [room.id]);
+
+  return (
+    <div className="preview-backdrop">
+      <div className="preview-panel">
+        <div className="preview-header">
+          <div>
+            <h3>{room.title || `直播间 ${room.realRoomId || room.id}`}</h3>
+            <p>{room.anchor || `房间 ${room.realRoomId || room.id}`}</p>
+          </div>
+          <button className="icon-button" title="关闭实时预览" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="live-preview">
+          <video ref={videoRef} controls muted playsInline />
+          {!preview && !error ? (
+            <div className="live-preview-status">
+              <Activity className="spin" size={24} />
+              <span>正在连接实时画面</span>
+            </div>
+          ) : null}
+          {error ? (
+            <div className="live-preview-status error">
+              <CircleAlert size={24} />
+              <span>{error}</span>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
   );
 }
 
