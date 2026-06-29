@@ -144,6 +144,12 @@ export type ExportResult = {
   eventCount?: number;
 };
 
+export type PreviewStartResult = {
+  previewUrl: string;
+  expiresAt: number;
+  stream: Omit<StreamChoice, 'url'> & { url: string };
+};
+
 export type ExportClipRequest = {
   mode: 'clean' | 'burn';
   cleanPath: string;
@@ -195,6 +201,7 @@ export type RecorderApi = {
   setMonitoring: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
+  startPreview: (roomId: string) => Promise<PreviewStartResult>;
   burnDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode']; prepareOnly?: boolean }) => Promise<AppState>;
   prepareDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode'] }) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;

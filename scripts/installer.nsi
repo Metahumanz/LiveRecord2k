@@ -1,5 +1,5 @@
 Unicode true
-RequestExecutionLevel user
+RequestExecutionLevel admin
 
 !ifndef APP_VERSION
   !define APP_VERSION "0.0.0"
@@ -42,6 +42,16 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey "OriginalFilename" "bili-record-2k-setup.exe"
 
 !include "MUI2.nsh"
+!include "FileFunc.nsh"
+
+!insertmacro GetParameters
+!insertmacro GetOptions
+
+Var UpdateStatusPath
+Var UpdateLogPath
+Var UpdatePackagePath
+Var UpdateStatusValue
+Var UpdateMessage
 
 !define MUI_ABORTWARNING
 !define MUI_ICON "${ICON_PATH}"
@@ -56,6 +66,49 @@ VIAddVersionKey "OriginalFilename" "bili-record-2k-setup.exe"
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
+
+Function .onInit
+  Call ParseUpdateArgs
+  StrCpy $UpdateStatusValue "applying"
+  StrCpy $UpdateMessage "Installer started."
+  Call WriteUpdateStatus
+  Call AppendUpdateLog
+FunctionEnd
+
+Function ParseUpdateArgs
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/STATUS=" $UpdateStatusPath
+  ClearErrors
+  ${GetOptions} $R0 "/LOG=" $UpdateLogPath
+  ClearErrors
+  ${GetOptions} $R0 "/PACKAGE=" $UpdatePackagePath
+FunctionEnd
+
+Function WriteUpdateStatus
+  StrCmp "$UpdateStatusPath" "" done
+  FileOpen $0 "$UpdateStatusPath" w
+  IfErrors done
+  FileWrite $0 "{$\r$\n"
+  FileWrite $0 "  $\"status$\": $\"$UpdateStatusValue$\",$\r$\n"
+  FileWrite $0 "  $\"version$\": $\"${APP_VERSION}$\",$\r$\n"
+  FileWrite $0 "  $\"packagePath$\": $\"$UpdatePackagePath$\",$\r$\n"
+  FileWrite $0 "  $\"logPath$\": $\"$UpdateLogPath$\",$\r$\n"
+  FileWrite $0 "  $\"message$\": $\"$UpdateMessage$\",$\r$\n"
+  FileWrite $0 "  $\"updatedAt$\": 0$\r$\n"
+  FileWrite $0 "}$\r$\n"
+  FileClose $0
+done:
+FunctionEnd
+
+Function AppendUpdateLog
+  StrCmp "$UpdateLogPath" "" done
+  FileOpen $0 "$UpdateLogPath" a
+  IfErrors done
+  FileWrite $0 "${APP_NAME} ${APP_VERSION}: $UpdateMessage$\r$\n"
+  FileClose $0
+done:
+FunctionEnd
 
 Function StopRunningApp
   DetailPrint "Stopping running ${APP_NAME} processes..."
@@ -76,6 +129,11 @@ Section "Install"
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\BiliRecord2K.exe" "--prod" "$INSTDIR\assets\app-icon.ico"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}\Uninstall ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe"
+
+  StrCpy $UpdateStatusValue "success"
+  StrCpy $UpdateMessage "Install completed."
+  Call WriteUpdateStatus
+  Call AppendUpdateLog
 
   IfSilent 0 +2
   ExecShell "open" "$INSTDIR\BiliRecord2K.exe" "--prod"

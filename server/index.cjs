@@ -57,6 +57,8 @@ const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
+const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
+const MAX_PREVIEW_PLAYLIST_BYTES = 2 * 1024 * 1024;
 
 class LiveRecordService {
   constructor() {
@@ -67,7 +69,10 @@ class LiveRecordService {
     this.logs = [];
     this.monitorTimers = new Map();
     this.recordingSessions = new Map();
+    this.recordingStartLocks = new Set();
+    this.reconnectPendingRooms = new Set();
     this.burnSessions = new Map();
+    this.previewSessions = new Map();
     this.recordings = [];
     this.clients = new Set();
     this.notifications = [];
@@ -272,9 +277,10 @@ class LiveRecordService {
     const session = this.recordingSessions.get(room.id);
     const activeRecording = session && !session.finished ? this.getCurrentRecordingStateFromSession(session) : null;
     const currentRecording = activeRecording || room.currentRecording;
+    const recordingIntent = this.hasRecordingIntent(room);
     return {
       ...room,
-      recording: Boolean(room.recording || activeRecording),
+      recording: Boolean(room.recording || activeRecording || recordingIntent),
       burning: this.isRoomBurning(room),
       currentRecording: currentRecording ? cloneRecordingState(currentRecording) : undefined,
       stream: room.stream ? { ...room.stream, url: '[hidden]' } : undefined
@@ -320,7 +326,15 @@ class LiveRecordService {
   }
 
   isRoomRecording(room) {
-    return Boolean(room?.recording || (room?.id && this.recordingSessions.has(room.id)));
+    return Boolean(room?.recording || (room?.id && (this.recordingSessions.has(room.id) || this.hasRecordingIntent(room))));
+  }
+
+  hasActiveRecordingSession(room) {
+    return Boolean(room?.recording || (room?.id && (this.recordingSessions.has(room.id) || this.recordingStartLocks.has(room.id))));
+  }
+
+  hasRecordingIntent(room) {
+    return Boolean(room?.id && (this.recordingStartLocks.has(room.id) || this.reconnectPendingRooms.has(room.id)));
   }
 
   isRoomBurning(room) {
@@ -846,6 +860,93 @@ class LiveRecordService {
     response.end(body);
   }
 
+  async startPreview(roomId) {
+    const room = this.getRoom(roomId);
+    if (!room.realRoomId || room.liveStatus !== 1) {
+      Object.assign(room, await this.fetchRoomInfo(room.id));
+    }
+    if (room.liveStatus !== 1) {
+      throw new Error(`${roomLabel(room)} 当前未开播，无法打开实时预览。`);
+    }
+    const stream = await this.resolvePlayStream(room);
+    const token = crypto.randomBytes(18).toString('base64url');
+    const expiresAt = Date.now() + PREVIEW_SESSION_TTL_MS;
+    this.previewSessions.set(token, {
+      roomId: room.id,
+      streamUrl: stream.url,
+      expiresAt
+    });
+    this.prunePreviewSessions();
+    this.log('info', `${roomLabel(room)} 已打开实时预览。`);
+    return {
+      previewUrl: createPreviewProxyPath(token, stream.url),
+      expiresAt,
+      stream: { ...stream, url: '[hidden]' }
+    };
+  }
+
+  async servePreview(parsed, request, response) {
+    const match = /^\/api\/preview\/([^/]+)\/([^/?#]+)/.exec(parsed.pathname);
+    if (!match) {
+      writeJson(response, 404, { error: '预览地址无效' });
+      return;
+    }
+    const [, token, encodedUrl] = match;
+    const session = this.previewSessions.get(token);
+    if (!session || session.expiresAt < Date.now()) {
+      this.previewSessions.delete(token);
+      writeJson(response, 404, { error: '实时预览已过期，请重新打开。' });
+      return;
+    }
+
+    let target;
+    try {
+      target = new URL(decodePreviewUrl(encodedUrl));
+    } catch {
+      writeJson(response, 400, { error: '预览资源地址无效' });
+      return;
+    }
+    if (!['http:', 'https:'].includes(target.protocol)) {
+      writeJson(response, 400, { error: '预览资源协议无效' });
+      return;
+    }
+
+    session.expiresAt = Date.now() + PREVIEW_SESSION_TTL_MS;
+    try {
+      const body = await requestUrlBuffer(target.toString(), {
+        headers: createPreviewProxyHeaders(target, this.settings.cookie, request.headers.range),
+        retries: 2,
+        timeoutMs: 20000
+      });
+      if (isPreviewPlaylist(target, body)) {
+        if (body.length > MAX_PREVIEW_PLAYLIST_BYTES) {
+          writeJson(response, 502, { error: '远端预览清单过大' });
+          return;
+        }
+        const playlist = rewriteHlsManifest(body.toString('utf8'), target, token);
+        writeText(response, 200, playlist, 'application/vnd.apple.mpegurl; charset=utf-8');
+        return;
+      }
+      response.writeHead(200, {
+        'Content-Type': previewMimeType(target.pathname),
+        'Content-Length': String(body.length),
+        'Cache-Control': 'no-store'
+      });
+      response.end(body);
+    } catch (error) {
+      writeJson(response, 502, { error: `实时预览获取失败：${error.message}` });
+    }
+  }
+
+  prunePreviewSessions() {
+    const now = Date.now();
+    for (const [token, session] of this.previewSessions) {
+      if (session.expiresAt < now) {
+        this.previewSessions.delete(token);
+      }
+    }
+  }
+
   async serveMedia(rawPath, request, response) {
     const filePath = path.resolve(String(rawPath || ''));
     if (!this.isKnownMediaPath(filePath)) {
@@ -1061,9 +1162,11 @@ class LiveRecordService {
 
   async startRecording(roomId, autoStart = false, options = {}) {
     const room = this.getRoom(roomId);
-    if (this.isRoomRecording(room)) {
+    if (this.hasActiveRecordingSession(room) || (this.reconnectPendingRooms.has(room.id) && !options.streamReconnect)) {
       return this.getState();
     }
+    this.recordingStartLocks.add(room.id);
+    this.emitState();
 
     try {
       if (!room.realRoomId || room.liveStatus !== 1) {
@@ -1183,6 +1286,7 @@ class LiveRecordService {
         videoInfo: null
       };
       this.recordingSessions.set(room.id, session);
+      this.reconnectPendingRooms.delete(room.id);
       this.armRecordingRotation(room, session);
       this.armNoMediaWatch(room, session);
       const startReason = options.streamReconnect
@@ -1268,7 +1372,14 @@ class LiveRecordService {
     } catch (error) {
       room.lastError = error.message;
       room.recording = false;
+      this.reconnectPendingRooms.delete(room.id);
       this.log('error', `${roomLabel(room)} 开始录制失败：${error.message}`);
+      this.emitState();
+    } finally {
+      this.recordingStartLocks.delete(room.id);
+      if (!this.recordingSessions.has(room.id)) {
+        this.reconnectPendingRooms.delete(room.id);
+      }
       this.emitState();
     }
     return this.getState();
@@ -1552,11 +1663,14 @@ class LiveRecordService {
         }${session.validReason ? `原因：${session.validReason}` : ''}`
       );
     }
+    const unexpectedStreamEnd = wasActiveSession && !session.stopping && !shouldContinueSegment;
+    const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
+    if (shouldReconnectLiveStream) {
+      this.reconnectPendingRooms.add(roomId);
+    }
     if (this.recordingSessions.get(roomId) === session) {
       this.recordingSessions.delete(roomId);
     }
-    const unexpectedStreamEnd = wasActiveSession && !session.stopping && !shouldContinueSegment;
-    const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
     const elapsedText = formatDurationSeconds(elapsedSec);
 
     if (shouldContinueSegment) {
@@ -1601,7 +1715,19 @@ class LiveRecordService {
     } else if (shouldReconnectLiveStream) {
       setTimeout(() => {
         const currentRoom = this.rooms.get(roomId);
-        if (!currentRoom || currentRoom.recording || !currentRoom.monitoring) {
+        if (!currentRoom || !currentRoom.monitoring) {
+          this.reconnectPendingRooms.delete(roomId);
+          if (currentRoom) {
+            this.finalizeReconnectGroup(currentRoom, session.mergeGroup, valid ? finishedRecording : null).catch((mergeError) => {
+              this.log('error', `${roomLabel(currentRoom)} 续录片段合并失败：${mergeError.message}`);
+            });
+          }
+          this.emitState();
+          return;
+        }
+        if (this.hasActiveRecordingSession(currentRoom)) {
+          this.reconnectPendingRooms.delete(roomId);
+          this.emitState();
           return;
         }
         this.startRecording(roomId, true, {
@@ -1612,15 +1738,20 @@ class LiveRecordService {
           mergeOutputPath: session.mergeOutputPath
         })
           .then(async () => {
+            this.reconnectPendingRooms.delete(roomId);
             if (!currentRoom.recording) {
               await this.finalizeReconnectGroup(currentRoom, session.mergeGroup, valid ? finishedRecording : null);
             }
           })
           .catch((error) => {
+            this.reconnectPendingRooms.delete(roomId);
             this.log('error', `${roomLabel(currentRoom)} 直播流续录失败：${error.message}`);
             this.finalizeReconnectGroup(currentRoom, session.mergeGroup, valid ? finishedRecording : null).catch((mergeError) => {
               this.log('error', `${roomLabel(currentRoom)} 续录片段合并失败：${mergeError.message}`);
             });
+          })
+          .finally(() => {
+            this.emitState();
           });
       }, 1200);
     } else {
@@ -2396,7 +2527,22 @@ class LiveRecordService {
     if (!isInstallerUpdatePackage(manifest, packagePath)) {
       return false;
     }
-    const args = normalizeInstallerArgs(manifest);
+    const args = buildInstallerArgs(manifest, {
+      packagePath,
+      statusPath: this.getUpdateStatusPath(),
+      logPath: this.getUpdateLogPath()
+    });
+    if (process.platform === 'win32') {
+      const script = createElevatedInstallerLaunchScript(packagePath, args);
+      const encoded = Buffer.from(script, 'utf16le').toString('base64');
+      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true
+      });
+      child.unref();
+      return true;
+    }
     const child = spawn(packagePath, args, {
       detached: true,
       stdio: 'ignore',
@@ -2543,6 +2689,7 @@ class LiveRecordService {
           return;
         }
         this.log('success', version ? `已更新到 ${version}。` : '更新已完成。');
+        await this.cleanupUpdateDownloads(status.packagePath);
         await fsp.rm(statusPath, { force: true });
       }
     } catch (error) {
@@ -2562,6 +2709,50 @@ class LiveRecordService {
 
   getUpdateDir() {
     return path.join(path.dirname(this.storePath), 'updates');
+  }
+
+  async cleanupUpdateDownloads(packagePath, attempt = 1) {
+    const updateDir = this.getUpdateDir();
+    const targets = new Set();
+    const normalizedPackagePath = String(packagePath || '').trim();
+    if (normalizedPackagePath && isPathInsideDirectory(normalizedPackagePath, updateDir)) {
+      targets.add(path.resolve(normalizedPackagePath));
+    }
+    const entries = await fsp.readdir(updateDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        continue;
+      }
+      const name = entry.name.toLowerCase();
+      if (
+        name.endsWith('.tmp') ||
+        (/^bili-record-2k-/.test(name) && /\.(?:exe|zip)$/i.test(name))
+      ) {
+        targets.add(path.join(updateDir, entry.name));
+      }
+    }
+    const failed = [];
+    for (const target of targets) {
+      try {
+        await fsp.rm(target, { force: true });
+      } catch (error) {
+        failed.push(target);
+        if (attempt === 1) {
+          this.log('warn', `更新安装包暂时无法删除，稍后重试：${target}（${error.message}）`);
+        }
+      }
+    }
+    if (failed.length > 0 && attempt < 4) {
+      setTimeout(() => {
+        this.cleanupUpdateDownloads(packagePath, attempt + 1).catch((error) => {
+          this.log('warn', `清理更新安装包失败：${error.message}`);
+        });
+      }, attempt * 2500).unref?.();
+      return;
+    }
+    if (targets.size > 0 && failed.length === 0) {
+      this.log('info', '已清理更新安装包。');
+    }
   }
 
   scheduleQueuedUpdateCheck(delayMs = 1500) {
@@ -2590,6 +2781,8 @@ class LiveRecordService {
   hasActiveJobs() {
     return (
       this.recordingSessions.size > 0 ||
+      this.recordingStartLocks.size > 0 ||
+      this.reconnectPendingRooms.size > 0 ||
       this.burnSessions.size > 0 ||
       Array.from(this.rooms.values()).some((room) => room.recording || room.burning)
     );
@@ -2852,6 +3045,11 @@ async function handleApi(service, parsed, port, request, response) {
     return;
   }
 
+  if (request.method === 'GET' && pathname.startsWith('/api/preview/')) {
+    await service.servePreview(parsed, request, response);
+    return;
+  }
+
   if (request.method === 'GET' && pathname === '/api/tray/state') {
     const afterSeq = Number(parsed.searchParams.get('after') || 0);
     writeText(response, 200, service.getTrayStateText(afterSeq));
@@ -2886,6 +3084,7 @@ async function handleApi(service, parsed, port, request, response) {
     '/api/rooms/monitor': () => service.setMonitoring(body.roomId, body.enabled),
     '/api/rooms/record/start': () => service.startRecording(body.roomId, false),
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
+    '/api/rooms/preview/start': () => service.startPreview(body.roomId),
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
     '/api/rooms/subtitles': () => service.prepareDanmakuForRoom(body.roomId, body.options || {}),
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
@@ -3044,9 +3243,9 @@ function writeJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
-function writeText(response, statusCode, text) {
+function writeText(response, statusCode, text, contentType = 'text/plain; charset=utf-8') {
   response.writeHead(statusCode, {
-    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Type': contentType,
     'Cache-Control': 'no-store'
   });
   response.end(text);
@@ -3841,11 +4040,104 @@ function createImageProxyHeaders(target, cookie) {
   return headers;
 }
 
+function createPreviewProxyHeaders(target, cookie, rangeHeader) {
+  const headers = {
+    Accept: '*/*',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+    'User-Agent': USER_AGENT
+  };
+  if (isBilibiliHost(target.hostname)) {
+    headers.Referer = 'https://live.bilibili.com/';
+    const safeCookie = sanitizeHeaderValue(cookie);
+    if (safeCookie) {
+      headers.Cookie = safeCookie;
+    }
+  }
+  const range = sanitizeHeaderValue(rangeHeader);
+  if (range) {
+    headers.Range = range;
+  }
+  return headers;
+}
+
+function createPreviewProxyPath(token, targetUrl) {
+  return `/api/preview/${encodeURIComponent(token)}/${encodePreviewUrl(targetUrl)}`;
+}
+
+function encodePreviewUrl(value) {
+  return Buffer.from(String(value || ''), 'utf8').toString('base64url');
+}
+
+function decodePreviewUrl(value) {
+  return Buffer.from(String(value || ''), 'base64url').toString('utf8');
+}
+
+function isPreviewPlaylist(target, body) {
+  const pathname = target.pathname.toLowerCase();
+  if (pathname.endsWith('.m3u8')) {
+    return true;
+  }
+  const prefix = body.subarray(0, 16).toString('utf8');
+  return prefix.startsWith('#EXTM3U');
+}
+
+function rewriteHlsManifest(text, baseUrl, token) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => rewriteHlsManifestLine(line, baseUrl, token))
+    .join('\n');
+}
+
+function rewriteHlsManifestLine(line, baseUrl, token) {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) {
+    return line;
+  }
+  if (trimmed.startsWith('#')) {
+    return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+      const resolved = resolveHlsResourceUrl(uri, baseUrl);
+      return resolved ? `URI="${createPreviewProxyPath(token, resolved)}"` : match;
+    });
+  }
+  const resolved = resolveHlsResourceUrl(trimmed, baseUrl);
+  return resolved ? createPreviewProxyPath(token, resolved) : line;
+}
+
+function resolveHlsResourceUrl(value, baseUrl) {
+  const text = String(value || '').trim();
+  if (!text || /^(?:data|blob):/i.test(text)) {
+    return '';
+  }
+  try {
+    return new URL(text, baseUrl).toString();
+  } catch {
+    return '';
+  }
+}
+
+function previewMimeType(pathname) {
+  const ext = path.extname(String(pathname || '')).toLowerCase();
+  return (
+    {
+      '.m3u8': 'application/vnd.apple.mpegurl',
+      '.m4s': 'video/iso.segment',
+      '.mp4': 'video/mp4',
+      '.ts': 'video/mp2t',
+      '.aac': 'audio/aac',
+      '.mp3': 'audio/mpeg',
+      '.webvtt': 'text/vtt'
+    }[ext] || 'application/octet-stream'
+  );
+}
+
 function isBilibiliHost(hostname) {
   const host = String(hostname || '').toLowerCase();
   return (
     host === 'bilibili.com' ||
     host.endsWith('.bilibili.com') ||
+    host === 'bilivideo.com' ||
+    host.endsWith('.bilivideo.com') ||
     host === 'hdslb.com' ||
     host.endsWith('.hdslb.com') ||
     host === 'biliimg.com' ||
@@ -3983,6 +4275,11 @@ function deriveClipPath(cleanPath, outputDir, mode, startTime, endTime) {
 function replaceExtension(filePath, extension) {
   const parsed = path.parse(filePath);
   return path.join(parsed.dir, `${parsed.name}${extension}`);
+}
+
+function isPathInsideDirectory(filePath, directory) {
+  const relative = path.relative(path.resolve(directory), path.resolve(filePath));
+  return Boolean(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 function createClipSuffix(startTime, endTime, mode) {
@@ -4828,6 +5125,35 @@ function normalizeInstallerArgs(manifest) {
     return splitCommandLineArgs(manifest.installerArgs);
   }
   return ['/S'];
+}
+
+function buildInstallerArgs(manifest, paths) {
+  const args = normalizeInstallerArgs(manifest);
+  if (!args.some((arg) => String(arg).toUpperCase() === '/S')) {
+    args.unshift('/S');
+  }
+  args.push(`/STATUS=${portableInstallerArgPath(paths.statusPath)}`);
+  args.push(`/LOG=${portableInstallerArgPath(paths.logPath)}`);
+  args.push(`/PACKAGE=${portableInstallerArgPath(paths.packagePath)}`);
+  return args;
+}
+
+function portableInstallerArgPath(filePath) {
+  return path.resolve(String(filePath || '')).replace(/\\/g, '/');
+}
+
+function createElevatedInstallerLaunchScript(packagePath, args) {
+  const encodedArgs = args.map((arg) => base64Utf8(arg));
+  return `
+$ErrorActionPreference = 'Stop'
+function DecodeText([string]$value) {
+  [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value))
+}
+$installer = DecodeText '${base64Utf8(packagePath)}'
+$arguments = @(${encodedArgs.map((arg) => `(DecodeText '${arg}')`).join(', ')})
+$argumentLine = ($arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+Start-Process -FilePath $installer -ArgumentList $argumentLine -Verb RunAs
+`;
 }
 
 function splitCommandLineArgs(value) {

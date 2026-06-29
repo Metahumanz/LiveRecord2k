@@ -24,6 +24,7 @@ export const recorder: RecorderApi = {
   setMonitoring: (roomId, enabled) => api<AppState>('/api/rooms/monitor', { roomId, enabled }),
   startRecording: (roomId) => api<AppState>('/api/rooms/record/start', { roomId }),
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
+  startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }),
   burnDanmaku: (roomId, options) => api<AppState>('/api/rooms/burn', { roomId, options }),
   prepareDanmaku: (roomId, options) => api<AppState>('/api/rooms/subtitles', { roomId, options }),
   prepareSubtitleAssets: (request) => api('/api/export/subtitles', request),

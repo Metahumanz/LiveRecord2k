@@ -753,6 +753,31 @@ button:disabled {
   font-weight: 900;
 }
 
+.preview-open-button {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 8px;
+  color: #eaf3f0;
+  background: rgba(0, 0, 0, 0.56);
+}
+
+.preview-open-button:hover:not(:disabled) {
+  border-color: rgba(121, 222, 213, 0.7);
+  color: #10201f;
+  background: #79ded5;
+}
+
+.preview-open-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .status-pill {
   position: absolute;
   left: 10px;
@@ -1356,7 +1381,8 @@ button:disabled {
   color: #ffb0b6;
 }
 
-.qr-backdrop {
+.qr-backdrop,
+.preview-backdrop {
   position: fixed;
   inset: 0;
   z-index: 40;
@@ -1365,6 +1391,10 @@ button:disabled {
   padding: 24px;
   background: rgba(4, 8, 12, 0.72);
   backdrop-filter: blur(10px);
+}
+
+.preview-backdrop {
+  z-index: 42;
 }
 
 .qr-panel {
@@ -1376,15 +1406,67 @@ button:disabled {
   padding: 22px;
 }
 
-.qr-header {
+.preview-panel {
+  width: min(1040px, calc(100vw - 48px));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: #121920;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+  padding: 16px;
+}
+
+.qr-header,
+.preview-header {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 44px;
   gap: 14px;
   align-items: start;
 }
 
-.qr-header h3 {
+.qr-header h3,
+.preview-header h3 {
   font-size: 22px;
+}
+
+.preview-header p {
+  margin-top: 3px;
+  color: #93a49f;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.live-preview {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  margin-top: 14px;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #000;
+}
+
+.live-preview video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: #000;
+}
+
+.live-preview-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  color: #cddbd8;
+  background: rgba(0, 0, 0, 0.62);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.live-preview-status.error {
+  color: #ffb0b6;
 }
 
 .qr-box {
