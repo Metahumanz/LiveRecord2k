@@ -54,6 +54,8 @@ const DEFAULT_UPDATE_MANIFEST_URL =
 const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/Metahumanz/LiveRecord2k/releases/latest';
 const UPDATE_CHECK_TIMEOUT_MS = 12000;
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
+const MAX_JSON_BODY_BYTES = 1024 * 1024;
 
 class LiveRecordService {
   constructor() {
@@ -755,14 +757,7 @@ class LiveRecordService {
     }
 
     const assetResponse = await fetch(target.toString(), {
-      headers: {
-        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-        Referer: 'https://live.bilibili.com/',
-        'User-Agent': USER_AGENT,
-        Cookie: sanitizeHeaderValue(this.settings.cookie)
-      }
+      headers: createImageProxyHeaders(target, this.settings.cookie)
     });
     if (!assetResponse.ok) {
       writeJson(response, 502, { error: `图片获取失败：HTTP ${assetResponse.status}` });
@@ -773,7 +768,16 @@ class LiveRecordService {
       writeJson(response, 502, { error: '远端返回的不是图片' });
       return;
     }
+    const contentLength = Number(assetResponse.headers.get('content-length') || 0);
+    if (contentLength > MAX_PROXY_IMAGE_BYTES) {
+      writeJson(response, 502, { error: '远端图片过大' });
+      return;
+    }
     const body = Buffer.from(await assetResponse.arrayBuffer());
+    if (body.length > MAX_PROXY_IMAGE_BYTES) {
+      writeJson(response, 502, { error: '远端图片过大' });
+      return;
+    }
     response.writeHead(200, {
       'Content-Type': contentType,
       'Content-Length': String(body.length),
@@ -2132,6 +2136,63 @@ class LiveRecordService {
     return this.getState();
   }
 
+  async downloadUpdateOnly() {
+    if (this.updateState.queued || this.updateState.status === 'queued') {
+      return this.getState();
+    }
+    if (!this.updateState.manifest || this.updateState.status === 'idle' || this.updateState.status === 'up-to-date') {
+      await this.checkUpdate();
+    }
+    const manifest = this.updateState.manifest;
+    if (!manifest || compareVersions(manifest.version, APP_VERSION) <= 0) {
+      return this.getState();
+    }
+
+    try {
+      const usablePackagePath = await this.getUsableDownloadedPackage(manifest);
+      this.updateState = {
+        ...this.updateState,
+        status: usablePackagePath ? 'available' : 'downloading',
+        queued: false,
+        message: usablePackagePath
+          ? `更新包已下载：${usablePackagePath}`
+          : `正在手动下载 ${manifest.version} 更新包...`,
+        downloadReceivedBytes: usablePackagePath ? this.updateState.downloadReceivedBytes : 0,
+        downloadTotalBytes: usablePackagePath ? this.updateState.downloadTotalBytes : 0,
+        downloadProgress: usablePackagePath ? 100 : 0,
+        updateLogPath: this.getUpdateLogPath(),
+        statusPath: this.getUpdateStatusPath(),
+        packagePath: usablePackagePath || ''
+      };
+      this.emitState();
+
+      const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
+      this.updateState = {
+        ...this.updateState,
+        status: 'available',
+        queued: false,
+        message: `更新包已下载：${packagePath}`,
+        downloadProgress: 100,
+        packagePath
+      };
+      this.log('success', `更新包已手动下载：${packagePath}`);
+      this.emitState();
+    } catch (error) {
+      this.updateState = {
+        ...this.updateState,
+        status: 'error',
+        queued: false,
+        message: `手动下载更新失败：${error.message}`,
+        downloadProgress: null,
+        updateLogPath: this.getUpdateLogPath(),
+        statusPath: this.getUpdateStatusPath()
+      };
+      this.log('error', this.updateState.message);
+      this.emitState();
+    }
+    return this.getState();
+  }
+
   async applyUpdate() {
     if (this.hasActiveJobs()) {
       this.updateState = {
@@ -2153,21 +2214,22 @@ class LiveRecordService {
     }
 
     try {
+      const usablePackagePath = await this.getUsableDownloadedPackage(manifest);
       this.updateState = {
         ...this.updateState,
         status: 'downloading',
         queued: false,
-        message: `正在下载 ${manifest.version} 更新包...`,
-        downloadReceivedBytes: 0,
-        downloadTotalBytes: 0,
-        downloadProgress: 0,
+        message: usablePackagePath ? `正在使用已下载的 ${manifest.version} 更新包...` : `正在下载 ${manifest.version} 更新包...`,
+        downloadReceivedBytes: usablePackagePath ? this.updateState.downloadReceivedBytes : 0,
+        downloadTotalBytes: usablePackagePath ? this.updateState.downloadTotalBytes : 0,
+        downloadProgress: usablePackagePath ? 100 : 0,
         updateLogPath: this.getUpdateLogPath(),
         statusPath: this.getUpdateStatusPath(),
-        packagePath: ''
+        packagePath: usablePackagePath || ''
       };
       this.emitState();
 
-      const packagePath = await this.downloadUpdatePackage(manifest);
+      const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
       this.updateState = {
         ...this.updateState,
         status: 'ready',
@@ -2205,6 +2267,26 @@ class LiveRecordService {
       this.emitState();
     }
     return this.getState();
+  }
+
+  async getUsableDownloadedPackage(manifest) {
+    const packagePath = String(this.updateState.packagePath || '').trim();
+    if (!packagePath) {
+      return '';
+    }
+    const stat = await fsp.stat(packagePath).catch(() => null);
+    if (!stat?.isFile() || stat.size <= 0) {
+      return '';
+    }
+    if (manifest.sha256) {
+      const actual = await fileSha256(packagePath).catch(() => '');
+      if (actual.toLowerCase() !== String(manifest.sha256).toLowerCase()) {
+        await fsp.rm(packagePath, { force: true }).catch(() => {});
+        this.log('warn', `已下载更新包校验失败，重新下载：${packagePath}`);
+        return '';
+      }
+    }
+    return packagePath;
   }
 
   async fetchUpdateManifest(onStatus) {
@@ -2700,7 +2782,7 @@ async function start() {
 
   const server = http.createServer((request, response) => {
     handleRequest(service, vite, port, request, response).catch((error) => {
-      writeJson(response, 500, { error: error.message || String(error) });
+      writeJson(response, error.statusCode || 500, { error: error.message || String(error) });
     });
   });
 
@@ -2746,7 +2828,7 @@ async function createViteMiddleware() {
 async function handleRequest(service, vite, port, request, response) {
   const parsed = new URL(request.url || '/', `http://${request.headers.host || `${HOST}:${port}`}`);
   if (parsed.pathname.startsWith('/api/')) {
-    await handleApi(service, parsed, request, response);
+    await handleApi(service, parsed, port, request, response);
     return;
   }
 
@@ -2758,8 +2840,12 @@ async function handleRequest(service, vite, port, request, response) {
   await serveStatic(parsed.pathname, response);
 }
 
-async function handleApi(service, parsed, request, response) {
+async function handleApi(service, parsed, port, request, response) {
   const pathname = parsed.pathname;
+  if (!isTrustedApiRequest(request, port)) {
+    writeJson(response, 403, { error: 'Forbidden' });
+    return;
+  }
   if (request.method === 'GET' && pathname === '/api/state') {
     writeJson(response, 200, service.getState());
     return;
@@ -2819,6 +2905,7 @@ async function handleApi(service, parsed, request, response) {
     '/api/shell/open-path-dir': () => service.openPathDir(body.path),
     '/api/shell/open-config': () => service.openConfigDir(),
     '/api/update/check': () => service.checkUpdate(),
+    '/api/update/download': () => service.downloadUpdateOnly(),
     '/api/update/apply': () => service.applyUpdate(),
     '/api/update/queue': () => service.queueUpdateAfterJobs(),
     '/api/system/startup': () => service.setStartup(body.enabled),
@@ -2843,14 +2930,83 @@ async function handleApi(service, parsed, request, response) {
 
 async function readJsonBody(request) {
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of request) {
+    totalBytes += chunk.length;
+    if (totalBytes > MAX_JSON_BODY_BYTES) {
+      const error = new Error('请求体过大。');
+      error.statusCode = 413;
+      throw error;
+    }
     chunks.push(chunk);
   }
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) {
     return {};
   }
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const error = new Error('请求体不是有效 JSON。');
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+function isTrustedApiRequest(request, port) {
+  const fetchSite = String(request.headers['sec-fetch-site'] || '').toLowerCase();
+  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+    return false;
+  }
+  const host = request.headers.host || `${HOST}:${port}`;
+  const origin = request.headers.origin;
+  if (origin && !isAllowedWebOrigin(origin, host, port)) {
+    return false;
+  }
+  const referer = request.headers.referer;
+  if (!origin && referer && !isAllowedWebOrigin(referer, host, port)) {
+    return false;
+  }
+  return true;
+}
+
+function isAllowedWebOrigin(value, hostHeader, port) {
+  let target;
+  try {
+    target = new URL(value);
+  } catch {
+    return false;
+  }
+  if (!['http:', 'https:'].includes(target.protocol)) {
+    return false;
+  }
+  const originPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+  const requestHost = normalizeHostHeader(hostHeader);
+  if (requestHost.hostname && target.hostname.toLowerCase() === requestHost.hostname && originPort === requestHost.port) {
+    return true;
+  }
+  return isLoopbackHost(target.hostname) && originPort === Number(port || DEFAULT_PORT);
+}
+
+function normalizeHostHeader(hostHeader) {
+  const raw = String(hostHeader || '').trim();
+  if (!raw) {
+    return { hostname: '', port: DEFAULT_PORT };
+  }
+  try {
+    const parsed = new URL(`http://${raw}`);
+    return {
+      hostname: parsed.hostname.toLowerCase(),
+      port: Number(parsed.port || DEFAULT_PORT)
+    };
+  } catch {
+    return { hostname: '', port: DEFAULT_PORT };
+  }
+}
+
+function isLoopbackHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
 }
 
 async function serveVite(vite, pathname, request, response) {
@@ -3670,6 +3826,35 @@ function sanitizeFilename(name) {
 
 function sanitizeHeaderValue(value) {
   return String(value || '').replace(/[\r\n]/g, '').trim();
+}
+
+function createImageProxyHeaders(target, cookie) {
+  const headers = {
+    Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+    'User-Agent': USER_AGENT
+  };
+  if (isBilibiliHost(target.hostname)) {
+    headers.Referer = 'https://live.bilibili.com/';
+    const safeCookie = sanitizeHeaderValue(cookie);
+    if (safeCookie) {
+      headers.Cookie = safeCookie;
+    }
+  }
+  return headers;
+}
+
+function isBilibiliHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return (
+    host === 'bilibili.com' ||
+    host.endsWith('.bilibili.com') ||
+    host === 'hdslb.com' ||
+    host.endsWith('.hdslb.com') ||
+    host === 'biliimg.com' ||
+    host.endsWith('.biliimg.com')
+  );
 }
 
 function getCookieValue(cookie, key) {
