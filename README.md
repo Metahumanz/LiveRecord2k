@@ -2,6 +2,19 @@
 
 本地 WebUI 版哔哩哔哩直播录制工具。后端是 Node.js，前端是 Vite/React。
 
+## 项目结构
+
+```text
+src/client/   React/Vite 前端界面
+src/server/   本地 Node.js 后端、录制、更新、预览代理
+scripts/      构建、安装器和 Windows 托盘启动器脚本
+assets/       应用图标等静态资源
+dist/         Vite 前端构建产物
+release/      可运行发布包、zip 和安装器
+```
+
+这里的 `server` 不是一个单独项目，也不是另一套语言，只是 Node 后端源码。开发时 `npm run dev` 会启动 `src/server/index.cjs`，后端再托管前端页面和本地 API。
+
 ## 启动
 
 ```powershell
@@ -23,6 +36,8 @@ http://127.0.0.1:3263
 ```powershell
 npm run build
 ```
+
+构建成功后，Windows 会自动打开资源管理器并选中生成的安装器；如果不想自动打开，可以设置 `BUILD_NO_OPEN=1`。
 
 产物位置：
 

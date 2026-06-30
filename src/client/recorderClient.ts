@@ -1,4 +1,4 @@
-import type { AppSettings, AppState, RecorderApi } from './vite-env';
+import type { AppSettings, AppState, RecorderApi } from './types';
 
 const listeners = new Set<(state: AppState) => void>();
 let eventSource: EventSource | null = null;

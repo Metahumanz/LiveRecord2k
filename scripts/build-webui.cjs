@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const root = process.cwd();
 const releaseRoot = path.join(root, 'release');
@@ -55,6 +55,7 @@ async function main() {
   if (fs.existsSync(setupPath)) {
     console.log(`  setup:    ${setupPath}`);
   }
+  openReleaseInExplorer();
 }
 
 async function writeVersionFile() {
@@ -81,7 +82,7 @@ async function readPackageJson() {
 async function bundleServer() {
   await fsp.mkdir(buildDir, { recursive: true });
   runNodeScript(path.join(root, 'node_modules', 'esbuild', 'bin', 'esbuild'), [
-    path.join(root, 'server', 'index.cjs'),
+    path.join(root, 'src', 'server', 'index.cjs'),
     '--bundle',
     '--platform=node',
     '--target=node24',
@@ -295,4 +296,21 @@ function escapePowerShellPath(value) {
 
 function isTruthy(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
+function openReleaseInExplorer() {
+  if (process.env.CI || isTruthy(process.env.BUILD_NO_OPEN)) {
+    return;
+  }
+  if (process.platform !== 'win32') {
+    return;
+  }
+  const target = fs.existsSync(setupPath) ? setupPath : releaseDir;
+  const args = fs.existsSync(setupPath) ? [`/select,${setupPath}`] : [releaseDir];
+  try {
+    spawn('explorer.exe', args, { detached: true, stdio: 'ignore' }).unref();
+    console.log(`  opened:   ${target}`);
+  } catch (error) {
+    console.log(`  open skipped: ${error.message}`);
+  }
 }

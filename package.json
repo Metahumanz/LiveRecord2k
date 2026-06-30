@@ -5,7 +5,7 @@
   "description": "本地 WebUI 哔哩哔哩直播录制工具，输出无弹幕源文件和有弹幕烧录版。",
   "type": "module",
   "scripts": {
-    "dev": "node server/index.cjs --dev",
+    "dev": "node src/server/index.cjs --dev",
     "build": "node scripts/build-webui.cjs"
   },
   "dependencies": {
