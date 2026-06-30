@@ -137,6 +137,7 @@ async function buildLauncherExe() {
     launcherExePath,
     '-lshell32',
     '-luser32',
+    '-ladvapi32',
     '-lwininet',
     '-lgdi32'
   ];
