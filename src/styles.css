@@ -584,6 +584,87 @@ button:disabled {
   font-weight: 900;
 }
 
+.job-progress {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.job-progress-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #dbe7e4;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.job-progress-heading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-progress-heading strong {
+  flex: 0 0 auto;
+  color: #79ded5;
+  font-size: 12px;
+}
+
+.job-progress-track {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.job-progress-track span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #79ded5, #d8c36e);
+  transition: width 180ms ease;
+}
+
+.job-progress-track.indeterminate span {
+  width: 38%;
+  animation: progress-slide 1.15s ease-in-out infinite;
+}
+
+.job-progress.completed .job-progress-heading strong {
+  color: #8ee3ad;
+}
+
+.job-progress.completed .job-progress-track span {
+  background: #8ee3ad;
+}
+
+.job-progress.error .job-progress-heading strong,
+.job-progress.error small {
+  color: #ffb0b6;
+}
+
+.job-progress.error .job-progress-track span {
+  width: 100%;
+  background: #f05c65;
+}
+
+.job-progress small {
+  min-width: 0;
+  overflow: hidden;
+  color: #9fb0ac;
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .update-diagnostic {
   display: block;
   max-width: min(640px, 58vw);
@@ -956,19 +1037,69 @@ button:disabled {
 .settings-page-grid {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "backup account"
+    "recording recording"
+    "notifications update"
+    "runtime runtime";
   align-content: start;
+  align-items: stretch;
   gap: 16px;
   overflow: auto;
   padding-right: 4px;
 }
 
 .settings-panel {
-  align-self: start;
+  min-width: 0;
+  height: 100%;
 }
 
-.settings-panel:nth-child(3) {
-  grid-row: span 2;
+.settings-panel-backup {
+  grid-area: backup;
+}
+
+.settings-panel-account {
+  grid-area: account;
+}
+
+.settings-panel-recording {
+  grid-area: recording;
+}
+
+.settings-panel-notifications {
+  grid-area: notifications;
+}
+
+.settings-panel-update {
+  grid-area: update;
+}
+
+.settings-panel-runtime {
+  grid-area: runtime;
+}
+
+.settings-panel .settings-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+}
+
+.settings-panel-recording .inline-toggles {
+  grid-column: span 2;
+  align-self: stretch;
+  margin-top: 14px;
+}
+
+.settings-panel-update .path-line,
+.settings-panel-runtime .path-line {
+  grid-template-columns: 78px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-panel-update .path-line p,
+.settings-panel-runtime .path-line p {
+  min-width: 0;
 }
 
 .export-layout {
@@ -1152,17 +1283,16 @@ button:disabled {
 
 .cut-marker {
   position: absolute;
-  top: 5px;
-  bottom: 5px;
-  width: 22px;
-  margin-left: -11px;
+  top: 0;
+  bottom: 0;
+  width: 18px;
+  margin-left: -9px;
   border: 0;
-  border-radius: 7px;
-  color: #10201f;
-  font-size: 11px;
-  font-weight: 900;
+  border-radius: 0;
+  color: #79ded5;
+  background: transparent;
   cursor: grab;
-  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.28);
+  box-shadow: none;
   touch-action: none;
 }
 
@@ -1170,29 +1300,67 @@ button:disabled {
   cursor: grabbing;
 }
 
+.cut-marker::before,
 .cut-marker::after {
   content: "";
   position: absolute;
+  pointer-events: none;
+}
+
+.cut-marker::before {
   left: 50%;
-  top: 100%;
   width: 2px;
-  height: 8px;
+  top: 9px;
+  bottom: 9px;
   transform: translateX(-50%);
   border-radius: 999px;
   background: currentColor;
 }
 
+.cut-marker::after {
+  left: 50%;
+  top: 3px;
+  width: 0;
+  height: 0;
+  transform: translateX(-50%);
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 9px solid currentColor;
+  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.36));
+}
+
 .cut-marker.start {
-  background: #79ded5;
+  color: #79ded5;
 }
 
 .cut-marker.playhead {
   z-index: 2;
-  background: #edf4f1;
+  color: #edf4f1;
+}
+
+.cut-marker.playhead::before {
+  width: 3px;
+  top: 4px;
+  bottom: 4px;
+  box-shadow: 0 0 0 1px rgba(16, 32, 31, 0.55);
+}
+
+.cut-marker.playhead::after {
+  top: 1px;
+  border-left-width: 6px;
+  border-right-width: 6px;
+  border-top-width: 8px;
 }
 
 .cut-marker.end {
-  background: #d8c36e;
+  color: #d8c36e;
+}
+
+.cut-marker.end::after {
+  top: auto;
+  bottom: 3px;
+  border-top: 0;
+  border-bottom: 9px solid currentColor;
 }
 
 .cut-marker:disabled {
@@ -1435,6 +1603,47 @@ button:disabled {
   font-weight: 800;
 }
 
+.preview-mode-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 14px;
+  padding: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.preview-mode-tabs button {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #aebfba;
+  font-size: 13px;
+  font-weight: 900;
+  padding: 0 12px;
+}
+
+.preview-mode-tabs button:hover:not(:disabled) {
+  color: #eef8f6;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.preview-mode-tabs button.active {
+  color: #0f1d1b;
+  background: #79ded5;
+}
+
+.preview-mode-tabs button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .live-preview {
   position: relative;
   width: 100%;
@@ -1547,7 +1756,22 @@ button:disabled {
   }
 
   .settings-page-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "backup"
+      "account"
+      "recording"
+      "notifications"
+      "update"
+      "runtime";
+  }
+
+  .settings-panel .settings-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-panel-recording .inline-toggles {
+    grid-column: auto;
   }
 
   .export-layout,
@@ -1632,6 +1856,16 @@ button:disabled {
   .overview-grid,
   .room-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-panel .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-panel-update .path-line,
+  .settings-panel-runtime .path-line {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
   }
 
   .compact-field {

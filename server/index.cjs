@@ -59,6 +59,17 @@ const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PREVIEW_PLAYLIST_BYTES = 2 * 1024 * 1024;
+const BURN_CODEC_CANDIDATES = [
+  { value: 'libx265', label: 'H.265 软件编码', kind: 'software' },
+  { value: 'libx264', label: 'H.264 软件编码', kind: 'software' },
+  { value: 'hevc_nvenc', label: 'NVIDIA H.265 硬件编码', kind: 'hardware', vendor: 'nvidia' },
+  { value: 'h264_nvenc', label: 'NVIDIA H.264 硬件编码', kind: 'hardware', vendor: 'nvidia' },
+  { value: 'hevc_qsv', label: 'Intel H.265 硬件编码', kind: 'hardware', vendor: 'intel' },
+  { value: 'h264_qsv', label: 'Intel H.264 硬件编码', kind: 'hardware', vendor: 'intel' },
+  { value: 'hevc_amf', label: 'AMD H.265 硬件编码', kind: 'hardware', vendor: 'amd' },
+  { value: 'h264_amf', label: 'AMD H.264 硬件编码', kind: 'hardware', vendor: 'amd' }
+];
+const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 
 class LiveRecordService {
   constructor() {
@@ -73,6 +84,8 @@ class LiveRecordService {
     this.reconnectPendingRooms = new Set();
     this.burnSessions = new Map();
     this.previewSessions = new Map();
+    this.exportProgress = null;
+    this.exportProgressClearTimer = null;
     this.recordings = [];
     this.clients = new Set();
     this.notifications = [];
@@ -96,6 +109,7 @@ class LiveRecordService {
     };
     this.queuedUpdateTimer = null;
     this.ffmpegPath = findFfmpegPath();
+    this.ffmpegCapabilities = detectFfmpegCapabilities(this.ffmpegPath);
   }
 
   createDefaultSettings() {
@@ -135,6 +149,7 @@ class LiveRecordService {
       }
     }
     this.log('success', `WebUI 后端已启动，ffmpeg: ${this.ffmpegPath}`);
+    this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
   }
 
   async loadStore() {
@@ -171,11 +186,16 @@ class LiveRecordService {
   }
 
   normalizeSettings(settings) {
+    let burnCodec = normalizeBurnCodec(settings.burnCodec);
+    const availableBurnCodecs = this.getAvailableBurnCodecs();
+    if (availableBurnCodecs.length && !availableBurnCodecs.includes(burnCodec)) {
+      burnCodec = availableBurnCodecs[0];
+    }
     return {
       ...this.createDefaultSettings(),
       ...settings,
       outputContainer: normalizeContainer(settings.outputContainer),
-      burnCodec: normalizeBurnCodec(settings.burnCodec),
+      burnCodec,
       pollIntervalSec: clamp(Number(settings.pollIntervalSec || 15), 5, 300),
       segmentMinutes: clamp(Number(settings.segmentMinutes || 60), 0.05, 1440),
       targetQn: normalizeTargetQn(settings.targetQn),
@@ -194,6 +214,11 @@ class LiveRecordService {
       updateManifestUrl: String(settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL).trim(),
       serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535)
     };
+  }
+
+  getAvailableBurnCodecs() {
+    const codecs = (this.ffmpegCapabilities?.burnCodecs || []).map((codec) => codec.value).filter(Boolean);
+    return codecs.length ? codecs : ['libx265', 'libx264'];
   }
 
   normalizeRoom(room) {
@@ -265,6 +290,8 @@ class LiveRecordService {
       version: APP_VERSION,
       update: this.getPublicUpdateState(),
       ffmpegPath: this.ffmpegPath,
+      ffmpegCapabilities: this.ffmpegCapabilities,
+      exportProgress: this.exportProgress ? { ...this.exportProgress } : null,
       startupEnabled: isStartupEnabled(),
       currentPort: this.currentPort || DEFAULT_PORT,
       storePath: this.storePath,
@@ -283,6 +310,7 @@ class LiveRecordService {
       recording: Boolean(room.recording || activeRecording || recordingIntent),
       burning: this.isRoomBurning(room),
       currentRecording: currentRecording ? cloneRecordingState(currentRecording) : undefined,
+      burnProgress: room.burnProgress ? { ...room.burnProgress } : undefined,
       stream: room.stream ? { ...room.stream, url: '[hidden]' } : undefined
     };
   }
@@ -2071,7 +2099,15 @@ class LiveRecordService {
         windowsHide: true,
         stdio: ['ignore', 'ignore', 'pipe']
       });
+      const progress = createFfmpegJobProgress({
+        kind: 'burn',
+        label: `生成弹幕版：${path.basename(burnedPath)}`,
+        outputPath: burnedPath,
+        durationSec: recording.durationSec,
+        roomId: room.id
+      });
       room.burning = true;
+      room.burnProgress = progress;
       this.burnSessions.set(room.id, ffmpeg);
       this.log('info', `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(overlayMode)}）`);
       if (this.settings.notifyBurnStarted) {
@@ -2080,35 +2116,51 @@ class LiveRecordService {
 
       ffmpeg.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8');
+        if (updateFfmpegJobProgress(room.burnProgress, text)) {
+          this.emitState();
+        }
         if (/error|failed|invalid/i.test(text)) {
           this.log('warn', `${roomLabel(room)} 烧录：${compactLogLine(text)}`);
         }
       });
       ffmpeg.on('error', (error) => {
+        finishFfmpegJobProgress(room.burnProgress, 'error', `启动失败：${error.message}`);
         this.log('error', `${roomLabel(room)} 烧录进程启动失败：${error.message}`);
+        this.emitState();
       });
       ffmpeg.on('close', (code, signal) => {
+        const progressId = room.burnProgress?.id;
         if (this.burnSessions.get(room.id) === ffmpeg) {
           room.burning = false;
           this.burnSessions.delete(room.id);
         }
         if (code === 0) {
+          finishFfmpegJobProgress(room.burnProgress, 'completed', '弹幕版已生成');
           this.log('success', `${roomLabel(room)} 有弹幕版已生成：${path.basename(burnedPath)}`);
           if (this.settings.notifyBurnEnded) {
             this.notify('弹幕版已生成', `${roomLabel(room)} ${path.basename(burnedPath)}`);
           }
         } else {
+          finishFfmpegJobProgress(room.burnProgress, 'error', `烧录失败：退出码 ${code}`);
           this.log('error', `${roomLabel(room)} 烧录失败：退出码 ${code}，信号 ${signal || '-'}`);
           if (this.settings.notifyBurnEnded) {
             this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${code}`);
           }
         }
         this.emitState();
+        setTimeout(() => {
+          if (room.burnProgress?.id === progressId) {
+            delete room.burnProgress;
+            this.emitState();
+          }
+        }, 5000).unref?.();
         this.scheduleQueuedUpdateCheck();
       });
     } catch (error) {
       room.burning = false;
+      finishFfmpegJobProgress(room.burnProgress, 'error', `生成失败：${error.message}`);
       this.log('error', `${roomLabel(room)} 生成弹幕版失败：${error.message}`);
+      this.emitState();
       return false;
     }
     this.emitState();
@@ -2148,6 +2200,12 @@ class LiveRecordService {
     }
     const startTime = parseTimeInput(options.startTime ?? options.start);
     const endTime = parseTimeInput(options.endTime ?? options.end);
+    if (!Number.isFinite(startTime) || startTime < 0) {
+      throw new Error('开始时间无效，请输入 00:00:00 或秒数。');
+    }
+    if (!Number.isFinite(endTime) || endTime <= startTime) {
+      throw new Error('结束时间必须大于开始时间。');
+    }
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const suffix = createClipSuffix(startTime, endTime, overlayMode);
     const assets = await this.generateSubtitleAssets(recording, {
@@ -2231,13 +2289,48 @@ class LiveRecordService {
       });
     }
 
-    this.log('info', `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`);
-    await runFfmpegJob(this.ffmpegPath, args, (line) => {
-      if (/error|failed|invalid/i.test(line)) {
-        this.log('warn', `剪辑导出：${compactLogLine(line)}`);
-      }
+    const progress = createFfmpegJobProgress({
+      kind: 'export',
+      label: `导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`,
+      outputPath,
+      durationSec: duration
     });
-    this.log('success', `片段已导出：${path.basename(outputPath)}`);
+    clearTimeout(this.exportProgressClearTimer);
+    this.exportProgress = progress;
+    this.emitState();
+
+    this.log('info', `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`);
+    try {
+      await runFfmpegJob(this.ffmpegPath, args, (line) => {
+        if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
+          this.emitState();
+        }
+        if (/error|failed|invalid/i.test(line)) {
+          this.log('warn', `剪辑导出：${compactLogLine(line)}`);
+        }
+      });
+      if (this.exportProgress?.id === progress.id) {
+        finishFfmpegJobProgress(this.exportProgress, 'completed', '片段已导出');
+        this.emitState();
+      }
+      this.log('success', `片段已导出：${path.basename(outputPath)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.exportProgress?.id === progress.id) {
+        finishFfmpegJobProgress(this.exportProgress, 'error', `导出失败：${message}`);
+        this.emitState();
+      }
+      throw error;
+    } finally {
+      const progressId = progress.id;
+      this.exportProgressClearTimer = setTimeout(() => {
+        if (this.exportProgress?.id === progressId) {
+          this.exportProgress = null;
+          this.emitState();
+        }
+      }, 5000);
+      this.exportProgressClearTimer.unref?.();
+    }
     return {
       ok: true,
       mode,
@@ -3797,14 +3890,18 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
 }
 
 function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration }) {
-  const args = ['-hide_banner', '-y', '-i', cleanPath];
-  if (Number.isFinite(Number(startTime)) && Number(startTime) > 0) {
+  const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
+  const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
+  const args = ['-hide_banner', '-y'];
+  if (hasStart) {
     args.push('-ss', formatFfmpegSeconds(startTime));
   }
-  if (Number.isFinite(Number(duration)) && Number(duration) > 0) {
+  args.push('-i', cleanPath);
+  if (hasDuration) {
     args.push('-t', formatFfmpegSeconds(duration));
   }
-  args.push('-vf', `ass='${escapeFilterPath(assPath)}'`, '-c:v', codec || 'libx265');
+  const videoFilter = `${hasStart || hasDuration ? 'setpts=PTS-STARTPTS,' : ''}ass='${escapeFilterPath(assPath)}'`;
+  args.push('-vf', videoFilter, '-c:v', codec || 'libx265');
 
   if ((codec || '').includes('nvenc')) {
     args.push('-preset', 'p5', '-cq', String(crf), '-b:v', '0');
@@ -3814,6 +3911,10 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
     args.push('-quality', 'balanced', '-qp_i', String(crf), '-qp_p', String(crf));
   } else {
     args.push('-preset', 'medium', '-crf', String(crf));
+  }
+
+  if (hasStart || hasDuration) {
+    args.push('-avoid_negative_ts', 'make_zero');
   }
 
   if (container === 'mp4') {
@@ -4200,10 +4301,178 @@ function mergeCommandCounts(items) {
   return merged;
 }
 
+function detectFfmpegCapabilities(ffmpegPath) {
+  const encoderProbe = runFfmpegProbe(ffmpegPath, ['-hide_banner', '-encoders']);
+  const hwaccelProbe = runFfmpegProbe(ffmpegPath, ['-hide_banner', '-hwaccels']);
+  const encoderNames = parseFfmpegEncoderNames(encoderProbe.output);
+  const hwaccels = parseFfmpegHwaccels(hwaccelProbe.output);
+  const videoAdapters = detectVideoAdapters();
+  const burnCodecs = [];
+  const unavailableBurnCodecs = [];
+
+  for (const candidate of BURN_CODEC_CANDIDATES) {
+    if (!encoderNames.has(candidate.value)) {
+      unavailableBurnCodecs.push({ ...candidate, reason: 'ffmpeg 未包含该编码器' });
+      continue;
+    }
+    if (candidate.kind === 'hardware') {
+      if (!hasVideoAdapterVendor(videoAdapters, candidate.vendor)) {
+        unavailableBurnCodecs.push({ ...candidate, reason: '未检测到对应显卡' });
+        continue;
+      }
+      const test = testFfmpegEncoder(ffmpegPath, candidate.value);
+      if (!test.ok) {
+        unavailableBurnCodecs.push({ ...candidate, reason: test.reason || '硬件编码测试未通过' });
+        continue;
+      }
+    }
+    burnCodecs.push(candidate);
+  }
+
+  return {
+    burnCodecs,
+    unavailableBurnCodecs,
+    hwaccels,
+    videoAdapters,
+    probedAt: Date.now(),
+    probeError: encoderProbe.ok ? '' : encoderProbe.error
+  };
+}
+
+function runFfmpegProbe(ffmpegPath, args) {
+  try {
+    const result = spawnSync(ffmpegPath, args, {
+      encoding: 'utf8',
+      timeout: 8000,
+      windowsHide: true
+    });
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+    return {
+      ok: result.status === 0 && !result.error,
+      output,
+      error: result.error ? result.error.message : result.status === 0 ? '' : compactLogLine(output)
+    };
+  } catch (error) {
+    return { ok: false, output: '', error: error.message };
+  }
+}
+
+function parseFfmpegEncoderNames(output) {
+  const names = new Set();
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const match = /^\s*[A-Z.]{6}\s+([^\s]+)\s+/i.exec(line);
+    if (match) {
+      names.add(match[1]);
+    }
+  }
+  return names;
+}
+
+function parseFfmpegHwaccels(output) {
+  return String(output || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.includes(':'))
+    .filter((line) => /^[a-z0-9_]+$/i.test(line));
+}
+
+function detectVideoAdapters() {
+  if (process.platform !== 'win32') {
+    return [];
+  }
+  const command =
+    'Get-CimInstance Win32_VideoController | Select-Object Name,AdapterCompatibility,PNPDeviceID | ConvertTo-Json -Compress';
+  for (const shell of ['powershell.exe', 'pwsh.exe']) {
+    try {
+      const result = spawnSync(shell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+        encoding: 'utf8',
+        timeout: 8000,
+        windowsHide: true
+      });
+      if (result.status !== 0 || !String(result.stdout || '').trim()) {
+        continue;
+      }
+      const parsed = JSON.parse(result.stdout);
+      const adapters = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+      return adapters
+        .map((adapter) => {
+          const name = String(adapter.Name || '').trim();
+          const compatibility = String(adapter.AdapterCompatibility || '').trim();
+          const pnpDeviceId = String(adapter.PNPDeviceID || '').trim();
+          return {
+            name: name || compatibility || pnpDeviceId,
+            vendor: detectVideoAdapterVendor(`${name} ${compatibility} ${pnpDeviceId}`)
+          };
+        })
+        .filter((adapter) => adapter.name);
+    } catch {
+      // Try the next shell.
+    }
+  }
+  return [];
+}
+
+function detectVideoAdapterVendor(value) {
+  const text = String(value || '').toLowerCase();
+  if (text.includes('nvidia') || text.includes('ven_10de')) {
+    return 'nvidia';
+  }
+  if (text.includes('intel') || text.includes('ven_8086')) {
+    return 'intel';
+  }
+  if (text.includes('amd') || text.includes('radeon') || text.includes('advanced micro devices') || text.includes('ven_1002')) {
+    return 'amd';
+  }
+  return 'unknown';
+}
+
+function hasVideoAdapterVendor(adapters, vendor) {
+  return adapters.some((adapter) => adapter.vendor === vendor);
+}
+
+function testFfmpegEncoder(ffmpegPath, codec) {
+  try {
+    const result = spawnSync(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=256x144:rate=1',
+        '-frames:v',
+        '1',
+        '-an',
+        '-c:v',
+        codec,
+        '-f',
+        'null',
+        '-'
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 10000,
+        windowsHide: true
+      }
+    );
+    if (result.status === 0 && !result.error) {
+      return { ok: true, reason: '' };
+    }
+    const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+    return {
+      ok: false,
+      reason: result.error?.code === 'ETIMEDOUT' ? '硬件编码测试超时' : output || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+}
+
 function normalizeBurnCodec(value) {
   const codec = String(value || '').trim();
-  const supported = new Set(['libx265', 'libx264', 'hevc_nvenc', 'hevc_qsv', 'hevc_amf']);
-  return supported.has(codec) ? codec : 'libx265';
+  return BURN_CODEC_VALUES.has(codec) ? codec : 'libx265';
 }
 
 function normalizeRoomImageMode(value) {
@@ -4349,6 +4618,95 @@ function runFfmpegJob(ffmpegPath, args, onStderr) {
       reject(new Error(`ffmpeg 退出码 ${code}，信号 ${signal || '-'}：${compactLogLine(stderr)}`));
     });
   });
+}
+
+function createFfmpegJobProgress({ kind, label, outputPath, durationSec, roomId }) {
+  const now = Date.now();
+  const duration = Number(durationSec || 0);
+  return {
+    id: `${kind}-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    kind,
+    status: 'running',
+    label,
+    outputPath,
+    roomId,
+    startedAt: now,
+    updatedAt: now,
+    currentTimeSec: 0,
+    durationSec: Number.isFinite(duration) && duration > 0 ? duration : 0,
+    percent: Number.isFinite(duration) && duration > 0 ? 0 : null,
+    message: '准备中'
+  };
+}
+
+function updateFfmpegJobProgress(progress, text) {
+  if (!progress || progress.status !== 'running') {
+    return false;
+  }
+  const currentTimeSec = parseFfmpegProgressTime(text);
+  if (!Number.isFinite(currentTimeSec)) {
+    return false;
+  }
+  const now = Date.now();
+  const duration = Number(progress.durationSec || 0);
+  const percent = duration > 0 ? clamp((currentTimeSec / duration) * 100, 0, 99.5) : null;
+  const previousPercent = Number(progress.percent ?? 0);
+  const previousTime = Number(progress.currentTimeSec || 0);
+  const percentChanged = percent === null ? Math.abs(currentTimeSec - previousTime) >= 1 : Math.abs(percent - previousPercent) >= 0.4;
+  if (!percentChanged && now - Number(progress.updatedAt || 0) < 500) {
+    return false;
+  }
+  progress.currentTimeSec = Math.max(0, currentTimeSec);
+  progress.percent = percent;
+  progress.updatedAt = now;
+  progress.message =
+    duration > 0
+      ? `${formatDurationSeconds(currentTimeSec)} / ${formatDurationSeconds(duration)}`
+      : `已处理 ${formatDurationSeconds(currentTimeSec)}`;
+  return true;
+}
+
+function finishFfmpegJobProgress(progress, status, message) {
+  if (!progress) {
+    return;
+  }
+  progress.status = status;
+  progress.updatedAt = Date.now();
+  progress.message = message;
+  if (status === 'completed') {
+    progress.percent = 100;
+    if (Number(progress.durationSec || 0) > 0) {
+      progress.currentTimeSec = Number(progress.durationSec || 0);
+    }
+  }
+}
+
+function parseFfmpegProgressTime(text) {
+  const value = String(text || '');
+  let match;
+  let latest = Number.NaN;
+  const timePattern = /time=\s*([0-9:.]+)/gi;
+  while ((match = timePattern.exec(value))) {
+    latest = parseFfmpegTime(match[1]);
+  }
+  const outTimePattern = /out_time(?:_ms)?=([0-9:.]+)/gi;
+  while ((match = outTimePattern.exec(value))) {
+    const raw = match[1];
+    const parsed = raw.includes(':') ? parseFfmpegTime(raw) : Number(raw) / 1_000_000;
+    latest = parsed;
+  }
+  return latest;
+}
+
+function parseFfmpegTime(value) {
+  const parts = String(value || '')
+    .trim()
+    .split(':')
+    .map((part) => Number(part));
+  if (parts.length !== 3 || parts.some((part) => !Number.isFinite(part) || part < 0)) {
+    return Number.NaN;
+  }
+  return parts[0] * 3600 + parts[1] * 60 + parts[2];
 }
 
 function isHevcCodec(codec) {

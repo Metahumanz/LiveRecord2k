@@ -17,6 +17,7 @@ export type RoomState = {
   qualityWarning?: string;
   stream?: StreamChoice;
   currentRecording?: RecordingState;
+  burnProgress?: FfmpegJobProgress;
 };
 
 export type StreamChoice = {
@@ -150,6 +151,41 @@ export type PreviewStartResult = {
   stream: Omit<StreamChoice, 'url'> & { url: string };
 };
 
+export type FfmpegCodecOption = {
+  value: string;
+  label: string;
+  kind: 'software' | 'hardware';
+  vendor?: 'nvidia' | 'intel' | 'amd';
+  reason?: string;
+};
+
+export type FfmpegCapabilities = {
+  burnCodecs: FfmpegCodecOption[];
+  unavailableBurnCodecs: FfmpegCodecOption[];
+  hwaccels: string[];
+  videoAdapters: Array<{
+    name: string;
+    vendor: 'nvidia' | 'intel' | 'amd' | 'unknown';
+  }>;
+  probedAt: number;
+  probeError?: string;
+};
+
+export type FfmpegJobProgress = {
+  id: string;
+  kind: 'burn' | 'export';
+  status: 'running' | 'completed' | 'error';
+  label: string;
+  outputPath?: string;
+  roomId?: string;
+  startedAt: number;
+  updatedAt: number;
+  currentTimeSec?: number;
+  durationSec?: number;
+  percent?: number | null;
+  message?: string;
+};
+
 export type ExportClipRequest = {
   mode: 'clean' | 'burn';
   cleanPath: string;
@@ -182,6 +218,8 @@ export type AppState = {
   version: string;
   update: UpdateState;
   ffmpegPath?: string;
+  ffmpegCapabilities?: FfmpegCapabilities;
+  exportProgress?: FfmpegJobProgress | null;
   startupEnabled: boolean;
   currentPort: number;
   storePath?: string;

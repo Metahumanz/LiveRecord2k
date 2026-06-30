@@ -35,7 +35,16 @@ import {
   Video,
   X
 } from 'lucide-react';
-import type { AppSettings, AppState, ExportResult, LogEntry, PreviewStartResult, RecordingState, RoomState } from './vite-env';
+import type {
+  AppSettings,
+  AppState,
+  ExportResult,
+  FfmpegCodecOption,
+  FfmpegJobProgress,
+  LogEntry,
+  RecordingState,
+  RoomState
+} from './vite-env';
 import { recorder } from './recorderClient';
 import changelogText from '../CHANGELOG.md?raw';
 
@@ -69,12 +78,9 @@ const qnOptions = [
   { label: '高清', value: 150 }
 ];
 
-const codecOptions = [
-  { label: 'H.265 软件编码', value: 'libx265' },
-  { label: 'H.264 软件编码', value: 'libx264' },
-  { label: 'NVIDIA H.265', value: 'hevc_nvenc' },
-  { label: 'Intel H.265', value: 'hevc_qsv' },
-  { label: 'AMD H.265', value: 'hevc_amf' }
+const fallbackCodecOptions: FfmpegCodecOption[] = [
+  { label: 'H.265 软件编码', value: 'libx265', kind: 'software' },
+  { label: 'H.264 软件编码', value: 'libx264', kind: 'software' }
 ];
 
 const containerOptions = [
@@ -556,6 +562,33 @@ function UpdateProgress({ update }: { update: AppState['update'] }) {
   );
 }
 
+function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
+  const hasPercent = typeof progress.percent === 'number' && Number.isFinite(progress.percent);
+  const percent = hasPercent ? clampNumber(progress.percent || 0, 0, 100) : 0;
+  const statusLabel =
+    progress.status === 'completed'
+      ? '完成'
+      : progress.status === 'error'
+        ? '失败'
+        : hasPercent
+          ? `${Math.round(percent)}%`
+          : '处理中';
+  return (
+    <div className={`job-progress ${progress.status}`}>
+      <div className="job-progress-heading">
+        <span>{progress.label}</span>
+        <strong>{statusLabel}</strong>
+      </div>
+      <div className={hasPercent ? 'job-progress-track' : 'job-progress-track indeterminate'}>
+        <span style={hasPercent ? { width: `${percent}%` } : undefined} />
+      </div>
+      <small title={progress.outputPath || ''}>
+        {progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度')}
+      </small>
+    </div>
+  );
+}
+
 function updateTitle(status: AppState['update']['status']) {
   if (status === 'available') return '有新版本';
   if (status === 'queued') return '更新已排队';
@@ -727,7 +760,7 @@ function ExportPage({
   const canExport = Boolean(
     selectedValid && draft.cleanPath && Number.isFinite(draftStart) && Number.isFinite(draftEnd) && draftEnd > draftStart
   );
-  const canPrepare = Boolean(selectedValid && draft.cleanPath && draft.danmakuPath);
+  const canPrepare = Boolean(canExport && draft.danmakuPath);
   const mediaSource = draft.cleanPath ? mediaUrl(draft.cleanPath) : '';
   const selectionLeft = canUseTimeline ? clampNumber((timelineStart / timelineDuration) * 100, 0, 100) : 0;
   const selectionWidth = canUseTimeline
@@ -965,40 +998,37 @@ function ExportPage({
                 type="button"
                 style={{ left: `${selectionLeft}%` }}
                 disabled={!canUseTimeline}
+                aria-label="入点"
                 title="入点"
                 onPointerDown={(event) => {
                   event.stopPropagation();
                   startTimelineDrag(event, 'start');
                 }}
-              >
-                <span>入</span>
-              </button>
+              />
               <button
                 className="cut-marker playhead"
                 type="button"
                 style={{ left: `${playheadLeft}%` }}
                 disabled={!canUseTimeline}
+                aria-label="播放点"
                 title="播放点"
                 onPointerDown={(event) => {
                   event.stopPropagation();
                   startTimelineDrag(event, 'playhead');
                 }}
-              >
-                <span>播</span>
-              </button>
+              />
               <button
                 className="cut-marker end"
                 type="button"
                 style={{ left: `${selectionLeft + selectionWidth}%` }}
                 disabled={!canUseTimeline}
+                aria-label="出点"
                 title="出点"
                 onPointerDown={(event) => {
                   event.stopPropagation();
                   startTimelineDrag(event, 'end');
                 }}
-              >
-                <span>出</span>
-              </button>
+              />
             </div>
             <div className="cut-time-row">
               <label>
@@ -1083,6 +1113,7 @@ function ExportPage({
               导出片段
             </button>
           </div>
+          {state.exportProgress ? <JobProgress progress={state.exportProgress} /> : null}
         </section>
 
         <section className="inspector-card export-panel export-result-panel">
@@ -1140,6 +1171,7 @@ function SettingsPage({
   const loggedIn = settingsDraft.cookie.includes('SESSDATA=');
   const hasActiveJobs = state.rooms.some((room) => room.recording || room.burning);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const codecOptions = burnCodecOptions(state.ffmpegCapabilities?.burnCodecs, settingsDraft.burnCodec);
 
   function exportSettings() {
     if (
@@ -1196,7 +1228,7 @@ function SettingsPage({
       />
 
       <section className="settings-page-grid">
-        <SettingPanel title="设置备份" icon={<FileCode2 size={18} />}>
+        <SettingPanel title="设置备份" icon={<FileCode2 size={18} />} className="settings-panel-backup">
           <input
             ref={importInputRef}
             className="file-input-hidden"
@@ -1225,7 +1257,7 @@ function SettingsPage({
           </div>
         </SettingPanel>
 
-        <SettingPanel title="账号登录" icon={<LogIn size={18} />}>
+        <SettingPanel title="账号登录" icon={<LogIn size={18} />} className="settings-panel-account">
           <div className="setting-row">
             <span className={loggedIn ? 'badge on' : 'badge'}>{loggedIn ? '已登录' : '未登录'}</span>
             <button
@@ -1249,7 +1281,7 @@ function SettingsPage({
           {state.login ? <p className="inline-status">{state.login.message}</p> : null}
         </SettingPanel>
 
-        <SettingPanel title="录制参数" icon={<Video size={18} />}>
+        <SettingPanel title="录制参数" icon={<Video size={18} />} className="settings-panel-recording">
           <label className="field">
             <span>输出目录</span>
             <div className="path-row">
@@ -1329,6 +1361,7 @@ function SettingsPage({
                   </option>
                 ))}
               </select>
+              <p className="inline-status">{burnCodecSummary(codecOptions)}</p>
             </label>
 
             <label className="field">
@@ -1399,7 +1432,7 @@ function SettingsPage({
           </div>
         </SettingPanel>
 
-        <SettingPanel title="启动和通知" icon={<Bell size={18} />}>
+        <SettingPanel title="启动和通知" icon={<Bell size={18} />} className="settings-panel-notifications">
           <div className="toggle-list">
             <Toggle
               label="开机自启"
@@ -1475,7 +1508,7 @@ function SettingsPage({
           </div>
         </SettingPanel>
 
-        <SettingPanel title="版本更新" icon={<Download size={18} />}>
+        <SettingPanel title="版本更新" icon={<Download size={18} />} className="settings-panel-update">
           <PathLine label="当前版本" value={state.version || '-'} />
           <PathLine label="最新版本" value={state.update.latestVersion || '尚未检查'} />
           <PathLine label="更新状态" value={state.update.message || '尚未检查更新'} />
@@ -1556,13 +1589,15 @@ function SettingsPage({
           </details>
         </SettingPanel>
 
-        <SettingPanel title="运行路径" icon={<HardDrive size={18} />}>
+        <SettingPanel title="运行路径" icon={<HardDrive size={18} />} className="settings-panel-runtime">
           <PathLine label="当前版本" value={state.version || ''} />
           <PathLine label="当前端口" value={String(state.currentPort || '')} />
           <PathLine label="配置文件" value={state.storePath || ''} />
           <PathLine label="应用目录" value={state.appRoot || ''} />
           <PathLine label="网页目录" value={state.distRoot || ''} />
           <PathLine label="ffmpeg" value={state.ffmpegPath || ''} />
+          <PathLine label="显卡" value={videoAdapterSummary(state)} />
+          <PathLine label="可用编码" value={ffmpegCodecSummary(state)} />
           <label className="field">
             <span>更新源</span>
             <input
@@ -1663,14 +1698,16 @@ function PageHeader({
 function SettingPanel({
   title,
   icon,
+  className = '',
   children
 }: {
   title: string;
   icon: React.ReactNode;
+  className?: string;
   children: React.ReactNode;
 }) {
   return (
-    <section className="inspector-card settings-panel">
+    <section className={`inspector-card settings-panel ${className}`}>
       <div className="card-heading">
         <div className="section-title">
           {icon}
@@ -1919,6 +1956,8 @@ function RoomCard({
           </div>
         ) : null}
 
+        {room.burnProgress ? <JobProgress progress={room.burnProgress} /> : null}
+
         <div className="action-row">
           <button
             className="icon-button"
@@ -1997,8 +2036,19 @@ function RoomCard({
 function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => void }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const [preview, setPreview] = useState<PreviewStartResult | null>(null);
+  const temporaryPath = room.currentRecording?.capturePath || '';
+  const canPreviewTemporary = Boolean(temporaryPath);
+  const [previewMode, setPreviewMode] = useState<'recording' | 'live'>(canPreviewTemporary ? 'recording' : 'live');
+  const [temporaryPreviewVersion, setTemporaryPreviewVersion] = useState(Date.now());
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const temporarySegmentIndex = Number(room.currentRecording?.mergeSequence || 0);
+
+  useEffect(() => {
+    if (!canPreviewTemporary && previewMode === 'recording') {
+      setPreviewMode('live');
+    }
+  }, [canPreviewTemporary, previewMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2006,19 +2056,39 @@ function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => v
     if (!video) {
       return;
     }
+    const player = video;
 
     async function start() {
       setError('');
-      setPreview(null);
+      setLoading(true);
       try {
-        const nextPreview = await recorder.startPreview(room.id);
-        if (cancelled || !video) {
+        hlsRef.current?.destroy();
+        hlsRef.current = null;
+        player.pause();
+        player.removeAttribute('src');
+        player.load();
+
+        if (previewMode === 'recording') {
+          if (!temporaryPath) {
+            setError('当前还没有可预览的临时 MKV。');
+            return;
+          }
+          player.muted = false;
+          player.autoplay = false;
+          player.playsInline = true;
+          player.src = mediaUrl(temporaryPath, temporaryPreviewVersion);
+          player.load();
+          setLoading(false);
           return;
         }
-        setPreview(nextPreview);
-        video.muted = true;
-        video.autoplay = true;
-        video.playsInline = true;
+
+        const nextPreview = await recorder.startPreview(room.id);
+        if (cancelled) {
+          return;
+        }
+        player.muted = true;
+        player.autoplay = true;
+        player.playsInline = true;
 
         if (Hls.isSupported()) {
           const hls = new Hls({
@@ -2027,30 +2097,38 @@ function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => v
             liveSyncDurationCount: 3
           });
           hlsRef.current = hls;
-          hls.attachMedia(video);
+          hls.attachMedia(player);
           hls.on(Hls.Events.MEDIA_ATTACHED, () => {
             hls.loadSource(nextPreview.previewUrl);
           });
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            video.play().catch(() => {});
+            setLoading(false);
+            player.play().catch(() => {});
           });
           hls.on(Hls.Events.ERROR, (_event, data) => {
             if (data.fatal) {
+              setLoading(false);
               setError(`实时预览播放失败：${data.details || data.type}`);
             }
           });
           return;
         }
 
-        if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = nextPreview.previewUrl;
-          video.play().catch(() => {});
+        if (player.canPlayType('application/vnd.apple.mpegurl')) {
+          player.src = nextPreview.previewUrl;
+          setLoading(false);
+          player.play().catch(() => {});
           return;
         }
 
         setError('当前浏览器不支持 HLS 实时预览。');
       } catch (err) {
+        setLoading(false);
         setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled && previewMode !== 'live') {
+          setLoading(false);
+        }
       }
     }
 
@@ -2059,11 +2137,11 @@ function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => v
       cancelled = true;
       hlsRef.current?.destroy();
       hlsRef.current = null;
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
     };
-  }, [room.id]);
+  }, [room.id, previewMode, temporaryPath, temporaryPreviewVersion]);
 
   return (
     <div className="preview-backdrop">
@@ -2071,18 +2149,60 @@ function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => v
         <div className="preview-header">
           <div>
             <h3>{room.title || `直播间 ${room.realRoomId || room.id}`}</h3>
-            <p>{room.anchor || `房间 ${room.realRoomId || room.id}`}</p>
+            <p>
+              {previewMode === 'recording' && temporaryPath
+                ? `临时 MKV${temporarySegmentIndex > 0 ? ` · 第 ${temporarySegmentIndex + 1} 段` : ''} · ${filename(
+                    temporaryPath
+                  )}`
+                : room.anchor || `房间 ${room.realRoomId || room.id}`}
+            </p>
           </div>
           <button className="icon-button" title="关闭实时预览" onClick={onClose}>
             <X size={18} />
           </button>
         </div>
+        <div className="preview-mode-tabs">
+          <button
+            className={previewMode === 'recording' ? 'active' : ''}
+            disabled={!canPreviewTemporary}
+            title={canPreviewTemporary ? '打开或刷新正在写入的临时 MKV' : '当前没有临时 MKV'}
+            onClick={() => {
+              setTemporaryPreviewVersion(Date.now());
+              setPreviewMode('recording');
+            }}
+          >
+            <RefreshCw size={14} />
+            临时 MKV
+          </button>
+          <button
+            className={previewMode === 'live' ? 'active' : ''}
+            title="预览直播流"
+            onClick={() => setPreviewMode('live')}
+          >
+            直播流
+          </button>
+        </div>
         <div className="live-preview">
-          <video ref={videoRef} controls muted playsInline />
-          {!preview && !error ? (
+          <video
+            ref={videoRef}
+            controls
+            muted={previewMode === 'live'}
+            playsInline
+            preload="metadata"
+            onError={() => {
+              setLoading(false);
+              setError((current) =>
+                current ||
+                (previewMode === 'recording'
+                  ? '临时 MKV 打开失败；如果当前段刚创建或正在分段，请稍后刷新。'
+                  : '实时预览播放失败。')
+              );
+            }}
+          />
+          {loading && !error ? (
             <div className="live-preview-status">
               <Activity className="spin" size={24} />
-              <span>正在连接实时画面</span>
+              <span>{previewMode === 'recording' ? '正在打开临时 MKV' : '正在连接实时画面'}</span>
             </div>
           ) : null}
           {error ? (
@@ -2261,6 +2381,51 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function burnCodecOptions(detected: FfmpegCodecOption[] | undefined, selected: string) {
+  const options = detected?.length ? detected : fallbackCodecOptions;
+  if (selected && !options.some((option) => option.value === selected)) {
+    return [
+      ...options,
+      {
+        value: selected,
+        label: `${selected}（当前不可用）`,
+        kind: 'software' as const,
+        reason: '当前 ffmpeg 环境未通过探测'
+      }
+    ];
+  }
+  return options;
+}
+
+function burnCodecSummary(options: FfmpegCodecOption[]) {
+  const hardware = options.filter((option) => option.kind === 'hardware');
+  const software = options.filter((option) => option.kind === 'software');
+  if (hardware.length) {
+    return `硬件 ${hardware.map((option) => option.label).join(' / ')}；软件 ${software
+      .map((option) => option.label)
+      .join(' / ')}`;
+  }
+  return `软件 ${software.map((option) => option.label).join(' / ')}`;
+}
+
+function videoAdapterSummary(state: AppState) {
+  const adapters = state.ffmpegCapabilities?.videoAdapters || [];
+  return adapters.length ? adapters.map((adapter) => adapter.name).join(' / ') : '未检测到';
+}
+
+function ffmpegCodecSummary(state: AppState) {
+  const capabilities = state.ffmpegCapabilities;
+  if (!capabilities) {
+    return '未探测';
+  }
+  if (capabilities.probeError) {
+    return `探测失败：${capabilities.probeError}`;
+  }
+  return capabilities.burnCodecs.length
+    ? capabilities.burnCodecs.map((codec) => codec.label).join(' / ')
+    : '未探测到可用编码';
+}
+
 function settingsExportStamp() {
   const date = new Date();
   const pad = (value: number) => String(value).padStart(2, '0');
@@ -2380,8 +2545,12 @@ function imageProxyUrl(url: string, version?: number) {
   return `/api/image?${params.toString()}`;
 }
 
-function mediaUrl(filePath: string) {
-  return `/api/media?${new URLSearchParams({ path: filePath }).toString()}`;
+function mediaUrl(filePath: string, version?: number) {
+  const params = new URLSearchParams({ path: filePath });
+  if (version) {
+    params.set('v', String(version));
+  }
+  return `/api/media?${params.toString()}`;
 }
 
 function parseTimelineInput(value: string) {
