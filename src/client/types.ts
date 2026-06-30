@@ -1,5 +1,3 @@
-/// <reference types="vite/client" />
-
 export type RoomState = {
   id: string;
   realRoomId?: number;
@@ -257,4 +255,17 @@ export type RecorderApi = {
   testNotification: () => Promise<AppState>;
   shutdown: () => Promise<void>;
   onStateChanged: (callback: (state: AppState) => void) => () => void;
+};
+
+export type Page = 'overview' | 'rooms' | 'export' | 'settings' | 'logs';
+
+export type ExportDraft = {
+  cleanPath: string;
+  danmakuPath: string;
+  cssPath: string;
+  startTime: string;
+  endTime: string;
+  mode: 'clean' | 'burn';
+  overlayMode: AppSettings['burnOverlayMode'];
+  outputDir: string;
 };

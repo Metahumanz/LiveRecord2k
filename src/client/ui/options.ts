@@ -1,0 +1,57 @@
+import type { AppSettings, FfmpegCodecOption } from '../types';
+
+export const qnOptions = [
+  { label: '4K / 超高清优先', value: 25000 },
+  { label: '2K / 原画优先', value: 15000 },
+  { label: '原画', value: 10000 },
+  { label: '蓝光', value: 400 },
+  { label: '超清', value: 250 },
+  { label: '高清', value: 150 }
+];
+
+export const fallbackCodecOptions: FfmpegCodecOption[] = [
+  { label: 'H.265 软件编码', value: 'libx265', kind: 'software' },
+  { label: 'H.264 软件编码', value: 'libx264', kind: 'software' }
+];
+
+export const containerOptions = [
+  { label: 'MP4', value: 'mp4' },
+  { label: 'MKV', value: 'mkv' }
+] as const;
+
+export const settingsExportKeys: Array<keyof AppSettings> = [
+  'outputDir',
+  'cookie',
+  'pollIntervalSec',
+  'targetQn',
+  'preferHevc',
+  'roomImageMode',
+  'outputContainer',
+  'segmentMinutes',
+  'autoBurnDanmaku',
+  'burnOverlayMode',
+  'burnCodec',
+  'burnCrf',
+  'notifyLiveStarted',
+  'notifyLiveEnded',
+  'notifyRecordingStarted',
+  'notifyRecordingEnded',
+  'notifyBurnStarted',
+  'notifyBurnEnded',
+  'openBrowserOnStart',
+  'updateManifestUrl',
+  'serverPort'
+];
+
+export const KEYFRAME_IMAGE_REFRESH_MS = 5000;
+export const KEYFRAME_INFO_REFRESH_MS = 15000;
+
+export const overlayModeOptions = [
+  { label: '仅弹幕', value: 'danmaku' },
+  { label: '弹幕和礼物', value: 'danmaku-gift' }
+] as const;
+
+export const exportModeOptions = [
+  { label: '纯净片段', value: 'clean' },
+  { label: '烧录片段', value: 'burn' }
+] as const;

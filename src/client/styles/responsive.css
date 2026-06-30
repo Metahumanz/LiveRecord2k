@@ -1,0 +1,130 @@
+@media (max-width: 1280px) {
+  body {
+    min-width: 980px;
+  }
+
+  .app-shell {
+    grid-template-columns: 250px minmax(620px, 1fr);
+  }
+
+  .overview-grid {
+    grid-template-columns: repeat(2, minmax(160px, 1fr));
+  }
+
+  .settings-page-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "backup"
+      "account"
+      "recording"
+      "notifications"
+      "update"
+      "runtime";
+  }
+
+  .settings-panel .settings-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-panel-recording .inline-toggles {
+    grid-column: auto;
+  }
+
+  .export-layout,
+  .time-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1040px) {
+  body {
+    min-width: 760px;
+  }
+
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .nav-panel,
+  .workspace-panel {
+    min-height: auto;
+  }
+
+  .nav-panel {
+    border-right: 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .page-add-room {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .rooms-toolbar,
+  .preview-switch {
+    width: 100%;
+  }
+
+  .preview-switch button {
+    flex: 1;
+  }
+
+  .workspace-header,
+  .header-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .update-notice,
+  .update-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 760px) {
+  body {
+    min-width: 0;
+    min-height: 100vh;
+  }
+
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .nav-panel {
+    padding: 18px;
+  }
+
+  .workspace-panel {
+    padding: 20px 16px;
+    overflow: visible;
+  }
+
+  .settings-grid,
+  .settings-page-grid,
+  .export-layout,
+  .time-grid,
+  .overview-grid,
+  .room-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-panel .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-panel-update .path-line,
+  .settings-panel-runtime .path-line {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+
+  .compact-field {
+    max-width: none;
+  }
+}

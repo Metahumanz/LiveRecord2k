@@ -1,0 +1,76 @@
+.log-panel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.full-log-panel {
+  grid-template-rows: 1fr;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: rgba(18, 25, 30, 0.78);
+  padding: 16px;
+}
+
+.log-header {
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+}
+
+.text-button {
+  min-height: 34px;
+  padding: 0 12px;
+  color: #a9bbb6;
+  background: transparent;
+}
+
+.log-list {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.empty-log {
+  color: #82938e;
+  padding: 14px 0;
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  gap: 12px;
+  min-height: 42px;
+  align-items: start;
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.log-row span {
+  color: #81938e;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+}
+
+.log-row p {
+  margin: 0;
+  color: #cddbd8;
+  font-size: 14px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.log-row.success p {
+  color: #a9efe8;
+}
+
+.log-row.warn p {
+  color: #f2d88d;
+}
+
+.log-row.error p {
+  color: #ffb0b6;
+}

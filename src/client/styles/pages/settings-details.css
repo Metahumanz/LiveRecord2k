@@ -1,0 +1,74 @@
+.changelog-box {
+  margin-top: 14px;
+  color: #dce8e5;
+}
+
+.changelog-box summary {
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.changelog-list {
+  max-height: 280px;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding-right: 4px;
+}
+
+.changelog-list article {
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.changelog-list h4 {
+  margin: 0 0 8px;
+  color: #79ded5;
+  font-size: 15px;
+}
+
+.changelog-list ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #aebfba;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.inline-toggles {
+  align-self: end;
+  margin-bottom: 0;
+}
+
+.path-line {
+  display: grid;
+  gap: 7px;
+  padding: 11px 0;
+  color: #aebfba;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.path-line + .path-line {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.path-line p {
+  margin: 0;
+  overflow: hidden;
+  color: #dbe7e4;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-status {
+  margin: 10px 0 0;
+  color: #9fb0ac;
+  font-size: 14px;
+}

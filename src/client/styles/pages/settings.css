@@ -1,0 +1,71 @@
+.inspector-card {
+  min-width: 0;
+}
+
+.settings-page-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "backup account"
+    "recording recording"
+    "notifications update"
+    "runtime runtime";
+  align-content: start;
+  align-items: stretch;
+  gap: 16px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.settings-panel {
+  min-width: 0;
+  height: 100%;
+}
+
+.settings-panel-backup {
+  grid-area: backup;
+}
+
+.settings-panel-account {
+  grid-area: account;
+}
+
+.settings-panel-recording {
+  grid-area: recording;
+}
+
+.settings-panel-notifications {
+  grid-area: notifications;
+}
+
+.settings-panel-update {
+  grid-area: update;
+}
+
+.settings-panel-runtime {
+  grid-area: runtime;
+}
+
+.settings-panel .settings-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+}
+
+.settings-panel-recording .inline-toggles {
+  grid-column: span 2;
+  align-self: stretch;
+  margin-top: 14px;
+}
+
+.settings-panel-update .path-line,
+.settings-panel-runtime .path-line {
+  grid-template-columns: 78px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-panel-update .path-line p,
+.settings-panel-runtime .path-line p {
+  min-width: 0;
+}

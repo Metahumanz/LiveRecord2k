@@ -1,0 +1,203 @@
+.update-notice {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: rgba(18, 25, 30, 0.78);
+}
+
+.update-notice.available {
+  border-color: rgba(121, 222, 213, 0.35);
+}
+
+.update-notice.queued {
+  border-color: rgba(216, 195, 110, 0.36);
+}
+
+.update-notice.error {
+  border-color: rgba(239, 91, 103, 0.38);
+}
+
+.update-copy,
+.update-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.update-copy {
+  min-width: 0;
+  color: #aebeba;
+}
+
+.update-copy svg {
+  flex: 0 0 auto;
+  color: #79ded5;
+}
+
+.update-notice.ok .update-copy svg {
+  color: #d8c36e;
+}
+
+.update-notice.error .update-copy svg {
+  color: #ffabb2;
+}
+
+.update-copy strong {
+  color: #eff7f4;
+  font-size: 16px;
+}
+
+.update-copy p {
+  margin: 4px 0 0;
+  color: #9bacaa;
+  font-size: 14px;
+}
+
+.update-progress {
+  width: min(420px, 52vw);
+  display: grid;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.update-progress-track {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.update-progress-track span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #79ded5, #d8c36e);
+  transition: width 180ms ease;
+}
+
+.update-progress-track.indeterminate span {
+  width: 38%;
+  animation: progress-slide 1.15s ease-in-out infinite;
+}
+
+.update-progress small {
+  color: #aebeba;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.job-progress {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.job-progress-heading {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #dbe7e4;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.job-progress-heading span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-progress-heading strong {
+  flex: 0 0 auto;
+  color: #79ded5;
+  font-size: 12px;
+}
+
+.job-progress-track {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.job-progress-track span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #79ded5, #d8c36e);
+  transition: width 180ms ease;
+}
+
+.job-progress-track.indeterminate span {
+  width: 38%;
+  animation: progress-slide 1.15s ease-in-out infinite;
+}
+
+.job-progress.completed .job-progress-heading strong {
+  color: #8ee3ad;
+}
+
+.job-progress.completed .job-progress-track span {
+  background: #8ee3ad;
+}
+
+.job-progress.error .job-progress-heading strong,
+.job-progress.error small {
+  color: #ffb0b6;
+}
+
+.job-progress.error .job-progress-track span {
+  width: 100%;
+  background: #f05c65;
+}
+
+.job-progress small {
+  min-width: 0;
+  overflow: hidden;
+  color: #9fb0ac;
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-diagnostic {
+  display: block;
+  max-width: min(640px, 58vw);
+  margin-top: 7px;
+  overflow: hidden;
+  color: #c3d1ce;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(270%);
+  }
+}
+
+.update-waiting {
+  color: #aebeba;
+  font-size: 14px;
+  font-weight: 900;
+}
