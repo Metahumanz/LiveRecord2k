@@ -1,5 +1,5 @@
 import { Plus, Radio } from 'lucide-react';
-import { PageHeader } from '../components/common';
+import { HelpBox, PageHeader, StepList } from '../components/common';
 import { ImageModeSwitch, RoomCard } from '../components/rooms';
 import type { AppSettings, RoomState } from '../types';
 
@@ -30,7 +30,7 @@ export function RoomsPage({
     <>
       <PageHeader
         title="直播间"
-        subtitle={`${rooms.length} 个房间`}
+        subtitle="把常看的直播间添加到这里，之后就能刷新状态、开启监听或直接录制。"
         actions={
           <div className="rooms-toolbar">
             <ImageModeSwitch
@@ -48,7 +48,7 @@ export function RoomsPage({
                   }
                 }}
                 inputMode="numeric"
-                placeholder="输入房间号"
+                placeholder="例如 22625025"
               />
               <button
                 className="wide-button primary"
@@ -63,11 +63,22 @@ export function RoomsPage({
         }
       />
 
+      <HelpBox title="录制一个直播间">
+        <StepList
+          steps={[
+            { title: '添加房间号', body: '从 B 站直播间地址里复制数字房间号，粘贴到右上角输入框。' },
+            { title: '刷新状态', body: '添加后先刷新一次，确认标题、主播和直播状态是否正确。' },
+            { title: '监听或录制', body: '想等开播提醒就开启监听；已经开播时可以直接点击录制。' }
+          ]}
+        />
+      </HelpBox>
+
       <section className="room-grid">
         {rooms.length === 0 ? (
           <div className="empty-state">
             <Radio size={38} />
-            <span>暂无直播间</span>
+            <span>还没有添加直播间。</span>
+            <p>打开 B 站直播间页面，从地址里复制房间号，例如 live.bilibili.com/22625025。</p>
           </div>
         ) : (
           rooms.map((room) => (

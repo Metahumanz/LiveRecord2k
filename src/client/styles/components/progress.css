@@ -87,9 +87,9 @@
   animation: progress-slide 1.15s ease-in-out infinite;
 }
 
-.update-progress small {
+.update-progress .progress-label {
   color: #aebeba;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 900;
 }
 
@@ -107,7 +107,7 @@
   justify-content: space-between;
   gap: 12px;
   color: #dbe7e4;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 900;
 }
 
@@ -121,7 +121,7 @@
 .job-progress-heading strong {
   flex: 0 0 auto;
   color: #79ded5;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .job-progress-track {
@@ -155,7 +155,7 @@
 }
 
 .job-progress.error .job-progress-heading strong,
-.job-progress.error small {
+.job-progress.error .job-progress-message {
   color: #ffb0b6;
 }
 
@@ -164,11 +164,11 @@
   background: #f05c65;
 }
 
-.job-progress small {
+.job-progress-message {
   min-width: 0;
   overflow: hidden;
   color: #9fb0ac;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 800;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -181,7 +181,7 @@
   overflow: hidden;
   color: #c3d1ce;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.45;
   text-overflow: ellipsis;
   white-space: nowrap;

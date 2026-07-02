@@ -14,20 +14,15 @@
   .settings-page-grid {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
-      "backup"
-      "account"
-      "recording"
+      "start"
+      "quality"
+      "danmaku"
       "notifications"
-      "update"
-      "runtime";
+      "advanced";
   }
 
   .settings-panel .settings-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .settings-panel-recording .inline-toggles {
-    grid-column: auto;
   }
 
   .export-layout,
@@ -70,12 +65,17 @@
   }
 
   .workspace-header,
-  .header-actions {
+  .header-actions,
+  .next-step {
     align-items: stretch;
     flex-direction: column;
   }
 
   .overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .step-list {
     grid-template-columns: 1fr;
   }
 
@@ -118,8 +118,7 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .settings-panel-update .path-line,
-  .settings-panel-runtime .path-line {
+  .settings-panel-advanced .path-line {
     grid-template-columns: minmax(0, 1fr);
     gap: 7px;
   }

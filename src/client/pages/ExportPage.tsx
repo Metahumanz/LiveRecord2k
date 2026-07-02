@@ -149,7 +149,7 @@ export function ExportPage({
     <>
       <PageHeader
         title="剪辑导出"
-        subtitle="选择历史录像，拖动时间轴，导出纯净或烧录片段"
+        subtitle="选择录像，拖动入点和出点，再导出纯净片段或弹幕视频片段。"
         actions={
           <>
             <button
@@ -175,12 +175,16 @@ export function ExportPage({
               <FileVideo size={18} />
               <span>源文件</span>
             </div>
-            <span className="panel-count">共 {recordings.length} 个 · 可用 {validRecordingCount} 个</span>
+            <span className="source-count">共 {recordings.length} 个，可用 {validRecordingCount} 个</span>
           </div>
 
           <div className="recording-list">
             {recordings.length === 0 ? (
-              <div className="empty-state compact-empty export-empty">输出目录里还没有可用源文件</div>
+              <div className="empty-state compact-empty export-empty">
+                <FileVideo size={34} />
+                <span>输出目录里还没有可用录像。</span>
+                <p>先完成一次录制，再点击刷新历史，这里会自动列出可导出的文件。</p>
+              </div>
             ) : (
               recordings.map((recording) => (
                 <button
@@ -198,41 +202,44 @@ export function ExportPage({
                   onClick={() => selectRecording(recording)}
                 >
                   <span>{recordingLabel(recording)}</span>
-                  <small>
+                  <span className="recording-meta">
                     {filename(recording.cleanPath)}
                     {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
                     {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
-                  </small>
+                  </span>
                 </button>
               ))
             )}
           </div>
 
           <label className="field">
-            <span>纯净视频</span>
+            <span>原始录像文件</span>
             <input
               value={draft.cleanPath}
               onChange={(event) => setDraft({ ...draft, cleanPath: event.target.value })}
               placeholder="C:\Videos\xxx.clean.mp4"
             />
+            <p className="field-help">从上面的历史录像选择时通常会自动填好。</p>
           </label>
 
           <label className="field">
-            <span>弹幕 JSONL</span>
+            <span>弹幕记录文件</span>
             <input
               value={draft.danmakuPath}
               onChange={(event) => setDraft({ ...draft, danmakuPath: event.target.value })}
               placeholder="C:\Videos\xxx.danmaku.jsonl"
             />
+            <p className="field-help">导出弹幕视频或字幕时需要这个文件；纯净片段可以不填。</p>
           </label>
 
           <label className="field">
-            <span>样式 CSS</span>
+            <span>弹幕样式文件</span>
             <input
               value={draft.cssPath}
               onChange={(event) => setDraft({ ...draft, cssPath: event.target.value })}
               placeholder="留空则自动生成 .danmaku.css"
             />
+            <p className="field-help">留空时会自动生成默认样式。</p>
           </label>
         </section>
 

@@ -45,10 +45,10 @@ export function UpdateNotice({
           </p>
           <UpdateProgress update={update} />
           {update.status === 'error' && (update.updateLogPath || update.statusPath) ? (
-            <small className="update-diagnostic">
+            <div className="update-diagnostic">
               {update.updateLogPath ? `日志 ${update.updateLogPath}` : ''}
               {update.statusPath ? `${update.updateLogPath ? ' · ' : ''}状态 ${update.statusPath}` : ''}
-            </small>
+            </div>
           ) : null}
         </div>
       </div>
@@ -124,7 +124,7 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
       <div className={hasPercent ? 'update-progress-track' : 'update-progress-track indeterminate'}>
         <span style={hasPercent ? { width: `${percent}%` } : undefined} />
       </div>
-      <small>{label}</small>
+      <span className="progress-label">{label}</span>
     </div>
   );
 }
@@ -149,9 +149,9 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
       <div className={hasPercent ? 'job-progress-track' : 'job-progress-track indeterminate'}>
         <span style={hasPercent ? { width: `${percent}%` } : undefined} />
       </div>
-      <small title={progress.outputPath || ''}>
+      <span className="job-progress-message" title={progress.outputPath || ''}>
         {progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度')}
-      </small>
+      </span>
     </div>
   );
 }
@@ -175,18 +175,52 @@ export function PageHeader({
   actions
 }: {
   title: string;
-  subtitle?: string;
+  subtitle?: React.ReactNode;
   actions?: React.ReactNode;
 }) {
   return (
     <header className="workspace-header">
       <div>
         <h2>{title}</h2>
-        {subtitle ? <p>{subtitle}</p> : null}
+        {subtitle ? <div className="workspace-description">{subtitle}</div> : null}
       </div>
       {actions ? <div className="header-actions">{actions}</div> : null}
     </header>
   );
+}
+
+export function HelpBox({
+  title,
+  children,
+  tone = 'default'
+}: {
+  title?: string;
+  children: React.ReactNode;
+  tone?: 'default' | 'success' | 'warning';
+}) {
+  return (
+    <section className={`help-box ${tone}`}>
+      {title ? <strong>{title}</strong> : null}
+      <div>{children}</div>
+    </section>
+  );
+}
+
+export function StepList({ steps }: { steps: Array<{ title: string; body: string }> }) {
+  return (
+    <ol className="step-list">
+      {steps.map((step) => (
+        <li key={step.title}>
+          <strong>{step.title}</strong>
+          <span>{step.body}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+export function TipLine({ children }: { children: React.ReactNode }) {
+  return <p className="tip-line">{children}</p>;
 }
 
 export function SettingPanel({

@@ -33,7 +33,7 @@
   margin: 0;
   padding-left: 18px;
   color: #aebfba;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.55;
 }
 
@@ -60,7 +60,7 @@
   overflow: hidden;
   color: #dbe7e4;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
   line-height: 1.45;
   text-overflow: ellipsis;
@@ -71,4 +71,5 @@
   margin: 10px 0 0;
   color: #9fb0ac;
   font-size: 14px;
+  line-height: 1.5;
 }
