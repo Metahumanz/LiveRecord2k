@@ -216,6 +216,7 @@ const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PREVIEW_PLAYLIST_BYTES = 2 * 1024 * 1024;
+const QUALITY_UPGRADE_CHECK_MS = 90 * 1000;
 const BURN_CODEC_CANDIDATES = [
   { value: 'libx265', label: 'H.265 软件编码', kind: 'software' },
   { value: 'libx264', label: 'H.264 软件编码', kind: 'software' },
@@ -1061,7 +1062,7 @@ class LiveRecordService {
     if (room.liveStatus !== 1) {
       throw new Error(`${roomLabel(room)} 当前未开播，无法打开实时预览。`);
     }
-    const stream = await this.resolvePlayStream(room);
+    const stream = await this.resolvePlayStream(room, { requireHls: true, purpose: '实时预览' });
     const token = crypto.randomBytes(18).toString('base64url');
     const expiresAt = Date.now() + PREVIEW_SESSION_TTL_MS;
     this.previewSessions.set(token, {
@@ -1262,7 +1263,7 @@ class LiveRecordService {
     }
   }
 
-  async resolvePlayStream(room) {
+  async resolvePlayStream(room, options = {}) {
     if (!room.realRoomId) {
       Object.assign(room, await this.fetchRoomInfo(room.id));
     }
@@ -1327,15 +1328,20 @@ class LiveRecordService {
       }
     }
 
-    if (candidates.length === 0) {
+    const selectableCandidates = options.requireHls ? candidates.filter(isHlsPreviewCandidate) : candidates;
+    if (selectableCandidates.length === 0) {
       if (lastPlayError) {
         throw lastPlayError;
       }
-      throw new Error('没有拿到可用直播流，可能未登录、未开播或清晰度受限。');
+      throw new Error(
+        options.requireHls
+          ? '没有拿到浏览器可播放的 HLS 直播流，请稍后刷新或确认直播间已开播。'
+          : '没有拿到可用直播流，可能未登录、未开播或清晰度受限。'
+      );
     }
 
-    candidates.sort((a, b) => streamScore(b, this.settings) - streamScore(a, this.settings));
-    room.stream = candidates[0];
+    selectableCandidates.sort((a, b) => streamScore(b, this.settings) - streamScore(a, this.settings));
+    room.stream = selectableCandidates[0];
     const availableQn = Array.from(
       new Set(candidates.flatMap((candidate) => [candidate.qn, ...(candidate.acceptQn || [])]).filter(Boolean))
     ).sort((a, b) => b - a);
@@ -1348,7 +1354,11 @@ class LiveRecordService {
     }
     this.log(
       'success',
-      `${roomLabel(room)} 选中直播流：编码 ${displayCodecName(room.stream.codec)}，清晰度码 ${room.stream.qn}，请求 ${qnProbes.join('/')}, 协议 ${room.stream.protocol}/${room.stream.format}，接口可选 ${availableQn.join('/') || '未知'}`
+      `${roomLabel(room)} ${options.purpose || '录制'}选中直播流：编码 ${displayCodecName(room.stream.codec)}，清晰度码 ${
+        room.stream.qn
+      }，请求 ${qnProbes.join('/')}, 协议 ${room.stream.protocol}/${room.stream.format}，接口可选 ${
+        availableQn.join('/') || '未知'
+      }`
     );
     return room.stream;
   }
@@ -1371,14 +1381,31 @@ class LiveRecordService {
         return this.getState();
       }
 
-      const inheritedStream = options.stream?.url ? { ...options.stream } : null;
-      const stream = inheritedStream || (await this.resolvePlayStream(room));
-      if (inheritedStream) {
-        room.stream = inheritedStream;
+      const explicitStream = options.stream?.url ? { ...options.stream } : null;
+      const fallbackStream = options.fallbackStream?.url ? { ...options.fallbackStream } : null;
+      let stream = explicitStream;
+      if (stream) {
+        room.stream = stream;
         this.log(
           'info',
-          `${roomLabel(room)} 分段继续沿用上一段直播流：编码 ${displayCodecName(stream.codec)}，清晰度码 ${stream.qn}`
+          `${roomLabel(room)} 使用已选直播流：编码 ${displayCodecName(stream.codec)}，清晰度码 ${stream.qn}`
         );
+      } else {
+        try {
+          stream = await this.resolvePlayStream(room);
+        } catch (error) {
+          if (!fallbackStream) {
+            throw error;
+          }
+          stream = fallbackStream;
+          room.stream = stream;
+          this.log(
+            'warn',
+            `${roomLabel(room)} 重新选流失败，暂时沿用上一段直播流：编码 ${displayCodecName(stream.codec)}，清晰度码 ${
+              stream.qn
+            }。原因：${error.message}`
+          );
+        }
       }
       await fsp.mkdir(this.settings.outputDir, { recursive: true });
 
@@ -1402,6 +1429,8 @@ class LiveRecordService {
       const segmentDurationSec = Number.isFinite(segmentMinutes) && segmentMinutes > 0 ? segmentMinutes * 60 : 0;
       const args = createRecordingArgs({
         streamUrl: stream.url,
+        streamProtocol: stream.protocol,
+        streamFormat: stream.format,
         headers: this.createFfmpegHeaders(room),
         outputPath: capturePath,
         maxDurationSec: segmentDurationSec
@@ -1447,7 +1476,10 @@ class LiveRecordService {
         videoInfo: null,
         rotateTimer: null,
         mediaWatchTimer: null,
+        qualityWatchTimer: null,
         rotating: false,
+        qualitySwitching: false,
+        nextStream: null,
         segmentMinutes,
         segmentDurationSec,
         finished: false,
@@ -1482,6 +1514,7 @@ class LiveRecordService {
       this.reconnectPendingRooms.delete(room.id);
       this.armRecordingRotation(room, session);
       this.armNoMediaWatch(room, session);
+      this.armQualityUpgradeWatch(room, session);
       const startReason = options.streamReconnect
         ? '直播流续录'
         : options.segmentContinue
@@ -1730,6 +1763,59 @@ class LiveRecordService {
     session.mediaWatchTimer.unref?.();
   }
 
+  armQualityUpgradeWatch(room, session) {
+    const targetQn = normalizeTargetQn(this.settings.targetQn);
+    if (!Number.isFinite(targetQn) || targetQn <= 0) {
+      return;
+    }
+    const schedule = () => {
+      session.qualityWatchTimer = setTimeout(async () => {
+        if (session.finished || session.stopping || this.recordingSessions.get(room.id) !== session) {
+          return;
+        }
+        try {
+          await this.checkRecordingQualityUpgrade(room, session, targetQn);
+        } catch (error) {
+          this.log('warn', `${roomLabel(room)} 清晰度升级检查失败：${error.message}`);
+        }
+        if (!session.finished && !session.stopping && this.recordingSessions.get(room.id) === session) {
+          schedule();
+        }
+      }, QUALITY_UPGRADE_CHECK_MS);
+      session.qualityWatchTimer.unref?.();
+    };
+    schedule();
+  }
+
+  async checkRecordingQualityUpgrade(room, session, targetQn) {
+    if (session.rotating || session.qualitySwitching || room.liveStatus !== 1) {
+      return;
+    }
+    const currentQn = Number(session.stream?.qn || 0);
+    if (currentQn >= targetQn) {
+      return;
+    }
+    const previousStream = session.stream ? { ...session.stream } : null;
+    const nextStream = await this.resolvePlayStream(room, { purpose: '清晰度升级检查' });
+    if (!nextStream?.url || !previousStream?.url) {
+      return;
+    }
+    const betterQuality = Number(nextStream.qn || 0) > currentQn;
+    const betterScore = streamScore(nextStream, this.settings) > streamScore(previousStream, this.settings);
+    if (!betterQuality && !betterScore) {
+      room.stream = previousStream;
+      return;
+    }
+    session.nextStream = { ...nextStream };
+    session.qualitySwitching = true;
+    this.log(
+      'success',
+      `${roomLabel(room)} 检测到更合适的直播流：qn ${currentQn || '未知'} -> ${nextStream.qn || '未知'}，正在切换到新文件。`
+    );
+    requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 5000 });
+    this.emitState();
+  }
+
   async rotateRecordingSegment(roomId) {
     const room = this.getRoom(roomId);
     const session = this.recordingSessions.get(room.id);
@@ -1751,6 +1837,8 @@ class LiveRecordService {
     }
     session.stopping = true;
     clearTimeout(session.rotateTimer);
+    clearTimeout(session.mediaWatchTimer);
+    clearTimeout(session.qualityWatchTimer);
     session.danmakuClient?.close('手动停止');
     requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 5000 });
     this.log('info', `${roomLabel(room)} 正在停止录制。`);
@@ -1767,6 +1855,7 @@ class LiveRecordService {
 
     clearTimeout(session.rotateTimer);
     clearTimeout(session.mediaWatchTimer);
+    clearTimeout(session.qualityWatchTimer);
     session.finished = true;
     session.danmakuClient?.close('录制结束');
     await new Promise((resolve) => session.eventStream.end(resolve));
@@ -1775,7 +1864,9 @@ class LiveRecordService {
     }
     const elapsedSec = Math.max(0, (Date.now() - session.startedAt) / 1000);
     const shouldContinueSegment =
-      wasActiveSession && (session.rotating || hasReachedSegmentLimit(session, elapsedSec)) && !session.stopping;
+      wasActiveSession &&
+      (session.rotating || session.qualitySwitching || hasReachedSegmentLimit(session, elapsedSec)) &&
+      !session.stopping;
     if (shouldContinueSegment) {
       this.recordingSessions.delete(roomId);
       await this.startNextSegmentNow(room, session);
@@ -1962,7 +2053,8 @@ class LiveRecordService {
     const nextOptions = {
       segmentContinue: true,
       silentNotify: true,
-      stream: session.stream,
+      stream: session.nextStream || undefined,
+      fallbackStream: session.stream,
       mergeGroup: session.mergeGroup,
       mergeSequence: Number(session.mergeSequence || 0) + 1,
       mergeOutputPath: session.mergeOutputPath
@@ -3194,6 +3286,7 @@ class LiveRecordService {
       const session = this.recordingSessions.get(room.id);
       clearTimeout(session?.rotateTimer);
       clearTimeout(session?.mediaWatchTimer);
+      clearTimeout(session?.qualityWatchTimer);
       session?.danmakuClient?.close('服务退出');
       if (session?.ffmpeg) {
         requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 1500 });
@@ -3222,6 +3315,13 @@ function writeText(response, statusCode, text, contentType = 'text/plain; charse
     'Cache-Control': 'no-store'
   });
   response.end(text);
+}
+
+function isHlsPreviewCandidate(stream) {
+  const protocol = String(stream?.protocol || '').toLowerCase();
+  const format = String(stream?.format || '').toLowerCase();
+  const url = String(stream?.url || '').toLowerCase();
+  return protocol.includes('hls') || format.includes('fmp4') || url.includes('.m3u8');
 }
 
 module.exports = {

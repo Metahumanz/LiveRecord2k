@@ -24,32 +24,33 @@ function escapeFilterPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 }
 
-function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec }) {
+function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec, streamProtocol, streamFormat }) {
+  const streamKind = `${streamProtocol || ''} ${streamFormat || ''} ${streamUrl || ''}`.toLowerCase();
+  const isHlsInput = streamKind.includes('hls') || streamKind.includes('.m3u8');
   const args = [
     '-hide_banner',
     '-stats',
     '-y',
     '-rw_timeout',
-    '30000000',
-    '-reconnect',
-    '1',
-    '-reconnect_streamed',
-    '1',
-    '-reconnect_at_eof',
-    '1',
-    '-reconnect_on_network_error',
-    '1',
-    '-reconnect_on_http_error',
-    '4xx,5xx',
-    '-reconnect_delay_max',
-    '10',
-    '-user_agent',
-    USER_AGENT,
-    '-headers',
-    headers,
-    '-i',
-    streamUrl
+    '30000000'
   ];
+  if (!isHlsInput) {
+    args.push(
+      '-reconnect',
+      '1',
+      '-reconnect_streamed',
+      '1',
+      '-reconnect_at_eof',
+      '1',
+      '-reconnect_on_network_error',
+      '1',
+      '-reconnect_on_http_error',
+      '4xx,5xx',
+      '-reconnect_delay_max',
+      '10'
+    );
+  }
+  args.push('-user_agent', USER_AGENT, '-headers', headers, '-i', streamUrl);
   if (Number.isFinite(Number(maxDurationSec)) && Number(maxDurationSec) > 0) {
     args.push('-t', formatFfmpegSeconds(maxDurationSec));
   }

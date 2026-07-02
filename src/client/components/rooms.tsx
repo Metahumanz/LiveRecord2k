@@ -160,6 +160,7 @@ export function RoomCard({
   openPreview: (roomId: string) => void;
 }) {
   const status = getRoomStatus(room);
+  const liveStatusLabel = room.liveStatus === 1 ? '直播中' : room.liveStatus === 2 ? '轮播' : '未开播';
   const roomKey = room.id;
   const requestedText = room.stream?.requestedQn ? qnLabel(room.stream.requestedQn) : '未请求';
   const selectedText = room.stream ? `${displayCodec(room.stream.codec)} · qn ${room.stream.qn}` : '未选流';
@@ -196,7 +197,7 @@ export function RoomCard({
         </div>
 
         <div className="badge-row">
-          <span className={room.liveStatus === 1 ? 'badge hot' : 'badge'}>{status.label}</span>
+          <span className={room.liveStatus === 1 ? 'badge hot' : 'badge'}>{liveStatusLabel}</span>
           <span className={room.monitoring ? 'badge on' : 'badge'}>{room.monitoring ? '已监听' : '未监听'}</span>
           <span className={room.recording ? 'badge hot' : 'badge'}>{room.recording ? '录制中' : '未录制'}</span>
           {room.burning ? <span className="badge work">生成弹幕视频中</span> : null}
@@ -380,7 +381,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
   const hlsRef = useRef<Hls | null>(null);
   const temporaryPath = room.currentRecording?.capturePath || '';
   const canPreviewTemporary = Boolean(temporaryPath);
-  const [previewMode, setPreviewMode] = useState<'recording' | 'live'>(canPreviewTemporary ? 'recording' : 'live');
+  const [previewMode, setPreviewMode] = useState<'recording' | 'live'>('live');
   const [temporaryPreviewVersion, setTemporaryPreviewVersion] = useState(Date.now());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -536,7 +537,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
               setError((current) =>
                 current ||
                 (previewMode === 'recording'
-                  ? '临时 MKV 打开失败；如果当前段刚创建或正在分段，请稍后刷新。'
+                  ? '浏览器通常无法直接播放正在写入的临时 MKV，请用直播流预览确认画面，或稍后查看最终 MP4。'
                   : '实时预览播放失败。')
               );
             }}
