@@ -40,6 +40,7 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'notifyBurnEnded',
   'openBrowserOnStart',
   'updateManifestUrl',
+  'serverHost',
   'serverPort'
 ];
 

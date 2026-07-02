@@ -1,8 +1,9 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const { HOST, DIST_ROOT, writeJson, writeText, mimeType } = require('./service.cjs');
+const { DIST_ROOT, writeJson, writeText, mimeType } = require('./service.cjs');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
+const DEFAULT_PORT = 3263;
 
 async function createViteMiddleware() {
   const { createServer } = await import('vite');
@@ -14,7 +15,7 @@ async function createViteMiddleware() {
 }
 
 async function handleRequest(service, vite, port, request, response) {
-  const parsed = new URL(request.url || '/', `http://${request.headers.host || `${HOST}:${port}`}`);
+  const parsed = new URL(request.url || '/', `http://${request.headers.host || `127.0.0.1:${port}`}`);
   if (parsed.pathname.startsWith('/api/')) {
     await handleApi(service, parsed, port, request, response);
     return;
@@ -90,9 +91,11 @@ async function handleApi(service, parsed, port, request, response) {
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
     '/api/rooms/preview/start': () => service.startPreview(body.roomId),
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
+    '/api/rooms/burn/cancel': () => service.cancelBurnDanmaku(body.roomId),
     '/api/rooms/subtitles': () => service.prepareDanmakuForRoom(body.roomId, body.options || {}),
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
     '/api/export/clip': () => service.exportClip(body),
+    '/api/export/cancel': () => service.cancelExportClip(),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
@@ -152,7 +155,7 @@ function isTrustedApiRequest(request, port) {
   if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
     return false;
   }
-  const host = request.headers.host || `${HOST}:${port}`;
+  const host = request.headers.host || `127.0.0.1:${port}`;
   const origin = request.headers.origin;
   if (origin && !isAllowedWebOrigin(origin, host, port)) {
     return false;

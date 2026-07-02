@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
-import { CheckCircle2, FileCode2, FileVideo, FolderOpen, RefreshCw, Scissors } from 'lucide-react';
+import { CheckCircle2, FileCode2, FileVideo, FolderOpen, RefreshCw, Scissors, Square } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
@@ -46,12 +46,13 @@ export function ExportPage({
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const draftStart = parseTimelineInput(draft.startTime);
   const draftEnd = parseTimelineInput(draft.endTime);
-  const timelineDuration = Math.max(mediaDuration, Number(selectedRecording?.durationSec || 0));
-  const timelineStart = Number.isFinite(draftStart) ? clampNumber(draftStart, 0, Math.max(timelineDuration, draftStart)) : 0;
-  const timelineEnd = Number.isFinite(draftEnd)
-    ? clampNumber(draftEnd, 0, Math.max(timelineDuration, draftEnd))
-    : timelineDuration;
+  const recordingDuration = Number(selectedRecording?.durationSec || 0);
+  const timelineDuration = mediaDuration > 0 ? mediaDuration : recordingDuration;
   const canUseTimeline = timelineDuration > 0;
+  const timelineStart = Number.isFinite(draftStart) ? clampNumber(draftStart, 0, canUseTimeline ? timelineDuration : 0) : 0;
+  const timelineEnd = Number.isFinite(draftEnd)
+    ? clampNumber(draftEnd, 0, canUseTimeline ? timelineDuration : 0)
+    : timelineDuration;
   const selectedValid = selectedRecording?.valid !== false;
   const canExport = Boolean(
     selectedValid && draft.cleanPath && Number.isFinite(draftStart) && Number.isFinite(draftEnd) && draftEnd > draftStart
@@ -266,8 +267,19 @@ export function ExportPage({
                     }
                     setMediaDuration(duration);
                     setPlaybackTime(event.currentTarget.currentTime || 0);
-                    if (!draft.endTime || !Number.isFinite(parseTimelineInput(draft.endTime))) {
-                      setDraft({ ...draft, endTime: formatTimelineTime(duration) });
+                    const currentStart = parseTimelineInput(draft.startTime);
+                    const currentEnd = parseTimelineInput(draft.endTime);
+                    const nextStart =
+                      Number.isFinite(currentStart) && currentStart >= 0 && currentStart < duration ? currentStart : 0;
+                    const needsStartUpdate = nextStart !== currentStart;
+                    const needsEndUpdate =
+                      !Number.isFinite(currentEnd) || currentEnd > duration || currentEnd <= nextStart;
+                    if (needsStartUpdate || needsEndUpdate) {
+                      setDraft({
+                        ...draft,
+                        startTime: needsStartUpdate ? formatTimelineTime(nextStart) : draft.startTime,
+                        endTime: needsEndUpdate ? formatTimelineTime(duration) : draft.endTime
+                      });
                     }
                   }}
                   onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
@@ -417,6 +429,17 @@ export function ExportPage({
             </button>
           </div>
           {state.exportProgress ? <JobProgress progress={state.exportProgress} /> : null}
+          {state.exportProgress?.status === 'running' ? (
+            <button
+              className="wide-button fill danger"
+              type="button"
+              disabled={busy === 'export-cancel'}
+              onClick={() => run('export-cancel', recorder.cancelExport)}
+            >
+              <Square size={17} />
+              中断当前导出
+            </button>
+          ) : null}
         </section>
 
         <section className="inspector-card export-panel export-result-panel">

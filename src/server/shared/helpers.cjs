@@ -593,12 +593,13 @@ function formatFfmpegSeconds(value) {
   return safe.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
 }
 
-function runFfmpegJob(ffmpegPath, args, onStderr) {
+function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, {
       windowsHide: true,
       stdio: ['ignore', 'ignore', 'pipe']
     });
+    options.onChild?.(child);
     let stderr = '';
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString('utf8');
@@ -703,6 +704,26 @@ function parseFfmpegTime(value) {
     return Number.NaN;
   }
   return parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+function parseFfmpegDuration(text) {
+  const match = String(text || '').match(/Duration:\s*([0-9:.]+)/i);
+  if (!match) {
+    return 0;
+  }
+  const duration = parseFfmpegTime(match[1]);
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function probeMediaFileInfo(ffmpegPath, filePath) {
+  if (!ffmpegPath || !filePath || !fs.existsSync(filePath)) {
+    return { durationSec: 0, videoInfo: null };
+  }
+  const probe = runFfmpegProbe(ffmpegPath, ['-hide_banner', '-i', filePath]);
+  return {
+    durationSec: parseFfmpegDuration(probe.output),
+    videoInfo: parseFfmpegVideoInfo(probe.output)
+  };
 }
 
 function isHevcCodec(codec) {
@@ -834,6 +855,30 @@ function getRuntimePort(settingsPort) {
     return clamp(Number(process.env.PORT), 1, 65535);
   }
   return clamp(Number(settingsPort || DEFAULT_PORT), 1, 65535);
+}
+
+function normalizeServerHost(value) {
+  const host = String(value || '').trim();
+  if (host === '0.0.0.0' || host === '::' || host === '127.0.0.1' || host === 'localhost') {
+    return host;
+  }
+  return '127.0.0.1';
+}
+
+function getRuntimeHost(settingsHost) {
+  const argv = process.argv;
+  const inline = argv.find((arg) => arg.startsWith('--host='));
+  if (inline) {
+    return normalizeServerHost(inline.split('=').slice(1).join('='));
+  }
+  const hostIndex = argv.indexOf('--host');
+  if (hostIndex >= 0 && argv[hostIndex + 1]) {
+    return normalizeServerHost(argv[hostIndex + 1]);
+  }
+  if (process.env.HOST) {
+    return normalizeServerHost(process.env.HOST);
+  }
+  return normalizeServerHost(settingsHost || '127.0.0.1');
 }
 
 function getAppRoot() {
@@ -1098,7 +1143,7 @@ function formatBytes(bytes) {
   return `${Math.round(value)} B`;
 }
 
-async function discoverRecordingFiles(outputDir) {
+async function discoverRecordingFiles(outputDir, options = {}) {
   let entries;
   try {
     entries = await fsp.readdir(outputDir, { withFileTypes: true });
@@ -1125,6 +1170,7 @@ async function discoverRecordingFiles(outputDir) {
     const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
     const eventCount = await countDanmakuLines(danmakuPath);
     const valid = stat.size >= 32 * 1024;
+    const mediaInfo = valid ? probeMediaFileInfo(options.ffmpegPath, cleanPath) : { durationSec: 0, videoInfo: null };
     recordings.push({
       id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
       startedAt: stat.mtimeMs,
@@ -1136,13 +1182,15 @@ async function discoverRecordingFiles(outputDir) {
       capturePath: '',
       containerStage: valid ? 'ready' : 'failed',
       validReason: valid ? '' : `文件过小：${formatBytes(stat.size)}`,
+      durationSec: mediaInfo.durationSec,
       fileSize: stat.size,
       valid,
       eventCount,
       capturedDanmakuCount: eventCount,
       rawDanmakuCount: eventCount,
       ignoredDanmakuCount: 0,
-      danmakuCommandCounts: {}
+      danmakuCommandCounts: {},
+      videoInfo: mediaInfo.videoInfo
     });
   }
   return recordings;
@@ -1394,10 +1442,10 @@ async function readTextSource(source, options = {}) {
   return fsp.readFile(filePath, 'utf8');
 }
 
-function isDefaultUpdateSource(source) {
+function isDefaultUpdateSource(source, defaultSource = '') {
   const normalized = String(source || '').trim().replace(/\/+$/, '');
-  const fallback = String(DEFAULT_UPDATE_MANIFEST_URL || '').trim().replace(/\/+$/, '');
-  return normalized === fallback || normalized.endsWith('/releases/latest/download/update.json');
+  const fallback = String(defaultSource || '').trim().replace(/\/+$/, '');
+  return (fallback && normalized === fallback) || normalized.endsWith('/releases/latest/download/update.json');
 }
 
 function normalizeUpdateManifest(payload) {
@@ -1784,6 +1832,8 @@ module.exports = {
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
   parseFfmpegTime,
+  parseFfmpegDuration,
+  probeMediaFileInfo,
   isHevcCodec,
   formatTimestamp,
   formatDurationSeconds,
@@ -1797,6 +1847,8 @@ module.exports = {
   roomLabel,
   guardName,
   getRuntimePort,
+  getRuntimeHost,
+  normalizeServerHost,
   getAppRoot,
   findFfmpegPath,
   getAppVersion,

@@ -135,6 +135,8 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const statusLabel =
     progress.status === 'completed'
       ? '完成'
+      : progress.status === 'cancelled'
+        ? '已取消'
       : progress.status === 'error'
         ? '失败'
         : hasPercent
