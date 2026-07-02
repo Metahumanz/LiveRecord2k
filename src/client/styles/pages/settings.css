@@ -7,10 +7,9 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   grid-template-areas:
-    "backup account"
-    "recording recording"
-    "notifications update"
-    "runtime runtime";
+    "start quality"
+    "danmaku notifications"
+    "advanced advanced";
   align-content: start;
   align-items: stretch;
   gap: 16px;
@@ -23,28 +22,24 @@
   height: 100%;
 }
 
-.settings-panel-backup {
-  grid-area: backup;
+.settings-panel-start {
+  grid-area: start;
 }
 
-.settings-panel-account {
-  grid-area: account;
+.settings-panel-quality {
+  grid-area: quality;
 }
 
-.settings-panel-recording {
-  grid-area: recording;
+.settings-panel-danmaku {
+  grid-area: danmaku;
 }
 
 .settings-panel-notifications {
   grid-area: notifications;
 }
 
-.settings-panel-update {
-  grid-area: update;
-}
-
-.settings-panel-runtime {
-  grid-area: runtime;
+.settings-panel-advanced {
+  grid-area: advanced;
 }
 
 .settings-panel .settings-grid {
@@ -52,20 +47,46 @@
   align-items: start;
 }
 
-.settings-panel-recording .inline-toggles {
-  grid-column: span 2;
+.settings-panel-quality .inline-toggles {
   align-self: stretch;
   margin-top: 14px;
 }
 
-.settings-panel-update .path-line,
-.settings-panel-runtime .path-line {
+.settings-panel-advanced .path-line {
   grid-template-columns: 78px minmax(0, 1fr);
   align-items: center;
   gap: 12px;
 }
 
-.settings-panel-update .path-line p,
-.settings-panel-runtime .path-line p {
+.settings-panel-advanced .path-line p {
   min-width: 0;
+}
+
+.settings-panel-advanced .settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.maintenance-section {
+  display: grid;
+  gap: 12px;
+  padding-top: 16px;
+  margin-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.maintenance-section:first-of-type {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.maintenance-section h3 {
+  margin: 0;
+  color: #eef8f6;
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.startup-row {
+  justify-content: flex-start;
 }

@@ -31,9 +31,9 @@
   gap: 2px;
 }
 
-.panel-count {
-  color: #93a49f;
-  font-size: 12px;
+.source-count {
+  color: #b6c7c2;
+  font-size: 14px;
   font-weight: 900;
 }
 
@@ -77,7 +77,7 @@
 }
 
 .recording-row span,
-.recording-row small {
+.recording-meta {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -88,14 +88,18 @@
   font-weight: 900;
 }
 
-.recording-row small {
+.recording-meta {
   color: #93a49f;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .export-empty {
   min-height: 156px;
+}
+
+.export-empty p {
+  max-width: 520px;
 }
 
 .clip-preview {
@@ -139,7 +143,7 @@
   gap: 12px;
   color: #96a8a3;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .timeline-summary strong {
@@ -273,7 +277,7 @@
   display: grid;
   gap: 6px;
   color: #aebfba;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 900;
 }
 

@@ -132,7 +132,6 @@ export function RoomPreview({
         </div>
       )}
       <span className={`status-pill ${status.kind}`}>{status.label}</span>
-      <span className="preview-mode">{roomImageMode === 'cover' ? '封面' : '预览图'}</span>
       <button
         className="preview-open-button"
         title={canPreview ? '打开实时预览' : '未开播，无法实时预览'}
@@ -197,73 +196,11 @@ export function RoomCard({
         </div>
 
         <div className="badge-row">
-          <span className={room.monitoring ? 'badge on' : 'badge'}>监听</span>
-          <span className={room.recording ? 'badge hot' : 'badge'}>录制</span>
-          <span className={room.burning ? 'badge work' : 'badge'}>弹幕版</span>
+          <span className={room.liveStatus === 1 ? 'badge hot' : 'badge'}>{status.label}</span>
+          <span className={room.monitoring ? 'badge on' : 'badge'}>{room.monitoring ? '已监听' : '未监听'}</span>
+          <span className={room.recording ? 'badge hot' : 'badge'}>{room.recording ? '录制中' : '未录制'}</span>
+          {room.burning ? <span className="badge work">生成弹幕视频中</span> : null}
         </div>
-
-        <div className="room-meta">
-          <span>
-            <Clock3 size={15} />
-            {room.lastCheckedAt ? formatClock(room.lastCheckedAt) : '未刷新'}
-          </span>
-          <span>
-            <Cpu size={15} />
-            请求 {requestedText}
-          </span>
-          <span>
-            <Gauge size={15} />
-            接口 {selectedText}
-          </span>
-          <span>
-            <Video size={15} />
-            实际 {actualText}
-          </span>
-        </div>
-
-        {room.currentRecording ? (
-          <div className="recording-info">
-            <span>
-              <HardDrive size={15} />
-              {containerStageLabel(room.currentRecording)}
-            </span>
-            <span>
-              <MessageSquareText size={15} />
-              可烧录事件 {room.currentRecording.capturedDanmakuCount ?? room.currentRecording.eventCount}
-            </span>
-            <span>
-              <Radio size={15} />
-              {room.currentRecording.danmakuMessage || '弹幕通道准备中'}
-            </span>
-            <span>
-              <Activity size={15} />
-              互动包 {room.currentRecording.rawDanmakuCount ?? 0} · 未烧录 {room.currentRecording.ignoredDanmakuCount ?? 0} · 热度{' '}
-              {room.currentRecording.danmakuPopularity ?? 0}
-            </span>
-            {danmakuCommandSummary ? (
-              <span title={danmakuCommandSummary}>
-                <ListVideo size={15} />
-                命令 {danmakuCommandSummary}
-              </span>
-            ) : null}
-            {room.currentRecording.validReason ? (
-              <span title={room.currentRecording.validReason}>
-                <CircleAlert size={15} />
-                {room.currentRecording.validReason}
-              </span>
-            ) : null}
-            {room.currentRecording.capturePath ? (
-              <span title={room.currentRecording.capturePath}>
-                <FileVideo size={15} />
-                临时 {filename(room.currentRecording.capturePath)}
-              </span>
-            ) : null}
-            <span title={room.currentRecording.cleanPath}>
-              <FileVideo size={15} />
-              最终 {filename(room.currentRecording.cleanPath)}
-            </span>
-          </div>
-        ) : null}
 
         {room.qualityWarning ? (
           <div className="warning-line">
@@ -281,14 +218,83 @@ export function RoomCard({
 
         {room.burnProgress ? <JobProgress progress={room.burnProgress} /> : null}
 
+        <details className="technical-details">
+          <summary>技术详情</summary>
+          <div className="room-meta">
+            <span>
+              <Clock3 size={15} />
+              上次刷新 {room.lastCheckedAt ? formatClock(room.lastCheckedAt) : '未刷新'}
+            </span>
+            <span>
+              <Cpu size={15} />
+              请求 {requestedText}
+            </span>
+            <span>
+              <Gauge size={15} />
+              接口 {selectedText}
+            </span>
+            <span>
+              <Video size={15} />
+              实际 {actualText}
+            </span>
+          </div>
+
+          {room.currentRecording ? (
+            <div className="recording-info">
+              <span>
+                <HardDrive size={15} />
+                {containerStageLabel(room.currentRecording)}
+              </span>
+              <span>
+                <MessageSquareText size={15} />
+                可烧录事件 {room.currentRecording.capturedDanmakuCount ?? room.currentRecording.eventCount}
+              </span>
+              <span>
+                <Radio size={15} />
+                {room.currentRecording.danmakuMessage || '弹幕通道准备中'}
+              </span>
+              <span>
+                <Activity size={15} />
+                互动包 {room.currentRecording.rawDanmakuCount ?? 0} · 未烧录 {room.currentRecording.ignoredDanmakuCount ?? 0} · 热度{' '}
+                {room.currentRecording.danmakuPopularity ?? 0}
+              </span>
+              {danmakuCommandSummary ? (
+                <span title={danmakuCommandSummary}>
+                  <ListVideo size={15} />
+                  命令 {danmakuCommandSummary}
+                </span>
+              ) : null}
+              {room.currentRecording.validReason ? (
+                <span title={room.currentRecording.validReason}>
+                  <CircleAlert size={15} />
+                  {room.currentRecording.validReason}
+                </span>
+              ) : null}
+              {room.currentRecording.capturePath ? (
+                <span title={room.currentRecording.capturePath}>
+                  <FileVideo size={15} />
+                  临时 {filename(room.currentRecording.capturePath)}
+                </span>
+              ) : null}
+              <span title={room.currentRecording.cleanPath}>
+                <FileVideo size={15} />
+                最终 {filename(room.currentRecording.cleanPath)}
+              </span>
+            </div>
+          ) : (
+            <p className="technical-empty">开始录制后会显示源流、分辨率、弹幕通道和输出文件信息。</p>
+          )}
+        </details>
+
         <div className="action-row">
           <button
-            className="icon-button"
+            className="wide-button"
             title="刷新状态"
             disabled={busy === `refresh-${roomKey}`}
             onClick={() => run(`refresh-${roomKey}`, () => recorder.refreshRoom(room.id))}
           >
             <RefreshCw size={18} />
+            刷新
           </button>
           <button
             className={room.monitoring ? 'wide-button active' : 'wide-button'}
@@ -333,7 +339,7 @@ export function RoomCard({
             ))}
           </select>
           <button
-            className="icon-button"
+            className="wide-button"
             title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}）`}
             disabled={!room.currentRecording || room.recording || room.burning}
             onClick={() =>
@@ -341,14 +347,16 @@ export function RoomCard({
             }
           >
             <FileCode2 size={18} />
+            生成字幕
           </button>
           <button
-            className="icon-button"
+            className="wide-button"
             title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}）`}
             disabled={!room.currentRecording || room.recording || room.burning}
             onClick={() => run(`burn-${roomKey}`, () => recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode }))}
           >
             <Sparkles size={18} />
+            生成弹幕视频
           </button>
         </div>
       </div>

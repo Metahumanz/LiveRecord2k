@@ -5,11 +5,18 @@
 }
 
 .full-log-panel {
-  grid-template-rows: 1fr;
+  grid-template-rows: auto 1fr;
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 8px;
   background: rgba(18, 25, 30, 0.78);
   padding: 16px;
+}
+
+.log-summary {
+  margin: 0 0 12px;
+  color: #b6c7c2;
+  font-size: 15px;
+  line-height: 1.5;
 }
 
 .log-header {
@@ -36,6 +43,8 @@
 .empty-log {
   color: #82938e;
   padding: 14px 0;
+  font-size: 15px;
+  line-height: 1.5;
 }
 
 .log-row {
@@ -52,7 +61,7 @@
 .log-row span {
   color: #81938e;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .log-row p {

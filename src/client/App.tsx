@@ -15,7 +15,7 @@ import { getStats, hydrateExportDraft, isAppState } from './utils';
 const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
   { id: 'overview', label: '总览', icon: <Home size={20} /> },
   { id: 'rooms', label: '直播间', icon: <ListVideo size={20} /> },
-  { id: 'export', label: '剪辑', icon: <Scissors size={20} /> },
+  { id: 'export', label: '剪辑导出', icon: <Scissors size={20} /> },
   { id: 'settings', label: '设置', icon: <Settings2 size={20} /> },
   { id: 'logs', label: '日志', icon: <MessageSquareText size={20} /> }
 ];
@@ -165,7 +165,6 @@ export default function App() {
           <img className="brand-logo" src="/app-icon.svg" alt="" />
           <div>
             <h1>哔哩录播 2K</h1>
-            <p>直播监听 · 源流录制 · 弹幕烧录</p>
           </div>
         </div>
 
