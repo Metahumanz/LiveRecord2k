@@ -87,6 +87,7 @@ export type AppSettings = {
   notifyBurnEnded: boolean;
   openBrowserOnStart: boolean;
   updateManifestUrl: string;
+  serverHost: '127.0.0.1' | '0.0.0.0' | 'localhost' | '::';
   serverPort: number;
 };
 
@@ -172,7 +173,7 @@ export type FfmpegCapabilities = {
 export type FfmpegJobProgress = {
   id: string;
   kind: 'burn' | 'export';
-  status: 'running' | 'completed' | 'error';
+  status: 'running' | 'completed' | 'error' | 'cancelled';
   label: string;
   outputPath?: string;
   roomId?: string;
@@ -219,6 +220,7 @@ export type AppState = {
   ffmpegCapabilities?: FfmpegCapabilities;
   exportProgress?: FfmpegJobProgress | null;
   startupEnabled: boolean;
+  currentHost: string;
   currentPort: number;
   storePath?: string;
   appRoot?: string;
@@ -239,9 +241,11 @@ export type RecorderApi = {
   stopRecording: (roomId: string) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
   burnDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode']; prepareOnly?: boolean }) => Promise<AppState>;
+  cancelBurnDanmaku: (roomId: string) => Promise<AppState>;
   prepareDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode'] }) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
+  cancelExport: () => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;

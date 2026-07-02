@@ -10,7 +10,7 @@ import { RoomsPage } from './pages/RoomsPage';
 import { ExportPage } from './pages/ExportPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { LogsPage } from './pages/LogsPage';
-import { getStats, hydrateExportDraft, isAppState } from './utils';
+import { formatTimelineTime, getStats, hydrateExportDraft, isAppState } from './utils';
 
 const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
   { id: 'overview', label: '总览', icon: <Home size={20} /> },
@@ -102,11 +102,14 @@ export default function App() {
 
   function selectExportRecording(recording: RecordingState) {
     setExportResult(null);
+    const duration = Number(recording.durationSec || 0);
     setExportDraft((current) => ({
       ...current,
       cleanPath: recording.cleanPath,
       danmakuPath: recording.danmakuPath || '',
       cssPath: recording.cssPath || '',
+      startTime: '00:00:00',
+      endTime: duration > 0 ? formatTimelineTime(duration) : '',
       overlayMode: state?.settings.burnOverlayMode || current.overlayMode,
       outputDir: current.outputDir || state?.settings.outputDir || ''
     }));

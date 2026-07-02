@@ -99,6 +99,7 @@ const {
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
   parseFfmpegTime,
+  probeMediaFileInfo,
   isHevcCodec,
   formatTimestamp,
   formatDurationSeconds,
@@ -112,6 +113,8 @@ const {
   roomLabel,
   guardName,
   getRuntimePort,
+  getRuntimeHost,
+  normalizeServerHost,
   getAppRoot,
   findFfmpegPath,
   getAppVersion,
@@ -195,7 +198,7 @@ const WBI_MIXIN_KEY_TABLE = [
   39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59,
   6, 63, 57, 62, 11, 36, 20, 34, 44, 52
 ];
-const HOST = process.env.HOST || '127.0.0.1';
+const DEFAULT_HOST = '127.0.0.1';
 const PROD_MODE = process.argv.includes('--prod');
 const DEV_MODE = process.argv.includes('--dev') || !PROD_MODE;
 const OPEN_BROWSER = !process.argv.includes('--no-open') && process.env.BILI_RECORD_NO_OPEN !== '1';
@@ -237,9 +240,12 @@ class LiveRecordService {
     this.recordingStartLocks = new Set();
     this.reconnectPendingRooms = new Set();
     this.burnSessions = new Map();
+    this.burnCancelRequests = new Set();
     this.previewSessions = new Map();
     this.exportProgress = null;
     this.exportProgressClearTimer = null;
+    this.exportProcess = null;
+    this.exportCancelRequested = false;
     this.recordings = [];
     this.clients = new Set();
     this.notifications = [];
@@ -288,6 +294,7 @@ class LiveRecordService {
       notifyBurnEnded: true,
       openBrowserOnStart: true,
       updateManifestUrl: DEFAULT_UPDATE_MANIFEST_URL,
+      serverHost: DEFAULT_HOST,
       serverPort: DEFAULT_PORT
     };
   }
@@ -366,6 +373,7 @@ class LiveRecordService {
       notifyBurnEnded: settings.notifyBurnEnded !== false,
       openBrowserOnStart: settings.openBrowserOnStart !== false,
       updateManifestUrl: String(settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL).trim(),
+      serverHost: normalizeServerHost(settings.serverHost || DEFAULT_HOST),
       serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535)
     };
   }
@@ -448,6 +456,7 @@ class LiveRecordService {
       exportProgress: this.exportProgress ? { ...this.exportProgress } : null,
       startupEnabled: isStartupEnabled(),
       currentPort: this.currentPort || DEFAULT_PORT,
+      currentHost: this.currentHost || DEFAULT_HOST,
       storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT
@@ -594,6 +603,8 @@ class LiveRecordService {
 
   getTrayStateText(afterSeq) {
     const port = this.currentPort || DEFAULT_PORT;
+    const host = this.currentHost || DEFAULT_HOST;
+    const uiHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
     const rooms = Array.from(this.rooms.values()).map((room) => this.getPublicRoomState(room));
     const monitoringCount = rooms.filter((room) => room.monitoring).length;
     const liveCount = rooms.filter((room) => room.liveStatus === 1).length;
@@ -603,13 +614,13 @@ class LiveRecordService {
     const tooltip =
       `哔哩录播 2K | ${statusLabel} | ` +
       `监听 ${monitoringCount} / 直播 ${liveCount} / 录制 ${recordingCount} / 烧录 ${burningCount} | ` +
-      `端口 ${port}`;
+      `监听地址 ${host}:${port}`;
 
     const notification = this.notifications.find((item) => item.id > afterSeq);
     const seq = notification ? notification.id : this.notificationSeq;
     return [
       `seq=${seq}`,
-      `url=${encodeURIComponent(`http://${HOST}:${port}`)}`,
+      `url=${encodeURIComponent(`http://${uiHost}:${port}`)}`,
       `tooltip=${encodeURIComponent(tooltip)}`,
       `notify=${notification ? 1 : 0}`,
       `title=${encodeURIComponent(notification?.title || '')}`,
@@ -1792,6 +1803,11 @@ class LiveRecordService {
       finalized = await this.finalizeRecordingContainer(room, session);
     }
     const fileSize = await getFileSize(session.cleanPath);
+    const mediaInfo = finalized ? probeMediaFileInfo(this.ffmpegPath, session.cleanPath) : { durationSec: 0, videoInfo: null };
+    if (mediaInfo.videoInfo) {
+      session.videoInfo = mediaInfo.videoInfo;
+    }
+    const actualDurationSec = mediaInfo.durationSec || elapsedSec;
     const valid = isRecordingFileLikelyPlayable({
       fileSize,
       elapsedSec,
@@ -1816,7 +1832,7 @@ class LiveRecordService {
       mergeGroup: session.mergeGroup,
       mergeSequence: session.mergeSequence,
       mergeOutputPath: session.mergeOutputPath,
-      durationSec: elapsedSec,
+      durationSec: actualDurationSec,
       fileSize,
       valid,
       eventCount: session.eventCount,
@@ -2051,7 +2067,7 @@ class LiveRecordService {
   }
 
   async refreshRecordingLibrary(options = {}) {
-    const discovered = await discoverRecordingFiles(this.settings.outputDir);
+    const discovered = await discoverRecordingFiles(this.settings.outputDir, { ffmpegPath: this.ffmpegPath });
     const existing = new Map(this.recordings.map((recording) => [path.resolve(recording.cleanPath).toLowerCase(), recording]));
     const nextRecordings = [];
     for (const recording of discovered) {
@@ -2063,7 +2079,8 @@ class LiveRecordService {
         roomId: current?.roomId || recording.roomId,
         roomTitle: current?.roomTitle || recording.roomTitle,
         anchor: current?.anchor || recording.anchor,
-        videoInfo: current?.videoInfo || recording.videoInfo
+        durationSec: Number(recording.durationSec || current?.durationSec || 0),
+        videoInfo: recording.videoInfo || current?.videoInfo
       });
       if (normalized) {
         nextRecordings.push(normalized);
@@ -2233,6 +2250,14 @@ class LiveRecordService {
 
     try {
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+      this.burnCancelRequests.delete(room.id);
+      const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+      if (mediaInfo.durationSec > 0) {
+        recording.durationSec = mediaInfo.durationSec;
+      }
+      if (mediaInfo.videoInfo) {
+        recording.videoInfo = mediaInfo.videoInfo;
+      }
       const assets = await this.generateSubtitleAssets(recording, { overlayMode });
       if (options.prepareOnly) {
         this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
@@ -2284,11 +2309,16 @@ class LiveRecordService {
       });
       ffmpeg.on('close', (code, signal) => {
         const progressId = room.burnProgress?.id;
+        const cancelled = this.burnCancelRequests.delete(room.id);
         if (this.burnSessions.get(room.id) === ffmpeg) {
           room.burning = false;
           this.burnSessions.delete(room.id);
         }
-        if (code === 0) {
+        if (cancelled) {
+          finishFfmpegJobProgress(room.burnProgress, 'cancelled', '弹幕视频生成已取消');
+          fsp.rm(burnedPath, { force: true }).catch(() => {});
+          this.log('info', `${roomLabel(room)} 已取消生成弹幕视频：${path.basename(burnedPath)}`);
+        } else if (code === 0) {
           finishFfmpegJobProgress(room.burnProgress, 'completed', '弹幕版已生成');
           this.log('success', `${roomLabel(room)} 有弹幕版已生成：${path.basename(burnedPath)}`);
           if (this.settings.notifyBurnEnded) {
@@ -2319,6 +2349,23 @@ class LiveRecordService {
     }
     this.emitState();
     return true;
+  }
+
+  async cancelBurnDanmaku(roomId) {
+    const room = this.getRoom(roomId);
+    const ffmpeg = this.burnSessions.get(room.id);
+    if (!ffmpeg) {
+      return this.getState();
+    }
+    this.burnCancelRequests.add(room.id);
+    if (room.burnProgress?.status === 'running') {
+      room.burnProgress.message = '正在中断弹幕视频生成';
+      room.burnProgress.updatedAt = Date.now();
+    }
+    this.log('info', `${roomLabel(room)} 正在取消弹幕视频生成。`);
+    requestFfmpegStop(ffmpeg, { graceful: false, timeoutMs: 1500 });
+    this.emitState();
+    return this.getState();
   }
 
   async generateSubtitleAssets(recording, options = {}) {
@@ -2353,7 +2400,17 @@ class LiveRecordService {
       throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
     const startTime = parseTimeInput(options.startTime ?? options.start);
-    const endTime = parseTimeInput(options.endTime ?? options.end);
+    let endTime = parseTimeInput(options.endTime ?? options.end);
+    const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+    if (mediaInfo.durationSec > 0) {
+      recording.durationSec = mediaInfo.durationSec;
+      if (Number.isFinite(endTime) && endTime > mediaInfo.durationSec) {
+        endTime = mediaInfo.durationSec;
+      }
+    }
+    if (mediaInfo.videoInfo) {
+      recording.videoInfo = mediaInfo.videoInfo;
+    }
     if (!Number.isFinite(startTime) || startTime < 0) {
       throw new Error('开始时间无效，请输入 00:00:00 或秒数。');
     }
@@ -2395,7 +2452,17 @@ class LiveRecordService {
     const mode = normalizeExportMode(options.mode);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const startTime = parseTimeInput(options.startTime ?? options.start);
-    const endTime = parseTimeInput(options.endTime ?? options.end);
+    let endTime = parseTimeInput(options.endTime ?? options.end);
+    const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+    if (mediaInfo.durationSec > 0) {
+      recording.durationSec = mediaInfo.durationSec;
+      if (Number.isFinite(endTime) && endTime > mediaInfo.durationSec) {
+        endTime = mediaInfo.durationSec;
+      }
+    }
+    if (mediaInfo.videoInfo) {
+      recording.videoInfo = mediaInfo.videoInfo;
+    }
     if (!Number.isFinite(startTime) || startTime < 0) {
       throw new Error('开始时间无效，请输入 00:00:00 或秒数。');
     }
@@ -2451,9 +2518,12 @@ class LiveRecordService {
     });
     clearTimeout(this.exportProgressClearTimer);
     this.exportProgress = progress;
+    this.exportProcess = null;
+    this.exportCancelRequested = false;
     this.emitState();
 
     this.log('info', `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`);
+    let cancelled = false;
     try {
       await runFfmpegJob(this.ffmpegPath, args, (line) => {
         if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
@@ -2461,6 +2531,10 @@ class LiveRecordService {
         }
         if (/error|failed|invalid/i.test(line)) {
           this.log('warn', `剪辑导出：${compactLogLine(line)}`);
+        }
+      }, {
+        onChild: (child) => {
+          this.exportProcess = child;
         }
       });
       if (this.exportProgress?.id === progress.id) {
@@ -2470,12 +2544,26 @@ class LiveRecordService {
       this.log('success', `片段已导出：${path.basename(outputPath)}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (this.exportProgress?.id === progress.id) {
+      cancelled = this.exportCancelRequested;
+      if (cancelled) {
+        if (this.exportProgress?.id === progress.id) {
+          finishFfmpegJobProgress(this.exportProgress, 'cancelled', '导出已取消');
+          this.emitState();
+        }
+        await fsp.rm(outputPath, { force: true }).catch(() => {});
+        this.log('info', `已取消导出片段：${path.basename(outputPath)}`);
+      } else if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'error', `导出失败：${message}`);
         this.emitState();
       }
-      throw error;
+      if (!cancelled) {
+        throw error;
+      }
     } finally {
+      if (this.exportProgress?.id === progress.id) {
+        this.exportProcess = null;
+        this.exportCancelRequested = false;
+      }
       const progressId = progress.id;
       this.exportProgressClearTimer = setTimeout(() => {
         if (this.exportProgress?.id === progressId) {
@@ -2485,6 +2573,15 @@ class LiveRecordService {
       }, 5000);
       this.exportProgressClearTimer.unref?.();
     }
+    if (cancelled) {
+      return {
+        ok: false,
+        mode,
+        cleanPath: recording.cleanPath,
+        cssPath,
+        assPath: mode === 'burn' ? assPath : undefined
+      };
+    }
     return {
       ok: true,
       mode,
@@ -2493,6 +2590,21 @@ class LiveRecordService {
       cssPath,
       assPath: mode === 'burn' ? assPath : undefined
     };
+  }
+
+  async cancelExportClip() {
+    if (!this.exportProcess) {
+      return this.getState();
+    }
+    this.exportCancelRequested = true;
+    if (this.exportProgress?.status === 'running') {
+      this.exportProgress.message = '正在中断导出';
+      this.exportProgress.updatedAt = Date.now();
+    }
+    this.log('info', '正在取消当前导出任务。');
+    requestFfmpegStop(this.exportProcess, { graceful: false, timeoutMs: 1500 });
+    this.emitState();
+    return this.getState();
   }
 
   createFfmpegHeaders(room) {
@@ -2815,7 +2927,7 @@ class LiveRecordService {
         }
       });
     } catch (error) {
-      if (!isDefaultUpdateSource(source)) {
+      if (!isDefaultUpdateSource(source, DEFAULT_UPDATE_MANIFEST_URL)) {
         throw error;
       }
       onStatus?.('默认更新清单连接失败，正在改用 GitHub Release API...');
@@ -3031,6 +3143,7 @@ class LiveRecordService {
       this.recordingStartLocks.size > 0 ||
       this.reconnectPendingRooms.size > 0 ||
       this.burnSessions.size > 0 ||
+      Boolean(this.exportProcess) ||
       Array.from(this.rooms.values()).some((room) => room.recording || room.burning)
     );
   }
@@ -3089,6 +3202,9 @@ class LiveRecordService {
     for (const ffmpeg of this.burnSessions.values()) {
       requestFfmpegStop(ffmpeg, { graceful: false, timeoutMs: 1500 });
     }
+    if (this.exportProcess) {
+      requestFfmpegStop(this.exportProcess, { graceful: false, timeoutMs: 1500 });
+    }
   }
 }
 
@@ -3110,7 +3226,7 @@ function writeText(response, statusCode, text, contentType = 'text/plain; charse
 
 module.exports = {
   LiveRecordService,
-  HOST,
+  DEFAULT_HOST,
   DEV_MODE,
   OPEN_BROWSER,
   DIST_ROOT,
@@ -3118,5 +3234,6 @@ module.exports = {
   writeText,
   mimeType,
   getRuntimePort,
+  getRuntimeHost,
   openUrl
 };

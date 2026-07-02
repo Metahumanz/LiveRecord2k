@@ -477,6 +477,22 @@ export function SettingsPage({
             <h3>运行信息</h3>
             <div className="settings-grid">
               <label className="field">
+                <span>监听地址（重启生效）</span>
+                <select
+                  value={settingsDraft.serverHost}
+                  onChange={(event) =>
+                    setSettingsDraft({
+                      ...settingsDraft,
+                      serverHost: event.target.value as AppSettings['serverHost']
+                    })
+                  }
+                >
+                  <option value="127.0.0.1">仅本机 127.0.0.1</option>
+                  <option value="0.0.0.0">局域网 0.0.0.0</option>
+                </select>
+                <p className="field-help">选择 0.0.0.0 后，其它电脑可用本机局域网 IP 加端口访问；可能需要放行 Windows 防火墙。</p>
+              </label>
+              <label className="field">
                 <span>服务端口（重启生效）</span>
                 <input
                   type="number"
@@ -497,6 +513,7 @@ export function SettingsPage({
                 />
               </label>
             </div>
+            <PathLine label="当前监听" value={`${state.currentHost || '127.0.0.1'}:${state.currentPort || ''}`} />
             <PathLine label="当前端口" value={String(state.currentPort || '')} />
             <PathLine label="配置文件" value={state.storePath || ''} />
             <PathLine label="应用目录" value={state.appRoot || ''} />

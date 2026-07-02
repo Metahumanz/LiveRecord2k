@@ -164,6 +164,15 @@
   background: #f05c65;
 }
 
+.job-progress.cancelled .job-progress-heading strong,
+.job-progress.cancelled .job-progress-message {
+  color: #f2d88d;
+}
+
+.job-progress.cancelled .job-progress-track span {
+  background: #d8c36e;
+}
+
 .job-progress-message {
   min-width: 0;
   overflow: hidden;

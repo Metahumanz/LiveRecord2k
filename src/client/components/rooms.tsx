@@ -217,6 +217,17 @@ export function RoomCard({
         ) : null}
 
         {room.burnProgress ? <JobProgress progress={room.burnProgress} /> : null}
+        {room.burnProgress?.status === 'running' ? (
+          <button
+            className="wide-button danger fill"
+            type="button"
+            disabled={busy === `cancel-burn-${roomKey}`}
+            onClick={() => run(`cancel-burn-${roomKey}`, () => recorder.cancelBurnDanmaku(room.id))}
+          >
+            <Square size={17} />
+            中断生成弹幕视频
+          </button>
+        ) : null}
 
         <details className="technical-details">
           <summary>技术详情</summary>
