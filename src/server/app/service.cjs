@@ -100,6 +100,8 @@ const {
   parseFfmpegProgressTime,
   parseFfmpegTime,
   probeMediaFileInfo,
+  resolveReliableDurationSec,
+  readDanmakuDurationSec,
   isHevcCodec,
   formatTimestamp,
   formatDurationSeconds,
@@ -441,6 +443,22 @@ class LiveRecordService {
       danmakuPopularity: Number(recording.danmakuPopularity || 0),
       videoInfo: recording.videoInfo || null
     };
+  }
+
+  getSegmentDurationSec() {
+    const minutes = Number(this.settings.segmentMinutes || 0);
+    return Number.isFinite(minutes) && minutes > 0 ? minutes * 60 : 0;
+  }
+
+  async resolveRecordingDuration(recording, mediaInfo = {}, fallbackDurationSec = 0) {
+    const danmakuDurationSec = recording?.danmakuPath ? await readDanmakuDurationSec(recording.danmakuPath) : 0;
+    return resolveReliableDurationSec({
+      mediaDurationSec: mediaInfo.durationSec,
+      elapsedSec: fallbackDurationSec,
+      storedDurationSec: recording?.durationSec,
+      danmakuDurationSec,
+      segmentDurationSec: this.getSegmentDurationSec()
+    });
   }
 
   getState() {
@@ -1426,7 +1444,7 @@ class LiveRecordService {
         options.mergeOutputPath || path.join(this.settings.outputDir, `${sanitizeFilename(mergeGroup)}.merged.${container}`);
 
       const segmentMinutes = Number(this.settings.segmentMinutes || 0);
-      const segmentDurationSec = Number.isFinite(segmentMinutes) && segmentMinutes > 0 ? segmentMinutes * 60 : 0;
+      const segmentDurationSec = this.getSegmentDurationSec();
       const args = createRecordingArgs({
         streamUrl: stream.url,
         streamProtocol: stream.protocol,
@@ -1898,7 +1916,11 @@ class LiveRecordService {
     if (mediaInfo.videoInfo) {
       session.videoInfo = mediaInfo.videoInfo;
     }
-    const actualDurationSec = mediaInfo.durationSec || elapsedSec;
+    const actualDurationSec = resolveReliableDurationSec({
+      mediaDurationSec: mediaInfo.durationSec,
+      elapsedSec,
+      segmentDurationSec: session.segmentDurationSec
+    });
     const valid = isRecordingFileLikelyPlayable({
       fileSize,
       elapsedSec,
@@ -2159,7 +2181,10 @@ class LiveRecordService {
   }
 
   async refreshRecordingLibrary(options = {}) {
-    const discovered = await discoverRecordingFiles(this.settings.outputDir, { ffmpegPath: this.ffmpegPath });
+    const discovered = await discoverRecordingFiles(this.settings.outputDir, {
+      ffmpegPath: this.ffmpegPath,
+      segmentDurationSec: this.getSegmentDurationSec()
+    });
     const existing = new Map(this.recordings.map((recording) => [path.resolve(recording.cleanPath).toLowerCase(), recording]));
     const nextRecordings = [];
     for (const recording of discovered) {
@@ -2344,8 +2369,9 @@ class LiveRecordService {
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
       this.burnCancelRequests.delete(room.id);
       const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
-      if (mediaInfo.durationSec > 0) {
-        recording.durationSec = mediaInfo.durationSec;
+      const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
+      if (durationSec > 0) {
+        recording.durationSec = durationSec;
       }
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
@@ -2494,10 +2520,11 @@ class LiveRecordService {
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
-    if (mediaInfo.durationSec > 0) {
-      recording.durationSec = mediaInfo.durationSec;
-      if (Number.isFinite(endTime) && endTime > mediaInfo.durationSec) {
-        endTime = mediaInfo.durationSec;
+    const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
+    if (durationSec > 0) {
+      recording.durationSec = durationSec;
+      if (Number.isFinite(endTime) && endTime > durationSec) {
+        endTime = durationSec;
       }
     }
     if (mediaInfo.videoInfo) {
@@ -2546,10 +2573,11 @@ class LiveRecordService {
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
-    if (mediaInfo.durationSec > 0) {
-      recording.durationSec = mediaInfo.durationSec;
-      if (Number.isFinite(endTime) && endTime > mediaInfo.durationSec) {
-        endTime = mediaInfo.durationSec;
+    const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
+    if (durationSec > 0) {
+      recording.durationSec = durationSec;
+      if (Number.isFinite(endTime) && endTime > durationSec) {
+        endTime = durationSec;
       }
     }
     if (mediaInfo.videoInfo) {
