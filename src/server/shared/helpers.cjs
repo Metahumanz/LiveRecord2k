@@ -715,6 +715,87 @@ function parseFfmpegDuration(text) {
   return Number.isFinite(duration) && duration > 0 ? duration : 0;
 }
 
+function normalizeDurationSeconds(value) {
+  const duration = Number(value || 0);
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function isLikelyCommonSegmentDuration(durationSec) {
+  const duration = normalizeDurationSeconds(durationSec);
+  if (!duration) {
+    return false;
+  }
+  const commonDurations = [300, 600, 900, 1200, 1800, 2700, 3600, 5400, 7200, 10800, 14400];
+  return commonDurations.some((candidate) => Math.abs(duration - candidate) <= Math.max(2, candidate * 0.002));
+}
+
+function isLikelySegmentPlaceholderDuration(mediaDurationSec, referenceDurationSec, segmentDurationSec) {
+  const mediaDuration = normalizeDurationSeconds(mediaDurationSec);
+  const referenceDuration = normalizeDurationSeconds(referenceDurationSec);
+  if (!mediaDuration || !referenceDuration || referenceDuration >= mediaDuration) {
+    return false;
+  }
+
+  const configuredSegment = normalizeDurationSeconds(segmentDurationSec);
+  const closeToConfiguredSegment =
+    configuredSegment > 0 && Math.abs(mediaDuration - configuredSegment) <= Math.max(2, Math.min(10, configuredSegment * 0.01));
+  const looksLikeSegmentLimit = closeToConfiguredSegment || isLikelyCommonSegmentDuration(mediaDuration);
+  const meaningfulGap = mediaDuration - referenceDuration > Math.max(10, Math.min(60, mediaDuration * 0.05));
+  return looksLikeSegmentLimit && meaningfulGap;
+}
+
+function resolveReliableDurationSec({
+  mediaDurationSec,
+  elapsedSec,
+  storedDurationSec,
+  danmakuDurationSec,
+  segmentDurationSec
+} = {}) {
+  const mediaDuration = normalizeDurationSeconds(mediaDurationSec);
+  const references = [elapsedSec, storedDurationSec, danmakuDurationSec].map(normalizeDurationSeconds).filter(Boolean);
+  const referenceDuration = references.length ? Math.max(...references) : 0;
+
+  if (mediaDuration && isLikelySegmentPlaceholderDuration(mediaDuration, referenceDuration, segmentDurationSec)) {
+    return referenceDuration;
+  }
+  return mediaDuration || referenceDuration || 0;
+}
+
+function parseRecordingStartedAtFromName(filePath) {
+  const name = path.basename(String(filePath || ''));
+  const matches = Array.from(name.matchAll(/_(\d{8})_(\d{6})(?=.*\.(?:clean|merged)\.(?:mp4|mkv)$)/gi));
+  const match = matches.at(-1);
+  if (!match) {
+    return 0;
+  }
+  const date = match[1];
+  const time = match[2];
+  const startedAt = new Date(
+    Number(date.slice(0, 4)),
+    Number(date.slice(4, 6)) - 1,
+    Number(date.slice(6, 8)),
+    Number(time.slice(0, 2)),
+    Number(time.slice(2, 4)),
+    Number(time.slice(4, 6))
+  ).getTime();
+  return Number.isFinite(startedAt) ? startedAt : 0;
+}
+
+function estimateRecordingDurationFromStats(filePath, stat) {
+  const startedAt = parseRecordingStartedAtFromName(filePath);
+  const endedAt = Number(stat?.mtimeMs || 0);
+  const duration = (endedAt - startedAt) / 1000;
+  return Number.isFinite(duration) && duration > 0 && duration < 7 * 24 * 3600 ? duration : 0;
+}
+
+async function readDanmakuDurationSec(danmakuPath) {
+  const events = await danmakuAss.readDanmakuEvents(danmakuPath);
+  return events.reduce((maxTime, event) => {
+    const time = Number(event?.time || 0);
+    return Number.isFinite(time) && time > maxTime ? time : maxTime;
+  }, 0);
+}
+
 function probeMediaFileInfo(ffmpegPath, filePath) {
   if (!ffmpegPath || !filePath || !fs.existsSync(filePath)) {
     return { durationSec: 0, videoInfo: null };
@@ -1169,6 +1250,8 @@ async function discoverRecordingFiles(outputDir, options = {}) {
     }
     const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
     const eventCount = await countDanmakuLines(danmakuPath);
+    const elapsedSec = estimateRecordingDurationFromStats(cleanPath, stat);
+    const danmakuDurationSec = await readDanmakuDurationSec(danmakuPath);
     const valid = stat.size >= 32 * 1024;
     const mediaInfo = valid ? probeMediaFileInfo(options.ffmpegPath, cleanPath) : { durationSec: 0, videoInfo: null };
     recordings.push({
@@ -1182,7 +1265,12 @@ async function discoverRecordingFiles(outputDir, options = {}) {
       capturePath: '',
       containerStage: valid ? 'ready' : 'failed',
       validReason: valid ? '' : `文件过小：${formatBytes(stat.size)}`,
-      durationSec: mediaInfo.durationSec,
+      durationSec: resolveReliableDurationSec({
+        mediaDurationSec: mediaInfo.durationSec,
+        elapsedSec,
+        danmakuDurationSec,
+        segmentDurationSec: options.segmentDurationSec
+      }),
       fileSize: stat.size,
       valid,
       eventCount,
@@ -1833,6 +1921,10 @@ module.exports = {
   parseFfmpegProgressTime,
   parseFfmpegTime,
   parseFfmpegDuration,
+  resolveReliableDurationSec,
+  parseRecordingStartedAtFromName,
+  estimateRecordingDurationFromStats,
+  readDanmakuDurationSec,
   probeMediaFileInfo,
   isHevcCodec,
   formatTimestamp,
