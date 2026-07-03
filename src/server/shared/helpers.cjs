@@ -1225,62 +1225,75 @@ function formatBytes(bytes) {
 }
 
 async function discoverRecordingFiles(outputDir, options = {}) {
-  let entries;
-  try {
-    entries = await fsp.readdir(outputDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
   const recordings = [];
-  for (const entry of entries) {
-    if (!entry.isFile()) {
-      continue;
+  const maxDepth = Number.isFinite(Number(options.maxDepth)) ? Number(options.maxDepth) : 4;
+
+  async function visit(directory, depth) {
+    let entries;
+    try {
+      entries = await fsp.readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
     }
-    const name = entry.name;
-    if (!/\.(?:clean|merged)\.(?:mp4|mkv)$/i.test(name)) {
-      continue;
+    for (const entry of entries) {
+      const filePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < maxDepth) {
+          await visit(filePath, depth + 1);
+        }
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      const name = entry.name;
+      if (!/\.(?:clean|merged)\.(?:mp4|mkv)$/i.test(name)) {
+        continue;
+      }
+      if (/\.tmp\.|\.finalizing\.|\.clip_/i.test(name)) {
+        continue;
+      }
+      const cleanPath = filePath;
+      const stat = await fsp.stat(cleanPath).catch(() => null);
+      if (!stat?.isFile()) {
+        continue;
+      }
+      const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
+      const eventCount = await countDanmakuLines(danmakuPath);
+      const elapsedSec = estimateRecordingDurationFromStats(cleanPath, stat);
+      const danmakuDurationSec = await readDanmakuDurationSec(danmakuPath);
+      const valid = stat.size >= 32 * 1024;
+      const mediaInfo = valid ? probeMediaFileInfo(options.ffmpegPath, cleanPath) : { durationSec: 0, videoInfo: null };
+      recordings.push({
+        id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
+        startedAt: stat.mtimeMs,
+        cleanPath,
+        danmakuPath,
+        cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
+        assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
+        burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
+        capturePath: '',
+        containerStage: valid ? 'ready' : 'failed',
+        validReason: valid ? '' : `文件过小：${formatBytes(stat.size)}`,
+        durationSec: resolveReliableDurationSec({
+          mediaDurationSec: mediaInfo.durationSec,
+          elapsedSec,
+          danmakuDurationSec,
+          segmentDurationSec: options.segmentDurationSec
+        }),
+        fileSize: stat.size,
+        valid,
+        eventCount,
+        capturedDanmakuCount: eventCount,
+        rawDanmakuCount: eventCount,
+        ignoredDanmakuCount: 0,
+        danmakuCommandCounts: {},
+        videoInfo: mediaInfo.videoInfo
+      });
     }
-    if (/\.tmp\.|\.finalizing\.|\.clip_/i.test(name)) {
-      continue;
-    }
-    const cleanPath = path.join(outputDir, name);
-    const stat = await fsp.stat(cleanPath).catch(() => null);
-    if (!stat?.isFile()) {
-      continue;
-    }
-    const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
-    const eventCount = await countDanmakuLines(danmakuPath);
-    const elapsedSec = estimateRecordingDurationFromStats(cleanPath, stat);
-    const danmakuDurationSec = await readDanmakuDurationSec(danmakuPath);
-    const valid = stat.size >= 32 * 1024;
-    const mediaInfo = valid ? probeMediaFileInfo(options.ffmpegPath, cleanPath) : { durationSec: 0, videoInfo: null };
-    recordings.push({
-      id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
-      startedAt: stat.mtimeMs,
-      cleanPath,
-      danmakuPath,
-      cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
-      assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
-      burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
-      capturePath: '',
-      containerStage: valid ? 'ready' : 'failed',
-      validReason: valid ? '' : `文件过小：${formatBytes(stat.size)}`,
-      durationSec: resolveReliableDurationSec({
-        mediaDurationSec: mediaInfo.durationSec,
-        elapsedSec,
-        danmakuDurationSec,
-        segmentDurationSec: options.segmentDurationSec
-      }),
-      fileSize: stat.size,
-      valid,
-      eventCount,
-      capturedDanmakuCount: eventCount,
-      rawDanmakuCount: eventCount,
-      ignoredDanmakuCount: 0,
-      danmakuCommandCounts: {},
-      videoInfo: mediaInfo.videoInfo
-    });
   }
+
+  await visit(outputDir, 0);
   return recordings;
 }
 

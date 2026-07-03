@@ -235,6 +235,7 @@ class LiveRecordService {
     this.reconnectPendingRooms = new Set();
     this.burnSessions = new Map();
     this.burnCancelRequests = new Set();
+    this.pendingSegmentCleanups = new Map();
     this.previewSessions = new Map();
     this.exportProgress = null;
     this.exportProgressClearTimer = null;
@@ -436,9 +437,9 @@ class LiveRecordService {
     };
   }
 
-  getSegmentDurationSec() {
-    const minutes = Number(this.settings.segmentMinutes || 0);
-    return Number.isFinite(minutes) && minutes > 0 ? minutes * 60 : 0;
+  getSegmentDurationSec(minutes = this.settings.segmentMinutes) {
+    const value = Number(minutes || 0);
+    return Number.isFinite(value) && value > 0 ? value * 60 : 0;
   }
 
   async resolveRecordingDuration(recording, mediaInfo = {}, fallbackDurationSec = 0) {
@@ -817,8 +818,10 @@ class LiveRecordService {
       ...nextSettings
     });
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
-    if (oldOutputDir !== this.settings.outputDir) {
+    if (oldOutputDir !== this.settings.outputDir && !this.hasActiveJobs()) {
       await this.refreshRecordingLibrary({ silent: true });
+    } else if (oldOutputDir !== this.settings.outputDir) {
+      this.log('info', '当前有录制或处理任务，已保留现有录像库；新保存目录会从下一次新录制开始使用。');
     }
     await this.saveStore();
     if (oldPollInterval !== this.settings.pollIntervalSec) {
@@ -1416,26 +1419,34 @@ class LiveRecordService {
           );
         }
       }
-      await fsp.mkdir(this.settings.outputDir, { recursive: true });
-
       const timestamp = formatTimestamp(new Date());
+      const outputRoot = String(this.settings.outputDir || '').trim() || this.settings.outputDir;
+      const roomFolder = sanitizeFilename(`${room.realRoomId || room.id}-${room.anchor || 'anchor'}`) || `room-${room.id}`;
+      const liveFolder = sanitizeFilename(`${timestamp}-${room.title || 'live'}`) || timestamp;
+      const outputDir = String(options.outputDir || path.join(outputRoot, roomFolder, liveFolder)).trim() || outputRoot;
+      await fsp.mkdir(outputDir, { recursive: true });
+
       const baseName = sanitizeFilename(
         `${room.realRoomId || room.id}_${room.anchor || 'anchor'}_${room.title || 'live'}_${timestamp}`
       );
-      const container = normalizeContainer(this.settings.outputContainer);
-      const cleanPath = path.join(this.settings.outputDir, `${baseName}.clean.${container}`);
-      const capturePath = container === 'mp4' ? path.join(this.settings.outputDir, `${baseName}.recording.mkv`) : cleanPath;
-      const danmakuPath = path.join(this.settings.outputDir, `${baseName}.danmaku.jsonl`);
-      const cssPath = path.join(this.settings.outputDir, `${baseName}.danmaku.css`);
-      const assPath = path.join(this.settings.outputDir, `${baseName}.danmaku.ass`);
-      const burnedPath = path.join(this.settings.outputDir, `${baseName}.danmaku.${container}`);
+      const container = normalizeContainer(options.outputContainer || this.settings.outputContainer);
+      const cleanPath = path.join(outputDir, `${baseName}.clean.${container}`);
+      const capturePath = container === 'mp4' ? path.join(outputDir, `${baseName}.recording.mkv`) : cleanPath;
+      const danmakuPath = path.join(outputDir, `${baseName}.danmaku.jsonl`);
+      const cssPath = path.join(outputDir, `${baseName}.danmaku.css`);
+      const assPath = path.join(outputDir, `${baseName}.danmaku.ass`);
+      const burnedPath = path.join(outputDir, `${baseName}.danmaku.${container}`);
       const mergeGroup = String(options.mergeGroup || baseName);
       const mergeSequence = Number(options.mergeSequence || 0);
       const mergeOutputPath =
-        options.mergeOutputPath || path.join(this.settings.outputDir, `${sanitizeFilename(mergeGroup)}.merged.${container}`);
+        options.mergeOutputPath || path.join(outputDir, `${sanitizeFilename(mergeGroup)}.merged.${container}`);
 
-      const segmentMinutes = Number(this.settings.segmentMinutes || 0);
-      const segmentDurationSec = this.getSegmentDurationSec();
+      const segmentMinutes = Number(options.segmentMinutes ?? this.settings.segmentMinutes ?? 0);
+      const optionSegmentDurationSec = Number(options.segmentDurationSec);
+      const segmentDurationSec =
+        Number.isFinite(optionSegmentDurationSec) && optionSegmentDurationSec > 0
+          ? optionSegmentDurationSec
+          : this.getSegmentDurationSec(segmentMinutes);
       const args = createRecordingArgs({
         streamUrl: stream.url,
         streamProtocol: stream.protocol,
@@ -1458,6 +1469,7 @@ class LiveRecordService {
         eventStream,
         danmakuClient: null,
         startedAt: Date.now(),
+        outputDir,
         outputContainer: container,
         cleanPath,
         capturePath,
@@ -2005,15 +2017,7 @@ class LiveRecordService {
     this.emitState();
 
     if (shouldContinueSegment) {
-      if (this.settings.autoBurnDanmaku && session.eventCount > 0) {
-        setTimeout(() => {
-          if (finishedRecording.valid) {
-            this.startBurnRecording(room, finishedRecording).catch((error) => {
-              this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
-            });
-          }
-        }, 500);
-      }
+      this.scheduleQueuedUpdateCheck();
     } else if (shouldReconnectLiveStream) {
       setTimeout(() => {
         const currentRoom = this.rooms.get(roomId);
@@ -2035,6 +2039,10 @@ class LiveRecordService {
         this.startRecording(roomId, true, {
           streamReconnect: true,
           silentNotify: true,
+          outputDir: session.outputDir,
+          outputContainer: session.outputContainer,
+          segmentMinutes: session.segmentMinutes,
+          segmentDurationSec: session.segmentDurationSec,
           mergeGroup: session.mergeGroup,
           mergeSequence: Number(session.mergeSequence || 0) + 1,
           mergeOutputPath: session.mergeOutputPath
@@ -2068,6 +2076,10 @@ class LiveRecordService {
       silentNotify: true,
       stream: session.nextStream || undefined,
       fallbackStream: session.stream,
+      outputDir: session.outputDir,
+      outputContainer: session.outputContainer,
+      segmentMinutes: session.segmentMinutes,
+      segmentDurationSec: session.segmentDurationSec,
       mergeGroup: session.mergeGroup,
       mergeSequence: Number(session.mergeSequence || 0) + 1,
       mergeOutputPath: session.mergeOutputPath
@@ -2301,11 +2313,20 @@ class LiveRecordService {
       danmakuCommandCounts: mergeCommandCounts(segments.map((segment) => segment.danmakuCommandCounts)),
       videoInfo: segments[0].videoInfo || null
     });
-    this.recordings = [mergedRecording, ...this.recordings.filter((recording) => recording.cleanPath !== outputPath)].slice(0, 80);
+    const outputPathKey = path.resolve(outputPath).toLowerCase();
+    const segmentPathKeys = new Set(segments.map((segment) => path.resolve(segment.cleanPath).toLowerCase()));
+    this.recordings = [
+      mergedRecording,
+      ...this.recordings.filter((recording) => {
+        const recordingKey = path.resolve(recording.cleanPath).toLowerCase();
+        return recordingKey !== outputPathKey && !segmentPathKeys.has(recordingKey);
+      })
+    ].slice(0, 80);
     if (!this.isRoomRecording(room)) {
       room.currentRecording = mergedRecording;
     }
     await this.saveStore();
+    await this.cleanupMergedSegmentFiles(room, segments, mergedRecording);
     this.log(
       'success',
       `${roomLabel(room)} 续录片段已合并：${path.basename(outputPath)}，共 ${segments.length} 段，时长 ${formatDurationSeconds(
@@ -2314,6 +2335,88 @@ class LiveRecordService {
     );
     this.emitState();
     return mergedRecording;
+  }
+
+  async cleanupMergedSegmentFiles(room, segments, mergedRecording) {
+    if (this.isRoomBurning(room)) {
+      this.pendingSegmentCleanups.set(room.id, {
+        segments: segments.map((segment) => cloneRecordingState(segment)),
+        mergedRecording: cloneRecordingState(mergedRecording)
+      });
+      this.log('info', `${roomLabel(room)} 当前仍有烧录任务，小分段文件会在烧录结束后清理。`);
+      return;
+    }
+
+    const cleanupPaths = new Map();
+    const protectedPaths = new Set();
+    const pathKey = (filePath) => {
+      const value = String(filePath || '').trim();
+      return value ? path.resolve(value).toLowerCase() : '';
+    };
+    const addCleanupPath = (filePath) => {
+      const key = pathKey(filePath);
+      if (key) {
+        cleanupPaths.set(key, String(filePath));
+      }
+    };
+    const addProtectedPath = (filePath) => {
+      const key = pathKey(filePath);
+      if (key) {
+        protectedPaths.add(key);
+      }
+    };
+    const addRecordingArtifacts = (recording, add) => {
+      if (!recording?.cleanPath) {
+        return;
+      }
+      add(recording.cleanPath);
+      add(recording.capturePath);
+      add(recording.danmakuPath);
+      add(recording.cssPath);
+      add(recording.assPath);
+      add(recording.burnedPath);
+      add(deriveSiblingPath(recording.cleanPath, 'danmaku', 'jsonl'));
+      add(deriveSiblingPath(recording.cleanPath, 'danmaku', 'css'));
+      add(deriveSiblingPath(recording.cleanPath, 'danmaku', 'ass'));
+      add(deriveSiblingPath(recording.cleanPath, 'danmaku-only', 'ass'));
+      add(deriveBurnedPath(recording.cleanPath, 'danmaku-gift'));
+      add(deriveBurnedPath(recording.cleanPath, 'danmaku'));
+      add(replaceExtension(recording.cleanPath, '.finalizing.mp4'));
+    };
+
+    addRecordingArtifacts(mergedRecording, addProtectedPath);
+    for (const session of this.recordingSessions.values()) {
+      addRecordingArtifacts(session, addProtectedPath);
+    }
+    for (const segment of segments) {
+      addRecordingArtifacts(segment, addCleanupPath);
+    }
+
+    let deletedCount = 0;
+    let failedCount = 0;
+    for (const [key, filePath] of cleanupPaths) {
+      if (protectedPaths.has(key)) {
+        continue;
+      }
+      const stat = await fsp.stat(filePath).catch(() => null);
+      if (!stat?.isFile()) {
+        continue;
+      }
+      try {
+        await fsp.rm(filePath, { force: true });
+        deletedCount += 1;
+      } catch (error) {
+        failedCount += 1;
+        this.log('warn', `${roomLabel(room)} 删除小分段文件失败：${filePath}，${error.message}`);
+      }
+    }
+
+    if (deletedCount > 0) {
+      this.log('success', `${roomLabel(room)} 已清理合并前的小分段文件 ${deletedCount} 个。`);
+    }
+    if (failedCount > 0) {
+      this.log('warn', `${roomLabel(room)} 有 ${failedCount} 个小分段文件未能删除，可稍后手动清理。`);
+    }
   }
 
   async startBurnDanmaku(roomId, options = {}) {
@@ -2447,6 +2550,13 @@ class LiveRecordService {
             this.emitState();
           }
         }, 5000).unref?.();
+        const pendingCleanup = this.pendingSegmentCleanups.get(room.id);
+        if (pendingCleanup && !this.isRoomBurning(room)) {
+          this.pendingSegmentCleanups.delete(room.id);
+          this.cleanupMergedSegmentFiles(room, pendingCleanup.segments, pendingCleanup.mergedRecording).catch((error) => {
+            this.log('warn', `${roomLabel(room)} 清理合并前小分段失败：${error.message}`);
+          });
+        }
         this.scheduleQueuedUpdateCheck();
       });
     } catch (error) {

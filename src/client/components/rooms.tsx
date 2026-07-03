@@ -148,6 +148,7 @@ export function RoomCard({
   room,
   roomImageMode,
   burnOverlayMode,
+  showDanmakuActions = true,
   busy,
   run,
   openPreview
@@ -155,6 +156,7 @@ export function RoomCard({
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
   burnOverlayMode: AppSettings['burnOverlayMode'];
+  showDanmakuActions?: boolean;
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
   openPreview: (roomId: string) => void;
@@ -337,39 +339,45 @@ export function RoomCard({
               录制
             </button>
           )}
-          <select
-            className="action-select"
-            value={cardOverlayMode}
-            disabled={!room.currentRecording || room.recording || room.burning}
-            title="弹幕版内容"
-            onChange={(event) => setCardOverlayMode(event.target.value as AppSettings['burnOverlayMode'])}
-          >
-            {overlayModeOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <button
-            className="wide-button"
-            title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}）`}
-            disabled={!room.currentRecording || room.recording || room.burning}
-            onClick={() =>
-              run(`subtitles-${roomKey}`, () => recorder.prepareDanmaku(room.id, { overlayMode: cardOverlayMode }))
-            }
-          >
-            <FileCode2 size={18} />
-            生成字幕
-          </button>
-          <button
-            className="wide-button"
-            title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}）`}
-            disabled={!room.currentRecording || room.recording || room.burning}
-            onClick={() => run(`burn-${roomKey}`, () => recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode }))}
-          >
-            <Sparkles size={18} />
-            生成弹幕视频
-          </button>
+          {showDanmakuActions ? (
+            <>
+              <select
+                className="action-select"
+                value={cardOverlayMode}
+                disabled={!room.currentRecording || room.recording || room.burning}
+                title="弹幕版内容"
+                onChange={(event) => setCardOverlayMode(event.target.value as AppSettings['burnOverlayMode'])}
+              >
+                {overlayModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="wide-button"
+                title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}）`}
+                disabled={!room.currentRecording || room.recording || room.burning}
+                onClick={() =>
+                  run(`subtitles-${roomKey}`, () => recorder.prepareDanmaku(room.id, { overlayMode: cardOverlayMode }))
+                }
+              >
+                <FileCode2 size={18} />
+                生成字幕
+              </button>
+              <button
+                className="wide-button"
+                title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}）`}
+                disabled={!room.currentRecording || room.recording || room.burning}
+                onClick={() =>
+                  run(`burn-${roomKey}`, () => recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode }))
+                }
+              >
+                <Sparkles size={18} />
+                生成弹幕视频
+              </button>
+            </>
+          ) : null}
         </div>
       </div>
     </article>
