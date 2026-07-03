@@ -60,7 +60,7 @@ export function UpdateNotice({
             onClick={() => run('update-queue', recorder.queueUpdate)}
           >
             <Clock3 size={18} />
-            录制结束后安装
+            结束后下载
           </button>
         ) : null}
         {canInstall ? (
@@ -71,16 +71,6 @@ export function UpdateNotice({
           >
             <Download size={18} />
             下载安装器
-          </button>
-        ) : null}
-        {canInstall && !activeJobs ? (
-          <button
-            className="wide-button primary"
-            disabled={busy === 'update-apply'}
-            onClick={() => run('update-apply', recorder.applyUpdate)}
-          >
-            <Download size={18} />
-            启动安装器
           </button>
         ) : null}
         {update.status === 'error' ? (
@@ -97,6 +87,16 @@ export function UpdateNotice({
           <button className="wide-button" onClick={() => run('open-config', recorder.openConfigDir)}>
             <FolderOpen size={18} />
             配置目录
+          </button>
+        ) : null}
+        {update.packagePath ? (
+          <button
+            className="wide-button"
+            disabled={busy === 'open-update-package'}
+            onClick={() => run('open-update-package', () => recorder.openPathDir(update.packagePath || ''))}
+          >
+            <FolderOpen size={18} />
+            打开下载目录
           </button>
         ) : null}
         {update.status === 'queued' ? <span className="update-waiting">等待任务结束</span> : null}
@@ -163,8 +163,8 @@ export function updateTitle(status: AppState['update']['status']) {
   if (status === 'queued') return '更新已排队';
   if (status === 'checking') return '正在检查更新';
   if (status === 'downloading') return '正在下载更新';
-  if (status === 'ready') return '安装器已就绪';
-  if (status === 'applying') return '安装器已启动';
+  if (status === 'ready') return '安装包已下载';
+  if (status === 'applying') return '安装状态待确认';
   if (status === 'up-to-date') return '已是最新';
   if (status === 'blocked') return '暂不更新';
   if (status === 'error') return '更新失败';

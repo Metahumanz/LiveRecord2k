@@ -152,14 +152,6 @@ const {
   isDefaultUpdateSource,
   normalizeUpdateManifest,
   normalizeVersion,
-  normalizeUpdatePackageType,
-  isInstallerFileName,
-  isInstallerUpdatePackage,
-  normalizeInstallerArgs,
-  buildInstallerArgs,
-  portableInstallerArgPath,
-  createElevatedInstallerLaunchScript,
-  splitCommandLineArgs,
   updatePackageLabel,
   updatePackageFileName,
   packageFileNameFromUrl,
@@ -170,7 +162,6 @@ const {
   setStartupEnabled,
   createStartupCommand,
   showWindowsToast,
-  base64Utf8,
   openUrl,
   openPath,
   mimeType
@@ -2833,7 +2824,7 @@ class LiveRecordService {
       ...this.updateState,
       status: 'queued',
       queued: true,
-      message: `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动启动安装器。`
+      message: `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动下载安装器。安装会中断监听和录制，请确认空闲后手动安装。`
     };
     this.log('info', this.updateState.message);
     this.emitState();
@@ -2859,7 +2850,7 @@ class LiveRecordService {
         status: usablePackagePath ? 'available' : 'downloading',
         queued: false,
         message: usablePackagePath
-          ? `${updatePackageLabel(manifest)}已下载：${usablePackagePath}`
+          ? this.createManualUpdateMessage(manifest, usablePackagePath)
           : `正在下载 ${manifest.version} ${updatePackageLabel(manifest)}...`,
         downloadReceivedBytes: usablePackagePath ? this.updateState.downloadReceivedBytes : 0,
         downloadTotalBytes: usablePackagePath ? this.updateState.downloadTotalBytes : 0,
@@ -2875,11 +2866,11 @@ class LiveRecordService {
         ...this.updateState,
         status: 'available',
         queued: false,
-        message: `${updatePackageLabel(manifest)}已下载：${packagePath}`,
+        message: this.createManualUpdateMessage(manifest, packagePath),
         downloadProgress: 100,
         packagePath
       };
-      this.log('success', `${updatePackageLabel(manifest)}已下载：${packagePath}`);
+      this.log('success', this.updateState.message);
       this.emitState();
     } catch (error) {
       this.updateState = {
@@ -2903,7 +2894,7 @@ class LiveRecordService {
         ...this.updateState,
         status: 'blocked',
         queued: false,
-        message: '当前仍有录制或烧录任务，暂不更新。'
+        message: '当前仍有录制或烧录任务，暂不准备更新。安装会中断监听和录制，请任务结束后再手动安装。'
       };
       this.emitState();
       return this.getState();
@@ -2924,7 +2915,7 @@ class LiveRecordService {
         status: 'downloading',
         queued: false,
         message: usablePackagePath
-          ? `正在使用已下载的 ${manifest.version} ${updatePackageLabel(manifest)}...`
+          ? `正在准备已下载的 ${manifest.version} ${updatePackageLabel(manifest)}...`
           : `正在下载 ${manifest.version} ${updatePackageLabel(manifest)}...`,
         downloadReceivedBytes: usablePackagePath ? this.updateState.downloadReceivedBytes : 0,
         downloadTotalBytes: usablePackagePath ? this.updateState.downloadTotalBytes : 0,
@@ -2938,33 +2929,13 @@ class LiveRecordService {
       const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
       this.updateState = {
         ...this.updateState,
-        status: 'ready',
-        message: `${updatePackageLabel(manifest)}已准备好，正在启动安装器...`,
+        status: 'available',
+        queued: false,
+        message: this.createManualUpdateMessage(manifest, packagePath),
         downloadProgress: 100,
         packagePath
       };
-      this.emitState();
-
-      const launched = this.launchUpdateInstaller(packagePath, manifest);
-      if (!launched) {
-        this.updateState = {
-          ...this.updateState,
-          status: 'available',
-          queued: false,
-          message: `更新包已下载，但当前更新源没有提供安装器。请打开下载目录后手动更新：${packagePath}`,
-          downloadProgress: 100,
-          packagePath
-        };
-        this.log('warn', this.updateState.message);
-        this.emitState();
-        return this.getState();
-      }
-      this.updateState = {
-        ...this.updateState,
-        status: 'applying',
-        message: '安装器已启动，应用会在安装过程中自动重启。'
-      };
-      this.log('success', `已启动 ${manifest.version} 安装器：${packagePath}`);
+      this.log('success', this.updateState.message);
       this.emitState();
     } catch (error) {
       this.updateState = {
@@ -2980,6 +2951,12 @@ class LiveRecordService {
       this.emitState();
     }
     return this.getState();
+  }
+
+  createManualUpdateMessage(manifest, packagePath) {
+    const label = updatePackageLabel(manifest);
+    const action = label === '安装器' ? '手动运行安装器' : '手动更新';
+    return `${label}已下载。安装会中断监听和录制，请确认空闲后打开下载目录${action}：${packagePath}`;
   }
 
   async getUsableDownloadedPackage(manifest) {
@@ -3000,35 +2977,6 @@ class LiveRecordService {
       }
     }
     return packagePath;
-  }
-
-  launchUpdateInstaller(packagePath, manifest) {
-    if (!isInstallerUpdatePackage(manifest, packagePath)) {
-      return false;
-    }
-    const args = buildInstallerArgs(manifest, {
-      packagePath,
-      statusPath: this.getUpdateStatusPath(),
-      logPath: this.getUpdateLogPath()
-    });
-    if (process.platform === 'win32') {
-      const script = createElevatedInstallerLaunchScript(packagePath, args);
-      const encoded = Buffer.from(script, 'utf16le').toString('base64');
-      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
-      });
-      child.unref();
-      return true;
-    }
-    const child = spawn(packagePath, args, {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false
-    });
-    child.unref();
-    return true;
   }
 
   async fetchUpdateManifest(onStatus) {
@@ -3248,7 +3196,7 @@ class LiveRecordService {
           ...this.updateState,
           status: 'error',
           queued: false,
-          message: `自动更新失败：${error.message}`
+          message: `自动下载更新失败：${error.message}`
         };
         this.log('error', this.updateState.message);
         this.emitState();

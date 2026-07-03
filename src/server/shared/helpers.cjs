@@ -1614,14 +1614,11 @@ function normalizeInstallerArgs(manifest) {
   if (typeof manifest?.installerArgs === 'string') {
     return splitCommandLineArgs(manifest.installerArgs);
   }
-  return ['/S'];
+  return [];
 }
 
 function buildInstallerArgs(manifest, paths) {
   const args = normalizeInstallerArgs(manifest);
-  if (!args.some((arg) => String(arg).toUpperCase() === '/S')) {
-    args.unshift('/S');
-  }
   args.push(`/STATUS=${portableInstallerArgPath(paths.statusPath)}`);
   args.push(`/LOG=${portableInstallerArgPath(paths.logPath)}`);
   args.push(`/PACKAGE=${portableInstallerArgPath(paths.packagePath)}`);
@@ -1630,20 +1627,6 @@ function buildInstallerArgs(manifest, paths) {
 
 function portableInstallerArgPath(filePath) {
   return path.resolve(String(filePath || '')).replace(/\\/g, '/');
-}
-
-function createElevatedInstallerLaunchScript(packagePath, args) {
-  const encodedArgs = args.map((arg) => base64Utf8(arg));
-  return `
-$ErrorActionPreference = 'Stop'
-function DecodeText([string]$value) {
-  [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value))
-}
-$installer = DecodeText '${base64Utf8(packagePath)}'
-$arguments = @(${encodedArgs.map((arg) => `(DecodeText '${arg}')`).join(', ')})
-$argumentLine = ($arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
-Start-Process -FilePath $installer -ArgumentList $argumentLine -Verb RunAs
-`;
 }
 
 function splitCommandLineArgs(value) {
@@ -1982,7 +1965,6 @@ module.exports = {
   normalizeInstallerArgs,
   buildInstallerArgs,
   portableInstallerArgPath,
-  createElevatedInstallerLaunchScript,
   splitCommandLineArgs,
   updatePackageLabel,
   updatePackageFileName,
