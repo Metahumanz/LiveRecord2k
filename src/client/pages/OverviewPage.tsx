@@ -152,6 +152,7 @@ export function OverviewPage({
                 room={room}
                 roomImageMode={state.settings.roomImageMode}
                 burnOverlayMode={state.settings.burnOverlayMode}
+                showDanmakuActions={false}
                 busy={null}
                 run={run}
                 openPreview={openPreview}
