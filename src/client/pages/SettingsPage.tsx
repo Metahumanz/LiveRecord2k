@@ -422,28 +422,16 @@ export function SettingsPage({
                 <Download size={18} />
                 下载安装器
               </button>
-              {state.update.status === 'available' || state.update.status === 'blocked' ? (
-                hasActiveJobs ? (
-                  <button
-                    className="wide-button fill active"
-                    type="button"
-                    disabled={busy === 'update-queue'}
-                    onClick={() => run('update-queue', recorder.queueUpdate)}
-                  >
-                    <Clock3 size={18} />
-                    录制结束后安装
-                  </button>
-                ) : (
-                  <button
-                    className="wide-button fill primary"
-                    type="button"
-                    disabled={busy === 'update-apply'}
-                    onClick={() => run('update-apply', recorder.applyUpdate)}
-                  >
-                    <Download size={18} />
-                    启动安装器
-                  </button>
-                )
+              {(state.update.status === 'available' || state.update.status === 'blocked') && hasActiveJobs ? (
+                <button
+                  className="wide-button fill active"
+                  type="button"
+                  disabled={busy === 'update-queue'}
+                  onClick={() => run('update-queue', recorder.queueUpdate)}
+                >
+                  <Clock3 size={18} />
+                  结束后下载
+                </button>
               ) : null}
             </div>
             {state.update.packagePath ? (
