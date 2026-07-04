@@ -478,6 +478,14 @@ button:disabled {
   gap: 18px;
 }
 
+.next-step-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .next-step h3 {
   margin: 0 0 6px;
   color: #eef8f6;

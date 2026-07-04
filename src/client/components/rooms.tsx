@@ -26,7 +26,7 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress } from './common';
 import type { AppSettings, AppState, RoomState } from '../types';
-import { KEYFRAME_IMAGE_REFRESH_MS, KEYFRAME_INFO_REFRESH_MS, overlayModeOptions } from '../ui/options';
+import { KEYFRAME_IMAGE_REFRESH_MS, KEYFRAME_INFO_REFRESH_MS, danmakuAreaOptions, overlayModeOptions } from '../ui/options';
 import {
   commandCountsSummary,
   containerStageLabel,
@@ -148,6 +148,7 @@ export function RoomCard({
   room,
   roomImageMode,
   burnOverlayMode,
+  burnDanmakuArea,
   showDanmakuActions = true,
   busy,
   run,
@@ -156,6 +157,7 @@ export function RoomCard({
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
   burnOverlayMode: AppSettings['burnOverlayMode'];
+  burnDanmakuArea: AppSettings['burnDanmakuArea'];
   showDanmakuActions?: boolean;
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
@@ -173,10 +175,14 @@ export function RoomCard({
       : '尚未写入';
   const danmakuCommandSummary = commandCountsSummary(room.currentRecording?.danmakuCommandCounts);
   const [cardOverlayMode, setCardOverlayMode] = useState<AppSettings['burnOverlayMode']>(burnOverlayMode);
+  const [cardDanmakuArea, setCardDanmakuArea] = useState<AppSettings['burnDanmakuArea']>(burnDanmakuArea);
 
   useEffect(() => {
     setCardOverlayMode(burnOverlayMode);
   }, [burnOverlayMode]);
+  useEffect(() => {
+    setCardDanmakuArea(burnDanmakuArea);
+  }, [burnDanmakuArea]);
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
@@ -354,12 +360,29 @@ export function RoomCard({
                   </option>
                 ))}
               </select>
+              <select
+                className="action-select"
+                value={cardDanmakuArea}
+                disabled={!room.currentRecording || room.recording || room.burning}
+                title="弹幕显示区域"
+                onChange={(event) => setCardDanmakuArea(event.target.value as AppSettings['burnDanmakuArea'])}
+              >
+                {danmakuAreaOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
               <button
                 className="wide-button"
-                title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}）`}
+                title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}，${
+                  danmakuAreaOptions.find((option) => option.value === cardDanmakuArea)?.label || '半屏'
+                }）`}
                 disabled={!room.currentRecording || room.recording || room.burning}
                 onClick={() =>
-                  run(`subtitles-${roomKey}`, () => recorder.prepareDanmaku(room.id, { overlayMode: cardOverlayMode }))
+                  run(`subtitles-${roomKey}`, () =>
+                    recorder.prepareDanmaku(room.id, { overlayMode: cardOverlayMode, danmakuArea: cardDanmakuArea })
+                  )
                 }
               >
                 <FileCode2 size={18} />
@@ -367,10 +390,14 @@ export function RoomCard({
               </button>
               <button
                 className="wide-button"
-                title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}）`}
+                title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}，${
+                  danmakuAreaOptions.find((option) => option.value === cardDanmakuArea)?.label || '半屏'
+                }）`}
                 disabled={!room.currentRecording || room.recording || room.burning}
                 onClick={() =>
-                  run(`burn-${roomKey}`, () => recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode }))
+                  run(`burn-${roomKey}`, () =>
+                    recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode, danmakuArea: cardDanmakuArea })
+                  )
                 }
               >
                 <Sparkles size={18} />

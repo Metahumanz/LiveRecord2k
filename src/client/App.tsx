@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type React from 'react';
-import { Activity, Gauge, Home, ListVideo, MessageSquareText, MonitorDot, Radio, Scissors, Settings2, Sparkles, Video } from 'lucide-react';
+import { Activity, Gauge, Home, ListVideo, MessageSquareText, MonitorDot, Radio, Scissors, Settings2, Sparkles, Video, Wrench } from 'lucide-react';
 import type { AppSettings, AppState, ExportDraft, ExportResult, Page, RecordingState } from './types';
 import { recorder } from './recorderClient';
 import { Metric } from './components/common';
@@ -9,6 +9,7 @@ import { OverviewPage } from './pages/OverviewPage';
 import { RoomsPage } from './pages/RoomsPage';
 import { ExportPage } from './pages/ExportPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { MaintenancePage } from './pages/MaintenancePage';
 import { LogsPage } from './pages/LogsPage';
 import { formatTimelineTime, getStats, hydrateExportDraft, isAppState } from './utils';
 
@@ -16,7 +17,8 @@ const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
   { id: 'overview', label: '总览', icon: <Home size={20} /> },
   { id: 'rooms', label: '直播间', icon: <ListVideo size={20} /> },
   { id: 'export', label: '剪辑导出', icon: <Scissors size={20} /> },
-  { id: 'settings', label: '设置', icon: <Settings2 size={20} /> },
+  { id: 'settings', label: '录制配置', icon: <Settings2 size={20} /> },
+  { id: 'maintenance', label: '软件维护', icon: <Wrench size={20} /> },
   { id: 'logs', label: '日志', icon: <MessageSquareText size={20} /> }
 ];
 
@@ -34,6 +36,7 @@ export default function App() {
     endTime: '',
     mode: 'clean',
     overlayMode: 'danmaku-gift',
+    danmakuArea: 'half',
     outputDir: ''
   });
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
@@ -111,6 +114,7 @@ export default function App() {
       startTime: '00:00:00',
       endTime: duration > 0 ? formatTimelineTime(duration) : '',
       overlayMode: state?.settings.burnOverlayMode || current.overlayMode,
+      danmakuArea: state?.settings.burnDanmakuArea || current.danmakuArea,
       outputDir: current.outputDir || state?.settings.outputDir || ''
     }));
   }
@@ -125,6 +129,7 @@ export default function App() {
         startTime: exportDraft.startTime,
         endTime: exportDraft.endTime,
         overlayMode: exportDraft.overlayMode,
+        danmakuArea: exportDraft.danmakuArea,
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
@@ -144,6 +149,7 @@ export default function App() {
         startTime: exportDraft.startTime,
         endTime: exportDraft.endTime,
         overlayMode: exportDraft.overlayMode,
+        danmakuArea: exportDraft.danmakuArea,
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
@@ -207,6 +213,7 @@ export default function App() {
             rooms={state.rooms}
             roomImageMode={state.settings.roomImageMode}
             burnOverlayMode={state.settings.burnOverlayMode}
+            burnDanmakuArea={state.settings.burnDanmakuArea}
             onRoomImageModeChange={changeRoomImageMode}
             roomInput={roomInput}
             setRoomInput={setRoomInput}
@@ -236,6 +243,15 @@ export default function App() {
             busy={busy}
             run={run}
             chooseOutputDir={chooseOutputDir}
+            setSettingsDraft={setSettingsDraft}
+          />
+        ) : null}
+        {page === 'maintenance' ? (
+          <MaintenancePage
+            state={state}
+            settingsDraft={settingsDraft}
+            busy={busy}
+            run={run}
             setSettingsDraft={setSettingsDraft}
           />
         ) : null}

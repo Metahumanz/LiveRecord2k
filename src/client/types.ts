@@ -66,6 +66,8 @@ export type RecordingState = {
   } | null;
 };
 
+export type DanmakuArea = 'quarter' | 'half' | 'three-quarter' | 'no-overlap' | 'unlimited';
+
 export type AppSettings = {
   outputDir: string;
   cookie: string;
@@ -77,6 +79,7 @@ export type AppSettings = {
   segmentMinutes: number;
   autoBurnDanmaku: boolean;
   burnOverlayMode: 'danmaku' | 'danmaku-gift';
+  burnDanmakuArea: DanmakuArea;
   burnCodec: string;
   burnCrf: number;
   notifyLiveStarted: boolean;
@@ -86,6 +89,7 @@ export type AppSettings = {
   notifyBurnStarted: boolean;
   notifyBurnEnded: boolean;
   openBrowserOnStart: boolean;
+  hideOverviewNextStep: boolean;
   updateManifestUrl: string;
   serverHost: '127.0.0.1' | '0.0.0.0' | 'localhost' | '::';
   serverPort: number;
@@ -193,12 +197,14 @@ export type ExportClipRequest = {
   startTime: string;
   endTime: string;
   overlayMode?: 'danmaku' | 'danmaku-gift';
+  danmakuArea?: DanmakuArea;
   outputDir?: string;
   outputPath?: string;
 };
 
 export type SubtitleRequest = Omit<ExportClipRequest, 'mode'> & {
   overlayMode?: 'danmaku' | 'danmaku-gift';
+  danmakuArea?: DanmakuArea;
 };
 
 export type LogEntry = {
@@ -240,9 +246,15 @@ export type RecorderApi = {
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
-  burnDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode']; prepareOnly?: boolean }) => Promise<AppState>;
+  burnDanmaku: (
+    roomId: string,
+    options?: { overlayMode?: AppSettings['burnOverlayMode']; danmakuArea?: DanmakuArea; prepareOnly?: boolean }
+  ) => Promise<AppState>;
   cancelBurnDanmaku: (roomId: string) => Promise<AppState>;
-  prepareDanmaku: (roomId: string, options?: { overlayMode?: AppSettings['burnOverlayMode'] }) => Promise<AppState>;
+  prepareDanmaku: (
+    roomId: string,
+    options?: { overlayMode?: AppSettings['burnOverlayMode']; danmakuArea?: DanmakuArea }
+  ) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
   cancelExport: () => Promise<AppState>;
@@ -261,7 +273,7 @@ export type RecorderApi = {
   onStateChanged: (callback: (state: AppState) => void) => () => void;
 };
 
-export type Page = 'overview' | 'rooms' | 'export' | 'settings' | 'logs';
+export type Page = 'overview' | 'rooms' | 'export' | 'settings' | 'maintenance' | 'logs';
 
 export type ExportDraft = {
   cleanPath: string;
@@ -271,5 +283,6 @@ export type ExportDraft = {
   endTime: string;
   mode: 'clean' | 'burn';
   overlayMode: AppSettings['burnOverlayMode'];
+  danmakuArea: DanmakuArea;
   outputDir: string;
 };

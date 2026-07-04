@@ -8,8 +8,21 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   grid-template-areas:
     "start quality"
-    "danmaku notifications"
-    "advanced advanced";
+    "danmaku notifications";
+  align-content: start;
+  align-items: stretch;
+  gap: 16px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.maintenance-page-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "backup update"
+    "runtime runtime";
   align-content: start;
   align-items: stretch;
   gap: 16px;
@@ -38,8 +51,16 @@
   grid-area: notifications;
 }
 
-.settings-panel-advanced {
-  grid-area: advanced;
+.maintenance-panel-backup {
+  grid-area: backup;
+}
+
+.maintenance-panel-update {
+  grid-area: update;
+}
+
+.maintenance-panel-runtime {
+  grid-area: runtime;
 }
 
 .settings-panel .settings-grid {
@@ -52,17 +73,17 @@
   margin-top: 14px;
 }
 
-.settings-panel-advanced .path-line {
+.maintenance-panel-runtime .path-line {
   grid-template-columns: 78px minmax(0, 1fr);
   align-items: center;
   gap: 12px;
 }
 
-.settings-panel-advanced .path-line p {
+.maintenance-panel-runtime .path-line p {
   min-width: 0;
 }
 
-.settings-panel-advanced .settings-grid {
+.maintenance-panel-runtime .settings-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 

@@ -30,6 +30,7 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'segmentMinutes',
   'autoBurnDanmaku',
   'burnOverlayMode',
+  'burnDanmakuArea',
   'burnCodec',
   'burnCrf',
   'notifyLiveStarted',
@@ -39,6 +40,7 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'notifyBurnStarted',
   'notifyBurnEnded',
   'openBrowserOnStart',
+  'hideOverviewNextStep',
   'updateManifestUrl',
   'serverHost',
   'serverPort'
@@ -50,6 +52,14 @@ export const KEYFRAME_INFO_REFRESH_MS = 15000;
 export const overlayModeOptions = [
   { label: '仅弹幕', value: 'danmaku' },
   { label: '弹幕和礼物', value: 'danmaku-gift' }
+] as const;
+
+export const danmakuAreaOptions = [
+  { label: '1/4屏', value: 'quarter' },
+  { label: '半屏', value: 'half' },
+  { label: '3/4屏', value: 'three-quarter' },
+  { label: '不重叠', value: 'no-overlap' },
+  { label: '不限', value: 'unlimited' }
 ] as const;
 
 export const exportModeOptions = [
