@@ -136,11 +136,16 @@ jobs:
           }
           $title = "BiliRecord2K $tag"
           $notes = @(
-            '自动构建的 Windows WebUI 发布包。',
+            'Windows 用户下载说明：',
             '',
-            '- bili-record-2k-setup.exe：Windows 安装器，应用内更新会下载并启动它',
-            '- bili-record-2k-webui.zip：完整运行包',
-            '- update.json：热更新检测 manifest'
+            '- 新用户推荐下载 bili-record-2k-setup.exe，双击安装后从开始菜单或桌面入口启动。',
+            '- 不想安装、想放在固定文件夹里手动运行的用户，下载 bili-record-2k-webui.zip，解压后运行 BiliRecord2K.exe。',
+            '- update.json 是应用内更新检测用的清单文件，不需要手动下载或打开。',
+            '',
+            '发布附件：',
+            '- bili-record-2k-setup.exe：Windows 安装器，也是应用内更新下载的包。',
+            '- bili-record-2k-webui.zip：完整免安装运行包。',
+            '- update.json：应用内更新检测 manifest。'
           ) -join [Environment]::NewLine
           $assets = @(
             "release\bili-record-2k-setup.exe",
