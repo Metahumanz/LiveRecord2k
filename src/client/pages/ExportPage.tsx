@@ -4,7 +4,7 @@ import { CheckCircle2, FileCode2, FileVideo, FolderOpen, RefreshCw, Scissors, Sq
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
-import { exportModeOptions, overlayModeOptions } from '../ui/options';
+import { danmakuAreaOptions, exportModeOptions, overlayModeOptions } from '../ui/options';
 import {
   clampNumber,
   filename,
@@ -402,6 +402,22 @@ export function ExportPage({
                 }
               >
                 {overlayModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="field">
+              <span>弹幕显示区域</span>
+              <select
+                value={draft.danmakuArea}
+                onChange={(event) =>
+                  setDraft({ ...draft, danmakuArea: event.target.value as AppSettings['burnDanmakuArea'] })
+                }
+              >
+                {danmakuAreaOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>

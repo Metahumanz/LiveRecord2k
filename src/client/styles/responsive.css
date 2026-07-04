@@ -17,8 +17,15 @@
       "start"
       "quality"
       "danmaku"
-      "notifications"
-      "advanced";
+      "notifications";
+  }
+
+  .maintenance-page-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "backup"
+      "update"
+      "runtime";
   }
 
   .settings-panel .settings-grid {
@@ -66,7 +73,8 @@
 
   .workspace-header,
   .header-actions,
-  .next-step {
+  .next-step,
+  .next-step-actions {
     align-items: stretch;
     flex-direction: column;
   }
@@ -107,6 +115,7 @@
 
   .settings-grid,
   .settings-page-grid,
+  .maintenance-page-grid,
   .export-layout,
   .time-grid,
   .overview-grid,
@@ -118,7 +127,7 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .settings-panel-advanced .path-line {
+  .maintenance-panel-runtime .path-line {
     grid-template-columns: minmax(0, 1fr);
     gap: 7px;
   }

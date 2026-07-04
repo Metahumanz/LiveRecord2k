@@ -1,4 +1,4 @@
-import { HardDrive, ListVideo, MessageSquareText, MonitorDot, Plus, Radio, RefreshCw, Video } from 'lucide-react';
+import { HardDrive, ListVideo, MessageSquareText, MonitorDot, Plus, Radio, RefreshCw, Video, X } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { BigMetric, HelpBox, PageHeader, UpdateNotice } from '../components/common';
 import { RoomCard } from '../components/rooms';
@@ -30,16 +30,16 @@ export function OverviewPage({
     if (!loggedIn) {
       return {
         title: '先完成扫码登录',
-        body: '登录后更容易拿到高画质源流。打开设置页，点击扫码登录，用哔哩哔哩 App 确认。',
-        action: '去设置',
+        body: '登录后更容易拿到高画质源流。打开录制配置页，点击扫码登录，用哔哩哔哩 App 确认。',
+        action: '去录制配置',
         page: 'settings' as Page
       };
     }
     if (!hasOutputDir) {
       return {
-        title: '设置录像保存位置',
+        title: '配置录像保存位置',
         body: '选择一个空间充足的文件夹，后续录像、弹幕记录和弹幕视频都会放在那里。',
-        action: '去设置',
+        action: '去录制配置',
         page: 'settings' as Page
       };
     }
@@ -110,18 +110,31 @@ export function OverviewPage({
         }
       />
 
-      <HelpBox title="下一步">
-        <div className="next-step">
-          <div>
-            <h3>{nextStep.title}</h3>
-            <p>{nextStep.body}</p>
+      {!state.settings.hideOverviewNextStep ? (
+        <HelpBox title="下一步">
+          <div className="next-step">
+            <div>
+              <h3>{nextStep.title}</h3>
+              <p>{nextStep.body}</p>
+            </div>
+            <div className="next-step-actions">
+              <button className="wide-button primary" type="button" onClick={() => setPage(nextStep.page)}>
+                <Plus size={18} />
+                {nextStep.action}
+              </button>
+              <button
+                className="wide-button"
+                type="button"
+                disabled={busy === 'hide-next-step'}
+                onClick={() => run('hide-next-step', () => recorder.saveSettings({ hideOverviewNextStep: true }))}
+              >
+                <X size={18} />
+                不再提示
+              </button>
+            </div>
           </div>
-          <button className="wide-button primary" type="button" onClick={() => setPage(nextStep.page)}>
-            <Plus size={18} />
-            {nextStep.action}
-          </button>
-        </div>
-      </HelpBox>
+        </HelpBox>
+      ) : null}
 
       <section className="overview-grid">
         <BigMetric icon={<ListVideo size={22} />} label="直播间" value={stats.rooms} />
@@ -152,6 +165,7 @@ export function OverviewPage({
                 room={room}
                 roomImageMode={state.settings.roomImageMode}
                 burnOverlayMode={state.settings.burnOverlayMode}
+                burnDanmakuArea={state.settings.burnDanmakuArea}
                 showDanmakuActions={false}
                 busy={null}
                 run={run}

@@ -17,6 +17,8 @@ const {
   mergeCookieString,
   danmakuCommandType,
   normalizeDanmakuEvent,
+  normalizeDanmakuDisplayArea,
+  danmakuDisplayAreaLabel,
   readDanmakuEvents,
   ensureDanmakuCss,
   readDanmakuStyle,
@@ -222,6 +224,15 @@ const BURN_CODEC_CANDIDATES = [
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 
+function createDanmakuAssSuffix(overlayMode, danmakuArea) {
+  const base = normalizeBurnOverlayMode(overlayMode) === 'danmaku' ? 'danmaku-only' : 'danmaku';
+  return `${base}.${normalizeDanmakuDisplayArea(danmakuArea)}`;
+}
+
+function createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea) {
+  return `${createClipSuffix(startTime, endTime, overlayMode)}.${normalizeDanmakuDisplayArea(danmakuArea)}`;
+}
+
 class LiveRecordService {
   constructor() {
     const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
@@ -279,6 +290,7 @@ class LiveRecordService {
       segmentMinutes: 60,
       autoBurnDanmaku: true,
       burnOverlayMode: 'danmaku-gift',
+      burnDanmakuArea: 'half',
       burnCodec: 'libx265',
       burnCrf: 24,
       notifyLiveStarted: true,
@@ -288,6 +300,7 @@ class LiveRecordService {
       notifyBurnStarted: true,
       notifyBurnEnded: true,
       openBrowserOnStart: true,
+      hideOverviewNextStep: false,
       updateManifestUrl: DEFAULT_UPDATE_MANIFEST_URL,
       serverHost: DEFAULT_HOST,
       serverPort: DEFAULT_PORT
@@ -360,6 +373,7 @@ class LiveRecordService {
       roomImageMode: normalizeRoomImageMode(settings.roomImageMode),
       autoBurnDanmaku: Boolean(settings.autoBurnDanmaku),
       burnOverlayMode: normalizeBurnOverlayMode(settings.burnOverlayMode),
+      burnDanmakuArea: normalizeDanmakuDisplayArea(settings.burnDanmakuArea),
       notifyLiveStarted: settings.notifyLiveStarted !== false,
       notifyLiveEnded: settings.notifyLiveEnded !== false,
       notifyRecordingStarted: settings.notifyRecordingStarted !== false,
@@ -367,6 +381,7 @@ class LiveRecordService {
       notifyBurnStarted: settings.notifyBurnStarted !== false,
       notifyBurnEnded: settings.notifyBurnEnded !== false,
       openBrowserOnStart: settings.openBrowserOnStart !== false,
+      hideOverviewNextStep: Boolean(settings.hideOverviewNextStep),
       updateManifestUrl: String(settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL).trim(),
       serverHost: normalizeServerHost(settings.serverHost || DEFAULT_HOST),
       serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535)
@@ -2442,7 +2457,8 @@ class LiveRecordService {
       return this.getState();
     }
     const assets = await this.generateSubtitleAssets(recording, {
-      overlayMode: options.overlayMode || this.settings.burnOverlayMode
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode,
+      danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea
     });
     this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
     this.emitState();
@@ -2461,6 +2477,7 @@ class LiveRecordService {
 
     try {
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+      const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
       this.burnCancelRequests.delete(room.id);
       const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
       const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
@@ -2470,7 +2487,7 @@ class LiveRecordService {
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
       }
-      const assets = await this.generateSubtitleAssets(recording, { overlayMode });
+      const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea });
       if (options.prepareOnly) {
         this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
         return true;
@@ -2500,7 +2517,12 @@ class LiveRecordService {
       room.burning = true;
       room.burnProgress = progress;
       this.burnSessions.set(room.id, ffmpeg);
-      this.log('info', `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(overlayMode)}）`);
+      this.log(
+        'info',
+        `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(
+          overlayMode
+        )}，${danmakuDisplayAreaLabel(danmakuArea)}）`
+      );
       if (this.settings.notifyBurnStarted) {
         this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`);
       }
@@ -2589,16 +2611,17 @@ class LiveRecordService {
 
   async generateSubtitleAssets(recording, options = {}) {
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+    const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const events = await readDanmakuEvents(recording.danmakuPath);
     const cssPath = options.cssPath || recording.cssPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'css');
     await ensureDanmakuCss(cssPath);
     const style = await readDanmakuStyle(cssPath);
     const assPath =
       options.assPath ||
-      recording.assPath ||
-      deriveSiblingPath(recording.cleanPath, overlayMode === 'danmaku' ? 'danmaku-only' : 'danmaku', 'ass');
+      deriveSiblingPath(recording.cleanPath, createDanmakuAssSuffix(overlayMode, danmakuArea), 'ass');
     const ass = createAss(events, {
       overlayMode,
+      danmakuArea,
       style,
       startTime: options.startTime,
       endTime: options.endTime,
@@ -2638,9 +2661,11 @@ class LiveRecordService {
       throw new Error('结束时间必须大于开始时间。');
     }
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
-    const suffix = createClipSuffix(startTime, endTime, overlayMode);
+    const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
+    const suffix = createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea);
     const assets = await this.generateSubtitleAssets(recording, {
       overlayMode,
+      danmakuArea,
       startTime,
       endTime,
       shiftTime: Number.isFinite(startTime),
@@ -2671,6 +2696,7 @@ class LiveRecordService {
     }
     const mode = normalizeExportMode(options.mode);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
+    const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
@@ -2711,6 +2737,7 @@ class LiveRecordService {
     } else {
       const assets = await this.generateSubtitleAssets(recording, {
         overlayMode,
+        danmakuArea,
         startTime,
         endTime,
         shiftTime: true,
