@@ -122,8 +122,6 @@ jobs:
             release/bili-record-2k-setup.exe
             release/bili-record-2k-webui.zip
             release/update.json
-            release/webui/BiliRecord2K.exe
-            release/webui/BiliRecord2K.Service.exe
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -142,16 +140,12 @@ jobs:
             '',
             '- bili-record-2k-setup.exe：Windows 安装器，应用内更新会下载并启动它',
             '- bili-record-2k-webui.zip：完整运行包',
-            '- BiliRecord2K.exe：托盘启动器',
-            '- BiliRecord2K.Service.exe：后台服务',
             '- update.json：热更新检测 manifest'
           ) -join [Environment]::NewLine
           $assets = @(
             "release\bili-record-2k-setup.exe",
             "release\bili-record-2k-webui.zip",
-            "release\update.json",
-            "release\webui\BiliRecord2K.exe",
-            "release\webui\BiliRecord2K.Service.exe"
+            "release\update.json"
           )
           $releaseExists = $false
           try {
