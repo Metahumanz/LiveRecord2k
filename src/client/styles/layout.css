@@ -3,6 +3,11 @@
   display: grid;
   grid-template-columns: 300px minmax(760px, 1fr);
   gap: 0;
+  transition: grid-template-columns 180ms ease;
+}
+
+.app-shell.nav-collapsed {
+  grid-template-columns: 88px minmax(760px, 1fr);
 }
 
 .nav-panel,
@@ -12,12 +17,19 @@
 }
 
 .nav-panel {
+  position: sticky;
+  top: 0;
+  height: 100vh;
   display: flex;
   flex-direction: column;
   gap: 18px;
   padding: 28px;
+  overflow: hidden;
   border-right: 1px solid rgba(255, 255, 255, 0.08);
   background: #11181d;
+  transition:
+    padding 180ms ease,
+    width 180ms ease;
 }
 
 .workspace-panel {
@@ -34,6 +46,13 @@
   align-items: center;
   gap: 14px;
   min-height: 66px;
+}
+
+.brand > div {
+  min-width: 0;
+  transition:
+    opacity 150ms ease,
+    width 180ms ease;
 }
 
 .brand-logo {
@@ -54,6 +73,7 @@
 .brand h1 {
   font-size: 24px;
   line-height: 1.18;
+  white-space: nowrap;
 }
 
 .room-heading p,
@@ -97,6 +117,14 @@
   background: transparent;
   font-weight: 900;
   cursor: pointer;
+}
+
+.nav-button span,
+.section-title span,
+.metric span {
+  transition:
+    opacity 150ms ease,
+    width 180ms ease;
 }
 
 .nav-button:hover,
@@ -261,6 +289,10 @@
   flex: 0 0 44px;
 }
 
+.nav-toggle {
+  margin-left: auto;
+}
+
 .wide-button {
   padding: 0 16px;
   min-width: 106px;
@@ -328,6 +360,80 @@ button:disabled {
   color: #eff7f4;
   font-size: 28px;
   line-height: 1;
+}
+
+.nav-collapsed .nav-panel {
+  align-items: center;
+  gap: 16px;
+  padding: 20px 14px;
+}
+
+.nav-collapsed .brand {
+  width: 100%;
+  justify-content: center;
+}
+
+.nav-collapsed .brand-logo {
+  width: 48px;
+  height: 48px;
+}
+
+.nav-collapsed .brand > div {
+  width: 0;
+  opacity: 0;
+  overflow: hidden;
+}
+
+.nav-collapsed .nav-toggle {
+  position: absolute;
+  right: 12px;
+  top: 18px;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  flex-basis: 34px;
+}
+
+.nav-collapsed .page-nav,
+.nav-collapsed .nav-section.compact {
+  width: 100%;
+}
+
+.nav-collapsed .nav-button {
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+}
+
+.nav-collapsed .nav-button span,
+.nav-collapsed .nav-section .section-title span,
+.nav-collapsed .metric span {
+  width: 0;
+  opacity: 0;
+  overflow: hidden;
+}
+
+.nav-collapsed .nav-section {
+  padding: 10px 8px;
+}
+
+.nav-collapsed .nav-section .section-title {
+  justify-content: center;
+}
+
+.nav-collapsed .side-metrics {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.nav-collapsed .metric {
+  min-height: 54px;
+  justify-items: center;
+  padding: 8px;
+}
+
+.nav-collapsed .metric strong {
+  font-size: 18px;
 }
 
 .workspace-header {

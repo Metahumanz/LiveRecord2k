@@ -20,16 +20,23 @@ export function MaintenancePage({
   settingsDraft,
   busy,
   run,
+  saveSettings,
   setSettingsDraft
 }: {
   state: AppState;
   settingsDraft: AppSettings;
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const hasActiveJobs = state.rooms.some((room) => room.recording || room.burning);
+  const currentCodec = state.ffmpegCapabilities?.burnCodecs.find((codec) => codec.value === state.settings.burnCodec);
+  const unavailableCodecText = (state.ffmpegCapabilities?.unavailableBurnCodecs || [])
+    .filter((codec) => codec.kind === 'hardware')
+    .map((codec) => `${codec.label}：${codec.reason || '不可用'}`)
+    .join('；');
 
   function exportSettings() {
     if (
@@ -77,7 +84,7 @@ export function MaintenancePage({
           <button
             className="wide-button primary"
             disabled={busy === 'save-settings'}
-            onClick={() => run('save-settings', () => recorder.saveSettings(settingsDraft))}
+            onClick={() => saveSettings(settingsDraft, '运行配置已保存')}
           >
             <Save size={18} />
             保存运行配置
@@ -229,6 +236,11 @@ export function MaintenancePage({
           <PathLine label="ffmpeg" value={state.ffmpegPath || ''} />
           <PathLine label="显卡" value={videoAdapterSummary(state)} />
           <PathLine label="可用编码" value={ffmpegCodecSummary(state)} />
+          <PathLine
+            label="当前弹幕编码"
+            value={`${currentCodec?.kind === 'hardware' ? '硬件' : '软件'} ${state.settings.burnCodec}`}
+          />
+          <PathLine label="不可用硬编" value={unavailableCodecText || '无'} />
           <PathLine label="更新日志" value={state.update.updateLogPath || ''} />
           <PathLine label="状态文件" value={state.update.statusPath || ''} />
           <PathLine label="下载文件" value={state.update.packagePath || ''} />

@@ -316,24 +316,6 @@
   flex: 1 1 118px;
 }
 
-.action-select {
-  min-height: 44px;
-  width: auto;
-  flex: 1 1 150px;
-  border: 1px solid rgba(255, 255, 255, 0.11);
-  border-radius: 7px;
-  outline: 0;
-  background: #0d1418;
-  color: #dbe7e4;
-  padding: 0 10px;
-  font-size: 14px;
-  font-weight: 900;
-}
-
-.action-select:disabled {
-  opacity: 0.5;
-}
-
 .technical-details {
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   padding-top: 10px;

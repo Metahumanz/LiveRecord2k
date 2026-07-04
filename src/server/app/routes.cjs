@@ -99,7 +99,7 @@ async function handleApi(service, parsed, port, request, response) {
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
-    '/api/shell/open-path-dir': () => service.openPathDir(body.path),
+    '/api/shell/open-path-dir': () => service.openPathDir(body.path, { asDirectory: Boolean(body.asDirectory) }),
     '/api/shell/open-config': () => service.openConfigDir(),
     '/api/update/check': () => service.checkUpdate(),
     '/api/update/download': () => service.downloadUpdateOnly(),

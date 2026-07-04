@@ -10,6 +10,7 @@ export function SettingsPage({
   settingsDraft,
   busy,
   run,
+  saveSettings,
   chooseOutputDir,
   setSettingsDraft
 }: {
@@ -17,11 +18,19 @@ export function SettingsPage({
   settingsDraft: AppSettings;
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
   chooseOutputDir: () => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
   const loggedIn = settingsDraft.cookie.includes('SESSDATA=');
   const codecOptions = burnCodecOptions(state.ffmpegCapabilities?.burnCodecs, settingsDraft.burnCodec);
+  const selectedCodec = codecOptions.find((option) => option.value === settingsDraft.burnCodec);
+  const unavailableHardware = (state.ffmpegCapabilities?.unavailableBurnCodecs || []).filter(
+    (option) => option.kind === 'hardware'
+  );
+  const unavailableHardwareText = unavailableHardware
+    .map((option) => `${option.label}：${option.reason || '不可用'}`)
+    .join('；');
 
   return (
     <>
@@ -32,7 +41,7 @@ export function SettingsPage({
           <button
             className="wide-button primary"
             disabled={busy === 'save-settings'}
-            onClick={() => run('save-settings', () => recorder.saveSettings(settingsDraft))}
+            onClick={() => saveSettings(settingsDraft)}
           >
             <Save size={18} />
             保存录制配置
@@ -77,7 +86,12 @@ export function SettingsPage({
               <button className="icon-button" title="选择目录" onClick={chooseOutputDir}>
                 <FolderOpen size={18} />
               </button>
-              <button className="icon-button" title="打开目录" onClick={() => run('open-output', recorder.openOutputDir)}>
+              <button
+                className="icon-button"
+                title="打开目录"
+                disabled={!settingsDraft.outputDir.trim() || busy === 'open-output-draft'}
+                onClick={() => run('open-output-draft', () => recorder.openPathDir(settingsDraft.outputDir, { asDirectory: true }))}
+              >
                 <HardDrive size={18} />
               </button>
             </div>
@@ -88,7 +102,7 @@ export function SettingsPage({
             className="wide-button fill primary"
             type="button"
             disabled={busy === 'save-settings'}
-            onClick={() => run('save-settings', () => recorder.saveSettings(settingsDraft))}
+            onClick={() => saveSettings(settingsDraft, '开始配置已保存')}
           >
             <Save size={18} />
             保存开始配置
@@ -228,7 +242,10 @@ export function SettingsPage({
                   </option>
                 ))}
               </select>
-              <p className="field-help">{burnCodecSummary(codecOptions)}</p>
+              <p className="field-help">
+                当前使用{selectedCodec?.kind === 'hardware' ? '硬件' : '软件'}编码 {settingsDraft.burnCodec}；{burnCodecSummary(codecOptions)}
+              </p>
+              {unavailableHardwareText ? <p className="field-help">不可用硬编：{unavailableHardwareText}</p> : null}
             </label>
 
             <label className="field">
@@ -326,7 +343,8 @@ export function SettingsPage({
             <button
               className="wide-button fill primary"
               type="button"
-              onClick={() => run('save-settings', () => recorder.saveSettings(settingsDraft))}
+              disabled={busy === 'save-settings'}
+              onClick={() => saveSettings(settingsDraft, '通知和启动配置已保存')}
             >
               <Save size={18} />
               保存通知配置

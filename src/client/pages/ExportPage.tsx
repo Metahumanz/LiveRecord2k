@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
-import { CheckCircle2, FileCode2, FileVideo, FolderOpen, RefreshCw, Scissors, Square } from 'lucide-react';
+import {
+  CheckCircle2,
+  CircleAlert,
+  FileCode2,
+  FileVideo,
+  FolderOpen,
+  RefreshCw,
+  Scissors,
+  SkipBack,
+  SkipForward,
+  Square
+} from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
@@ -41,6 +52,7 @@ export function ExportPage({
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
+  const [previewError, setPreviewError] = useState('');
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
@@ -69,7 +81,27 @@ export function ExportPage({
   useEffect(() => {
     setMediaDuration(0);
     setPlaybackTime(0);
+    setPreviewError('');
   }, [draft.cleanPath]);
+
+  async function describePreviewError(video: HTMLVideoElement) {
+    const fallback =
+      video.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+        ? '浏览器无法播放这个视频编码；如果源文件是 H.265/HEVC，Chrome 可能会受系统解码器限制。'
+        : '预览加载失败，请确认文件存在且浏览器支持该视频编码。';
+    try {
+      const response = await fetch(mediaSource, { headers: { Range: 'bytes=0-0' } });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        setPreviewError(payload?.error || `预览接口返回 HTTP ${response.status}`);
+        return;
+      }
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : fallback);
+      return;
+    }
+    setPreviewError(fallback);
+  }
 
   function updateTimelineStart(value: number) {
     const next = clampNumber(value, 0, Math.max(0, timelineEnd - 0.1));
@@ -254,13 +286,15 @@ export function ExportPage({
 
           <div className="clip-preview">
             {mediaSource ? (
-              <video
-                ref={videoRef}
-                key={draft.cleanPath}
-                src={mediaSource}
-                controls
-                preload="metadata"
+              <>
+                <video
+                  ref={videoRef}
+                  key={draft.cleanPath}
+                  src={mediaSource}
+                  controls
+                  preload="metadata"
                   onLoadedMetadata={(event) => {
+                    setPreviewError('');
                     const duration = event.currentTarget.duration;
                     if (!Number.isFinite(duration) || duration <= 0) {
                       return;
@@ -284,7 +318,17 @@ export function ExportPage({
                   }}
                   onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
                   onSeeking={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
+                  onError={(event) => {
+                    void describePreviewError(event.currentTarget);
+                  }}
                 />
+                {previewError ? (
+                  <div className="clip-preview-error">
+                    <CircleAlert size={24} />
+                    <span>{previewError}</span>
+                  </div>
+                ) : null}
+              </>
               ) : (
               <div className="clip-preview-empty">
                 <FileVideo size={38} />
@@ -348,11 +392,23 @@ export function ExportPage({
             <div className="cut-time-row">
               <label>
                 <span>入点</span>
-                <input
-                  value={draft.startTime}
-                  onChange={(event) => setDraft({ ...draft, startTime: event.target.value })}
-                  placeholder="00:12:30.5"
-                />
+                <div className="cut-input-line">
+                  <input
+                    value={draft.startTime}
+                    onChange={(event) => setDraft({ ...draft, startTime: event.target.value })}
+                    placeholder="00:12:30.5"
+                  />
+                  <button
+                    className="cut-now-button"
+                    type="button"
+                    disabled={!canUseTimeline}
+                    title="从当前播放位置开始"
+                    aria-label="从当前播放位置开始"
+                    onClick={() => updateTimelineStart(playheadTime)}
+                  >
+                    <SkipBack size={17} />
+                  </button>
+                </div>
               </label>
               <label>
                 <span>播放</span>
@@ -360,11 +416,23 @@ export function ExportPage({
               </label>
               <label>
                 <span>出点</span>
-                <input
-                  value={draft.endTime}
-                  onChange={(event) => setDraft({ ...draft, endTime: event.target.value })}
-                  placeholder="00:18:00"
-                />
+                <div className="cut-input-line">
+                  <input
+                    value={draft.endTime}
+                    onChange={(event) => setDraft({ ...draft, endTime: event.target.value })}
+                    placeholder="00:18:00"
+                  />
+                  <button
+                    className="cut-now-button"
+                    type="button"
+                    disabled={!canUseTimeline}
+                    title="从当前播放位置结束"
+                    aria-label="从当前播放位置结束"
+                    onClick={() => updateTimelineEnd(playheadTime)}
+                  >
+                    <SkipForward size={17} />
+                  </button>
+                </div>
               </label>
             </div>
           </div>

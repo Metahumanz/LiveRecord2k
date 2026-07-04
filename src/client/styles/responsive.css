@@ -7,6 +7,10 @@
     grid-template-columns: 250px minmax(620px, 1fr);
   }
 
+  .app-shell.nav-collapsed {
+    grid-template-columns: 88px minmax(620px, 1fr);
+  }
+
   .overview-grid {
     grid-template-columns: repeat(2, minmax(160px, 1fr));
   }
@@ -47,14 +51,57 @@
     grid-template-columns: 1fr;
   }
 
+  .app-shell.nav-collapsed {
+    grid-template-columns: 1fr;
+  }
+
   .nav-panel,
   .workspace-panel {
     min-height: auto;
   }
 
   .nav-panel {
+    position: static;
+    height: auto;
+    overflow: visible;
     border-right: 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .nav-collapsed .nav-panel {
+    align-items: stretch;
+    padding: 24px;
+  }
+
+  .nav-collapsed .brand {
+    justify-content: flex-start;
+  }
+
+  .nav-collapsed .brand > div,
+  .nav-collapsed .nav-button span,
+  .nav-collapsed .nav-section .section-title span,
+  .nav-collapsed .metric span {
+    width: auto;
+    opacity: 1;
+    overflow: visible;
+  }
+
+  .nav-collapsed .nav-toggle {
+    position: static;
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
+    flex-basis: 44px;
+  }
+
+  .nav-collapsed .nav-button {
+    justify-content: flex-start;
+    gap: 12px;
+    padding: 0 14px;
+  }
+
+  .nav-collapsed .side-metrics {
+    grid-template-columns: 1fr 1fr;
   }
 
   .page-add-room {
@@ -105,6 +152,10 @@
   }
 
   .nav-panel {
+    padding: 18px;
+  }
+
+  .nav-collapsed .nav-panel {
     padding: 18px;
   }
 

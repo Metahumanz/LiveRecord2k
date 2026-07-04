@@ -5,7 +5,6 @@ import {
   CircleAlert,
   Clock3,
   Cpu,
-  FileCode2,
   FileVideo,
   Gauge,
   HardDrive,
@@ -17,7 +16,6 @@ import {
   QrCode,
   Radio,
   RefreshCw,
-  Sparkles,
   Square,
   Trash2,
   Video,
@@ -26,7 +24,7 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress } from './common';
 import type { AppSettings, AppState, RoomState } from '../types';
-import { KEYFRAME_IMAGE_REFRESH_MS, KEYFRAME_INFO_REFRESH_MS, danmakuAreaOptions, overlayModeOptions } from '../ui/options';
+import { KEYFRAME_IMAGE_REFRESH_MS, KEYFRAME_INFO_REFRESH_MS } from '../ui/options';
 import {
   commandCountsSummary,
   containerStageLabel,
@@ -38,7 +36,6 @@ import {
   imageProxyUrl,
   loginStatusLabel,
   mediaUrl,
-  overlayModeLabel,
   qnLabel
 } from '../utils';
 
@@ -147,18 +144,12 @@ export function RoomPreview({
 export function RoomCard({
   room,
   roomImageMode,
-  burnOverlayMode,
-  burnDanmakuArea,
-  showDanmakuActions = true,
   busy,
   run,
   openPreview
 }: {
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
-  burnOverlayMode: AppSettings['burnOverlayMode'];
-  burnDanmakuArea: AppSettings['burnDanmakuArea'];
-  showDanmakuActions?: boolean;
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
   openPreview: (roomId: string) => void;
@@ -174,15 +165,8 @@ export function RoomCard({
       ? '正在探测实际分辨率'
       : '尚未写入';
   const danmakuCommandSummary = commandCountsSummary(room.currentRecording?.danmakuCommandCounts);
-  const [cardOverlayMode, setCardOverlayMode] = useState<AppSettings['burnOverlayMode']>(burnOverlayMode);
-  const [cardDanmakuArea, setCardDanmakuArea] = useState<AppSettings['burnDanmakuArea']>(burnDanmakuArea);
-
-  useEffect(() => {
-    setCardOverlayMode(burnOverlayMode);
-  }, [burnOverlayMode]);
-  useEffect(() => {
-    setCardDanmakuArea(burnDanmakuArea);
-  }, [burnDanmakuArea]);
+  const roomNumber = room.realRoomId || room.id;
+  const roomSubtitle = room.anchor ? `${room.anchor} · 房间号 ${roomNumber}` : `房间号 ${roomNumber}`;
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
@@ -192,7 +176,7 @@ export function RoomCard({
         <div className="room-heading">
           <div>
             <h3>{room.title || `直播间 ${room.realRoomId || room.id}`}</h3>
-            <p>{room.anchor || `房间 ${room.realRoomId || room.id}`}</p>
+            <p>{roomSubtitle}</p>
           </div>
           <button
             className="icon-button danger"
@@ -345,66 +329,6 @@ export function RoomCard({
               录制
             </button>
           )}
-          {showDanmakuActions ? (
-            <>
-              <select
-                className="action-select"
-                value={cardOverlayMode}
-                disabled={!room.currentRecording || room.recording || room.burning}
-                title="弹幕版内容"
-                onChange={(event) => setCardOverlayMode(event.target.value as AppSettings['burnOverlayMode'])}
-              >
-                {overlayModeOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="action-select"
-                value={cardDanmakuArea}
-                disabled={!room.currentRecording || room.recording || room.burning}
-                title="弹幕显示区域"
-                onChange={(event) => setCardDanmakuArea(event.target.value as AppSettings['burnDanmakuArea'])}
-              >
-                {danmakuAreaOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <button
-                className="wide-button"
-                title={`只生成字幕文件（${overlayModeLabel(cardOverlayMode)}，${
-                  danmakuAreaOptions.find((option) => option.value === cardDanmakuArea)?.label || '半屏'
-                }）`}
-                disabled={!room.currentRecording || room.recording || room.burning}
-                onClick={() =>
-                  run(`subtitles-${roomKey}`, () =>
-                    recorder.prepareDanmaku(room.id, { overlayMode: cardOverlayMode, danmakuArea: cardDanmakuArea })
-                  )
-                }
-              >
-                <FileCode2 size={18} />
-                生成字幕
-              </button>
-              <button
-                className="wide-button"
-                title={`生成弹幕版（${overlayModeLabel(cardOverlayMode)}，${
-                  danmakuAreaOptions.find((option) => option.value === cardDanmakuArea)?.label || '半屏'
-                }）`}
-                disabled={!room.currentRecording || room.recording || room.burning}
-                onClick={() =>
-                  run(`burn-${roomKey}`, () =>
-                    recorder.burnDanmaku(room.id, { overlayMode: cardOverlayMode, danmakuArea: cardDanmakuArea })
-                  )
-                }
-              >
-                <Sparkles size={18} />
-                生成弹幕视频
-              </button>
-            </>
-          ) : null}
         </div>
       </div>
     </article>
@@ -414,6 +338,7 @@ export function RoomCard({
 export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => void }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const temporaryRetryCountRef = useRef(0);
   const temporaryPath = room.currentRecording?.capturePath || '';
   const canPreviewTemporary = Boolean(temporaryPath);
   const [previewMode, setPreviewMode] = useState<'recording' | 'live'>('live');
@@ -429,22 +354,59 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
   }, [canPreviewTemporary, previewMode]);
 
   useEffect(() => {
+    temporaryRetryCountRef.current = 0;
+  }, [previewMode, temporaryPath]);
+
+  useEffect(() => {
     let cancelled = false;
+    let retryTimer: number | undefined;
+    let liveRetryCount = 0;
+    let triedNetworkRecovery = false;
+    let triedMediaRecovery = false;
+    let nativeErrorHandler: (() => void) | null = null;
     const video = videoRef.current;
     if (!video) {
       return;
     }
     const player = video;
 
+    function resetPlayer() {
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+      if (nativeErrorHandler) {
+        player.removeEventListener('error', nativeErrorHandler);
+        nativeErrorHandler = null;
+      }
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+    }
+
+    function scheduleLiveRetry(detail?: string) {
+      if (cancelled || previewMode !== 'live') {
+        return;
+      }
+      if (liveRetryCount >= 3) {
+        setLoading(false);
+        setError(`实时预览播放失败：${detail || '网络连接中断'}`);
+        return;
+      }
+      liveRetryCount += 1;
+      setError('');
+      setLoading(true);
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+      }
+      retryTimer = window.setTimeout(() => {
+        void start();
+      }, Math.min(800 * liveRetryCount, 2400));
+    }
+
     async function start() {
       setError('');
       setLoading(true);
       try {
-        hlsRef.current?.destroy();
-        hlsRef.current = null;
-        player.pause();
-        player.removeAttribute('src');
-        player.load();
+        resetPlayer();
 
         if (previewMode === 'recording') {
           if (!temporaryPath) {
@@ -467,6 +429,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
         player.muted = true;
         player.autoplay = true;
         player.playsInline = true;
+        nativeErrorHandler = () => scheduleLiveRetry('播放器无法读取实时流');
 
         if (Hls.isSupported()) {
           const hls = new Hls({
@@ -483,16 +446,33 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
             setLoading(false);
             player.play().catch(() => {});
           });
+          hls.on(Hls.Events.FRAG_LOADED, () => {
+            setLoading(false);
+          });
           hls.on(Hls.Events.ERROR, (_event, data) => {
-            if (data.fatal) {
-              setLoading(false);
-              setError(`实时预览播放失败：${data.details || data.type}`);
+            if (!data.fatal) {
+              return;
             }
+            const detail = data.details || data.type;
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !triedNetworkRecovery) {
+              triedNetworkRecovery = true;
+              setLoading(true);
+              hls.startLoad();
+              return;
+            }
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !triedMediaRecovery) {
+              triedMediaRecovery = true;
+              setLoading(true);
+              hls.recoverMediaError();
+              return;
+            }
+            scheduleLiveRetry(detail);
           });
           return;
         }
 
         if (player.canPlayType('application/vnd.apple.mpegurl')) {
+          player.addEventListener('error', nativeErrorHandler);
           player.src = nextPreview.previewUrl;
           setLoading(false);
           player.play().catch(() => {});
@@ -501,8 +481,13 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
 
         setError('当前浏览器不支持 HLS 实时预览。');
       } catch (err) {
-        setLoading(false);
-        setError(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        if (previewMode === 'live') {
+          scheduleLiveRetry(message);
+        } else {
+          setLoading(false);
+          setError(message);
+        }
       } finally {
         if (!cancelled && previewMode !== 'live') {
           setLoading(false);
@@ -513,11 +498,10 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
     start();
     return () => {
       cancelled = true;
-      hlsRef.current?.destroy();
-      hlsRef.current = null;
-      player.pause();
-      player.removeAttribute('src');
-      player.load();
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+      }
+      resetPlayer();
     };
   }, [room.id, previewMode, temporaryPath, temporaryPreviewVersion]);
 
@@ -568,13 +552,20 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
             playsInline
             preload="metadata"
             onError={() => {
-              setLoading(false);
+              if (previewMode === 'recording' && temporaryRetryCountRef.current < 2) {
+                temporaryRetryCountRef.current += 1;
+                setError('');
+                setLoading(true);
+                window.setTimeout(() => setTemporaryPreviewVersion(Date.now()), 700);
+                return;
+              }
               setError((current) =>
                 current ||
                 (previewMode === 'recording'
                   ? '浏览器通常无法直接播放正在写入的临时 MKV，请用直播流预览确认画面，或稍后查看最终 MP4。'
                   : '实时预览播放失败。')
               );
+              setLoading(false);
             }}
           />
           {loading && !error ? (

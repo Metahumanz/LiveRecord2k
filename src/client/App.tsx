@@ -1,9 +1,24 @@
 import { useEffect, useMemo, useState } from 'react';
 import type React from 'react';
-import { Activity, Gauge, Home, ListVideo, MessageSquareText, MonitorDot, Radio, Scissors, Settings2, Sparkles, Video, Wrench } from 'lucide-react';
+import {
+  Activity,
+  Gauge,
+  Home,
+  ListVideo,
+  MessageSquareText,
+  MonitorDot,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Radio,
+  Scissors,
+  Settings2,
+  Sparkles,
+  Video,
+  Wrench
+} from 'lucide-react';
 import type { AppSettings, AppState, ExportDraft, ExportResult, Page, RecordingState } from './types';
 import { recorder } from './recorderClient';
-import { Metric } from './components/common';
+import { Metric, ToastHost, type ToastItem } from './components/common';
 import { LivePreviewModal, QrLoginPanel } from './components/rooms';
 import { OverviewPage } from './pages/OverviewPage';
 import { RoomsPage } from './pages/RoomsPage';
@@ -28,6 +43,8 @@ export default function App() {
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
   const [roomInput, setRoomInput] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
+  const [navCollapsed, setNavCollapsed] = useState(() => window.localStorage.getItem('br2k-nav-collapsed') === '1');
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [exportDraft, setExportDraft] = useState<ExportDraft>({
     cleanPath: '',
     danmakuPath: '',
@@ -63,6 +80,10 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => {
+    window.localStorage.setItem('br2k-nav-collapsed', navCollapsed ? '1' : '0');
+  }, [navCollapsed]);
+
   const stats = useMemo(() => getStats(state?.rooms ?? []), [state?.rooms]);
   const previewRoom = previewRoomId ? state?.rooms.find((room) => room.id === previewRoomId) || null : null;
 
@@ -77,6 +98,21 @@ export default function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  function closeToast(id: number) {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
+
+  function showToast(toast: Omit<ToastItem, 'id'>) {
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    setToasts((current) => [...current.slice(-2), { id, kind: 'success', ...toast }]);
+    window.setTimeout(() => closeToast(id), 4200);
+  }
+
+  async function saveSettingsWithToast(settings: Partial<AppSettings>, message = '录制配置已保存') {
+    await run('save-settings', () => recorder.saveSettings(settings));
+    showToast({ title: '保存成功', message });
   }
 
   async function addRoom() {
@@ -168,13 +204,22 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={navCollapsed ? 'app-shell nav-collapsed' : 'app-shell'}>
       <aside className="nav-panel">
         <div className="brand">
           <img className="brand-logo" src="/app-icon.svg" alt="" />
           <div>
             <h1>哔哩录播 2K</h1>
           </div>
+          <button
+            className="icon-button nav-toggle"
+            type="button"
+            title={navCollapsed ? '展开导航栏' : '收起导航栏'}
+            aria-label={navCollapsed ? '展开导航栏' : '收起导航栏'}
+            onClick={() => setNavCollapsed((current) => !current)}
+          >
+            {navCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+          </button>
         </div>
 
         <nav className="page-nav">
@@ -212,8 +257,6 @@ export default function App() {
           <RoomsPage
             rooms={state.rooms}
             roomImageMode={state.settings.roomImageMode}
-            burnOverlayMode={state.settings.burnOverlayMode}
-            burnDanmakuArea={state.settings.burnDanmakuArea}
             onRoomImageModeChange={changeRoomImageMode}
             roomInput={roomInput}
             setRoomInput={setRoomInput}
@@ -242,6 +285,7 @@ export default function App() {
             settingsDraft={settingsDraft}
             busy={busy}
             run={run}
+            saveSettings={saveSettingsWithToast}
             chooseOutputDir={chooseOutputDir}
             setSettingsDraft={setSettingsDraft}
           />
@@ -252,6 +296,7 @@ export default function App() {
             settingsDraft={settingsDraft}
             busy={busy}
             run={run}
+            saveSettings={saveSettingsWithToast}
             setSettingsDraft={setSettingsDraft}
           />
         ) : null}
@@ -260,6 +305,7 @@ export default function App() {
 
       {state.login ? <QrLoginPanel login={state.login} busy={busy} run={run} /> : null}
       {previewRoom ? <LivePreviewModal room={previewRoom} onClose={() => setPreviewRoomId(null)} /> : null}
+      <ToastHost toasts={toasts} onClose={closeToast} />
     </main>
   );
 }

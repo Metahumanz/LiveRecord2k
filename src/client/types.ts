@@ -181,10 +181,13 @@ export type FfmpegJobProgress = {
   label: string;
   outputPath?: string;
   roomId?: string;
+  codec?: string;
+  codecKind?: 'software' | 'hardware';
   startedAt: number;
   updatedAt: number;
   currentTimeSec?: number;
   durationSec?: number;
+  estimatedRemainingSec?: number | null;
   percent?: number | null;
   message?: string;
 };
@@ -261,7 +264,7 @@ export type RecorderApi = {
   scanRecordings: () => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
-  openPathDir: (path: string) => Promise<AppState>;
+  openPathDir: (path: string, options?: { asDirectory?: boolean }) => Promise<AppState>;
   openConfigDir: () => Promise<AppState>;
   checkUpdate: () => Promise<AppState>;
   downloadUpdate: () => Promise<AppState>;
