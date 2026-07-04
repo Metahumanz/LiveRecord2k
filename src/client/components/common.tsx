@@ -1,5 +1,5 @@
 import type React from 'react';
-import { CheckCircle2, Clock3, Download, FolderOpen, RefreshCw } from 'lucide-react';
+import { CheckCircle2, Clock3, Download, FolderOpen, RefreshCw, X } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import type { AppState, FfmpegJobProgress, LogEntry } from '../types';
 import { clampNumber, filename, formatClock, formatFileSize, getStats } from '../utils';
@@ -132,6 +132,13 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
 export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const hasPercent = typeof progress.percent === 'number' && Number.isFinite(progress.percent);
   const percent = hasPercent ? clampNumber(progress.percent || 0, 0, 100) : 0;
+  const hasEta =
+    progress.status === 'running' &&
+    typeof progress.estimatedRemainingSec === 'number' &&
+    Number.isFinite(progress.estimatedRemainingSec);
+  const codecLabel = progress.codec
+    ? `${progress.codecKind === 'hardware' ? '硬件' : '软件'}编码 ${progress.codec}`
+    : '';
   const statusLabel =
     progress.status === 'completed'
       ? '完成'
@@ -152,8 +159,46 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         <span style={hasPercent ? { width: `${percent}%` } : undefined} />
       </div>
       <span className="job-progress-message" title={progress.outputPath || ''}>
-        {progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度')}
+        {[
+          progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度'),
+          hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : '',
+          codecLabel
+        ]
+          .filter(Boolean)
+          .join(' · ')}
       </span>
+    </div>
+  );
+}
+
+export type ToastItem = {
+  id: number;
+  title: string;
+  message?: string;
+  kind?: 'success';
+};
+
+export function ToastHost({ toasts, onClose }: { toasts: ToastItem[]; onClose: (id: number) => void }) {
+  if (!toasts.length) {
+    return null;
+  }
+  return (
+    <div className="toast-host" aria-live="polite" aria-atomic="false">
+      {toasts.map((toast) => (
+        <div className={`toast-card ${toast.kind || 'success'}`} key={toast.id}>
+          <div className="toast-copy">
+            <CheckCircle2 size={19} />
+            <div>
+              <strong>{toast.title}</strong>
+              {toast.message ? <span>{toast.message}</span> : null}
+            </div>
+          </div>
+          <button className="toast-close" type="button" title="关闭" onClick={() => onClose(toast.id)}>
+            <X size={16} />
+          </button>
+          <span className="toast-timer" />
+        </div>
+      ))}
     </div>
   );
 }
@@ -169,6 +214,20 @@ export function updateTitle(status: AppState['update']['status']) {
   if (status === 'blocked') return '暂不更新';
   if (status === 'error') return '更新失败';
   return '更新';
+}
+
+function formatCompactDuration(seconds: number) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) {
+    return `${hours}小时${String(minutes).padStart(2, '0')}分`;
+  }
+  if (minutes > 0) {
+    return `${minutes}分${String(secs).padStart(2, '0')}秒`;
+  }
+  return `${secs}秒`;
 }
 
 export function PageHeader({

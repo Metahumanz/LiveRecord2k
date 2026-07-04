@@ -6,8 +6,6 @@ import type { AppSettings, RoomState } from '../types';
 export function RoomsPage({
   rooms,
   roomImageMode,
-  burnOverlayMode,
-  burnDanmakuArea,
   onRoomImageModeChange,
   roomInput,
   setRoomInput,
@@ -18,8 +16,6 @@ export function RoomsPage({
 }: {
   rooms: RoomState[];
   roomImageMode: AppSettings['roomImageMode'];
-  burnOverlayMode: AppSettings['burnOverlayMode'];
-  burnDanmakuArea: AppSettings['burnDanmakuArea'];
   onRoomImageModeChange: (mode: AppSettings['roomImageMode']) => Promise<void>;
   roomInput: string;
   setRoomInput: (value: string) => void;
@@ -88,8 +84,6 @@ export function RoomsPage({
               key={room.id}
               room={room}
               roomImageMode={roomImageMode}
-              burnOverlayMode={burnOverlayMode}
-              burnDanmakuArea={burnDanmakuArea}
               busy={busy}
               run={run}
               openPreview={openPreview}

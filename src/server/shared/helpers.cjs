@@ -617,7 +617,7 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   });
 }
 
-function createFfmpegJobProgress({ kind, label, outputPath, durationSec, roomId }) {
+function createFfmpegJobProgress({ kind, label, outputPath, durationSec, roomId, codec, codecKind }) {
   const now = Date.now();
   const duration = Number(durationSec || 0);
   return {
@@ -627,10 +627,13 @@ function createFfmpegJobProgress({ kind, label, outputPath, durationSec, roomId 
     label,
     outputPath,
     roomId,
+    codec: codec || '',
+    codecKind: codecKind || undefined,
     startedAt: now,
     updatedAt: now,
     currentTimeSec: 0,
     durationSec: Number.isFinite(duration) && duration > 0 ? duration : 0,
+    estimatedRemainingSec: null,
     percent: Number.isFinite(duration) && duration > 0 ? 0 : null,
     message: '准备中'
   };
@@ -653,8 +656,13 @@ function updateFfmpegJobProgress(progress, text) {
   if (!percentChanged && now - Number(progress.updatedAt || 0) < 500) {
     return false;
   }
+  const elapsedSec = Math.max(0, (now - Number(progress.startedAt || now)) / 1000);
+  const processedSec = Math.max(0, currentTimeSec);
+  const remainingSec = duration > 0 ? Math.max(0, duration - processedSec) : 0;
   progress.currentTimeSec = Math.max(0, currentTimeSec);
   progress.percent = percent;
+  progress.estimatedRemainingSec =
+    duration > 0 && processedSec >= 1 && elapsedSec >= 1 ? remainingSec / Math.max(processedSec / elapsedSec, 0.001) : null;
   progress.updatedAt = now;
   progress.message =
     duration > 0
@@ -672,9 +680,12 @@ function finishFfmpegJobProgress(progress, status, message) {
   progress.message = message;
   if (status === 'completed') {
     progress.percent = 100;
+    progress.estimatedRemainingSec = 0;
     if (Number(progress.durationSec || 0) > 0) {
       progress.currentTimeSec = Number(progress.durationSec || 0);
     }
+  } else {
+    progress.estimatedRemainingSec = null;
   }
 }
 
@@ -1851,7 +1862,10 @@ function mimeType(filePath) {
       '.ico': 'image/x-icon',
       '.webp': 'image/webp',
       '.mp4': 'video/mp4',
-      '.mkv': 'video/x-matroska'
+      '.m4v': 'video/mp4',
+      '.mov': 'video/quicktime',
+      '.mkv': 'video/x-matroska',
+      '.webm': 'video/webm'
     }[ext] || 'application/octet-stream'
   );
 }

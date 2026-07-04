@@ -188,6 +188,9 @@ const DEFAULT_PORT = 3263;
 const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
 const MIN_PLAYABLE_BYTES = 128 * 1024;
 const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
+const MEDIA_STALL_CHECK_MS = 20 * 1000;
+const MEDIA_STALL_TIMEOUT_MS = 75 * 1000;
+const MIN_MEDIA_GROWTH_BYTES = 32 * 1024;
 const WBI_MIXIN_KEY_TABLE = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14,
   39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59,
@@ -212,6 +215,7 @@ const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PREVIEW_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const QUALITY_UPGRADE_CHECK_MS = 90 * 1000;
+const LOCAL_MEDIA_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.mkv', '.webm']);
 const BURN_CODEC_CANDIDATES = [
   { value: 'libx265', label: 'H.265 软件编码', kind: 'software' },
   { value: 'libx264', label: 'H.264 软件编码', kind: 'software' },
@@ -276,6 +280,7 @@ class LiveRecordService {
     this.queuedUpdateTimer = null;
     this.ffmpegPath = findFfmpegPath();
     this.ffmpegCapabilities = detectFfmpegCapabilities(this.ffmpegPath);
+    this.settings = this.normalizeSettings(this.settings);
   }
 
   createDefaultSettings() {
@@ -319,6 +324,7 @@ class LiveRecordService {
     }
     this.log('success', `WebUI 后端已启动，ffmpeg: ${this.ffmpegPath}`);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
+    this.log('info', `当前弹幕版编码：${this.getBurnCodecInfo(this.settings.burnCodec).label}（${this.settings.burnCodec}）`);
   }
 
   async loadStore() {
@@ -355,11 +361,7 @@ class LiveRecordService {
   }
 
   normalizeSettings(settings) {
-    let burnCodec = normalizeBurnCodec(settings.burnCodec);
-    const availableBurnCodecs = this.getAvailableBurnCodecs();
-    if (availableBurnCodecs.length && !availableBurnCodecs.includes(burnCodec)) {
-      burnCodec = availableBurnCodecs[0];
-    }
+    const burnCodec = this.chooseBurnCodec(settings.burnCodec);
     return {
       ...this.createDefaultSettings(),
       ...settings,
@@ -391,6 +393,39 @@ class LiveRecordService {
   getAvailableBurnCodecs() {
     const codecs = (this.ffmpegCapabilities?.burnCodecs || []).map((codec) => codec.value).filter(Boolean);
     return codecs.length ? codecs : ['libx265', 'libx264'];
+  }
+
+  chooseBurnCodec(value) {
+    const rawCodec = String(value || '').trim();
+    const burnCodec = normalizeBurnCodec(rawCodec);
+    const availableBurnCodecs = this.getAvailableBurnCodecs();
+    const availableSet = new Set(availableBurnCodecs);
+    const preferredHardwareCodec = this.getPreferredHardwareBurnCodec();
+    const stillDefaultSoftware = !rawCodec || burnCodec === 'libx265';
+    if (preferredHardwareCodec && stillDefaultSoftware) {
+      return preferredHardwareCodec;
+    }
+    if (availableBurnCodecs.length && !availableSet.has(burnCodec)) {
+      return preferredHardwareCodec || availableBurnCodecs[0];
+    }
+    return burnCodec;
+  }
+
+  getPreferredHardwareBurnCodec() {
+    const available = new Set(this.getAvailableBurnCodecs());
+    return ['hevc_nvenc', 'h264_nvenc', 'hevc_qsv', 'h264_qsv', 'hevc_amf', 'h264_amf'].find((codec) =>
+      available.has(codec)
+    );
+  }
+
+  getBurnCodecInfo(codec) {
+    const value = String(codec || '').trim();
+    return (
+      (this.ffmpegCapabilities?.burnCodecs || []).find((option) => option.value === value) ||
+      (this.ffmpegCapabilities?.unavailableBurnCodecs || []).find((option) => option.value === value) ||
+      BURN_CODEC_CANDIDATES.find((option) => option.value === value) ||
+      { value, label: value || '未知编码', kind: 'software' }
+    );
   }
 
   normalizeRoom(room) {
@@ -666,14 +701,14 @@ class LiveRecordService {
     return this.getState();
   }
 
-  async openPathDir(filePath) {
+  async openPathDir(filePath, options = {}) {
     const targetPath = String(filePath || '').trim();
     if (!targetPath) {
       throw new Error('路径为空。');
     }
     const resolved = path.resolve(targetPath);
     const stat = await fsp.stat(resolved).catch(() => null);
-    const dir = stat?.isDirectory() ? resolved : path.dirname(resolved);
+    const dir = options.asDirectory || stat?.isDirectory() ? resolved : path.dirname(resolved);
     await fsp.mkdir(dir, { recursive: true });
     openPath(dir);
     this.log('info', `已打开所在目录：${dir}`);
@@ -1226,7 +1261,26 @@ class LiveRecordService {
     if (normalized === outputRoot || normalized.startsWith(`${outputRoot}${path.sep}`)) {
       return true;
     }
-    return this.recordings.some((recording) => path.resolve(recording.cleanPath).toLowerCase() === normalized);
+    const knownRecordingPath = this.recordings.some((recording) =>
+      [recording.cleanPath, recording.capturePath, recording.burnedPath].some(
+        (candidate) => candidate && path.resolve(candidate).toLowerCase() === normalized
+      )
+    );
+    if (knownRecordingPath) {
+      return true;
+    }
+    for (const room of this.rooms.values()) {
+      const recording = room.currentRecording;
+      if (
+        recording &&
+        [recording.cleanPath, recording.capturePath, recording.burnedPath].some(
+          (candidate) => candidate && path.resolve(candidate).toLowerCase() === normalized
+        )
+      ) {
+        return true;
+      }
+    }
+    return LOCAL_MEDIA_EXTENSIONS.has(path.extname(normalized));
   }
 
   async fetchDanmuInfo(roomId) {
@@ -1513,6 +1567,9 @@ class LiveRecordService {
         rotateTimer: null,
         mediaWatchTimer: null,
         qualityWatchTimer: null,
+        lastMediaSize: 0,
+        lastMediaGrowthAt: Date.now(),
+        mediaStalled: false,
         rotating: false,
         qualitySwitching: false,
         nextStream: null,
@@ -1774,28 +1831,51 @@ class LiveRecordService {
   }
 
   armNoMediaWatch(room, session) {
-    session.mediaWatchTimer = setTimeout(async () => {
+    const check = async () => {
       if (session.finished || session.stopping || this.recordingSessions.get(room.id) !== session) {
         return;
       }
-      if (session.videoInfo) {
-        return;
-      }
       const fileSize = await getFileSize(session.capturePath || session.cleanPath);
-      if (fileSize >= MIN_PLAYABLE_BYTES) {
+      const now = Date.now();
+      if (fileSize > Number(session.lastMediaSize || 0) + MIN_MEDIA_GROWTH_BYTES) {
+        session.lastMediaSize = fileSize;
+        session.lastMediaGrowthAt = now;
+      }
+
+      if (!session.videoInfo && now - Number(session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS && fileSize >= MIN_PLAYABLE_BYTES) {
         this.log(
           'warn',
           `${roomLabel(room)} 录制已写入 ${formatBytes(fileSize)}，但还没解析到视频信息；继续观察。`
         );
+      }
+
+      if (!session.videoInfo && now - Number(session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS && fileSize < MIN_PLAYABLE_BYTES) {
+        session.noMediaDetected = true;
+        this.log(
+          'error',
+          `${roomLabel(room)} 录制 ${Math.round(NO_MEDIA_TIMEOUT_MS / 1000)} 秒仍未写入有效视频数据，正在重连直播流。`
+        );
+        requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
         return;
       }
-      session.noMediaDetected = true;
-      this.log(
-        'error',
-        `${roomLabel(room)} 录制 ${Math.round(NO_MEDIA_TIMEOUT_MS / 1000)} 秒仍未写入有效视频数据，正在重连直播流。`
-      );
-      requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
-    }, NO_MEDIA_TIMEOUT_MS);
+
+      if (
+        fileSize >= MIN_PLAYABLE_BYTES &&
+        now - Number(session.lastMediaGrowthAt || session.startedAt || now) >= MEDIA_STALL_TIMEOUT_MS
+      ) {
+        session.mediaStalled = true;
+        this.log(
+          'error',
+          `${roomLabel(room)} 临时录像 ${Math.round(MEDIA_STALL_TIMEOUT_MS / 1000)} 秒没有继续增长，正在重连直播流。`
+        );
+        requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
+        return;
+      }
+
+      session.mediaWatchTimer = setTimeout(check, MEDIA_STALL_CHECK_MS);
+      session.mediaWatchTimer.unref?.();
+    };
+    session.mediaWatchTimer = setTimeout(check, Math.min(NO_MEDIA_TIMEOUT_MS, MEDIA_STALL_CHECK_MS));
     session.mediaWatchTimer.unref?.();
   }
 
@@ -2494,6 +2574,7 @@ class LiveRecordService {
       }
       const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
       recording.burnedPath = burnedPath;
+      const codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
 
       const args = createBurnArgs({
         cleanPath: recording.cleanPath,
@@ -2512,7 +2593,9 @@ class LiveRecordService {
         label: `生成弹幕版：${path.basename(burnedPath)}`,
         outputPath: burnedPath,
         durationSec: recording.durationSec,
-        roomId: room.id
+        roomId: room.id,
+        codec: this.settings.burnCodec,
+        codecKind: codecInfo.kind
       });
       room.burning = true;
       room.burnProgress = progress;
@@ -2521,7 +2604,9 @@ class LiveRecordService {
         'info',
         `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(
           overlayMode
-        )}，${danmakuDisplayAreaLabel(danmakuArea)}）`
+        )}，${danmakuDisplayAreaLabel(danmakuArea)}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
+          codecInfo.label
+        }）`
       );
       if (this.settings.notifyBurnStarted) {
         this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`);
@@ -2726,6 +2811,7 @@ class LiveRecordService {
     let cssPath = recording.cssPath;
     let assPath = recording.assPath;
     let args;
+    let codecInfo = null;
     if (mode === 'clean') {
       args = createClipCopyArgs({
         cleanPath: recording.cleanPath,
@@ -2746,6 +2832,7 @@ class LiveRecordService {
       });
       cssPath = assets.cssPath;
       assPath = assets.assPath;
+      codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
       args = createBurnArgs({
         cleanPath: recording.cleanPath,
         assPath,
@@ -2762,7 +2849,9 @@ class LiveRecordService {
       kind: 'export',
       label: `导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`,
       outputPath,
-      durationSec: duration
+      durationSec: duration,
+      codec: codecInfo?.value,
+      codecKind: codecInfo?.kind
     });
     clearTimeout(this.exportProgressClearTimer);
     this.exportProgress = progress;
@@ -2770,7 +2859,12 @@ class LiveRecordService {
     this.exportCancelRequested = false;
     this.emitState();
 
-    this.log('info', `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`);
+    this.log(
+      'info',
+      `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}${
+        codecInfo ? `（${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${codecInfo.label}）` : ''
+      }`
+    );
     let cancelled = false;
     try {
       await runFfmpegJob(this.ffmpegPath, args, (line) => {

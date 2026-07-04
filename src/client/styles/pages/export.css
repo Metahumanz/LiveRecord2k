@@ -103,6 +103,7 @@
 }
 
 .clip-preview {
+  position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
   display: grid;
@@ -117,6 +118,25 @@
   height: 100%;
   display: block;
   background: #000;
+}
+
+.clip-preview-error {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  padding: 22px;
+  color: #ffb0b6;
+  background: rgba(9, 13, 16, 0.82);
+  font-weight: 900;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.clip-preview-error span {
+  max-width: 520px;
 }
 
 .clip-preview-empty {
@@ -290,6 +310,36 @@
   color: #edf4f1;
   padding: 9px 10px;
   font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.cut-input-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cut-input-line input {
+  min-width: 0;
+}
+
+.cut-now-button {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: #10201f;
+  background: #79ded5;
+  cursor: pointer;
+  transition:
+    transform 120ms ease,
+    background 120ms ease;
+}
+
+.cut-now-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: #8debe2;
 }
 
 .cut-time-row input:focus {
