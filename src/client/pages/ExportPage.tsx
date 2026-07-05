@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
+import Hls from 'hls.js';
 import {
   CheckCircle2,
   CircleAlert,
@@ -53,9 +54,13 @@ export function ExportPage({
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [previewError, setPreviewError] = useState('');
+  const [previewNeedsProxy, setPreviewNeedsProxy] = useState(false);
+  const [previewDeclined, setPreviewDeclined] = useState(false);
+  const [previewStarting, setPreviewStarting] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
   const draftStart = parseTimelineInput(draft.startTime);
   const draftEnd = parseTimelineInput(draft.endTime);
   const recordingDuration = Number(selectedRecording?.durationSec || 0);
@@ -71,18 +76,74 @@ export function ExportPage({
   );
   const canPrepare = Boolean(canExport && draft.danmakuPath);
   const mediaSource = draft.cleanPath ? mediaUrl(draft.cleanPath) : '';
+  const selectedPathKey = draft.cleanPath.toLowerCase();
+  const activeProxy =
+    state.previewProxy?.sourcePath.toLowerCase() === selectedPathKey && state.previewProxy.ready ? state.previewProxy : null;
+  const activePreviewProgress =
+    state.previewProgress?.outputPath?.toLowerCase() === selectedPathKey && state.previewProgress.status === 'running'
+      ? state.previewProgress
+      : null;
   const selectionLeft = canUseTimeline ? clampNumber((timelineStart / timelineDuration) * 100, 0, 100) : 0;
   const selectionWidth = canUseTimeline
     ? clampNumber(((timelineEnd - timelineStart) / timelineDuration) * 100, 0, 100 - selectionLeft)
     : 0;
   const playheadTime = canUseTimeline ? clampNumber(playbackTime, 0, timelineDuration) : 0;
   const playheadLeft = canUseTimeline ? clampNumber((playheadTime / timelineDuration) * 100, 0, 100) : 0;
+  const exportQueue = state.exportQueue || [];
+  const hasExportBacklog = state.exportProgress?.status === 'running' || exportQueue.length > 0;
 
   useEffect(() => {
     setMediaDuration(0);
     setPlaybackTime(0);
     setPreviewError('');
+    setPreviewNeedsProxy(false);
+    setPreviewDeclined(false);
+    hlsRef.current?.destroy();
+    hlsRef.current = null;
   }, [draft.cleanPath]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !draft.cleanPath) {
+      return;
+    }
+    hlsRef.current?.destroy();
+    hlsRef.current = null;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+
+    if (activeProxy) {
+      setPreviewError('');
+      setPreviewNeedsProxy(false);
+      if (Hls.isSupported()) {
+        const hls = new Hls();
+        hlsRef.current = hls;
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(activeProxy.previewUrl));
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) {
+            setPreviewError(`兼容预览播放失败：${data.details || data.type}`);
+          }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = activeProxy.previewUrl;
+      } else {
+        setPreviewError('当前浏览器无法播放 HLS 兼容预览。');
+      }
+      return () => {
+        hlsRef.current?.destroy();
+        hlsRef.current = null;
+      };
+    }
+
+    video.src = mediaSource;
+    video.load();
+    return () => {
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+    };
+  }, [activeProxy?.id, activeProxy?.previewUrl, draft.cleanPath, mediaSource]);
 
   async function describePreviewError(video: HTMLVideoElement) {
     const fallback =
@@ -94,13 +155,42 @@ export function ExportPage({
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
         setPreviewError(payload?.error || `预览接口返回 HTTP ${response.status}`);
+        setPreviewNeedsProxy(false);
         return;
       }
     } catch (error) {
       setPreviewError(error instanceof Error ? error.message : fallback);
+      setPreviewNeedsProxy(false);
       return;
     }
     setPreviewError(fallback);
+    setPreviewNeedsProxy(true);
+  }
+
+  async function startCompatiblePreview() {
+    if (!draft.cleanPath || previewStarting) {
+      return;
+    }
+    setPreviewStarting(true);
+    setPreviewNeedsProxy(false);
+    setPreviewDeclined(false);
+    try {
+      await recorder.startExportPreview({ cleanPath: draft.cleanPath });
+    } catch (error) {
+      setPreviewError(error instanceof Error ? error.message : '兼容预览启动失败。');
+      setPreviewNeedsProxy(true);
+    } finally {
+      setPreviewStarting(false);
+    }
+  }
+
+  async function chooseDraftPath(type: 'directory' | 'video' | 'danmaku' | 'css', currentPath: string, apply: (path: string) => void) {
+    const result = await recorder.selectPath({ type, currentPath });
+    if (result.path) {
+      apply(result.path);
+    } else if (result.message && !result.cancelled) {
+      window.alert(result.message);
+    }
   }
 
   function updateTimelineStart(value: number) {
@@ -247,31 +337,69 @@ export function ExportPage({
 
           <label className="field">
             <span>原始录像文件</span>
-            <input
-              value={draft.cleanPath}
-              onChange={(event) => setDraft({ ...draft, cleanPath: event.target.value })}
-              placeholder="C:\Videos\xxx.clean.mp4"
-            />
+            <div className="path-row">
+              <input
+                value={draft.cleanPath}
+                onChange={(event) => setDraft({ ...draft, cleanPath: event.target.value })}
+                placeholder="C:\Videos\xxx.clean.mp4"
+              />
+              <button
+                className="icon-button"
+                type="button"
+                title="选择原始录像文件"
+                onClick={() => chooseDraftPath('video', draft.cleanPath || state.settings.outputDir, (nextPath) => setDraft({ ...draft, cleanPath: nextPath }))}
+              >
+                <FileVideo size={18} />
+              </button>
+            </div>
             <p className="field-help">从上面的历史录像选择时通常会自动填好。</p>
           </label>
 
           <label className="field">
             <span>弹幕记录文件</span>
-            <input
-              value={draft.danmakuPath}
-              onChange={(event) => setDraft({ ...draft, danmakuPath: event.target.value })}
-              placeholder="C:\Videos\xxx.danmaku.jsonl"
-            />
+            <div className="path-row">
+              <input
+                value={draft.danmakuPath}
+                onChange={(event) => setDraft({ ...draft, danmakuPath: event.target.value })}
+                placeholder="C:\Videos\xxx.danmaku.jsonl"
+              />
+              <button
+                className="icon-button"
+                type="button"
+                title="选择弹幕记录文件"
+                onClick={() =>
+                  chooseDraftPath('danmaku', draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
+                    setDraft({ ...draft, danmakuPath: nextPath })
+                  )
+                }
+              >
+                <FileCode2 size={18} />
+              </button>
+            </div>
             <p className="field-help">导出弹幕视频或字幕时需要这个文件；纯净片段可以不填。</p>
           </label>
 
           <label className="field">
             <span>弹幕样式文件</span>
-            <input
-              value={draft.cssPath}
-              onChange={(event) => setDraft({ ...draft, cssPath: event.target.value })}
-              placeholder="留空则自动生成 .danmaku.css"
-            />
+            <div className="path-row">
+              <input
+                value={draft.cssPath}
+                onChange={(event) => setDraft({ ...draft, cssPath: event.target.value })}
+                placeholder="留空则自动生成 .danmaku.css"
+              />
+              <button
+                className="icon-button"
+                type="button"
+                title="选择弹幕样式文件"
+                onClick={() =>
+                  chooseDraftPath('css', draft.cssPath || draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
+                    setDraft({ ...draft, cssPath: nextPath })
+                  )
+                }
+              >
+                <FileCode2 size={18} />
+              </button>
+            </div>
             <p className="field-help">留空时会自动生成默认样式。</p>
           </label>
         </section>
@@ -289,13 +417,18 @@ export function ExportPage({
               <>
                 <video
                   ref={videoRef}
-                  key={draft.cleanPath}
-                  src={mediaSource}
+                  key={`${draft.cleanPath}:${activeProxy?.id || 'native'}`}
                   controls
                   preload="metadata"
                   onLoadedMetadata={(event) => {
                     setPreviewError('');
+                    setPreviewNeedsProxy(false);
                     const duration = event.currentTarget.duration;
+                    if (!activeProxy && event.currentTarget.videoWidth <= 0 && Number.isFinite(duration) && duration > 0) {
+                      setPreviewError('浏览器只解码到音频，无法显示这个视频编码的画面。');
+                      setPreviewNeedsProxy(true);
+                      return;
+                    }
                     if (!Number.isFinite(duration) || duration <= 0) {
                       return;
                     }
@@ -319,13 +452,45 @@ export function ExportPage({
                   onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
                   onSeeking={(event) => setPlaybackTime(event.currentTarget.currentTime || 0)}
                   onError={(event) => {
+                    if (activeProxy) {
+                      setPreviewError('兼容预览播放失败，请重新生成或检查源文件。');
+                      return;
+                    }
                     void describePreviewError(event.currentTarget);
                   }}
                 />
+                {activePreviewProgress ? (
+                  <div className="clip-preview-progress">
+                    <JobProgress progress={activePreviewProgress} />
+                  </div>
+                ) : null}
                 {previewError ? (
                   <div className="clip-preview-error">
                     <CircleAlert size={24} />
                     <span>{previewError}</span>
+                    {previewNeedsProxy && !previewDeclined ? (
+                      <div className="preview-proxy-actions">
+                        <button
+                          className="wide-button primary"
+                          type="button"
+                          disabled={previewStarting}
+                          onClick={startCompatiblePreview}
+                        >
+                          <FileVideo size={17} />
+                          生成兼容预览
+                        </button>
+                        <button
+                          className="wide-button"
+                          type="button"
+                          onClick={() => {
+                            setPreviewNeedsProxy(false);
+                            setPreviewDeclined(true);
+                          }}
+                        >
+                          暂不生成
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </>
@@ -439,11 +604,25 @@ export function ExportPage({
 
           <label className="field">
             <span>输出目录</span>
-            <input
-              value={draft.outputDir}
-              onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
-              placeholder={state.settings.outputDir}
-            />
+            <div className="path-row">
+              <input
+                value={draft.outputDir}
+                onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
+                placeholder={state.settings.outputDir}
+              />
+              <button
+                className="icon-button"
+                type="button"
+                title="选择输出目录"
+                onClick={() =>
+                  chooseDraftPath('directory', draft.outputDir || state.settings.outputDir, (nextPath) =>
+                    setDraft({ ...draft, outputDir: nextPath })
+                  )
+                }
+              >
+                <FolderOpen size={18} />
+              </button>
+            </div>
           </label>
 
           <div className="settings-grid">
@@ -509,7 +688,7 @@ export function ExportPage({
               onClick={exportClip}
             >
               <Scissors size={18} />
-              导出片段
+              {hasExportBacklog ? '加入导出队列' : '导出片段'}
             </button>
           </div>
           {state.exportProgress ? <JobProgress progress={state.exportProgress} /> : null}
@@ -524,6 +703,27 @@ export function ExportPage({
               中断当前导出
             </button>
           ) : null}
+          {exportQueue.length > 0 ? (
+            <div className="export-queue">
+              <div className="export-queue-heading">
+                <FileVideo size={17} />
+                <span>等待队列</span>
+                <strong>{exportQueue.length}</strong>
+              </div>
+              <div className="export-queue-list">
+                {exportQueue.map((item, index) => (
+                  <div className="export-queue-row" key={item.id}>
+                    <span>
+                      #{index + 1} {item.label}
+                    </span>
+                    <small>
+                      {filename(item.outputPath || item.cleanPath)} · {item.startTime} - {item.endTime}
+                    </small>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <section className="inspector-card export-panel export-result-panel">
@@ -535,17 +735,23 @@ export function ExportPage({
           </div>
           {result ? (
             <div className="result-lines">
-              <PathLine label="输出视频" value={result.outputPath || ''} />
-              <PathLine label="样式 CSS" value={result.cssPath || ''} />
-              <PathLine label="字幕 ASS" value={result.assPath || ''} />
-              {typeof result.eventCount === 'number' ? (
+              {result.queued ? <PathLine label="队列状态" value={result.message || '已加入导出队列'} /> : null}
+              {result.mode === 'subtitles' ? (
+                <>
+                  <PathLine label="样式 CSS" value={result.cssPath || ''} />
+                  <PathLine label="字幕 ASS" value={result.assPath || ''} />
+                </>
+              ) : (
+                <PathLine label={result.queued ? '预计输出' : '输出视频'} value={result.outputPath || ''} />
+              )}
+              {!result.queued && result.mode === 'subtitles' && typeof result.eventCount === 'number' ? (
                 <PathLine label="事件数量" value={String(result.eventCount)} />
               ) : null}
               <button
                 className="wide-button fill"
                 type="button"
-                disabled={!result.outputPath}
-                onClick={() => run('open-result-dir', () => recorder.openPathDir(result.outputPath || ''))}
+                disabled={!(result.outputPath || result.assPath || result.cssPath)}
+                onClick={() => run('open-result-dir', () => recorder.openPathDir(result.outputPath || result.assPath || result.cssPath || ''))}
               >
                 <FolderOpen size={18} />
                 打开所在目录

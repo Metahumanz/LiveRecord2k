@@ -192,6 +192,7 @@ export function RoomCard({
           <span className={room.liveStatus === 1 ? 'badge hot' : 'badge'}>{liveStatusLabel}</span>
           <span className={room.monitoring ? 'badge on' : 'badge'}>{room.monitoring ? '已监听' : '未监听'}</span>
           <span className={room.recording ? 'badge hot' : 'badge'}>{room.recording ? '录制中' : '未录制'}</span>
+          {room.mergeProgress?.status === 'running' ? <span className="badge work">合并分段中</span> : null}
           {room.burning ? <span className="badge work">生成弹幕视频中</span> : null}
         </div>
 
@@ -206,6 +207,14 @@ export function RoomCard({
           <div className="error-line">
             <CircleAlert size={16} />
             <span>{room.lastError}</span>
+          </div>
+        ) : null}
+
+        {room.mergeProgress ? <JobProgress progress={room.mergeProgress} /> : null}
+        {room.mergeProgress?.status === 'running' ? (
+          <div className="warning-line">
+            <CircleAlert size={16} />
+            <span>正在生成合并后的 merged 文件。合并完成前先不要烧录小分段，建议等合并产物完成后再烧录，或使用自动烧录。</span>
           </div>
         ) : null}
 

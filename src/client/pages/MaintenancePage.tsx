@@ -1,5 +1,5 @@
 import { useRef } from 'react';
-import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Save, Upload } from 'lucide-react';
+import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Save, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, PathLine, SettingPanel, UpdateProgress } from '../components/common';
 import type { AppSettings, AppState } from '../types';
@@ -119,6 +119,18 @@ export function MaintenancePage({
             >
               <Upload size={18} />
               导入配置
+            </button>
+          </div>
+          <div className="maintenance-section">
+            <h3>录像清理</h3>
+            <button
+              className="wide-button fill"
+              type="button"
+              disabled={busy === 'cleanup-merged'}
+              onClick={() => run('cleanup-merged', recorder.cleanupMergedResiduals)}
+            >
+              <Trash2 size={18} />
+              清理已合并分段残留
             </button>
           </div>
         </SettingPanel>

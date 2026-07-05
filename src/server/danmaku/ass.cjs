@@ -36,13 +36,19 @@ function normalizeDanmakuEvent(command, startedAt) {
 
   if (type === 'SEND_GIFT' || type === 'COMBO_SEND') {
     const data = command.data || {};
+    const count = Number(data.num || data.combo_num || data.combo_count || 1);
+    const unitPrice = Number(data.price || data.discount_price || 0) / 1000;
+    const totalPrice = Number(data.total_coin || data.total_price || 0) / 1000 || unitPrice * count;
     return {
       type: 'gift',
       time,
+      uid: Number(data.uid || 0),
       user: String(data.uname || data.username || ''),
       giftName: String(data.giftName || data.gift_name || '礼物'),
-      count: Number(data.num || data.combo_num || data.combo_count || 1),
-      price: Number(data.price || data.discount_price || 0) / 1000
+      count,
+      unitPrice,
+      totalPrice,
+      price: unitPrice
     };
   }
 
@@ -51,6 +57,7 @@ function normalizeDanmakuEvent(command, startedAt) {
     return {
       type: 'superchat',
       time,
+      uid: Number(data.uid || 0),
       user: String(data.user_info?.uname || data.uname || ''),
       text: String(data.message || ''),
       price: Number(data.price || 0),
@@ -60,13 +67,19 @@ function normalizeDanmakuEvent(command, startedAt) {
 
   if (type === 'GUARD_BUY' || type === 'USER_TOAST_MSG') {
     const data = command.data || {};
+    const count = Number(data.num || 1);
+    const unitPrice = Number(data.price || 0) / 1000;
     return {
       type: 'guard',
       time,
+      uid: Number(data.uid || 0),
       user: String(data.username || data.uname || data.user_show_info?.uname || ''),
       giftName: String(data.gift_name || data.role_name || guardName(data.guard_level)),
-      count: Number(data.num || 1),
-      price: Number(data.price || 0) / 1000
+      count,
+      guardLevel: Number(data.guard_level || 0),
+      unitPrice,
+      totalPrice: unitPrice * count,
+      price: unitPrice
     };
   }
 
@@ -89,12 +102,12 @@ const DEFAULT_DANMAKU_STYLE = {
   superChatBottom: 618,
   giftLanes: 4,
   giftBottom: 934,
-  giftWidth: 334,
-  giftHeight: 30,
-  giftAreaHeight: 142,
+  giftWidth: 460,
+  giftHeight: 46,
+  giftAreaHeight: 190,
   giftGap: 8,
-  giftRadius: 8,
-  giftFontSize: 16,
+  giftRadius: 12,
+  giftFontSize: 18,
   giftScrollDuration: 5
 };
 
@@ -167,12 +180,12 @@ function createDefaultDanmakuCss() {
   --superchat-bottom: 618;
   --gift-lanes: 4;
   --gift-bottom: 934;
-  --gift-width: 334;
-  --gift-height: 30;
-  --gift-area-height: 142;
+  --gift-width: 460;
+  --gift-height: 46;
+  --gift-area-height: 190;
   --gift-gap: 8;
-  --gift-radius: 8;
-  --gift-font-size: 16;
+  --gift-radius: 12;
+  --gift-font-size: 18;
   --gift-scroll-duration: 5;
 }
 `;
@@ -260,16 +273,56 @@ function getDanmakuEventDuration(event) {
   return event.type === 'guard' ? 8 : 5;
 }
 
+function mergeGiftCombos(events) {
+  const result = [];
+  const lastByKey = new Map();
+  for (const event of events) {
+    if (event.type !== 'gift' && event.type !== 'guard') {
+      result.push(event);
+      continue;
+    }
+    const key = `${event.type}|${event.uid || event.user || ''}|${event.giftName || ''}`;
+    const last = lastByKey.get(key);
+    if (last && Number(event.time || 0) - Number(last.lastComboTime || last.time || 0) <= 6) {
+      const count = Number(event.count || 1);
+      last.count = Number(last.count || 1) + count;
+      last.totalPrice = Number(last.totalPrice || 0) + resolveGiftTotalPrice(event);
+      last.comboCount = Number(last.comboCount || 1) + 1;
+      last.lastComboTime = Number(event.time || 0);
+      continue;
+    }
+    const next = {
+      ...event,
+      totalPrice: resolveGiftTotalPrice(event),
+      comboCount: 1,
+      lastComboTime: Number(event.time || 0)
+    };
+    result.push(next);
+    lastByKey.set(key, next);
+  }
+  return result.sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
+}
+
+function resolveGiftTotalPrice(event) {
+  const explicit = Number(event.totalPrice || 0);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return explicit;
+  }
+  const unit = Number(event.unitPrice ?? event.price ?? 0);
+  const count = Number(event.count || 1);
+  return Number.isFinite(unit) && unit > 0 ? unit * Math.max(1, count) : 0;
+}
+
 function createAss(events, options = {}) {
   const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
   const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea);
   const style = normalizeDanmakuStyle(options.style);
-  const sorted = prepareAssEvents(events, {
+  const sorted = mergeGiftCombos(prepareAssEvents(events, {
     overlayMode,
     startTime: options.startTime,
     endTime: options.endTime,
     shiftTime: options.shiftTime
-  });
+  }));
   const lines = [
     '[Script Info]',
     'ScriptType: v4.00+',
@@ -351,10 +404,14 @@ function createAss(events, options = {}) {
       const displayEnd = displayStart + duration;
       nextGiftStart = displayStart + giftScroll.minStartGap;
       const x = style.panelLeft;
+      const totalPrice = resolveGiftTotalPrice(event);
+      const priceLabel = totalPrice > 0 ? `￥${formatGiftPrice(totalPrice)}` : '';
+      const comboLabel = Number(event.comboCount || 0) > 1 ? ` COMBO ${event.comboCount}` : '';
       const label =
         event.type === 'guard'
-          ? `${event.user || '用户'} 开通 ${event.giftName || '舰长'} x${event.count || 1}`
-          : `${event.user || '用户'} 送出 ${event.giftName || '礼物'} x${event.count || 1}`;
+          ? `${event.user || '用户'} 开通 ${event.giftName || guardName(event.guardLevel)} x${event.count || 1}${comboLabel}`
+          : `${event.user || '用户'} 送出 ${event.giftName || '礼物'} x${event.count || 1}${comboLabel}`;
+      const subLabel = priceLabel || (event.type === 'guard' ? '大航海' : '礼物互动');
       lines.push(
         drawRoundedRect(
           5,
@@ -365,7 +422,7 @@ function createAss(events, options = {}) {
           style.giftWidth,
           style.giftHeight,
           style.giftRadius,
-          '&H8A2A1B12&',
+          event.type === 'guard' ? '&HB8422514&' : '&HAE2A1B12&',
           {
             clip: giftScroll.clip,
             move: { x1: x, y1: giftScroll.startY, x2: x, y2: giftScroll.endY }
@@ -373,16 +430,46 @@ function createAss(events, options = {}) {
         )
       );
       lines.push(
-        dialogue(
+        drawRoundedRect(
           6,
           displayStart,
           displayEnd,
+          x + 9,
+          giftScroll.startY + 7,
+          32,
+          32,
+          16,
+          event.type === 'guard' ? '&H00D8C36E&' : '&H0079DED5&',
+          {
+            clip: giftScroll.clip,
+            move: { x1: x + 9, y1: giftScroll.startY + 7, x2: x + 9, y2: giftScroll.endY + 7 }
+          }
+        )
+      );
+      lines.push(
+        dialogue(
+          7,
+          displayStart,
+          displayEnd,
           'BoxText',
-          `{\\fad(120,260)${clipTag(giftScroll.clip)}\\move(${assNumber(x + 12)},${assNumber(
-            giftScroll.startY + giftScroll.textOffsetY
-          )},${assNumber(x + 12)},${assNumber(giftScroll.endY + giftScroll.textOffsetY)})\\fs${assNumber(
+          `{\\fad(120,260)${clipTag(giftScroll.clip)}\\move(${assNumber(x + 52)},${assNumber(
+            giftScroll.startY + 5
+          )},${assNumber(x + 52)},${assNumber(giftScroll.endY + 5)})\\fs${assNumber(
             style.giftFontSize
-          )}}${assEscape(truncateTextToWidth(label, style.giftWidth - 24, style.giftFontSize))}`
+          )}\\b1}${assEscape(truncateTextToWidth(label, style.giftWidth - 112, style.giftFontSize))}`
+        )
+      );
+      lines.push(
+        dialogue(
+          7,
+          displayStart,
+          displayEnd,
+          'BoxText',
+          `{\\fad(120,260)${clipTag(giftScroll.clip)}\\move(${assNumber(x + 52)},${assNumber(
+            giftScroll.startY + 25
+          )},${assNumber(x + 52)},${assNumber(giftScroll.endY + 25)})\\fs${assNumber(
+            Math.max(12, style.giftFontSize - 4)
+          )}\\1c&H00D8C36E&}${assEscape(truncateTextToWidth(subLabel, style.giftWidth - 112, style.giftFontSize - 4))}`
         )
       );
     }
@@ -553,6 +640,17 @@ function superChatPalette(price) {
     return { header: '&H0000C8B8&', body: '&H0033B9B0&' };
   }
   return { header: '&H00D88B2D&', body: '&H00B87931&' };
+}
+
+function formatGiftPrice(value) {
+  const amount = Math.max(0, Number(value) || 0);
+  if (amount >= 10000) {
+    return `${(amount / 10000).toFixed(amount >= 100000 ? 0 : 1).replace(/\.0$/, '')}万`;
+  }
+  if (amount >= 100) {
+    return amount.toFixed(0);
+  }
+  return amount.toFixed(2).replace(/\.00$/, '');
 }
 
 function chooseLane(lanes, start, duration) {

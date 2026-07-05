@@ -55,11 +55,11 @@ export const overlayModeOptions = [
 ] as const;
 
 export const danmakuAreaOptions = [
-  { label: '1/4屏', value: 'quarter' },
-  { label: '半屏', value: 'half' },
-  { label: '3/4屏', value: 'three-quarter' },
-  { label: '不重叠', value: 'no-overlap' },
-  { label: '不限', value: 'unlimited' }
+  { label: '1/4屏（顶部25%）', value: 'quarter' },
+  { label: '半屏（顶部50%）', value: 'half' },
+  { label: '3/4屏（顶部75%）', value: 'three-quarter' },
+  { label: '不重叠（全屏避让）', value: 'no-overlap' },
+  { label: '不限（全屏）', value: 'unlimited' }
 ] as const;
 
 export const exportModeOptions = [

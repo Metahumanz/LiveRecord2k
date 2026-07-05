@@ -16,6 +16,7 @@ export type RoomState = {
   stream?: StreamChoice;
   currentRecording?: RecordingState;
   burnProgress?: FfmpegJobProgress;
+  mergeProgress?: FfmpegJobProgress;
 };
 
 export type StreamChoice = {
@@ -141,6 +142,9 @@ export type LoginState = {
 export type ExportResult = {
   ok: boolean;
   mode: 'clean' | 'burn' | 'subtitles';
+  queued?: boolean;
+  queueId?: string;
+  message?: string;
   outputPath?: string;
   cleanPath?: string;
   cssPath?: string;
@@ -152,6 +156,38 @@ export type PreviewStartResult = {
   previewUrl: string;
   expiresAt: number;
   stream: Omit<StreamChoice, 'url'> & { url: string };
+};
+
+export type ExportPreviewResult = {
+  ok: boolean;
+  id: string;
+  previewUrl: string;
+  ready: boolean;
+  cached: boolean;
+  progress?: FfmpegJobProgress;
+};
+
+export type PreviewProxyState = {
+  id: string;
+  sourcePath: string;
+  previewUrl: string;
+  status: 'running' | 'ready' | 'error';
+  ready: boolean;
+  cached: boolean;
+  message?: string;
+  updatedAt: number;
+};
+
+export type SelectPathRequest = {
+  type: 'directory' | 'video' | 'danmaku' | 'css';
+  currentPath?: string;
+};
+
+export type SelectPathResult = {
+  ok: boolean;
+  path?: string;
+  cancelled?: boolean;
+  message?: string;
 };
 
 export type FfmpegCodecOption = {
@@ -176,7 +212,7 @@ export type FfmpegCapabilities = {
 
 export type FfmpegJobProgress = {
   id: string;
-  kind: 'burn' | 'export';
+  kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
   status: 'running' | 'completed' | 'error' | 'cancelled';
   label: string;
   outputPath?: string;
@@ -190,6 +226,17 @@ export type FfmpegJobProgress = {
   estimatedRemainingSec?: number | null;
   percent?: number | null;
   message?: string;
+};
+
+export type ExportQueueItem = {
+  id: string;
+  label: string;
+  mode: 'clean' | 'burn';
+  cleanPath: string;
+  outputPath?: string;
+  startTime: string;
+  endTime: string;
+  createdAt: number;
 };
 
 export type ExportClipRequest = {
@@ -228,6 +275,9 @@ export type AppState = {
   ffmpegPath?: string;
   ffmpegCapabilities?: FfmpegCapabilities;
   exportProgress?: FfmpegJobProgress | null;
+  exportQueue?: ExportQueueItem[];
+  previewProgress?: FfmpegJobProgress | null;
+  previewProxy?: PreviewProxyState | null;
   startupEnabled: boolean;
   currentHost: string;
   currentPort: number;
@@ -241,6 +291,7 @@ export type RecorderApi = {
   startQrLogin: () => Promise<AppState>;
   cancelQrLogin: () => Promise<AppState>;
   chooseOutputDir: () => Promise<string | undefined>;
+  selectPath: (request: SelectPathRequest) => Promise<SelectPathResult>;
   saveSettings: (settings: Partial<AppSettings>) => Promise<AppState>;
   addRoom: (roomId: string) => Promise<AppState>;
   removeRoom: (roomId: string) => Promise<AppState>;
@@ -249,6 +300,8 @@ export type RecorderApi = {
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
+  startExportPreview: (request: { cleanPath: string }) => Promise<ExportPreviewResult>;
+  cancelExportPreview: () => Promise<AppState>;
   burnDanmaku: (
     roomId: string,
     options?: { overlayMode?: AppSettings['burnOverlayMode']; danmakuArea?: DanmakuArea; prepareOnly?: boolean }
@@ -262,6 +315,7 @@ export type RecorderApi = {
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
   cancelExport: () => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
+  cleanupMergedResiduals: () => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
   openPathDir: (path: string, options?: { asDirectory?: boolean }) => Promise<AppState>;

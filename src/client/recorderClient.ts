@@ -14,9 +14,10 @@ export const recorder: RecorderApi = {
   cancelQrLogin: () => api<AppState>('/api/auth/qr/cancel', {}),
   async chooseOutputDir() {
     const current = latestState?.settings.outputDir || '';
-    const next = window.prompt('输入录像输出目录路径', current);
-    return next?.trim() || undefined;
+    const result = await api<{ path?: string }>('/api/settings/choose-output-dir', { currentPath: current });
+    return result.path?.trim() || undefined;
   },
+  selectPath: (request) => api('/api/shell/select-path', request),
   saveSettings: (settings) => api<AppState>('/api/settings/save', { settings }),
   addRoom: (roomId) => api<AppState>('/api/rooms/add', { roomId }),
   removeRoom: (roomId) => api<AppState>('/api/rooms/remove', { roomId }),
@@ -25,6 +26,8 @@ export const recorder: RecorderApi = {
   startRecording: (roomId) => api<AppState>('/api/rooms/record/start', { roomId }),
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
   startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }),
+  startExportPreview: (request) => api('/api/export/preview/start', request),
+  cancelExportPreview: () => api<AppState>('/api/export/preview/cancel', {}),
   burnDanmaku: (roomId, options) => api<AppState>('/api/rooms/burn', { roomId, options }),
   cancelBurnDanmaku: (roomId) => api<AppState>('/api/rooms/burn/cancel', { roomId }),
   prepareDanmaku: (roomId, options) => api<AppState>('/api/rooms/subtitles', { roomId, options }),
@@ -32,6 +35,7 @@ export const recorder: RecorderApi = {
   exportClip: (request) => api('/api/export/clip', request),
   cancelExport: () => api<AppState>('/api/export/cancel', {}),
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}),
+  cleanupMergedResiduals: () => api<AppState>('/api/recordings/cleanup-merged', {}),
   clearLogs: () => api<AppState>('/api/logs/clear', {}),
   openOutputDir: () => api<AppState>('/api/shell/open-output', {}),
   openPathDir: (path, options) => api<AppState>('/api/shell/open-path-dir', { path, ...options }),

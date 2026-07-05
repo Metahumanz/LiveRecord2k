@@ -50,6 +50,11 @@ async function handleApi(service, parsed, port, request, response) {
     return;
   }
 
+  if (request.method === 'GET' && pathname.startsWith('/api/export/preview/')) {
+    await service.serveExportPreview(parsed, request, response);
+    return;
+  }
+
   if (request.method === 'GET' && pathname.startsWith('/api/preview/')) {
     await service.servePreview(parsed, request, response);
     return;
@@ -81,7 +86,7 @@ async function handleApi(service, parsed, port, request, response) {
   const routes = {
     '/api/auth/qr/start': () => service.startQrLogin(),
     '/api/auth/qr/cancel': () => service.cancelQrLogin(),
-    '/api/settings/choose-output-dir': () => service.chooseOutputDir(),
+    '/api/settings/choose-output-dir': () => service.chooseOutputDir(body.currentPath),
     '/api/settings/save': () => service.saveSettings(body.settings || body),
     '/api/rooms/add': () => service.addRoom(body.roomId),
     '/api/rooms/remove': () => service.removeRoom(body.roomId),
@@ -93,13 +98,17 @@ async function handleApi(service, parsed, port, request, response) {
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
     '/api/rooms/burn/cancel': () => service.cancelBurnDanmaku(body.roomId),
     '/api/rooms/subtitles': () => service.prepareDanmakuForRoom(body.roomId, body.options || {}),
+    '/api/export/preview/start': () => service.startExportPreview(body),
+    '/api/export/preview/cancel': () => service.cancelExportPreview(),
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
     '/api/export/clip': () => service.exportClip(body),
     '/api/export/cancel': () => service.cancelExportClip(),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
+    '/api/recordings/cleanup-merged': () => service.cleanupMergedSegmentResiduals(),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
     '/api/shell/open-path-dir': () => service.openPathDir(body.path, { asDirectory: Boolean(body.asDirectory) }),
+    '/api/shell/select-path': () => service.selectPath(body),
     '/api/shell/open-config': () => service.openConfigDir(),
     '/api/update/check': () => service.checkUpdate(),
     '/api/update/download': () => service.downloadUpdateOnly(),
