@@ -101,14 +101,41 @@ const DEFAULT_DANMAKU_STYLE = {
   superChatLanes: 3,
   superChatBottom: 618,
   giftLanes: 4,
+  giftBottom: 922,
+  giftWidth: 540,
+  giftHeight: 58,
+  giftAreaHeight: 260,
+  giftGap: 10,
+  giftRadius: 10,
+  giftFontSize: 22,
+  giftScrollDuration: 5
+};
+
+const LEGACY_DEFAULT_DANMAKU_STYLE = {
   giftBottom: 934,
   giftWidth: 460,
   giftHeight: 46,
   giftAreaHeight: 190,
   giftGap: 8,
   giftRadius: 12,
-  giftFontSize: 18,
-  giftScrollDuration: 5
+  giftFontSize: 18
+};
+
+const SUPERCHAT_CARD = {
+  minWidth: 300,
+  maxWidth: 500,
+  headerHeight: 34,
+  bodyHeight: 70,
+  rowGap: 108,
+  radius: 10,
+  titleFontSize: 23,
+  textFontSize: 20,
+  paddingX: 16,
+  titleOffsetY: 6,
+  textOffsetY: 42,
+  defaultDuration: 10,
+  minDuration: 5,
+  maxDuration: 15
 };
 
 const DANMAKU_DISPLAY_AREAS = {
@@ -179,13 +206,13 @@ function createDefaultDanmakuCss() {
   --superchat-lanes: 3;
   --superchat-bottom: 618;
   --gift-lanes: 4;
-  --gift-bottom: 934;
-  --gift-width: 460;
-  --gift-height: 46;
-  --gift-area-height: 190;
-  --gift-gap: 8;
-  --gift-radius: 12;
-  --gift-font-size: 18;
+  --gift-bottom: 922;
+  --gift-width: 540;
+  --gift-height: 58;
+  --gift-area-height: 260;
+  --gift-gap: 10;
+  --gift-radius: 10;
+  --gift-font-size: 22;
   --gift-scroll-duration: 5;
 }
 `;
@@ -202,7 +229,19 @@ function parseCssVariables(css) {
 }
 
 function normalizeDanmakuStyle(values = {}) {
-  const pickNumber = (key, fallback, min, max) => clamp(Number(values[key] ?? fallback), min, max);
+  const pickNumber = (key, fallback, min, max, options = {}) => {
+    const raw = values[key];
+    const numeric = Number(raw ?? fallback);
+    if (
+      options.upgradeLegacyDefault !== undefined &&
+      raw !== undefined &&
+      Number.isFinite(numeric) &&
+      Math.abs(numeric - options.upgradeLegacyDefault) < 0.001
+    ) {
+      return clamp(fallback, min, max);
+    }
+    return clamp(numeric, min, max);
+  };
   const fontFamily = String(values['font-family'] || DEFAULT_DANMAKU_STYLE.fontFamily)
     .replace(/["']/g, '')
     .trim();
@@ -221,13 +260,27 @@ function normalizeDanmakuStyle(values = {}) {
     superChatLanes: Math.round(pickNumber('superchat-lanes', DEFAULT_DANMAKU_STYLE.superChatLanes, 1, 10)),
     superChatBottom: pickNumber('superchat-bottom', DEFAULT_DANMAKU_STYLE.superChatBottom, 0, 4000),
     giftLanes: Math.round(pickNumber('gift-lanes', DEFAULT_DANMAKU_STYLE.giftLanes, 1, 16)),
-    giftBottom: pickNumber('gift-bottom', DEFAULT_DANMAKU_STYLE.giftBottom, 0, 4000),
-    giftWidth: pickNumber('gift-width', DEFAULT_DANMAKU_STYLE.giftWidth, 160, 1200),
-    giftHeight: pickNumber('gift-height', DEFAULT_DANMAKU_STYLE.giftHeight, 20, 120),
-    giftAreaHeight: pickNumber('gift-area-height', DEFAULT_DANMAKU_STYLE.giftAreaHeight, 40, 1000),
-    giftGap: pickNumber('gift-gap', DEFAULT_DANMAKU_STYLE.giftGap, 0, 100),
-    giftRadius: pickNumber('gift-radius', DEFAULT_DANMAKU_STYLE.giftRadius, 0, 60),
-    giftFontSize: pickNumber('gift-font-size', DEFAULT_DANMAKU_STYLE.giftFontSize, 10, 60),
+    giftBottom: pickNumber('gift-bottom', DEFAULT_DANMAKU_STYLE.giftBottom, 0, 4000, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftBottom
+    }),
+    giftWidth: pickNumber('gift-width', DEFAULT_DANMAKU_STYLE.giftWidth, 160, 1200, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftWidth
+    }),
+    giftHeight: pickNumber('gift-height', DEFAULT_DANMAKU_STYLE.giftHeight, 20, 120, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftHeight
+    }),
+    giftAreaHeight: pickNumber('gift-area-height', DEFAULT_DANMAKU_STYLE.giftAreaHeight, 40, 1000, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftAreaHeight
+    }),
+    giftGap: pickNumber('gift-gap', DEFAULT_DANMAKU_STYLE.giftGap, 0, 100, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftGap
+    }),
+    giftRadius: pickNumber('gift-radius', DEFAULT_DANMAKU_STYLE.giftRadius, 0, 60, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftRadius
+    }),
+    giftFontSize: pickNumber('gift-font-size', DEFAULT_DANMAKU_STYLE.giftFontSize, 10, 60, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftFontSize
+    }),
     giftScrollDuration: pickNumber('gift-scroll-duration', DEFAULT_DANMAKU_STYLE.giftScrollDuration, 2, 20)
   };
 }
@@ -265,7 +318,11 @@ function prepareAssEvents(events, options = {}) {
 
 function getDanmakuEventDuration(event) {
   if (event.type === 'superchat') {
-    return clamp(Number(event.duration || 60), 30, 180);
+    return clamp(
+      Number(event.duration) || SUPERCHAT_CARD.defaultDuration,
+      SUPERCHAT_CARD.minDuration,
+      SUPERCHAT_CARD.maxDuration
+    );
   }
   if (event.type === 'danmaku') {
     return 8;
@@ -369,21 +426,44 @@ function createAss(events, options = {}) {
     }
 
     if (event.type === 'superchat') {
-      const duration = clamp(Number(event.duration || 60), 30, 180);
+      const duration = clamp(
+        Number(event.duration) || SUPERCHAT_CARD.defaultDuration,
+        SUPERCHAT_CARD.minDuration,
+        SUPERCHAT_CARD.maxDuration
+      );
       const row = chooseLane(scRows, event.time, duration);
       const x = style.panelLeft;
-      const y = style.superChatBottom - row * 132;
+      const y = style.superChatBottom - row * SUPERCHAT_CARD.rowGap;
       const palette = superChatPalette(event.price || 0);
       const title = `${event.user || '用户'}  ￥${event.price || 0}`;
-      lines.push(drawRect(7, event.time, event.time + duration, x, y, 570, 42, palette.header));
-      lines.push(drawRect(6, event.time, event.time + duration, x, y + 42, 570, 88, palette.body));
+      const cardWidth = resolveSuperChatWidth(title, event.text);
+      const textWidth = cardWidth - SUPERCHAT_CARD.paddingX * 2;
       lines.push(
-        dialogue(
-          8,
+        drawRoundedRect(
+          7,
           event.time,
           event.time + duration,
-          'BoxText',
-          `{\\fad(120,260)\\pos(${x + 18},${y + 8})\\fs27\\b1}${assEscape(title)}`
+          x,
+          y,
+          cardWidth,
+          SUPERCHAT_CARD.headerHeight,
+          SUPERCHAT_CARD.radius,
+          palette.header,
+          { corners: { tl: true, tr: true, br: false, bl: false } }
+        )
+      );
+      lines.push(
+        drawRoundedRect(
+          6,
+          event.time,
+          event.time + duration,
+          x,
+          y + SUPERCHAT_CARD.headerHeight,
+          cardWidth,
+          SUPERCHAT_CARD.bodyHeight,
+          SUPERCHAT_CARD.radius,
+          palette.body,
+          { corners: { tl: false, tr: false, br: true, bl: true } }
         )
       );
       lines.push(
@@ -392,7 +472,20 @@ function createAss(events, options = {}) {
           event.time,
           event.time + duration,
           'BoxText',
-          `{\\fad(120,260)\\pos(${x + 18},${y + 54})\\fs24\\b0}${assEscape(wrapText(event.text, 28, 2))}`
+          `{\\fad(120,260)\\pos(${x + SUPERCHAT_CARD.paddingX},${y + SUPERCHAT_CARD.titleOffsetY})\\fs${
+            SUPERCHAT_CARD.titleFontSize
+          }\\b1}${assEscape(title)}`
+        )
+      );
+      lines.push(
+        dialogue(
+          8,
+          event.time,
+          event.time + duration,
+          'BoxText',
+          `{\\fad(120,260)\\pos(${x + SUPERCHAT_CARD.paddingX},${y + SUPERCHAT_CARD.textOffsetY})\\fs${
+            SUPERCHAT_CARD.textFontSize
+          }\\b0}${assEscape(wrapTextToWidth(event.text, textWidth, SUPERCHAT_CARD.textFontSize, 2))}`
         )
       );
       continue;
@@ -412,6 +505,14 @@ function createAss(events, options = {}) {
           ? `${event.user || '用户'} 开通 ${event.giftName || guardName(event.guardLevel)} x${event.count || 1}${comboLabel}`
           : `${event.user || '用户'} 送出 ${event.giftName || '礼物'} x${event.count || 1}${comboLabel}`;
       const subLabel = priceLabel || (event.type === 'guard' ? '大航海' : '礼物互动');
+      const avatarSize = clamp(style.giftHeight - 18, 32, 44);
+      const avatarInset = Math.max(7, Math.round((style.giftHeight - avatarSize) / 2));
+      const textX = x + avatarInset + avatarSize + 12;
+      const titleOffsetY = Math.max(6, Math.round(style.giftHeight * 0.12));
+      const subOffsetY = Math.max(titleOffsetY + style.giftFontSize + 4, Math.round(style.giftHeight * 0.58));
+      const giftWidth = resolveGiftWidth(style, textX - x, label, subLabel);
+      const giftRadius = Math.min(style.giftRadius, Math.floor(style.giftHeight / 4));
+      const textWidth = giftWidth - (textX - x) - 18;
       lines.push(
         drawRoundedRect(
           5,
@@ -419,13 +520,14 @@ function createAss(events, options = {}) {
           displayEnd,
           x,
           giftScroll.startY,
-          style.giftWidth,
+          giftWidth,
           style.giftHeight,
-          style.giftRadius,
+          giftRadius,
           event.type === 'guard' ? '&HB8422514&' : '&HAE2A1B12&',
           {
             clip: giftScroll.clip,
-            move: { x1: x, y1: giftScroll.startY, x2: x, y2: giftScroll.endY }
+            move: { x1: x, y1: giftScroll.startY, x2: x, y2: giftScroll.endY },
+            popIn: true
           }
         )
       );
@@ -434,15 +536,21 @@ function createAss(events, options = {}) {
           6,
           displayStart,
           displayEnd,
-          x + 9,
-          giftScroll.startY + 7,
-          32,
-          32,
-          16,
+          x + avatarInset,
+          giftScroll.startY + avatarInset,
+          avatarSize,
+          avatarSize,
+          avatarSize / 2,
           event.type === 'guard' ? '&H00D8C36E&' : '&H0079DED5&',
           {
             clip: giftScroll.clip,
-            move: { x1: x + 9, y1: giftScroll.startY + 7, x2: x + 9, y2: giftScroll.endY + 7 }
+            move: {
+              x1: x + avatarInset,
+              y1: giftScroll.startY + avatarInset,
+              x2: x + avatarInset,
+              y2: giftScroll.endY + avatarInset
+            },
+            popIn: true
           }
         )
       );
@@ -452,11 +560,11 @@ function createAss(events, options = {}) {
           displayStart,
           displayEnd,
           'BoxText',
-          `{\\fad(120,260)${clipTag(giftScroll.clip)}\\move(${assNumber(x + 52)},${assNumber(
-            giftScroll.startY + 5
-          )},${assNumber(x + 52)},${assNumber(giftScroll.endY + 5)})\\fs${assNumber(
+          `{\\fad(120,260)${clipTag(giftScroll.clip)}${popInTag()}\\move(${assNumber(textX)},${assNumber(
+            giftScroll.startY + titleOffsetY
+          )},${assNumber(textX)},${assNumber(giftScroll.endY + titleOffsetY)})\\fs${assNumber(
             style.giftFontSize
-          )}\\b1}${assEscape(truncateTextToWidth(label, style.giftWidth - 112, style.giftFontSize))}`
+          )}\\b1}${assEscape(truncateTextToWidth(label, textWidth, style.giftFontSize))}`
         )
       );
       lines.push(
@@ -465,11 +573,11 @@ function createAss(events, options = {}) {
           displayStart,
           displayEnd,
           'BoxText',
-          `{\\fad(120,260)${clipTag(giftScroll.clip)}\\move(${assNumber(x + 52)},${assNumber(
-            giftScroll.startY + 25
-          )},${assNumber(x + 52)},${assNumber(giftScroll.endY + 25)})\\fs${assNumber(
+          `{\\fad(120,260)${clipTag(giftScroll.clip)}${popInTag()}\\move(${assNumber(textX)},${assNumber(
+            giftScroll.startY + subOffsetY
+          )},${assNumber(textX)},${assNumber(giftScroll.endY + subOffsetY)})\\fs${assNumber(
             Math.max(12, style.giftFontSize - 4)
-          )}\\1c&H00D8C36E&}${assEscape(truncateTextToWidth(subLabel, style.giftWidth - 112, style.giftFontSize - 4))}`
+          )}\\1c&H00D8C36E&}${assEscape(truncateTextToWidth(subLabel, textWidth, style.giftFontSize - 4))}`
         )
       );
     }
@@ -490,22 +598,23 @@ function drawRect(layer, start, end, x, y, width, height, color) {
 }
 
 function drawRoundedRect(layer, start, end, x, y, width, height, radius, color, options = {}) {
-  const shape = roundedRectPath(width, height, radius);
+  const shape = roundedRectPath(width, height, radius, options.corners);
   const position = options.move
     ? `\\move(${assNumber(options.move.x1)},${assNumber(options.move.y1)},${assNumber(options.move.x2)},${assNumber(
         options.move.y2
       )})`
     : `\\pos(${assNumber(x)},${assNumber(y)})`;
+  const popIn = options.popIn ? popInTag() : '';
   return dialogue(
     layer,
     start,
     end,
     'Shape',
-    `{\\fad(120,260)${clipTag(options.clip)}\\p1${position}\\bord0\\shad0${assShapeColorTags(color)}}${shape}`
+    `{\\fad(120,260)${clipTag(options.clip)}${popIn}\\p1${position}\\bord0\\shad0${assShapeColorTags(color)}}${shape}`
   );
 }
 
-function roundedRectPath(width, height, radius) {
+function roundedRectPath(width, height, radius, corners = {}) {
   const w = Math.max(0, Number(width) || 0);
   const h = Math.max(0, Number(height) || 0);
   const r = clamp(Number(radius) || 0, 0, Math.min(w, h) / 2);
@@ -513,19 +622,52 @@ function roundedRectPath(width, height, radius) {
     return `m 0 0 l ${assNumber(w)} 0 l ${assNumber(w)} ${assNumber(h)} l 0 ${assNumber(h)}`;
   }
   const c = r * 0.55228475;
+  const corner = {
+    tl: corners.tl !== false,
+    tr: corners.tr !== false,
+    br: corners.br !== false,
+    bl: corners.bl !== false
+  };
   return [
-    `m ${assNumber(r)} 0`,
-    `l ${assNumber(w - r)} 0`,
-    `b ${assNumber(w - r + c)} 0 ${assNumber(w)} ${assNumber(r - c)} ${assNumber(w)} ${assNumber(r)}`,
-    `l ${assNumber(w)} ${assNumber(h - r)}`,
-    `b ${assNumber(w)} ${assNumber(h - r + c)} ${assNumber(w - r + c)} ${assNumber(h)} ${assNumber(
-      w - r
-    )} ${assNumber(h)}`,
-    `l ${assNumber(r)} ${assNumber(h)}`,
-    `b ${assNumber(r - c)} ${assNumber(h)} 0 ${assNumber(h - r + c)} 0 ${assNumber(h - r)}`,
-    `l 0 ${assNumber(r)}`,
-    `b 0 ${assNumber(r - c)} ${assNumber(r - c)} 0 ${assNumber(r)} 0`
+    `m ${assNumber(corner.tl ? r : 0)} 0`,
+    `l ${assNumber(corner.tr ? w - r : w)} 0`,
+    corner.tr
+      ? `b ${assNumber(w - r + c)} 0 ${assNumber(w)} ${assNumber(r - c)} ${assNumber(w)} ${assNumber(r)}`
+      : '',
+    `l ${assNumber(w)} ${assNumber(corner.br ? h - r : h)}`,
+    corner.br
+      ? `b ${assNumber(w)} ${assNumber(h - r + c)} ${assNumber(w - r + c)} ${assNumber(h)} ${assNumber(
+          w - r
+        )} ${assNumber(h)}`
+      : '',
+    `l ${assNumber(corner.bl ? r : 0)} ${assNumber(h)}`,
+    corner.bl
+      ? `b ${assNumber(r - c)} ${assNumber(h)} 0 ${assNumber(h - r + c)} 0 ${assNumber(h - r)}`
+      : '',
+    `l 0 ${assNumber(corner.tl ? r : 0)}`,
+    corner.tl
+      ? `b 0 ${assNumber(r - c)} ${assNumber(r - c)} 0 ${assNumber(r)} 0`
+      : ''
   ].join(' ');
+}
+
+function resolveSuperChatWidth(title, text) {
+  const maxTextWidth = SUPERCHAT_CARD.maxWidth - SUPERCHAT_CARD.paddingX * 2;
+  const desiredTextWidth = Math.min(estimateTextWidth(text, SUPERCHAT_CARD.textFontSize), maxTextWidth);
+  const desiredTitleWidth = Math.min(estimateTextWidth(title, SUPERCHAT_CARD.titleFontSize), maxTextWidth);
+  return clamp(
+    Math.ceil(Math.max(desiredTitleWidth, desiredTextWidth) + SUPERCHAT_CARD.paddingX * 2),
+    SUPERCHAT_CARD.minWidth,
+    SUPERCHAT_CARD.maxWidth
+  );
+}
+
+function resolveGiftWidth(style, textOffsetX, label, subLabel) {
+  const maxWidth = Math.max(180, Number(style.giftWidth) || DEFAULT_DANMAKU_STYLE.giftWidth);
+  const minWidth = Math.min(maxWidth, Math.max(280, Math.round(Number(style.giftHeight || 0) * 5.2)));
+  const labelWidth = estimateTextWidth(label, style.giftFontSize);
+  const subLabelWidth = estimateTextWidth(subLabel, Math.max(12, style.giftFontSize - 4));
+  return clamp(Math.ceil(textOffsetX + Math.max(labelWidth, subLabelWidth) + 18), minWidth, maxWidth);
 }
 
 function getGiftScrollMetrics(style) {
@@ -576,6 +718,10 @@ function clipTag(clip) {
     return '';
   }
   return `\\clip(${assNumber(clip.x1)},${assNumber(clip.y1)},${assNumber(clip.x2)},${assNumber(clip.y2)})`;
+}
+
+function popInTag() {
+  return '\\fscx88\\fscy88\\t(0,130,0.45,\\fscx110\\fscy110)\\t(130,420,1.8,\\fscx100\\fscy100)';
 }
 
 function assNumber(value) {
@@ -724,6 +870,35 @@ function wrapText(text, maxCharsPerLine, maxLines) {
     lines[lines.length - 1] = `${Array.from(lines[lines.length - 1])
       .slice(0, maxCharsPerLine - 1)
       .join('')}…`;
+  }
+  return lines.join('\\N');
+}
+
+function wrapTextToWidth(text, maxWidth, fontSize, maxLines) {
+  const chars = Array.from(String(text || ''));
+  const safeWidth = Math.max(20, Number(maxWidth) || 20);
+  const lines = [];
+  let current = '';
+  for (const char of chars) {
+    const next = `${current}${char}`;
+    if (current && estimateTextWidth(next, fontSize) > safeWidth) {
+      lines.push(current);
+      current = char;
+      if (lines.length >= maxLines) {
+        break;
+      }
+      continue;
+    }
+    current = next;
+  }
+  if (lines.length < maxLines && current) {
+    lines.push(current);
+  }
+  if (lines.length > maxLines) {
+    lines.length = maxLines;
+  }
+  if (chars.length > lines.join('').length && lines.length > 0) {
+    lines[lines.length - 1] = truncateTextToWidth(`${lines[lines.length - 1]}…`, safeWidth, fontSize);
   }
   return lines.join('\\N');
 }

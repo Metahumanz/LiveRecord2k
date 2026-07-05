@@ -104,15 +104,15 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  args.push('-i', cleanPath);
   if (hasStart) {
     args.push('-ss', formatFfmpegSeconds(startTime));
   }
-  args.push('-i', cleanPath);
   if (hasDuration) {
     args.push('-t', formatFfmpegSeconds(duration));
   }
-  const videoFilter = `${hasStart || hasDuration ? 'setpts=PTS-STARTPTS,' : ''}ass='${escapeFilterPath(assPath)}'`;
-  args.push('-vf', videoFilter, '-c:v', codec || 'libx265');
+  const videoFilter = `setpts=PTS-STARTPTS,ass='${escapeFilterPath(assPath)}'`;
+  args.push('-map', '0:v:0', '-map', '0:a?', '-vf', videoFilter, '-c:v', codec || 'libx265');
 
   if ((codec || '').includes('nvenc')) {
     args.push('-preset', 'p5', '-cq', String(crf), '-b:v', '0');
@@ -124,9 +124,7 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
     args.push('-preset', 'medium', '-crf', String(crf));
   }
 
-  if (hasStart || hasDuration) {
-    args.push('-avoid_negative_ts', 'make_zero');
-  }
+  args.push('-avoid_negative_ts', 'make_zero');
 
   if (container === 'mp4') {
     if (isHevcCodec(codec)) {
@@ -135,7 +133,7 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
     args.push('-movflags', '+faststart');
   }
 
-  args.push('-c:a', 'copy', burnedPath);
+  args.push('-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-b:a', '160k', '-ac', '2', burnedPath);
   return args;
 }
 
@@ -260,16 +258,24 @@ function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, contai
   const args = [
     '-hide_banner',
     '-y',
-    '-ss',
-    formatFfmpegSeconds(startTime),
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
     '-i',
     cleanPath,
+    '-ss',
+    formatFfmpegSeconds(startTime),
     '-t',
     formatFfmpegSeconds(duration),
     '-map',
-    '0',
+    '0:v:0',
+    '-map',
+    '0:a?',
     '-c',
     'copy',
+    '-dn',
+    '-sn',
     '-avoid_negative_ts',
     'make_zero'
   ];

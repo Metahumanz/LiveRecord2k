@@ -2928,7 +2928,7 @@ exit 2
     const transcodePath = path.join(repairDir, 'source.repaired.mp4');
     const reuseCandidate = [remuxPath, transcodePath].find((candidate) => fs.existsSync(candidate));
     if (reuseCandidate) {
-      this.log('info', `已复用烧录修复副本：${path.basename(reuseCandidate)}`);
+      this.log('info', `已复用源文件修复副本：${path.basename(reuseCandidate)}`);
       return reuseCandidate;
     }
     await fsp.rm(repairDir, { recursive: true, force: true }).catch(() => {});
@@ -3449,8 +3449,44 @@ exit 2
     let args;
     let codecInfo = null;
     if (mode === 'clean') {
+      let cleanSourcePath;
+      try {
+        cleanSourcePath = await this.prepareRepairedBurnSource(recording, {
+          mediaInfo,
+          durationSec,
+          label: `修复导出源文件：${path.basename(recording.cleanPath)}`,
+          assignProgress: (progress) => {
+            clearTimeout(this.exportProgressClearTimer);
+            this.exportProgress = progress;
+            this.exportProcess = null;
+            this.emitState();
+          },
+          onChild: (child) => {
+            this.exportProcess = child || null;
+          },
+          isCancelled: () => this.exportCancelRequested
+        });
+      } catch (error) {
+        if (this.exportCancelRequested) {
+          return {
+            ok: false,
+            mode,
+            cleanPath: recording.cleanPath,
+            cssPath
+          };
+        }
+        throw error;
+      }
+      if (this.exportCancelRequested) {
+        return {
+          ok: false,
+          mode,
+          cleanPath: recording.cleanPath,
+          cssPath
+        };
+      }
       args = createClipCopyArgs({
-        cleanPath: recording.cleanPath,
+        cleanPath: cleanSourcePath,
         outputPath,
         startTime,
         duration,
