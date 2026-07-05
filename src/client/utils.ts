@@ -30,24 +30,12 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
       outputDir: current.outputDir || state.settings.outputDir
     };
   }
-  const recording = recordings.find((item) => item.valid !== false) || recordings[0];
-  if (!recording) {
-    return {
-      ...current,
-      cleanPath: '',
-      danmakuPath: '',
-      cssPath: '',
-      endTime: '',
-      overlayMode: state.settings.burnOverlayMode,
-      danmakuArea: state.settings.burnDanmakuArea,
-      outputDir: current.outputDir || state.settings.outputDir
-    };
-  }
   return {
     ...current,
-    cleanPath: recording.cleanPath,
-    danmakuPath: recording.danmakuPath || '',
-    cssPath: recording.cssPath || '',
+    cleanPath: '',
+    danmakuPath: '',
+    cssPath: '',
+    endTime: '',
     overlayMode: state.settings.burnOverlayMode,
     danmakuArea: state.settings.burnDanmakuArea,
     outputDir: current.outputDir || state.settings.outputDir

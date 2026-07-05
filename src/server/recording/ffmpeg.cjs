@@ -29,6 +29,10 @@ function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec, s
     '-hide_banner',
     '-stats',
     '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
     '-rw_timeout',
     '30000000'
   ];
@@ -72,7 +76,9 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
     '-hide_banner',
     '-y',
     '-fflags',
-    '+genpts',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
     '-i',
     inputPath,
     '-ignore_unknown',
@@ -97,7 +103,7 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
 function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
-  const args = ['-hide_banner', '-y'];
+  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   if (hasStart) {
     args.push('-ss', formatFfmpegSeconds(startTime));
   }
@@ -130,6 +136,123 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
   }
 
   args.push('-c:a', 'copy', burnedPath);
+  return args;
+}
+
+function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern }) {
+  return [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-i',
+    inputPath,
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a?',
+    '-vf',
+    'scale=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    '28',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '96k',
+    '-ac',
+    '2',
+    '-dn',
+    '-sn',
+    '-f',
+    'hls',
+    '-hls_time',
+    '4',
+    '-hls_list_size',
+    '0',
+    '-hls_segment_filename',
+    segmentPattern,
+    playlistPath
+  ];
+}
+
+function createRepairRemuxArgs({ inputPath, outputPath, container, streamCodec }) {
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-i',
+    inputPath,
+    '-ignore_unknown',
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a?',
+    '-c',
+    'copy',
+    '-dn',
+    '-sn',
+    '-avoid_negative_ts',
+    'make_zero'
+  ];
+  if (container === 'mp4') {
+    if (isHevcCodec(streamCodec)) {
+      args.push('-tag:v', 'hvc1');
+    }
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
+  return args;
+}
+
+function createRepairTranscodeArgs({ inputPath, outputPath, container }) {
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-i',
+    inputPath,
+    '-ignore_unknown',
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a?',
+    '-vf',
+    'setpts=PTS-STARTPTS,format=yuv420p',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    '20',
+    '-af',
+    'aresample=async=1:first_pts=0',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '160k',
+    '-ac',
+    '2',
+    '-dn',
+    '-sn',
+    '-avoid_negative_ts',
+    'make_zero'
+  ];
+  if (container === 'mp4') {
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
   return args;
 }
 
@@ -219,6 +342,9 @@ module.exports = {
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
+  createPreviewHlsArgs,
+  createRepairRemuxArgs,
+  createRepairTranscodeArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
   writeConcatFile,
