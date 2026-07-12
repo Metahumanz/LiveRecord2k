@@ -777,7 +777,9 @@ exit 2
 `;
     const result = spawnSync('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', script], {
       encoding: 'utf8',
-      windowsHide: false,
+      // The picker still appears, but PowerShell itself must remain invisible.
+      // A visible console is distracting and, in packaged builds, briefly steals focus.
+      windowsHide: true,
       env: {
         ...process.env,
         BR2K_DIALOG_TYPE: dialogType,
