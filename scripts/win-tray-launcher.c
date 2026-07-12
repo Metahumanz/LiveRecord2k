@@ -42,19 +42,6 @@ static DWORD g_last_open_tick = 0;
 static wchar_t g_notification_title[128] = L"";
 static wchar_t g_notification_message[256] = L"";
 
-static int is_process_elevated(void) {
-  HANDLE token = NULL;
-  TOKEN_ELEVATION elevation;
-  DWORD size = 0;
-  ZeroMemory(&elevation, sizeof(elevation));
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-    return 0;
-  }
-  BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
-  CloseHandle(token);
-  return ok && elevation.TokenIsElevated;
-}
-
 static int append_space_if_needed(wchar_t *buffer, size_t capacity) {
   size_t length = wcslen(buffer);
   if (length == 0) {
@@ -96,56 +83,10 @@ static int append_quoted_arg(wchar_t *buffer, size_t capacity, const wchar_t *ar
   return append_char(buffer, capacity, L'"');
 }
 
-static int build_current_arguments(wchar_t *buffer, size_t capacity) {
-  buffer[0] = L'\0';
-  int argc = 0;
-  LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  if (!argv) {
-    return 0;
-  }
-  for (int index = 1; index < argc; index++) {
-    if (!append_quoted_arg(buffer, capacity, argv[index])) {
-      LocalFree(argv);
-      return 0;
-    }
-  }
-  LocalFree(argv);
-  return 1;
-}
-
 static void show_error(const wchar_t *message, DWORD code) {
   wchar_t buffer[1024];
   swprintf(buffer, 1024, L"%ls\n\n错误码：%lu", message, code);
   MessageBoxW(NULL, buffer, APP_NAME, MB_OK | MB_ICONERROR);
-}
-
-static int relaunch_as_admin(void) {
-  wchar_t launcher_path[MAX_PATH];
-  DWORD path_length = GetModuleFileNameW(NULL, launcher_path, MAX_PATH);
-  if (path_length == 0 || path_length >= MAX_PATH) {
-    show_error(L"无法定位启动器路径。", GetLastError());
-    return 0;
-  }
-
-  wchar_t arguments[COMMAND_CAPACITY];
-  if (!build_current_arguments(arguments, COMMAND_CAPACITY)) {
-    show_error(L"启动命令过长。", 0);
-    return 0;
-  }
-
-  HINSTANCE result = ShellExecuteW(
-    NULL,
-    L"runas",
-    launcher_path,
-    arguments[0] ? arguments : NULL,
-    NULL,
-    SW_SHOWNORMAL
-  );
-  if ((INT_PTR)result <= 32) {
-    show_error(L"需要管理员权限启动哔哩录播 2K。", (DWORD)(INT_PTR)result);
-    return 0;
-  }
-  return 1;
 }
 
 static int read_text_file(const wchar_t *path, char *buffer, DWORD capacity) {
@@ -703,10 +644,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command, int s
   (void)show;
   g_instance = instance;
   g_port = resolve_port_from_args();
-
-  if (!is_process_elevated()) {
-    return relaunch_as_admin() ? 0 : 1;
-  }
 
   HANDLE mutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
   if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
