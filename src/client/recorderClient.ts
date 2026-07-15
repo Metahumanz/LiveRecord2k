@@ -14,36 +14,43 @@ export const recorder: RecorderApi = {
   cancelQrLogin: () => api<AppState>('/api/auth/qr/cancel', {}),
   async chooseOutputDir() {
     const current = latestState?.settings.outputDir || '';
-    const result = await api<{ path?: string }>('/api/settings/choose-output-dir', { currentPath: current });
+    const result = await api<{ path?: string; cancelled?: boolean; message?: string }>(
+      '/api/settings/choose-output-dir',
+      { currentPath: current },
+      { timeoutMs: 0 }
+    );
+    if (result.message && !result.cancelled) {
+      throw new Error(result.message);
+    }
     return result.path?.trim() || undefined;
   },
-  selectPath: (request) => api('/api/shell/select-path', request),
-  saveSettings: (settings) => api<AppState>('/api/settings/save', { settings }),
-  addRoom: (roomId) => api<AppState>('/api/rooms/add', { roomId }),
+  selectPath: (request) => api('/api/shell/select-path', request, { timeoutMs: 0 }),
+  saveSettings: (settings) => api<AppState>('/api/settings/save', { settings }, { timeoutMs: 120000 }),
+  addRoom: (roomId) => api<AppState>('/api/rooms/add', { roomId }, { timeoutMs: 75000 }),
   removeRoom: (roomId) => api<AppState>('/api/rooms/remove', { roomId }),
-  refreshRoom: (roomId, options) => api<AppState>('/api/rooms/refresh', { roomId, ...options }),
+  refreshRoom: (roomId, options) => api<AppState>('/api/rooms/refresh', { roomId, ...options }, { timeoutMs: 75000 }),
   setMonitoring: (roomId, enabled) => api<AppState>('/api/rooms/monitor', { roomId, enabled }),
-  startRecording: (roomId) => api<AppState>('/api/rooms/record/start', { roomId }),
+  startRecording: (roomId) => api<AppState>('/api/rooms/record/start', { roomId }, { timeoutMs: 120000 }),
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
-  startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }),
+  startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }, { timeoutMs: 120000 }),
   startExportPreview: (request) => api('/api/export/preview/start', request),
   cancelExportPreview: () => api<AppState>('/api/export/preview/cancel', {}),
-  burnDanmaku: (roomId, options) => api<AppState>('/api/rooms/burn', { roomId, options }),
+  burnDanmaku: (roomId, options) => api<AppState>('/api/rooms/burn', { roomId, options }, { timeoutMs: 180000 }),
   cancelBurnDanmaku: (roomId) => api<AppState>('/api/rooms/burn/cancel', { roomId }),
-  prepareDanmaku: (roomId, options) => api<AppState>('/api/rooms/subtitles', { roomId, options }),
-  prepareSubtitleAssets: (request) => api('/api/export/subtitles', request),
+  prepareDanmaku: (roomId, options) => api<AppState>('/api/rooms/subtitles', { roomId, options }, { timeoutMs: 180000 }),
+  prepareSubtitleAssets: (request) => api('/api/export/subtitles', request, { timeoutMs: 180000 }),
   exportClip: (request) => api('/api/export/clip', request),
   cancelExport: () => api<AppState>('/api/export/cancel', {}),
-  scanRecordings: () => api<AppState>('/api/recordings/scan', {}),
-  cleanupMergedResiduals: () => api<AppState>('/api/recordings/cleanup-merged', {}),
+  scanRecordings: () => api<AppState>('/api/recordings/scan', {}, { timeoutMs: 180000 }),
+  cleanupMergedResiduals: () => api<AppState>('/api/recordings/cleanup-merged', {}, { timeoutMs: 180000 }),
   clearLogs: () => api<AppState>('/api/logs/clear', {}),
   openOutputDir: () => api<AppState>('/api/shell/open-output', {}),
   openPathDir: (path, options) => api<AppState>('/api/shell/open-path-dir', { path, ...options }),
   openConfigDir: () => api<AppState>('/api/shell/open-config', {}),
   checkUpdate: () => api<AppState>('/api/update/check', {}, { timeoutMs: 52000 }),
-  downloadUpdate: () => api<AppState>('/api/update/download', {}),
-  applyUpdate: () => api<AppState>('/api/update/apply', {}),
-  queueUpdate: () => api<AppState>('/api/update/queue', {}),
+  downloadUpdate: () => api<AppState>('/api/update/download', {}, { timeoutMs: 0 }),
+  applyUpdate: () => api<AppState>('/api/update/apply', {}, { timeoutMs: 0 }),
+  queueUpdate: () => api<AppState>('/api/update/queue', {}, { timeoutMs: 0 }),
   setStartup: (enabled) => api<AppState>('/api/system/startup', { enabled }),
   testNotification: () => api<AppState>('/api/system/test-notification', {}),
   shutdown: () => api('/api/system/shutdown', {}),
@@ -61,9 +68,10 @@ export const recorder: RecorderApi = {
 };
 
 async function api<T = unknown>(url: string, body?: unknown, options: { timeoutMs?: number } = {}): Promise<T> {
-  const controller = options.timeoutMs ? new AbortController() : null;
-  const timer = options.timeoutMs
-    ? window.setTimeout(() => controller?.abort(), options.timeoutMs)
+  const timeoutMs = options.timeoutMs === undefined ? 30000 : Math.max(0, options.timeoutMs);
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = timeoutMs
+    ? window.setTimeout(() => controller?.abort(), timeoutMs)
     : 0;
   let response: Response;
   try {
@@ -74,7 +82,7 @@ async function api<T = unknown>(url: string, body?: unknown, options: { timeoutM
       signal: controller?.signal
     });
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
+    if (error instanceof Error && error.name === 'AbortError') {
       throw new Error('请求超时，请稍后重试。');
     }
     throw error;

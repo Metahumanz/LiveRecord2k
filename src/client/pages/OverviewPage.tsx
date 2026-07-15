@@ -17,7 +17,7 @@ export function OverviewPage({
   stats: ReturnType<typeof getStats>;
   busy: string | null;
   setPage: (page: Page) => void;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   openPreview: (roomId: string) => void;
 }) {
   const activeRooms = state.rooms.filter((room) => room.liveStatus === 1 || room.recording);

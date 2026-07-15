@@ -9,7 +9,7 @@ export function LogsPage({
 }: {
   logs: LogEntry[];
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   return (
     <>

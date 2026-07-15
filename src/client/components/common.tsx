@@ -1,5 +1,5 @@
 import type React from 'react';
-import { CheckCircle2, Clock3, Download, FolderOpen, RefreshCw, X } from 'lucide-react';
+import { CheckCircle2, CircleAlert, Clock3, Download, FolderOpen, RefreshCw, X } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import type { AppState, FfmpegJobProgress, LogEntry } from '../types';
 import { clampNumber, filename, formatClock, formatFileSize, getStats } from '../utils';
@@ -13,7 +13,7 @@ export function UpdateNotice({
   state: AppState;
   stats: ReturnType<typeof getStats>;
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   const update = state.update;
   if (!update || update.status === 'idle') {
@@ -175,7 +175,7 @@ export type ToastItem = {
   id: number;
   title: string;
   message?: string;
-  kind?: 'success';
+  kind?: 'success' | 'error';
 };
 
 export function ToastHost({ toasts, onClose }: { toasts: ToastItem[]; onClose: (id: number) => void }) {
@@ -187,7 +187,7 @@ export function ToastHost({ toasts, onClose }: { toasts: ToastItem[]; onClose: (
       {toasts.map((toast) => (
         <div className={`toast-card ${toast.kind || 'success'}`} key={toast.id}>
           <div className="toast-copy">
-            <CheckCircle2 size={19} />
+            {toast.kind === 'error' ? <CircleAlert size={19} /> : <CheckCircle2 size={19} />}
             <div>
               <strong>{toast.title}</strong>
               {toast.message ? <span>{toast.message}</span> : null}

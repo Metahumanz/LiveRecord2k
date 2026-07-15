@@ -87,7 +87,7 @@ export default function App() {
   const stats = useMemo(() => getStats(state?.rooms ?? []), [state?.rooms]);
   const previewRoom = previewRoomId ? state?.rooms.find((room) => room.id === previewRoomId) || null : null;
 
-  async function run<T>(key: string, action: () => Promise<T>) {
+  async function run<T>(key: string, action: () => Promise<T>): Promise<boolean> {
     setBusy(key);
     try {
       const result = await action();
@@ -95,6 +95,14 @@ export default function App() {
         setState(result);
         setSettingsDraft(result.settings);
       }
+      return true;
+    } catch (error) {
+      showToast({
+        kind: 'error',
+        title: '操作失败',
+        message: error instanceof Error ? error.message : '请求未能完成，请稍后重试。'
+      });
+      return false;
     } finally {
       setBusy(null);
     }
@@ -111,8 +119,10 @@ export default function App() {
   }
 
   async function saveSettingsWithToast(settings: Partial<AppSettings>, message = '录制配置已保存') {
-    await run('save-settings', () => recorder.saveSettings(settings));
-    showToast({ title: '保存成功', message });
+    const succeeded = await run('save-settings', () => recorder.saveSettings(settings));
+    if (succeeded) {
+      showToast({ title: '保存成功', message });
+    }
   }
 
   async function addRoom() {
@@ -120,15 +130,25 @@ export default function App() {
     if (!value) {
       return;
     }
-    await run('add-room', () => recorder.addRoom(value));
+    const succeeded = await run('add-room', () => recorder.addRoom(value));
+    if (!succeeded) {
+      return;
+    }
     setRoomInput('');
     setPage('rooms');
   }
 
   async function chooseOutputDir() {
-    const selected = await recorder.chooseOutputDir();
-    if (selected && settingsDraft) {
-      setSettingsDraft({ ...settingsDraft, outputDir: selected });
+    setBusy('choose-output-dir');
+    try {
+      const selected = await recorder.chooseOutputDir();
+      if (selected && settingsDraft) {
+        setSettingsDraft({ ...settingsDraft, outputDir: selected });
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '系统路径选择器打开失败。');
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -169,6 +189,12 @@ export default function App() {
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
+    } catch (error) {
+      showToast({
+        kind: 'error',
+        title: '字幕生成失败',
+        message: error instanceof Error ? error.message : '字幕生成未能完成。'
+      });
     } finally {
       setBusy(null);
     }
@@ -189,6 +215,12 @@ export default function App() {
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
+    } catch (error) {
+      showToast({
+        kind: 'error',
+        title: '导出失败',
+        message: error instanceof Error ? error.message : '导出请求未能完成。'
+      });
     } finally {
       setBusy(null);
     }

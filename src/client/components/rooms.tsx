@@ -151,7 +151,7 @@ export function RoomCard({
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   openPreview: (roomId: string) => void;
 }) {
   const status = getRoomStatus(room);
@@ -602,7 +602,7 @@ export function QrLoginPanel({
 }: {
   login: NonNullable<AppState['login']>;
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   return (
     <div className="qr-backdrop">
