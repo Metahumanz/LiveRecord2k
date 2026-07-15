@@ -1,4 +1,9 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <wininet.h>
 #include <stdio.h>
@@ -10,6 +15,7 @@
 #define APP_NAME L"BiliRecord2K"
 #define MUTEX_NAME L"Local\\BiliRecord2K.Tray"
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_TRAY_POLL_COMPLETE (WM_APP + 2)
 #define TIMER_POLL 1
 #define TIMER_NOTIFICATION 3
 #define TRAY_UID 1
@@ -18,6 +24,9 @@
 #define DEFAULT_PORT 3263
 #define COMMAND_CAPACITY 32768
 #define HTTP_CAPACITY 65536
+#define HTTP_CONNECT_TIMEOUT_MS 800
+#define HTTP_SEND_TIMEOUT_MS 1000
+#define HTTP_RECEIVE_TIMEOUT_MS 1000
 
 #ifndef NIN_SELECT
 #define NIN_SELECT (WM_USER + 0)
@@ -39,8 +48,19 @@ static HANDLE g_service_process;
 static int g_port = DEFAULT_PORT;
 static DWORD g_last_notification_seq = 0;
 static DWORD g_last_open_tick = 0;
+static volatile LONG g_poll_in_progress = 0;
 static wchar_t g_notification_title[128] = L"";
 static wchar_t g_notification_message[256] = L"";
+
+typedef struct TrayPollRequest {
+  HWND window;
+  DWORD after_seq;
+} TrayPollRequest;
+
+typedef struct TrayPollResult {
+  int ok;
+  char response[HTTP_CAPACITY];
+} TrayPollResult;
 
 static int append_space_if_needed(wchar_t *buffer, size_t capacity) {
   size_t length = wcslen(buffer);
@@ -187,11 +207,21 @@ static int http_read_all(HINTERNET request, char *buffer, DWORD capacity) {
   return 1;
 }
 
+static void configure_http_timeouts(HINTERNET internet) {
+  DWORD connect_timeout = HTTP_CONNECT_TIMEOUT_MS;
+  DWORD send_timeout = HTTP_SEND_TIMEOUT_MS;
+  DWORD receive_timeout = HTTP_RECEIVE_TIMEOUT_MS;
+  InternetSetOptionW(internet, INTERNET_OPTION_CONNECT_TIMEOUT, &connect_timeout, sizeof(connect_timeout));
+  InternetSetOptionW(internet, INTERNET_OPTION_SEND_TIMEOUT, &send_timeout, sizeof(send_timeout));
+  InternetSetOptionW(internet, INTERNET_OPTION_RECEIVE_TIMEOUT, &receive_timeout, sizeof(receive_timeout));
+}
+
 static int http_get_path(const wchar_t *path, char *buffer, DWORD capacity) {
   HINTERNET internet = InternetOpenW(APP_NAME, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
   if (!internet) {
     return 0;
   }
+  configure_http_timeouts(internet);
   HINTERNET connect = InternetConnectW(internet, L"127.0.0.1", (INTERNET_PORT)g_port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
   if (!connect) {
     InternetCloseHandle(internet);
@@ -216,6 +246,7 @@ static void http_post_shutdown(void) {
   if (!internet) {
     return;
   }
+  configure_http_timeouts(internet);
   HINTERNET connect = InternetConnectW(internet, L"127.0.0.1", (INTERNET_PORT)g_port, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0);
   if (!connect) {
     InternetCloseHandle(internet);
@@ -429,18 +460,7 @@ static void show_tray_notification(const wchar_t *title, const wchar_t *message)
   }
 }
 
-static int poll_tray_state(void) {
-  wchar_t path[128];
-  swprintf(path, 128, L"/api/tray/state?after=%lu", g_last_notification_seq);
-
-  char response[HTTP_CAPACITY];
-  if (!http_get_path(path, response, sizeof(response))) {
-    wchar_t tip[128];
-    swprintf(tip, 128, L"哔哩录播 2K | 启动中 | 端口 %d", g_port);
-    update_tray_tip(tip);
-    return 0;
-  }
-
+static void apply_tray_state_response(const char *response) {
   wchar_t tooltip[128];
   if (read_encoded_value(response, "tooltip=", tooltip, 128)) {
     update_tray_tip(tooltip);
@@ -462,12 +482,108 @@ static int poll_tray_state(void) {
   }
 
   g_last_notification_seq = next_seq;
-  return 1;
 }
 
-static void show_tray_menu(HWND hwnd) {
-  POINT point;
-  GetCursorPos(&point);
+static DWORD WINAPI tray_poll_thread(LPVOID parameter) {
+  TrayPollRequest *request = (TrayPollRequest *)parameter;
+  TrayPollResult *result = (TrayPollResult *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TrayPollResult));
+  if (result) {
+    wchar_t path[128];
+    swprintf(path, 128, L"/api/tray/state?after=%lu", request->after_seq);
+    result->ok = http_get_path(path, result->response, sizeof(result->response));
+    if (!PostMessageW(request->window, WM_TRAY_POLL_COMPLETE, 0, (LPARAM)result)) {
+      HeapFree(GetProcessHeap(), 0, result);
+      InterlockedExchange(&g_poll_in_progress, 0);
+    }
+  } else {
+    InterlockedExchange(&g_poll_in_progress, 0);
+  }
+  HeapFree(GetProcessHeap(), 0, request);
+  return 0;
+}
+
+static void start_tray_poll(HWND hwnd) {
+  if (InterlockedCompareExchange(&g_poll_in_progress, 1, 0) != 0) {
+    return;
+  }
+  TrayPollRequest *request = (TrayPollRequest *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TrayPollRequest));
+  if (!request) {
+    InterlockedExchange(&g_poll_in_progress, 0);
+    return;
+  }
+  request->window = hwnd;
+  request->after_seq = g_last_notification_seq;
+  HANDLE thread = CreateThread(NULL, 0, tray_poll_thread, request, 0, NULL);
+  if (!thread) {
+    HeapFree(GetProcessHeap(), 0, request);
+    InterlockedExchange(&g_poll_in_progress, 0);
+    return;
+  }
+  CloseHandle(thread);
+}
+
+static int get_tray_icon_anchor(HWND hwnd, POINT *point) {
+  NOTIFYICONIDENTIFIER identifier;
+  ZeroMemory(&identifier, sizeof(identifier));
+  identifier.cbSize = sizeof(identifier);
+  identifier.hWnd = hwnd;
+  identifier.uID = TRAY_UID;
+  RECT rect;
+  if (SUCCEEDED(Shell_NotifyIconGetRect(&identifier, &rect))) {
+    point->x = (rect.left + rect.right) / 2;
+    point->y = (rect.top + rect.bottom) / 2;
+    return 1;
+  }
+  return GetCursorPos(point);
+}
+
+static UINT tray_menu_alignment_flags(POINT point) {
+  MONITORINFO info;
+  ZeroMemory(&info, sizeof(info));
+  info.cbSize = sizeof(info);
+  HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+  if (!GetMonitorInfoW(monitor, &info)) {
+    return TPM_LEFTALIGN | TPM_BOTTOMALIGN;
+  }
+
+  if (point.y >= info.rcWork.bottom) {
+    return TPM_LEFTALIGN | TPM_BOTTOMALIGN;
+  }
+  if (point.y <= info.rcWork.top) {
+    return TPM_LEFTALIGN | TPM_TOPALIGN;
+  }
+  if (point.x >= info.rcWork.right) {
+    return TPM_RIGHTALIGN | TPM_TOPALIGN;
+  }
+  if (point.x <= info.rcWork.left) {
+    return TPM_LEFTALIGN | TPM_TOPALIGN;
+  }
+
+  LONG distances[4] = {
+    labs(point.x - info.rcWork.left),
+    labs(point.x - info.rcWork.right),
+    labs(point.y - info.rcWork.top),
+    labs(point.y - info.rcWork.bottom)
+  };
+  int nearest = 0;
+  for (int index = 1; index < 4; index++) {
+    if (distances[index] < distances[nearest]) {
+      nearest = index;
+    }
+  }
+  if (nearest == 0) {
+    return TPM_LEFTALIGN | TPM_TOPALIGN;
+  }
+  if (nearest == 1) {
+    return TPM_RIGHTALIGN | TPM_TOPALIGN;
+  }
+  if (nearest == 2) {
+    return TPM_LEFTALIGN | TPM_TOPALIGN;
+  }
+  return TPM_LEFTALIGN | TPM_BOTTOMALIGN;
+}
+
+static void show_tray_menu(HWND hwnd, POINT point) {
 
   HMENU menu = CreatePopupMenu();
   InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, MENU_OPEN, L"打开主界面");
@@ -475,7 +591,7 @@ static void show_tray_menu(HWND hwnd) {
   InsertMenuW(menu, 2, MF_BYPOSITION | MF_STRING, MENU_EXIT, L"退出程序");
 
   SetForegroundWindow(hwnd);
-  TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, point.x, point.y, 0, hwnd, NULL);
+  TrackPopupMenu(menu, TPM_RIGHTBUTTON | tray_menu_alignment_flags(point), point.x, point.y, 0, hwnd, NULL);
   PostMessageW(hwnd, WM_NULL, 0, 0);
   DestroyMenu(menu);
 }
@@ -513,10 +629,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
   switch (message) {
     case WM_TIMER:
       if (wparam == TIMER_POLL) {
-        int ok = poll_tray_state();
-        if (!ok && g_service_process && WaitForSingleObject(g_service_process, 0) == WAIT_OBJECT_0) {
-          exit_tray_only(hwnd);
-        }
+        start_tray_poll(hwnd);
       } else if (wparam == TIMER_NOTIFICATION) {
         KillTimer(hwnd, TIMER_NOTIFICATION);
         if (g_notification_popup) {
@@ -524,6 +637,28 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         }
       }
       return 0;
+    case WM_TRAY_POLL_COMPLETE: {
+      TrayPollResult *result = (TrayPollResult *)lparam;
+      InterlockedExchange(&g_poll_in_progress, 0);
+      if (result && result->ok) {
+        apply_tray_state_response(result->response);
+      } else {
+        wchar_t tip[128];
+        swprintf(tip, 128, L"哔哩录播 2K | 启动中 | 端口 %d", g_port);
+        update_tray_tip(tip);
+        if (g_service_process && WaitForSingleObject(g_service_process, 0) == WAIT_OBJECT_0) {
+          if (result) {
+            HeapFree(GetProcessHeap(), 0, result);
+          }
+          exit_tray_only(hwnd);
+          return 0;
+        }
+      }
+      if (result) {
+        HeapFree(GetProcessHeap(), 0, result);
+      }
+      return 0;
+    }
     case WM_COMMAND:
       switch (LOWORD(wparam)) {
         case MENU_OPEN:
@@ -541,7 +676,17 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         return 0;
       }
       if (tray_event == WM_RBUTTONUP || tray_event == WM_CONTEXTMENU) {
-        show_tray_menu(hwnd);
+        POINT point;
+        if (tray_event == WM_CONTEXTMENU) {
+          point.x = GET_X_LPARAM(wparam);
+          point.y = GET_Y_LPARAM(wparam);
+          if ((point.x == -1 && point.y == -1) || (point.x == 0 && point.y == 0)) {
+            get_tray_icon_anchor(hwnd, &point);
+          }
+        } else if (!GetCursorPos(&point)) {
+          get_tray_icon_anchor(hwnd, &point);
+        }
+        show_tray_menu(hwnd, point);
         return 0;
       }
       break;
@@ -701,7 +846,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command, int s
   }
 
   SetTimer(g_window, TIMER_POLL, 2000, NULL);
-  poll_tray_state();
+  start_tray_poll(g_window);
 
   MSG message;
   while (GetMessageW(&message, NULL, 0, 0) > 0) {
