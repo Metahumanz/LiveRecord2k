@@ -3,15 +3,12 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const QRCode = require('qrcode');
 const {
   DanmakuClient,
-  unpackDanmakuPackets,
-  decodeDanmakuPacket,
-  safeDecodeDanmakuPacket,
-  decodeAuthReply,
   requestBiliJsonWithCookies,
+  fetchWithTimeout,
   getSetCookieHeaders,
   splitSetCookieHeader,
   mergeCookieString,
@@ -19,15 +16,12 @@ const {
   normalizeDanmakuEvent,
   normalizeDanmakuDisplayArea,
   danmakuDisplayAreaLabel,
-  readDanmakuEvents,
   ensureDanmakuCss,
-  readDanmakuStyle,
   createDefaultDanmakuCss,
   parseCssVariables,
   normalizeDanmakuStyle,
   prepareAssEvents,
   getDanmakuEventDuration,
-  createAss,
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
@@ -72,6 +66,7 @@ const {
   normalizeCommandCounts,
   mergeCommandCounts,
   detectFfmpegCapabilities,
+  runCapturedProcess,
   runFfmpegProbe,
   parseFfmpegEncoderNames,
   parseFfmpegHwaccels,
@@ -253,6 +248,7 @@ class LiveRecordService {
     this.rooms = new Map();
     this.logs = [];
     this.monitorTimers = new Map();
+    this.roomTickLocks = new Set();
     this.recordingSessions = new Map();
     this.recordingStartLocks = new Set();
     this.reconnectPendingRooms = new Set();
@@ -271,11 +267,15 @@ class LiveRecordService {
     this.exportQueue = [];
     this.exportQueueRunning = false;
     this.recordings = [];
+    this.recordingScanPromise = null;
     this.clients = new Set();
     this.notifications = [];
     this.notificationSeq = 0;
     this.loginSession = null;
     this.wbiCache = null;
+    this.pathPickerPromise = null;
+    this.pathPickerProcess = null;
+    this.startupEnabled = false;
     this.updateState = {
       status: 'idle',
       currentVersion: APP_VERSION,
@@ -293,7 +293,14 @@ class LiveRecordService {
     };
     this.queuedUpdateTimer = null;
     this.ffmpegPath = findFfmpegPath();
-    this.ffmpegCapabilities = detectFfmpegCapabilities(this.ffmpegPath);
+    this.ffmpegCapabilities = {
+      burnCodecs: BURN_CODEC_CANDIDATES.filter((codec) => codec.kind === 'software'),
+      unavailableBurnCodecs: [],
+      hwaccels: [],
+      videoAdapters: [],
+      probedAt: 0,
+      probeError: ''
+    };
     this.settings = this.normalizeSettings(this.settings);
   }
 
@@ -329,18 +336,44 @@ class LiveRecordService {
   async init() {
     await this.loadStore();
     await this.loadLastUpdateStatus();
-    await fsp.mkdir(this.settings.outputDir, { recursive: true });
     await fsp.mkdir(this.previewCacheDir, { recursive: true });
     await fsp.mkdir(this.repairCacheDir, { recursive: true });
-    await this.refreshRecordingLibrary({ silent: true });
+    this.settings = this.normalizeSettings(this.settings);
     for (const room of this.rooms.values()) {
       if (room.monitoring) {
         this.startMonitorTimer(room.id);
       }
     }
     this.log('success', `WebUI 后端已启动，ffmpeg: ${this.ffmpegPath}`);
+    this.log('info', '正在后台探测 ffmpeg、显卡能力和录像库。');
+    setImmediate(() => {
+      this.initializeRuntimeCapabilities().catch((error) => {
+        this.log('warn', `后台能力探测失败：${error.message}`);
+        this.emitState();
+      });
+    });
+    setImmediate(() => {
+      this.initializeRecordingLibrary().catch((error) => {
+        this.log('warn', `后台扫描录像库失败：${error.message}`);
+        this.emitState();
+      });
+    });
+  }
+
+  async initializeRecordingLibrary() {
+    await fsp.mkdir(this.settings.outputDir, { recursive: true });
+    await this.refreshRecordingLibrary({ silent: true });
+  }
+
+  async initializeRuntimeCapabilities() {
+    [this.ffmpegCapabilities, this.startupEnabled] = await Promise.all([
+      detectFfmpegCapabilities(this.ffmpegPath),
+      isStartupEnabled()
+    ]);
+    this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     this.log('info', `当前弹幕版编码：${this.getBurnCodecInfo(this.settings.burnCodec).label}（${this.settings.burnCodec}）`);
+    this.emitState();
   }
 
   async loadStore() {
@@ -377,7 +410,9 @@ class LiveRecordService {
   }
 
   normalizeSettings(settings) {
-    const burnCodec = this.chooseBurnCodec(settings.burnCodec);
+    const burnCodec = this.ffmpegCapabilities
+      ? this.chooseBurnCodec(settings.burnCodec)
+      : normalizeBurnCodec(settings.burnCodec);
     return {
       ...this.createDefaultSettings(),
       ...settings,
@@ -534,7 +569,7 @@ class LiveRecordService {
       exportQueue: this.exportQueue.map((item) => this.getPublicExportQueueItem(item)),
       previewProgress: this.exportPreviewProgress ? { ...this.exportPreviewProgress } : null,
       previewProxy: this.exportPreview ? { ...this.exportPreview } : null,
-      startupEnabled: isStartupEnabled(),
+      startupEnabled: this.startupEnabled,
       currentPort: this.currentPort || DEFAULT_PORT,
       currentHost: this.currentHost || DEFAULT_HOST,
       storePath: this.storePath,
@@ -738,6 +773,13 @@ class LiveRecordService {
         message: '当前系统暂不支持原生路径选择，请直接在输入框中填写路径。'
       };
     }
+    if (this.pathPickerPromise) {
+      return {
+        ok: false,
+        cancelled: false,
+        message: '已有系统路径选择器打开，请先完成选择或取消。'
+      };
+    }
     const filters = {
       video: '视频文件 (*.mp4;*.mkv;*.mov;*.m4v;*.webm)|*.mp4;*.mkv;*.mov;*.m4v;*.webm|所有文件 (*.*)|*.*',
       danmaku: '弹幕记录 (*.jsonl)|*.jsonl|所有文件 (*.*)|*.*',
@@ -752,42 +794,74 @@ class LiveRecordService {
     const script = `
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 $type = $env:BR2K_DIALOG_TYPE
 $current = $env:BR2K_CURRENT_PATH
-if ($type -eq 'directory') {
-  $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-  $dialog.Description = $env:BR2K_DIALOG_TITLE
-  if ($current -and (Test-Path -LiteralPath $current)) { $dialog.SelectedPath = $current }
-  if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath; exit 0 }
-  exit 2
-}
-$dialog = New-Object System.Windows.Forms.OpenFileDialog
-$dialog.Title = $env:BR2K_DIALOG_TITLE
-$dialog.Filter = $env:BR2K_FILE_FILTER
-if ($current) {
-  if (Test-Path -LiteralPath $current -PathType Leaf) {
-    $dialog.InitialDirectory = Split-Path -LiteralPath $current -Parent
-    $dialog.FileName = Split-Path -LiteralPath $current -Leaf
-  } elseif (Test-Path -LiteralPath $current -PathType Container) {
-    $dialog.InitialDirectory = $current
+$owner = New-Object System.Windows.Forms.Form
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Location = [System.Windows.Forms.Cursor]::Position
+$owner.Opacity = 0
+$owner.TopMost = $true
+$dialog = $null
+try {
+  $owner.Show()
+  $owner.Activate()
+  if ($type -eq 'directory') {
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = $env:BR2K_DIALOG_TITLE
+    if ($current) {
+      try { $dialog.SelectedPath = $current } catch {}
+    }
+    if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+      Write-Output $dialog.SelectedPath
+      exit 0
+    }
+    exit 2
   }
-}
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.FileName; exit 0 }
-exit 2
-`;
-    const result = spawnSync('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', script], {
-      encoding: 'utf8',
-      // The picker still appears, but PowerShell itself must remain invisible.
-      // A visible console is distracting and, in packaged builds, briefly steals focus.
-      windowsHide: true,
-      env: {
-        ...process.env,
-        BR2K_DIALOG_TYPE: dialogType,
-        BR2K_CURRENT_PATH: currentPath,
-        BR2K_DIALOG_TITLE: titles[dialogType],
-        BR2K_FILE_FILTER: filters[dialogType] || ''
+  $dialog = New-Object System.Windows.Forms.OpenFileDialog
+  $dialog.Title = $env:BR2K_DIALOG_TITLE
+  $dialog.Filter = $env:BR2K_FILE_FILTER
+  if ($current) {
+    try {
+      $extension = [System.IO.Path]::GetExtension($current)
+      if ($extension) {
+        $dialog.InitialDirectory = [System.IO.Path]::GetDirectoryName($current)
+        $dialog.FileName = [System.IO.Path]::GetFileName($current)
+      } else {
+        $dialog.InitialDirectory = $current
       }
+    } catch {}
+  }
+  if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    Write-Output $dialog.FileName
+    exit 0
+  }
+  exit 2
+} finally {
+  if ($dialog) { $dialog.Dispose() }
+  $owner.Close()
+  $owner.Dispose()
+}
+`;
+    const pickerPromise = this.runWindowsPathPicker(script, {
+      BR2K_DIALOG_TYPE: dialogType,
+      BR2K_CURRENT_PATH: currentPath,
+      BR2K_DIALOG_TITLE: titles[dialogType],
+      BR2K_FILE_FILTER: filters[dialogType] || ''
     });
+    this.pathPickerPromise = pickerPromise;
+    let result;
+    try {
+      result = await pickerPromise;
+    } finally {
+      if (this.pathPickerPromise === pickerPromise) {
+        this.pathPickerPromise = null;
+        this.pathPickerProcess = null;
+      }
+    }
     if (result.status === 0) {
       const selectedPath = String(result.stdout || '').trim();
       if (selectedPath) {
@@ -800,8 +874,45 @@ exit 2
     return {
       ok: false,
       cancelled: false,
-      message: String(result.stderr || result.stdout || '系统路径选择器打开失败。').trim()
+      message: String(result.error?.message || result.stderr || result.stdout || '系统路径选择器打开失败。').trim()
     };
+  }
+
+  runWindowsPathPicker(script, environment) {
+    return new Promise((resolve) => {
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+      const finish = (status, error = null) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve({ status, stdout, stderr, error });
+      };
+
+      let child;
+      try {
+        child = spawn('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, ...environment }
+        });
+        this.pathPickerProcess = child;
+      } catch (error) {
+        finish(null, error);
+        return;
+      }
+
+      child.stdout.on('data', (chunk) => {
+        stdout = `${stdout}${chunk.toString('utf8')}`.slice(-64 * 1024);
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr = `${stderr}${chunk.toString('utf8')}`.slice(-64 * 1024);
+      });
+      child.on('error', (error) => finish(null, error));
+      child.on('close', (status) => finish(status));
+    });
   }
 
   async openOutputDir() {
@@ -979,7 +1090,12 @@ exit 2
     });
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
     if (oldOutputDir !== this.settings.outputDir && !this.hasActiveJobs()) {
-      await this.refreshRecordingLibrary({ silent: true });
+      setImmediate(() => {
+        this.refreshRecordingLibrary({ silent: true }).catch((error) => {
+          this.log('warn', `后台刷新录像库失败：${error.message}`);
+          this.emitState();
+        });
+      });
     } else if (oldOutputDir !== this.settings.outputDir) {
       this.log('info', '当前有录制或处理任务，已保留现有录像库；新保存目录会从下一次新录制开始使用。');
     }
@@ -1102,9 +1218,10 @@ exit 2
 
   async tickRoom(roomId) {
     const room = this.rooms.get(roomId);
-    if (!room || !room.monitoring) {
+    if (!room || !room.monitoring || this.roomTickLocks.has(roomId)) {
       return;
     }
+    this.roomTickLocks.add(roomId);
     try {
       await this.refreshRoom(room.id);
       if (room.liveStatus === 1 && !this.isRoomRecording(room)) {
@@ -1112,6 +1229,8 @@ exit 2
       }
     } catch (error) {
       this.log('error', `${roomLabel(room)} 监听异常：${error.message}`);
+    } finally {
+      this.roomTickLocks.delete(roomId);
     }
   }
 
@@ -1196,34 +1315,49 @@ exit 2
       return;
     }
 
-    const assetResponse = await fetch(target.toString(), {
-      headers: createImageProxyHeaders(target, this.settings.cookie)
-    });
-    if (!assetResponse.ok) {
-      writeJson(response, 502, { error: `图片获取失败：HTTP ${assetResponse.status}` });
+    const asset = await fetchWithTimeout(
+      target.toString(),
+      { headers: createImageProxyHeaders(target, this.settings.cookie) },
+      15000,
+      '图片请求',
+      async (assetResponse) => {
+        const contentType = assetResponse.headers.get('content-type') || 'image/jpeg';
+        const contentLength = Number(assetResponse.headers.get('content-length') || 0);
+        const canReadBody =
+          assetResponse.ok &&
+          contentType.toLowerCase().startsWith('image/') &&
+          contentLength <= MAX_PROXY_IMAGE_BYTES;
+        return {
+          ok: assetResponse.ok,
+          status: assetResponse.status,
+          contentType,
+          contentLength,
+          body: canReadBody ? Buffer.from(await assetResponse.arrayBuffer()) : null
+        };
+      }
+    );
+    if (!asset.ok) {
+      writeJson(response, 502, { error: `图片获取失败：HTTP ${asset.status}` });
       return;
     }
-    const contentType = assetResponse.headers.get('content-type') || 'image/jpeg';
-    if (!contentType.toLowerCase().startsWith('image/')) {
+    if (!asset.contentType.toLowerCase().startsWith('image/')) {
       writeJson(response, 502, { error: '远端返回的不是图片' });
       return;
     }
-    const contentLength = Number(assetResponse.headers.get('content-length') || 0);
-    if (contentLength > MAX_PROXY_IMAGE_BYTES) {
+    if (asset.contentLength > MAX_PROXY_IMAGE_BYTES || !asset.body) {
       writeJson(response, 502, { error: '远端图片过大' });
       return;
     }
-    const body = Buffer.from(await assetResponse.arrayBuffer());
-    if (body.length > MAX_PROXY_IMAGE_BYTES) {
+    if (asset.body.length > MAX_PROXY_IMAGE_BYTES) {
       writeJson(response, 502, { error: '远端图片过大' });
       return;
     }
     response.writeHead(200, {
-      'Content-Type': contentType,
-      'Content-Length': String(body.length),
+      'Content-Type': asset.contentType,
+      'Content-Length': String(asset.body.length),
       'Cache-Control': 'no-store'
     });
-    response.end(body);
+    response.end(asset.body);
   }
 
   async startPreview(roomId) {
@@ -1267,7 +1401,7 @@ exit 2
     const previewDir = path.join(this.previewCacheDir, id);
     const playlistPath = path.join(previewDir, 'index.m3u8');
     const previewUrl = `/api/export/preview/${id}/index.m3u8`;
-    if (fs.existsSync(playlistPath)) {
+    if (await isExistingFile(playlistPath)) {
       this.exportPreview = {
         id,
         sourcePath,
@@ -1288,7 +1422,7 @@ exit 2
     await fsp.rm(previewDir, { recursive: true, force: true }).catch(() => {});
     await fsp.mkdir(previewDir, { recursive: true });
 
-    const mediaInfo = probeMediaFileInfo(this.ffmpegPath, sourcePath);
+    const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, sourcePath);
     const durationSec = await this.resolveRecordingDuration({ cleanPath: sourcePath }, mediaInfo).catch(() => mediaInfo.durationSec || 0);
     const progress = createFfmpegJobProgress({
       kind: 'preview',
@@ -1625,15 +1759,20 @@ exit 2
   }
 
   async fetchBiliJson(url) {
-    const response = await fetch(url, {
-      headers: {
-        Accept: 'application/json, text/plain, */*',
-        Referer: 'https://live.bilibili.com/',
-        'User-Agent': USER_AGENT,
-        Cookie: sanitizeHeaderValue(this.settings.cookie)
-      }
-    });
-    const text = await response.text();
+    const { response, text } = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          Referer: 'https://live.bilibili.com/',
+          'User-Agent': USER_AGENT,
+          Cookie: sanitizeHeaderValue(this.settings.cookie)
+        }
+      },
+      15000,
+      'B站接口请求',
+      async (response) => ({ response, text: await response.text() })
+    );
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${text.slice(0, 120)}`);
     }
@@ -1728,6 +1867,7 @@ exit 2
     ).sort((a, b) => b - a);
     if (Number(this.settings.targetQn || 0) >= 10000 && Number(room.stream.qn || 0) < Number(this.settings.targetQn)) {
       room.qualityWarning = `请求 ${this.settings.targetQn}，接口实际选中 ${room.stream.qn}，可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先扫码登录或刷新 Cookie。`;
+      const capturePathExists = capturePath !== session.cleanPath && (await isExistingFile(capturePath));
       this.log(
         'warn',
         `${roomLabel(room)} 未拿到请求的高画质清晰度 ${this.settings.targetQn}，实际选中 ${room.stream.qn}，接口可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先到设置页扫码登录，或重新扫码刷新 Cookie 后再试。`
@@ -2310,7 +2450,12 @@ exit 2
       finalized = await this.finalizeRecordingContainer(room, session);
     }
     const fileSize = await getFileSize(session.cleanPath);
-    const mediaInfo = finalized ? probeMediaFileInfo(this.ffmpegPath, session.cleanPath) : { durationSec: 0, videoInfo: null };
+    const mediaInfo = finalized
+      ? await probeMediaFileInfo(this.ffmpegPath, session.cleanPath).catch((error) => {
+          this.log('warn', `${roomLabel(room)} 最终文件媒体信息探测失败：${error.message}`);
+          return { durationSec: 0, videoInfo: null };
+        })
+      : { durationSec: 0, videoInfo: null };
     if (mediaInfo.videoInfo) {
       session.videoInfo = mediaInfo.videoInfo;
     }
@@ -2368,7 +2513,7 @@ exit 2
         `${roomLabel(room)} 当前录像文件过小或没有视频流，已跳过历史列表：${path.basename(
           session.cleanPath
         )}（最终 ${formatBytes(fileSize)}，临时 ${formatBytes(fileSizeBeforeFinalize)}）。${
-          capturePath !== session.cleanPath && fs.existsSync(capturePath) ? `可检查临时文件：${capturePath}` : ''
+          capturePathExists ? `可检查临时文件：${capturePath}` : ''
         }${session.validReason ? `原因：${session.validReason}` : ''}`
       );
     }
@@ -2490,7 +2635,7 @@ exit 2
       return true;
     }
     const sourcePath = session.capturePath || session.cleanPath;
-    if (!fs.existsSync(sourcePath)) {
+    if (!(await isExistingFile(sourcePath))) {
       session.containerStage = 'failed';
       session.validReason = `临时录制文件不存在：${sourcePath}`;
       if (this.shouldUpdateCurrentRecording(room, session)) {
@@ -2579,6 +2724,22 @@ exit 2
   }
 
   async refreshRecordingLibrary(options = {}) {
+    if (this.recordingScanPromise) {
+      await this.recordingScanPromise;
+      return this.getState();
+    }
+    const scanPromise = this.performRecordingLibraryRefresh(options);
+    this.recordingScanPromise = scanPromise;
+    try {
+      return await scanPromise;
+    } finally {
+      if (this.recordingScanPromise === scanPromise) {
+        this.recordingScanPromise = null;
+      }
+    }
+  }
+
+  async performRecordingLibraryRefresh(options = {}) {
     const discovered = await discoverRecordingFiles(this.settings.outputDir, {
       ffmpegPath: this.ffmpegPath,
       segmentDurationSec: this.getSegmentDurationSec()
@@ -2640,11 +2801,13 @@ exit 2
     if (!groupId) {
       return fallbackRecording;
     }
-    const segments = this.recordings
+    const segmentCandidates = this.recordings
       .filter((recording) => recording.mergeGroup === groupId && !recording.mergedFrom?.length)
       .filter((recording) => recording.valid !== false)
-      .filter((recording) => recording.cleanPath && recording.cleanPath !== recording.mergeOutputPath)
-      .filter((recording) => fs.existsSync(recording.cleanPath))
+      .filter((recording) => recording.cleanPath && recording.cleanPath !== recording.mergeOutputPath);
+    const segmentExists = await Promise.all(segmentCandidates.map((recording) => isExistingFile(recording.cleanPath)));
+    const segments = segmentCandidates
+      .filter((_recording, index) => segmentExists[index])
       .sort((a, b) => {
         const sequenceDiff = Number(a.mergeSequence || 0) - Number(b.mergeSequence || 0);
         return sequenceDiff || Number(a.startedAt || 0) - Number(b.startedAt || 0);
@@ -2917,18 +3080,19 @@ exit 2
 
   async prepareRepairedBurnSource(recording, options = {}) {
     const sourcePath = path.resolve(String(recording?.cleanPath || '').trim());
-    if (!sourcePath || !fs.existsSync(sourcePath)) {
+    if (!sourcePath || !(await isExistingFile(sourcePath))) {
       throw new Error('烧录源文件不存在。');
     }
     const stat = await fsp.stat(sourcePath);
-    const mediaInfo = options.mediaInfo || probeMediaFileInfo(this.ffmpegPath, sourcePath);
+    const mediaInfo = options.mediaInfo || (await probeMediaFileInfo(this.ffmpegPath, sourcePath));
     const durationSec = Number(options.durationSec || mediaInfo.durationSec || recording.durationSec || 0);
     const container = getContainerFromPath(sourcePath);
     const id = this.createFileCacheId(sourcePath, stat, REPAIR_CACHE_VERSION);
     const repairDir = path.join(this.repairCacheDir, id);
     const remuxPath = path.join(repairDir, `source.remux.${container}`);
     const transcodePath = path.join(repairDir, 'source.repaired.mp4');
-    const reuseCandidate = [remuxPath, transcodePath].find((candidate) => fs.existsSync(candidate));
+    const reuseChecks = await Promise.all([remuxPath, transcodePath].map((candidate) => isExistingFile(candidate)));
+    const reuseCandidate = [remuxPath, transcodePath].find((_candidate, index) => reuseChecks[index]);
     if (reuseCandidate) {
       this.log('info', `已复用源文件修复副本：${path.basename(reuseCandidate)}`);
       return reuseCandidate;
@@ -3061,7 +3225,7 @@ exit 2
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
       const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
       this.burnCancelRequests.delete(room.id);
-      const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+      const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
       const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
       if (durationSec > 0) {
         recording.durationSec = durationSec;
@@ -3226,25 +3390,24 @@ exit 2
   async generateSubtitleAssets(recording, options = {}) {
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
-    const events = await readDanmakuEvents(recording.danmakuPath);
     const cssPath = options.cssPath || recording.cssPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'css');
     await ensureDanmakuCss(cssPath);
-    const style = await readDanmakuStyle(cssPath);
     const assPath =
       options.assPath ||
       deriveSiblingPath(recording.cleanPath, createDanmakuAssSuffix(overlayMode, danmakuArea), 'ass');
-    const ass = createAss(events, {
+    const result = await runAssWorkerJob({
+      danmakuPath: recording.danmakuPath,
+      cssPath,
+      assPath,
       overlayMode,
       danmakuArea,
-      style,
       startTime: options.startTime,
       endTime: options.endTime,
       shiftTime: options.shiftTime
     });
-    await fsp.writeFile(assPath, ass, 'utf8');
     recording.cssPath = cssPath;
     recording.assPath = assPath;
-    return { cssPath, assPath, eventCount: events.length };
+    return { cssPath, assPath, eventCount: result.eventCount };
   }
 
   async prepareSubtitleExport(options = {}) {
@@ -3257,7 +3420,7 @@ exit 2
     }
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
-    const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+    const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
     const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
     if (durationSec > 0) {
       recording.durationSec = durationSec;
@@ -3305,7 +3468,7 @@ exit 2
     if (recording.valid === false) {
       throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
-    if (!fs.existsSync(recording.cleanPath)) {
+    if (!(await isExistingFile(recording.cleanPath))) {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
     }
     const mode = normalizeExportMode(options.mode);
@@ -3412,7 +3575,7 @@ exit 2
     if (recording.valid === false) {
       throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
-    if (!fs.existsSync(recording.cleanPath)) {
+    if (!(await isExistingFile(recording.cleanPath))) {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
     }
     const mode = normalizeExportMode(options.mode);
@@ -3420,7 +3583,7 @@ exit 2
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
-    const mediaInfo = probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+    const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
     const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
     if (durationSec > 0) {
       recording.durationSec = durationSec;
@@ -4163,7 +4326,8 @@ exit 2
     if (process.platform !== 'win32') {
       throw new Error('开机自启目前只支持 Windows。');
     }
-    setStartupEnabled(Boolean(enabled));
+    await setStartupEnabled(Boolean(enabled));
+    this.startupEnabled = Boolean(enabled);
     this.log(Boolean(enabled) ? 'success' : 'info', Boolean(enabled) ? '已开启开机自启。' : '已关闭开机自启。');
     this.emitState();
     return this.getState();
@@ -4197,6 +4361,11 @@ exit 2
   shutdown() {
     this.clearLoginTimer();
     clearTimeout(this.queuedUpdateTimer);
+    if (this.pathPickerProcess) {
+      this.pathPickerProcess.kill('SIGKILL');
+      this.pathPickerProcess = null;
+      this.pathPickerPromise = null;
+    }
     for (const timer of this.monitorTimers.values()) {
       clearInterval(timer);
     }
@@ -4241,6 +4410,53 @@ function isHlsPreviewCandidate(stream) {
   const format = String(stream?.format || '').toLowerCase();
   const url = String(stream?.url || '').toLowerCase();
   return protocol.includes('hls') || format.includes('fmp4') || url.includes('.m3u8');
+}
+
+async function isExistingFile(filePath) {
+  if (!filePath) {
+    return false;
+  }
+  return fsp
+    .stat(filePath)
+    .then((stat) => stat.isFile())
+    .catch(() => false);
+}
+
+async function runAssWorkerJob(payload) {
+  const args = isSingleExecutableRuntime()
+    ? ['--ass-worker']
+    : [path.join(APP_ROOT, 'src', 'server', 'index.cjs'), '--ass-worker'];
+  const result = await runCapturedProcess(process.execPath, args, {
+    input: JSON.stringify(payload),
+    timeoutMs: 180000,
+    maxOutputBytes: 256 * 1024
+  });
+  if (result.timedOut) {
+    throw new Error('字幕生成超时，已终止后台字幕任务。');
+  }
+  if (result.error) {
+    throw new Error(`字幕任务启动失败：${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`字幕生成失败：${compactLogLine(result.stderr || result.stdout) || `退出码 ${result.status}`}`);
+  }
+  try {
+    const response = JSON.parse(String(result.stdout || '').trim());
+    if (!response.ok) {
+      throw new Error(response.message || '字幕任务未成功完成。');
+    }
+    return response;
+  } catch (error) {
+    throw new Error(`字幕任务返回无效：${error.message}`);
+  }
+}
+
+function isSingleExecutableRuntime() {
+  try {
+    return Boolean(require('node:sea').isSea());
+  } catch {
+    return Boolean(process.pkg);
+  }
 }
 
 module.exports = {

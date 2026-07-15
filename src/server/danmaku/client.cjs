@@ -1,5 +1,11 @@
 const zlib = require('node:zlib');
+const { promisify } = require('node:util');
 const WebSocket = require('ws');
+
+const inflate = promisify(zlib.inflate);
+const brotliDecompress = promisify(zlib.brotliDecompress);
+const MAX_WEBSOCKET_PAYLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_DECOMPRESSED_PAYLOAD_BYTES = 32 * 1024 * 1024;
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -28,11 +34,12 @@ class DanmakuClient {
     this.onCommand = options.onCommand;
     this.ws = null;
     this.heartbeatTimer = null;
+    this.messageQueue = Promise.resolve();
   }
 
   connect() {
     const host = this.pickHost();
-    this.ws = new WebSocket(host);
+    this.ws = new WebSocket(host, { maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES });
     this.ws.binaryType = 'nodebuffer';
     this.ws.on('open', () => {
       this.onOpen?.();
@@ -40,7 +47,11 @@ class DanmakuClient {
       this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
       this.sendHeartbeat();
     });
-    this.ws.on('message', (data) => this.handleMessage(Buffer.from(data)));
+    this.ws.on('message', (data) => {
+      this.messageQueue = this.messageQueue
+        .then(() => this.handleMessage(Buffer.from(data)))
+        .catch((error) => this.onError?.(error));
+    });
     this.ws.on('error', (error) => this.onError?.(error));
     this.ws.on('close', (_code, reason) => {
       clearInterval(this.heartbeatTimer);
@@ -91,7 +102,7 @@ class DanmakuClient {
     this.ws.send(buffer);
   }
 
-  handleMessage(buffer) {
+  async handleMessage(buffer) {
     for (const packet of unpackDanmakuPackets(buffer)) {
       if (packet.operation === DANMAKU_OP.AUTH_REPLY) {
         this.onAuthReply?.(decodeAuthReply(packet));
@@ -106,7 +117,7 @@ class DanmakuClient {
       if (packet.operation !== DANMAKU_OP.MESSAGE) {
         continue;
       }
-      for (const body of safeDecodeDanmakuPacket(packet)) {
+      for (const body of await safeDecodeDanmakuPacket(packet)) {
         try {
           const command = JSON.parse(body);
           this.onCommand?.(command);
@@ -148,24 +159,32 @@ function unpackDanmakuPackets(buffer) {
   return packets;
 }
 
-function decodeDanmakuPacket(packet) {
+async function decodeDanmakuPacket(packet) {
   if (packet.version === 0 || packet.version === 1) {
     return [packet.body.toString('utf8')].filter(Boolean);
   }
   if (packet.version === 2) {
-    const inflated = zlib.inflateSync(packet.body);
-    return unpackDanmakuPackets(inflated).flatMap(decodeDanmakuPacket);
+    const inflated = await inflate(packet.body, { maxOutputLength: MAX_DECOMPRESSED_PAYLOAD_BYTES });
+    return decodeNestedDanmakuPackets(inflated);
   }
   if (packet.version === 3) {
-    const decompressed = zlib.brotliDecompressSync(packet.body);
-    return unpackDanmakuPackets(decompressed).flatMap(decodeDanmakuPacket);
+    const decompressed = await brotliDecompress(packet.body, { maxOutputLength: MAX_DECOMPRESSED_PAYLOAD_BYTES });
+    return decodeNestedDanmakuPackets(decompressed);
   }
   return [];
 }
 
-function safeDecodeDanmakuPacket(packet) {
+async function decodeNestedDanmakuPackets(buffer) {
+  const bodies = [];
+  for (const packet of unpackDanmakuPackets(buffer)) {
+    bodies.push(...(await decodeDanmakuPacket(packet)));
+  }
+  return bodies;
+}
+
+async function safeDecodeDanmakuPacket(packet) {
   try {
-    return decodeDanmakuPacket(packet);
+    return await decodeDanmakuPacket(packet);
   } catch {
     return [];
   }
