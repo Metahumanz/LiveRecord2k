@@ -6,7 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const tls = require('node:tls');
 const crypto = require('node:crypto');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 
 let ffmpegStatic = null;
 try {
@@ -41,16 +41,44 @@ const danmakuClient = require('../danmaku/client.cjs');
 const danmakuAss = require('../danmaku/ass.cjs');
 const ffmpegHelpers = require('../recording/ffmpeg.cjs');
 
-async function requestBiliJsonWithCookies(url) {
-  const response = await fetch(url, {
-    headers: {
-      Accept: 'application/json, text/plain, */*',
-      Referer: 'https://passport.bilibili.com/',
-      Origin: 'https://passport.bilibili.com',
-      'User-Agent': USER_AGENT
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000, label = '网络请求', consumeResponse = null) {
+  const timeout = Math.max(0, Number(timeoutMs || 0));
+  if (!timeout) {
+    return fetch(url, options);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  timer.unref?.();
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return consumeResponse ? await consumeResponse(response) : response;
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === 'AbortError') {
+      const timeoutError = new Error(`${label}超时（${timeout}ms）`);
+      timeoutError.code = 'FETCH_TIMEOUT';
+      throw timeoutError;
     }
-  });
-  const text = await response.text();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestBiliJsonWithCookies(url) {
+  const { response, text } = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        Referer: 'https://passport.bilibili.com/',
+        Origin: 'https://passport.bilibili.com',
+        'User-Agent': USER_AGENT
+      }
+    },
+    15000,
+    'B站登录接口请求',
+    async (response) => ({ response, text: await response.text() })
+  );
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${text.slice(0, 120)}`);
   }
@@ -297,12 +325,14 @@ function mergeCommandCounts(items) {
   return merged;
 }
 
-function detectFfmpegCapabilities(ffmpegPath) {
-  const encoderProbe = runFfmpegProbe(ffmpegPath, ['-hide_banner', '-encoders']);
-  const hwaccelProbe = runFfmpegProbe(ffmpegPath, ['-hide_banner', '-hwaccels']);
+async function detectFfmpegCapabilities(ffmpegPath) {
+  const [encoderProbe, hwaccelProbe, videoAdapters] = await Promise.all([
+    runFfmpegProbe(ffmpegPath, ['-hide_banner', '-encoders']),
+    runFfmpegProbe(ffmpegPath, ['-hide_banner', '-hwaccels']),
+    detectVideoAdapters()
+  ]);
   const encoderNames = parseFfmpegEncoderNames(encoderProbe.output);
   const hwaccels = parseFfmpegHwaccels(hwaccelProbe.output);
-  const videoAdapters = detectVideoAdapters();
   const burnCodecs = [];
   const unavailableBurnCodecs = [];
 
@@ -316,7 +346,7 @@ function detectFfmpegCapabilities(ffmpegPath) {
         unavailableBurnCodecs.push({ ...candidate, reason: '未检测到对应显卡' });
         continue;
       }
-      const test = testFfmpegEncoder(ffmpegPath, candidate.value);
+      const test = await testFfmpegEncoder(ffmpegPath, candidate.value);
       if (!test.ok) {
         unavailableBurnCodecs.push({ ...candidate, reason: test.reason || '硬件编码测试未通过' });
         continue;
@@ -335,22 +365,85 @@ function detectFfmpegCapabilities(ffmpegPath) {
   };
 }
 
-function runFfmpegProbe(ffmpegPath, args) {
+async function runFfmpegProbe(ffmpegPath, args, options = {}) {
   try {
-    const result = spawnSync(ffmpegPath, args, {
-      encoding: 'utf8',
-      timeout: 8000,
-      windowsHide: true
+    const result = await runCapturedProcess(ffmpegPath, args, {
+      timeoutMs: Number(options.timeoutMs || 8000),
+      maxOutputBytes: Number(options.maxOutputBytes || 256 * 1024)
     });
     const output = `${result.stdout || ''}\n${result.stderr || ''}`;
     return {
-      ok: result.status === 0 && !result.error,
+      ok: result.status === 0 && !result.error && !result.timedOut,
       output,
-      error: result.error ? result.error.message : result.status === 0 ? '' : compactLogLine(output)
+      error: result.timedOut
+        ? `ffmpeg 探测超时（${result.timeoutMs}ms）`
+        : result.error
+          ? result.error.message
+          : result.status === 0
+            ? ''
+            : compactLogLine(output)
     };
   } catch (error) {
     return { ok: false, output: '', error: error.message };
   }
+}
+
+function runCapturedProcess(command, args, options = {}) {
+  return new Promise((resolve) => {
+    const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
+    const maxOutputBytes = Math.max(1024, Number(options.maxOutputBytes || 256 * 1024));
+    let child;
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+    let timer = null;
+
+    const appendOutput = (current, chunk) => `${current}${chunk.toString('utf8')}`.slice(-maxOutputBytes);
+    const finish = (status, signal, error = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      options.onChild?.(null);
+      resolve({ status, signal, stdout, stderr, error, timedOut, timeoutMs });
+    };
+
+    try {
+      const hasInput = options.input !== undefined && options.input !== null;
+      child = spawn(command, args, {
+        windowsHide: true,
+        stdio: [hasInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        env: options.env || process.env
+      });
+      options.onChild?.(child);
+      if (hasInput) {
+        child.stdin?.on('error', () => {});
+        child.stdin?.end(String(options.input));
+      }
+    } catch (error) {
+      finish(null, null, error);
+      return;
+    }
+
+    child.stdout?.on('data', (chunk) => {
+      stdout = appendOutput(stdout, chunk);
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr = appendOutput(stderr, chunk);
+    });
+    child.on('error', (error) => finish(null, null, error));
+    child.on('close', (status, signal) => finish(status, signal));
+
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, timeoutMs);
+      timer.unref?.();
+    }
+  });
 }
 
 function parseFfmpegEncoderNames(output) {
@@ -372,7 +465,7 @@ function parseFfmpegHwaccels(output) {
     .filter((line) => /^[a-z0-9_]+$/i.test(line));
 }
 
-function detectVideoAdapters() {
+async function detectVideoAdapters() {
   if (process.platform !== 'win32') {
     return [];
   }
@@ -380,10 +473,9 @@ function detectVideoAdapters() {
     'Get-CimInstance Win32_VideoController | Select-Object Name,AdapterCompatibility,PNPDeviceID | ConvertTo-Json -Compress';
   for (const shell of ['powershell.exe', 'pwsh.exe']) {
     try {
-      const result = spawnSync(shell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
-        encoding: 'utf8',
-        timeout: 8000,
-        windowsHide: true
+      const result = await runCapturedProcess(shell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+        timeoutMs: 8000,
+        maxOutputBytes: 128 * 1024
       });
       if (result.status !== 0 || !String(result.stdout || '').trim()) {
         continue;
@@ -426,9 +518,9 @@ function hasVideoAdapterVendor(adapters, vendor) {
   return adapters.some((adapter) => adapter.vendor === vendor);
 }
 
-function testFfmpegEncoder(ffmpegPath, codec) {
+async function testFfmpegEncoder(ffmpegPath, codec) {
   try {
-    const result = spawnSync(
+    const result = await runCapturedProcess(
       ffmpegPath,
       [
         '-hide_banner',
@@ -448,9 +540,8 @@ function testFfmpegEncoder(ffmpegPath, codec) {
         '-'
       ],
       {
-        encoding: 'utf8',
-        timeout: 10000,
-        windowsHide: true
+        timeoutMs: 10000,
+        maxOutputBytes: 128 * 1024
       }
     );
     if (result.status === 0 && !result.error) {
@@ -459,7 +550,7 @@ function testFfmpegEncoder(ffmpegPath, codec) {
     const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
     return {
       ok: false,
-      reason: result.error?.code === 'ETIMEDOUT' ? '硬件编码测试超时' : output || `ffmpeg 退出码 ${result.status}`
+      reason: result.timedOut ? '硬件编码测试超时' : output || result.error?.message || `ffmpeg 退出码 ${result.status}`
     };
   } catch (error) {
     return { ok: false, reason: error.message };
@@ -800,18 +891,26 @@ function estimateRecordingDurationFromStats(filePath, stat) {
 }
 
 async function readDanmakuDurationSec(danmakuPath) {
-  const events = await danmakuAss.readDanmakuEvents(danmakuPath);
-  return events.reduce((maxTime, event) => {
-    const time = Number(event?.time || 0);
-    return Number.isFinite(time) && time > maxTime ? time : maxTime;
-  }, 0);
+  const result = await danmakuAss.inspectDanmakuFile(danmakuPath);
+  return result.durationSec;
 }
 
-function probeMediaFileInfo(ffmpegPath, filePath) {
-  if (!ffmpegPath || !filePath || !fs.existsSync(filePath)) {
+async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
+  if (!ffmpegPath || !filePath) {
     return { durationSec: 0, videoInfo: null };
   }
-  const probe = runFfmpegProbe(ffmpegPath, ['-hide_banner', '-i', filePath]);
+  const exists = await fsp.stat(filePath).then((stat) => stat.isFile()).catch(() => false);
+  if (!exists) {
+    return { durationSec: 0, videoInfo: null };
+  }
+  const probe = await runFfmpegProbe(ffmpegPath, ['-hide_banner', '-i', filePath], {
+    timeoutMs: Number(options.timeoutMs || 8000)
+  });
+  if (!probe.ok && /超时/.test(probe.error || '')) {
+    const error = new Error(`媒体信息探测超时：${path.basename(filePath)}`);
+    error.code = 'MEDIA_PROBE_TIMEOUT';
+    throw error;
+  }
   return {
     durationSec: parseFfmpegDuration(probe.output),
     videoInfo: parseFfmpegVideoInfo(probe.output)
@@ -1053,9 +1152,9 @@ async function requestUrlBuffer(rawUrl, options = {}, redirectCount = 0) {
   throw lastError;
 }
 
-function requestUrlBufferOnce(rawUrl, options = {}, redirectCount = 0) {
+async function requestUrlBufferOnce(rawUrl, options = {}, redirectCount = 0) {
   const target = new URL(rawUrl);
-  const proxy = getProxyForUrl(target);
+  const proxy = await getProxyForUrl(target);
   return proxy
     ? requestUrlViaHttpProxy(target, proxy, options, redirectCount)
     : requestUrlDirect(target, options, redirectCount);
@@ -1270,11 +1369,17 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         continue;
       }
       const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
-      const eventCount = await countDanmakuLines(danmakuPath);
+      const danmakuInfo = await danmakuAss.inspectDanmakuFile(danmakuPath);
+      const eventCount = danmakuInfo.eventCount;
       const elapsedSec = estimateRecordingDurationFromStats(cleanPath, stat);
-      const danmakuDurationSec = await readDanmakuDurationSec(danmakuPath);
+      const danmakuDurationSec = danmakuInfo.durationSec;
       const valid = stat.size >= 32 * 1024;
-      const mediaInfo = valid ? probeMediaFileInfo(options.ffmpegPath, cleanPath) : { durationSec: 0, videoInfo: null };
+      let mediaInfo = { durationSec: 0, videoInfo: null };
+      if (valid) {
+        mediaInfo = await probeMediaFileInfo(options.ffmpegPath, cleanPath, { timeoutMs: options.probeTimeoutMs }).catch(
+          () => mediaInfo
+        );
+      }
       recordings.push({
         id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
         startedAt: stat.mtimeMs,
@@ -1309,12 +1414,8 @@ async function discoverRecordingFiles(outputDir, options = {}) {
 }
 
 async function countDanmakuLines(filePath) {
-  try {
-    const text = await fsp.readFile(filePath, 'utf8');
-    return text.split(/\r?\n/).filter(Boolean).length;
-  } catch {
-    return 0;
-  }
+  const result = await danmakuAss.inspectDanmakuFile(filePath).catch(() => ({ eventCount: 0 }));
+  return result.eventCount;
 }
 
 function requestUrlViaHttpProxy(target, proxy, options, redirectCount) {
@@ -1411,7 +1512,7 @@ function collectUrlResponse(response, target, options, redirectCount, resolve, r
   response.on('error', reject);
 }
 
-function getProxyForUrl(target) {
+async function getProxyForUrl(target) {
   if (shouldBypassProxy(target.hostname)) {
     return null;
   }
@@ -1419,7 +1520,7 @@ function getProxyForUrl(target) {
     target.protocol === 'https:'
       ? process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
       : process.env.HTTP_PROXY || process.env.http_proxy;
-  const proxySource = envProxy || getWindowsProxyForUrl(target) || '';
+  const proxySource = envProxy || (await getWindowsProxyForUrl(target)) || '';
   return normalizeProxyUrl(proxySource);
 }
 
@@ -1436,30 +1537,30 @@ function shouldBypassProxy(hostname) {
     .some((rule) => rule === '*' || host === rule || (rule.startsWith('.') ? host.endsWith(rule) : host.endsWith(`.${rule}`)));
 }
 
-function getWindowsProxyForUrl(target) {
+async function getWindowsProxyForUrl(target) {
   if (process.platform !== 'win32') {
     return '';
   }
-  const winInetProxy = getWinInetProxyServer();
+  const winInetProxy = await getWinInetProxyServer();
   if (winInetProxy) {
     return selectProxyServer(winInetProxy, target.protocol);
   }
-  const winHttpProxy = getWinHttpProxyServer();
+  const winHttpProxy = await getWinHttpProxyServer();
   return winHttpProxy ? selectProxyServer(winHttpProxy, target.protocol) : '';
 }
 
-function getWinInetProxyServer() {
+async function getWinInetProxyServer() {
   const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
-  const enabled = spawnSync('reg.exe', ['query', key, '/v', 'ProxyEnable'], {
-    encoding: 'utf8',
-    windowsHide: true
+  const enabled = await runCapturedProcess('reg.exe', ['query', key, '/v', 'ProxyEnable'], {
+    timeoutMs: 2500,
+    maxOutputBytes: 32 * 1024
   });
   if (enabled.status !== 0 || !/ProxyEnable\s+REG_DWORD\s+0x1/i.test(enabled.stdout || '')) {
     return '';
   }
-  const server = spawnSync('reg.exe', ['query', key, '/v', 'ProxyServer'], {
-    encoding: 'utf8',
-    windowsHide: true
+  const server = await runCapturedProcess('reg.exe', ['query', key, '/v', 'ProxyServer'], {
+    timeoutMs: 2500,
+    maxOutputBytes: 32 * 1024
   });
   if (server.status !== 0) {
     return '';
@@ -1467,10 +1568,10 @@ function getWinInetProxyServer() {
   return parseRegistryValue(server.stdout, 'ProxyServer');
 }
 
-function getWinHttpProxyServer() {
-  const result = spawnSync('netsh.exe', ['winhttp', 'show', 'proxy'], {
-    encoding: 'utf8',
-    windowsHide: true
+async function getWinHttpProxyServer() {
+  const result = await runCapturedProcess('netsh.exe', ['winhttp', 'show', 'proxy'], {
+    timeoutMs: 3000,
+    maxOutputBytes: 64 * 1024
   });
   if (result.status !== 0 || /Direct access|直接访问|无代理/i.test(result.stdout || '')) {
     return '';
@@ -1753,25 +1854,25 @@ async function fileSha256(filePath) {
   return hash.digest('hex');
 }
 
-function isStartupEnabled() {
+async function isStartupEnabled() {
   if (process.platform !== 'win32') {
     return false;
   }
-  const result = spawnSync('reg.exe', ['query', RUN_KEY, '/v', APP_NAME], {
-    encoding: 'utf8',
-    windowsHide: true
+  const result = await runCapturedProcess('reg.exe', ['query', RUN_KEY, '/v', APP_NAME], {
+    timeoutMs: 2500,
+    maxOutputBytes: 32 * 1024
   });
   return result.status === 0;
 }
 
-function setStartupEnabled(enabled) {
+async function setStartupEnabled(enabled) {
   const command = createStartupCommand();
   const args = enabled
     ? ['add', RUN_KEY, '/v', APP_NAME, '/t', 'REG_SZ', '/d', command, '/f']
     : ['delete', RUN_KEY, '/v', APP_NAME, '/f'];
-  const result = spawnSync('reg.exe', args, {
-    encoding: 'utf8',
-    windowsHide: true
+  const result = await runCapturedProcess('reg.exe', args, {
+    timeoutMs: 4000,
+    maxOutputBytes: 64 * 1024
   });
   if (result.status !== 0 && enabled) {
     throw new Error((result.stderr || result.stdout || '写入开机自启失败').trim());
@@ -1874,6 +1975,7 @@ module.exports = {
   ...danmakuClient,
   ...danmakuAss,
   ...ffmpegHelpers,
+  fetchWithTimeout,
   requestBiliJsonWithCookies,
   getSetCookieHeaders,
   splitSetCookieHeader,
@@ -1898,6 +2000,7 @@ module.exports = {
   normalizeCommandCounts,
   mergeCommandCounts,
   detectFfmpegCapabilities,
+  runCapturedProcess,
   runFfmpegProbe,
   parseFfmpegEncoderNames,
   parseFfmpegHwaccels,

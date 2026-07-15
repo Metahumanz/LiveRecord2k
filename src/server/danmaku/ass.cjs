@@ -1,4 +1,6 @@
+const fs = require('node:fs');
 const fsp = require('node:fs/promises');
+const readline = require('node:readline');
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
@@ -156,23 +158,45 @@ function danmakuDisplayAreaLabel(value) {
 }
 
 async function readDanmakuEvents(danmakuPath) {
-  const raw = await fsp.readFile(danmakuPath, 'utf8').catch((error) => {
-    if (error.code === 'ENOENT') {
-      return '';
-    }
-    throw error;
-  });
-  return raw
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
+  const result = await inspectDanmakuFile(danmakuPath, { includeEvents: true });
+  return result.events;
+}
+
+async function inspectDanmakuFile(danmakuPath, options = {}) {
+  const result = { eventCount: 0, durationSec: 0, events: [] };
+  if (!danmakuPath) {
+    return result;
+  }
+  const input = fs.createReadStream(danmakuPath, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) {
+        continue;
       }
-    })
-    .filter(Boolean);
+      result.eventCount += 1;
+      try {
+        const event = JSON.parse(line);
+        const time = Number(event?.time || 0);
+        if (Number.isFinite(time) && time > result.durationSec) {
+          result.durationSec = time;
+        }
+        if (options.includeEvents) {
+          result.events.push(event);
+        }
+      } catch {
+        // Keep the physical event count compatible with the previous scanner.
+      }
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+  return result;
 }
 
 async function ensureDanmakuCss(cssPath) {
@@ -909,6 +933,7 @@ module.exports = {
   DANMAKU_DISPLAY_AREAS,
   normalizeDanmakuDisplayArea,
   danmakuDisplayAreaLabel,
+  inspectDanmakuFile,
   readDanmakuEvents,
   ensureDanmakuCss,
   readDanmakuStyle,

@@ -46,7 +46,7 @@ export function ExportPage({
   selectRecording: (recording: RecordingState) => void;
   prepareSubtitles: () => Promise<void>;
   exportClip: () => Promise<void>;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   const recordings = state.recordings.filter((recording) => recording.cleanPath);
   const validRecordingCount = recordings.filter((recording) => recording.valid !== false).length;
@@ -57,6 +57,7 @@ export function ExportPage({
   const [previewNeedsProxy, setPreviewNeedsProxy] = useState(false);
   const [previewDeclined, setPreviewDeclined] = useState(false);
   const [previewStarting, setPreviewStarting] = useState(false);
+  const [pathPickerBusy, setPathPickerBusy] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
@@ -185,11 +186,21 @@ export function ExportPage({
   }
 
   async function chooseDraftPath(type: 'directory' | 'video' | 'danmaku' | 'css', currentPath: string, apply: (path: string) => void) {
-    const result = await recorder.selectPath({ type, currentPath });
-    if (result.path) {
-      apply(result.path);
-    } else if (result.message && !result.cancelled) {
-      window.alert(result.message);
+    if (pathPickerBusy) {
+      return;
+    }
+    setPathPickerBusy(true);
+    try {
+      const result = await recorder.selectPath({ type, currentPath });
+      if (result.path) {
+        apply(result.path);
+      } else if (result.message && !result.cancelled) {
+        window.alert(result.message);
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '系统路径选择器打开失败。');
+    } finally {
+      setPathPickerBusy(false);
     }
   }
 
@@ -347,6 +358,7 @@ export function ExportPage({
                 className="icon-button"
                 type="button"
                 title="选择原始录像文件"
+                disabled={pathPickerBusy}
                 onClick={() => chooseDraftPath('video', draft.cleanPath || state.settings.outputDir, (nextPath) => setDraft({ ...draft, cleanPath: nextPath }))}
               >
                 <FileVideo size={18} />
@@ -367,6 +379,7 @@ export function ExportPage({
                 className="icon-button"
                 type="button"
                 title="选择弹幕记录文件"
+                disabled={pathPickerBusy}
                 onClick={() =>
                   chooseDraftPath('danmaku', draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
                     setDraft({ ...draft, danmakuPath: nextPath })
@@ -391,6 +404,7 @@ export function ExportPage({
                 className="icon-button"
                 type="button"
                 title="选择弹幕样式文件"
+                disabled={pathPickerBusy}
                 onClick={() =>
                   chooseDraftPath('css', draft.cssPath || draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
                     setDraft({ ...draft, cssPath: nextPath })
@@ -614,6 +628,7 @@ export function ExportPage({
                 className="icon-button"
                 type="button"
                 title="选择输出目录"
+                disabled={pathPickerBusy}
                 onClick={() =>
                   chooseDraftPath('directory', draft.outputDir || state.settings.outputDir, (nextPath) =>
                     setDraft({ ...draft, outputDir: nextPath })

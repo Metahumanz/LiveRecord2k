@@ -17,7 +17,7 @@ export function SettingsPage({
   state: AppState;
   settingsDraft: AppSettings;
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
   chooseOutputDir: () => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
@@ -83,7 +83,12 @@ export function SettingsPage({
                 onChange={(event) => setSettingsDraft({ ...settingsDraft, outputDir: event.target.value })}
                 placeholder="例如 C:\Users\你的用户名\Videos\哔哩录播2K"
               />
-              <button className="icon-button" title="选择目录" onClick={chooseOutputDir}>
+              <button
+                className="icon-button"
+                title="选择目录"
+                disabled={busy === 'choose-output-dir'}
+                onClick={chooseOutputDir}
+              >
                 <FolderOpen size={18} />
               </button>
               <button

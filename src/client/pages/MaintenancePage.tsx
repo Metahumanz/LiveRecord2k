@@ -26,7 +26,7 @@ export function MaintenancePage({
   state: AppState;
   settingsDraft: AppSettings;
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
 }) {

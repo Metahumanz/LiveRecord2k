@@ -21,7 +21,7 @@ export function RoomsPage({
   setRoomInput: (value: string) => void;
   addRoom: () => Promise<void>;
   busy: string | null;
-  run: <T>(key: string, action: () => Promise<T>) => Promise<void>;
+  run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   openPreview: (roomId: string) => void;
 }) {
   return (
