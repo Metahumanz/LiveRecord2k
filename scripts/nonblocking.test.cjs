@@ -3,13 +3,44 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
 const { LiveRecordService } = require('../src/server/app/service.cjs');
 const { fetchWithTimeout, runCapturedProcess, runFfmpegProbe } = require('../src/server/shared/helpers.cjs');
 const { createDefaultDanmakuCss, inspectDanmakuFile } = require('../src/server/danmaku/ass.cjs');
+const {
+  handleRequest,
+  isLocalRequest,
+  redactRemoteState,
+  LOCAL_ONLY_API_PATHS,
+  LOCAL_ONLY_ERROR
+} = require('../src/server/app/routes.cjs');
 
 const projectRoot = path.resolve(__dirname, '..');
+
+async function invokeApi({ remoteAddress = '127.0.0.1', method = 'GET', pathname, body, service }) {
+  const request = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]);
+  request.method = method;
+  request.url = pathname;
+  request.headers = { host: '127.0.0.1:3263' };
+  request.socket = { remoteAddress };
+  let statusCode = 200;
+  let responseBody = '';
+  const response = new Writable({
+    write(chunk, _encoding, callback) {
+      responseBody += chunk.toString('utf8');
+      callback();
+    }
+  });
+  response.writeHead = (status) => {
+    statusCode = status;
+  };
+  const finished = new Promise((resolve) => response.once('finish', resolve));
+  await handleRequest(service, null, 3263, request, response);
+  await finished;
+  return { statusCode, body: JSON.parse(responseBody) };
+}
 
 test('captured child processes do not block the Node event loop', async () => {
   let heartbeat = false;
@@ -194,6 +225,124 @@ test('recording scans and room ticks are single-flight', async () => {
   assert.equal(refreshCount, 1);
   finishRefresh();
   await firstTick;
+});
+
+test('LAN state and SSE never expose the Bilibili cookie', async () => {
+  const service = new LiveRecordService();
+  service.settings.cookie = 'SESSDATA=secret-cookie';
+
+  assert.equal(service.getState().settings.cookie, 'SESSDATA=secret-cookie');
+  assert.equal(service.getState({ redactCookie: true }).settings.cookie, '');
+  assert.equal(redactRemoteState({ settings: { cookie: 'SESSDATA=secret-cookie' } }, { redactCookie: true }).settings.cookie, '');
+
+  let ssePayload = '';
+  const response = {
+    write(value) {
+      ssePayload += value;
+    },
+    on() {}
+  };
+  service.addClient(response, { redactCookie: true });
+  service.emitState();
+  assert.doesNotMatch(ssePayload, /secret-cookie/);
+
+  const stateResponse = await invokeApi({
+    remoteAddress: '192.168.1.20',
+    pathname: '/api/state',
+    service
+  });
+  assert.equal(stateResponse.statusCode, 200);
+  assert.equal(stateResponse.body.settings.cookie, '');
+
+  let saveOptions;
+  const saveResponse = await invokeApi({
+    remoteAddress: '192.168.1.20',
+    method: 'POST',
+    pathname: '/api/settings/save',
+    body: { settings: { cookie: '', pollIntervalSec: 20 } },
+    service: {
+      saveSettings(_settings, options) {
+        saveOptions = options;
+        return { settings: { cookie: 'SESSDATA=secret-cookie' } };
+      }
+    }
+  });
+  assert.deepEqual(saveOptions, { preserveCookie: true });
+  assert.equal(saveResponse.body.settings.cookie, '');
+});
+
+test('media and export paths stay inside the recording library and match recording names', () => {
+  const service = new LiveRecordService();
+  const libraryDir = path.join(os.tmpdir(), 'br2k-recording-library');
+  const sourcePath = path.join(libraryDir, '123456_anchor_title_20260716_120000.clean.mp4');
+  const burnedPath = path.join(libraryDir, '123456_anchor_title_20260716_120000.danmaku.mp4');
+  const clipPath = path.join(libraryDir, '123456_anchor_title_20260716_120000.clip_0-120.clean.mp4');
+  const arbitraryName = path.join(libraryDir, 'holiday-video.mp4');
+  const outsidePath = path.join(os.tmpdir(), 'br2k-outside', 'secret.clean.mp4');
+  service.settings.outputDir = libraryDir;
+
+  assert.equal(service.isKnownMediaPath(sourcePath), true);
+  assert.equal(service.isKnownMediaPath(burnedPath), true);
+  assert.equal(service.isKnownMediaPath(clipPath), true);
+  assert.equal(service.isKnownMediaPath(arbitraryName), false);
+  assert.equal(service.isKnownMediaPath(outsidePath), false);
+  assert.doesNotThrow(() => service.assertExportSourcePath(sourcePath));
+  assert.throws(() => service.assertExportSourcePath(outsidePath), /录像库目录/);
+  assert.doesNotThrow(() => service.assertExportOutputPath(libraryDir, clipPath));
+  assert.throws(() => service.assertExportOutputPath(path.dirname(outsidePath), outsidePath), /录像库目录/);
+});
+
+test('only the server computer can run system-level API actions', async () => {
+  assert.equal(isLocalRequest({ socket: { remoteAddress: '127.0.0.1' } }), true);
+  assert.equal(isLocalRequest({ socket: { remoteAddress: '::1' } }), true);
+  assert.equal(isLocalRequest({ socket: { remoteAddress: '::ffff:127.0.0.1' } }), true);
+  assert.equal(isLocalRequest({ socket: { remoteAddress: '192.168.1.20' } }), false);
+  assert.equal(LOCAL_ONLY_API_PATHS.has('/api/shell/open-output'), true);
+  assert.equal(LOCAL_ONLY_API_PATHS.has('/api/update/apply'), false);
+  assert.equal(LOCAL_ONLY_API_PATHS.has('/api/system/shutdown'), false);
+
+  const invoke = async (remoteAddress) => {
+    const request = new Readable({
+      read() {
+        this.push(null);
+      }
+    });
+    request.method = 'POST';
+    request.url = '/api/shell/open-output';
+    request.headers = { host: '127.0.0.1:3263' };
+    request.socket = { remoteAddress };
+    let statusCode = 200;
+    let responseBody = '';
+    const response = new Writable({
+      write(chunk, _encoding, callback) {
+        responseBody += chunk.toString('utf8');
+        callback();
+      }
+    });
+    response.writeHead = (status) => {
+      statusCode = status;
+    };
+    let opened = false;
+    const service = {
+      openOutputDir: () => {
+        opened = true;
+        return { ok: true };
+      }
+    };
+    const finished = new Promise((resolve) => response.once('finish', resolve));
+    await handleRequest(service, null, 3263, request, response);
+    await finished;
+    return { opened, statusCode, responseBody };
+  };
+
+  const remote = await invoke('192.168.1.20');
+  assert.equal(remote.opened, false);
+  assert.equal(remote.statusCode, 403);
+  assert.match(remote.responseBody, new RegExp(LOCAL_ONLY_ERROR));
+
+  const local = await invoke('127.0.0.1');
+  assert.equal(local.opened, true);
+  assert.equal(local.statusCode, 200);
 });
 
 test(

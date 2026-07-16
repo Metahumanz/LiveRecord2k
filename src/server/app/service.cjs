@@ -213,7 +213,8 @@ const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PREVIEW_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const QUALITY_UPGRADE_CHECK_MS = 90 * 1000;
-const LOCAL_MEDIA_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.mkv', '.webm']);
+const RECORDING_MEDIA_FILE_PATTERN =
+  /(?:\.(?:clean|merged|danmaku|danmaku-only)|\.clip_[^.]+\.(?:clean|danmaku|danmaku-only))\.(?:mp4|mkv)$/i;
 const EXPORT_PREVIEW_EXTENSIONS = new Set(['.m3u8', '.ts']);
 const PREVIEW_CACHE_VERSION = 'v1';
 const REPAIR_CACHE_VERSION = 'v1';
@@ -268,7 +269,7 @@ class LiveRecordService {
     this.exportQueueRunning = false;
     this.recordings = [];
     this.recordingScanPromise = null;
-    this.clients = new Set();
+    this.clients = new Map();
     this.notifications = [];
     this.notificationSeq = 0;
     this.loginSession = null;
@@ -554,9 +555,13 @@ class LiveRecordService {
     });
   }
 
-  getState() {
+  getState(options = {}) {
+    const settings = { ...this.settings };
+    if (options.redactCookie) {
+      settings.cookie = '';
+    }
     return {
-      settings: { ...this.settings },
+      settings,
       rooms: Array.from(this.rooms.values()).map((room) => this.getPublicRoomState(room)),
       recordings: this.recordings,
       logs: this.logs,
@@ -681,21 +686,21 @@ class LiveRecordService {
     };
   }
 
-  addClient(response) {
-    this.clients.add(response);
-    this.writeSseState(response);
+  addClient(response, options = {}) {
+    this.clients.set(response, { redactCookie: Boolean(options.redactCookie) });
+    this.writeSseState(response, options);
     response.on('close', () => this.clients.delete(response));
   }
 
   emitState() {
-    for (const response of this.clients) {
-      this.writeSseState(response);
+    for (const [response, options] of this.clients) {
+      this.writeSseState(response, options);
     }
   }
 
-  writeSseState(response) {
+  writeSseState(response, options = {}) {
     try {
-      response.write(`data: ${JSON.stringify(this.getState())}\n\n`);
+      response.write(`data: ${JSON.stringify(this.getState(options))}\n\n`);
     } catch {
       this.clients.delete(response);
     }
@@ -1081,12 +1086,16 @@ try {
     }
   }
 
-  async saveSettings(nextSettings) {
+  async saveSettings(nextSettings, options = {}) {
     const oldPollInterval = this.settings.pollIntervalSec;
     const oldOutputDir = this.settings.outputDir;
+    const settingsUpdate = { ...(nextSettings || {}) };
+    if (options.preserveCookie) {
+      delete settingsUpdate.cookie;
+    }
     this.settings = this.normalizeSettings({
       ...this.settings,
-      ...nextSettings
+      ...settingsUpdate
     });
     await fsp.mkdir(this.settings.outputDir, { recursive: true });
     if (oldOutputDir !== this.settings.outputDir && !this.hasActiveJobs()) {
@@ -1691,8 +1700,10 @@ try {
 
   isKnownMediaPath(filePath) {
     const normalized = path.resolve(filePath).toLowerCase();
-    const outputRoot = path.resolve(this.settings.outputDir).toLowerCase();
-    if (normalized === outputRoot || normalized.startsWith(`${outputRoot}${path.sep}`)) {
+    if (!this.isRecordingMediaFileName(normalized)) {
+      return false;
+    }
+    if (this.isPathInRecordingLibrary(normalized)) {
       return true;
     }
     const knownRecordingPath = this.recordings.some((recording) =>
@@ -1714,7 +1725,32 @@ try {
         return true;
       }
     }
-    return LOCAL_MEDIA_EXTENSIONS.has(path.extname(normalized));
+    return false;
+  }
+
+  isRecordingMediaFileName(filePath) {
+    return RECORDING_MEDIA_FILE_PATTERN.test(path.basename(String(filePath || '')));
+  }
+
+  isPathInRecordingLibrary(filePath) {
+    const targetPath = path.resolve(String(filePath || ''));
+    const outputRoot = path.resolve(this.settings.outputDir);
+    return targetPath === outputRoot || isPathInsideDirectory(targetPath, outputRoot);
+  }
+
+  assertExportSourcePath(filePath) {
+    if (!this.isPathInRecordingLibrary(filePath) || !this.isRecordingMediaFileName(filePath)) {
+      throw new Error('导出源文件必须位于录像库目录且符合录播文件名格式。');
+    }
+  }
+
+  assertExportOutputPath(outputDir, outputPath) {
+    if (!this.isPathInRecordingLibrary(outputDir) || !this.isPathInRecordingLibrary(outputPath)) {
+      throw new Error('导出目录和输出文件必须位于录像库目录。');
+    }
+    if (!this.isRecordingMediaFileName(outputPath)) {
+      throw new Error('导出文件名必须符合录播文件命名格式。');
+    }
   }
 
   async fetchDanmuInfo(roomId) {
@@ -3418,6 +3454,7 @@ try {
     if (recording.valid === false) {
       throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
+    this.assertExportSourcePath(recording.cleanPath);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
@@ -3468,6 +3505,7 @@ try {
     if (recording.valid === false) {
       throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
+    this.assertExportSourcePath(recording.cleanPath);
     if (!(await isExistingFile(recording.cleanPath))) {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
     }
@@ -3486,11 +3524,13 @@ try {
     if (!Number.isFinite(endTime) || endTime <= startTime) {
       throw new Error('结束时间必须大于开始时间。');
     }
-    const outputDir = String(options.outputDir || path.dirname(recording.cleanPath));
-    await fsp.mkdir(outputDir, { recursive: true });
-    const outputPath =
+    const outputDir = path.resolve(String(options.outputDir || path.dirname(recording.cleanPath)));
+    const outputPath = path.resolve(
       options.outputPath ||
-      deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime);
+        deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime)
+    );
+    this.assertExportOutputPath(outputDir, outputPath);
+    await fsp.mkdir(outputDir, { recursive: true });
     const id = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const startTimeText = formatFfmpegSeconds(startTime);
     const endTimeText = formatFfmpegSeconds(endTime);
@@ -3575,6 +3615,7 @@ try {
     if (recording.valid === false) {
       throw new Error('这个录像文件被标记为无效，请换一个源文件。');
     }
+    this.assertExportSourcePath(recording.cleanPath);
     if (!(await isExistingFile(recording.cleanPath))) {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
     }

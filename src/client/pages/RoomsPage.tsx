@@ -46,7 +46,7 @@ export function RoomsPage({
                   }
                 }}
                 inputMode="numeric"
-                placeholder="例如 22625025"
+                placeholder="123456"
               />
               <button
                 className="wide-button primary"
