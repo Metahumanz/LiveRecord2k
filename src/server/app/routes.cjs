@@ -4,6 +4,14 @@ const { DIST_ROOT, writeJson, writeText, mimeType } = require('./service.cjs');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const DEFAULT_PORT = 3263;
+const LOCAL_ONLY_API_PATHS = new Set([
+  '/api/settings/choose-output-dir',
+  '/api/shell/open-output',
+  '/api/shell/open-path-dir',
+  '/api/shell/select-path',
+  '/api/shell/open-config'
+]);
+const LOCAL_ONLY_ERROR = '此操作只能在服务端电脑上执行，请在服务端电脑操作。';
 
 async function createViteMiddleware() {
   const { createServer } = await import('vite');
@@ -35,8 +43,9 @@ async function handleApi(service, parsed, port, request, response) {
     writeJson(response, 403, { error: 'Forbidden' });
     return;
   }
+  const stateOptions = { redactCookie: !isLocalRequest(request) };
   if (request.method === 'GET' && pathname === '/api/state') {
-    writeJson(response, 200, service.getState());
+    writeJson(response, 200, service.getState(stateOptions));
     return;
   }
 
@@ -73,7 +82,7 @@ async function handleApi(service, parsed, port, request, response) {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no'
     });
-    service.addClient(response);
+    service.addClient(response, stateOptions);
     return;
   }
 
@@ -82,12 +91,17 @@ async function handleApi(service, parsed, port, request, response) {
     return;
   }
 
+  if (LOCAL_ONLY_API_PATHS.has(pathname) && !isLocalRequest(request)) {
+    writeJson(response, 403, { error: LOCAL_ONLY_ERROR });
+    return;
+  }
+
   const body = await readJsonBody(request);
   const routes = {
     '/api/auth/qr/start': () => service.startQrLogin(),
     '/api/auth/qr/cancel': () => service.cancelQrLogin(),
     '/api/settings/choose-output-dir': () => service.chooseOutputDir(body.currentPath),
-    '/api/settings/save': () => service.saveSettings(body.settings || body),
+    '/api/settings/save': () => service.saveSettings(body.settings || body, { preserveCookie: stateOptions.redactCookie }),
     '/api/rooms/add': () => service.addRoom(body.roomId),
     '/api/rooms/remove': () => service.removeRoom(body.roomId),
     '/api/rooms/refresh': () => service.refreshRoom(body.roomId, { silent: Boolean(body.silent) }),
@@ -127,7 +141,7 @@ async function handleApi(service, parsed, port, request, response) {
 
   try {
     const result = await action();
-    writeJson(response, 200, result === undefined ? { ok: true } : result);
+    writeJson(response, 200, result === undefined ? { ok: true } : redactRemoteState(result, stateOptions));
   } catch (error) {
     service.log('error', error.message || String(error));
     writeJson(response, 500, { error: error.message || String(error) });
@@ -215,6 +229,21 @@ function isLoopbackHost(hostname) {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
 }
 
+function isLocalRequest(request) {
+  const remoteAddress = String(request.socket?.remoteAddress || request.connection?.remoteAddress || '').toLowerCase();
+  return remoteAddress === '127.0.0.1' || remoteAddress === '::1' || remoteAddress === '::ffff:127.0.0.1';
+}
+
+function redactRemoteState(result, options = {}) {
+  if (!options.redactCookie || !result || typeof result !== 'object' || !result.settings) {
+    return result;
+  }
+  return {
+    ...result,
+    settings: { ...result.settings, cookie: '' }
+  };
+}
+
 async function serveVite(vite, pathname, request, response) {
   await new Promise((resolve, reject) => {
     let settled = false;
@@ -285,5 +314,9 @@ async function serveStatic(pathname, response) {
 
 module.exports = {
   createViteMiddleware,
-  handleRequest
+  handleRequest,
+  isLocalRequest,
+  redactRemoteState,
+  LOCAL_ONLY_API_PATHS,
+  LOCAL_ONLY_ERROR
 };
