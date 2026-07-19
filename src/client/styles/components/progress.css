@@ -227,6 +227,25 @@
   color: #fff0f0;
 }
 
+.toast-card.warning {
+  border-color: rgba(212, 139, 35, 0.5);
+  background: rgba(255, 247, 230, 0.97);
+}
+
+.toast-card.warning .toast-copy svg,
+.toast-card.warning .toast-copy strong {
+  color: #9a5b08;
+}
+
+.toast-card.warning .toast-copy span,
+.toast-card.warning .toast-close {
+  color: #70450b;
+}
+
+.toast-card.warning .toast-timer {
+  background: #d48b23;
+}
+
 .toast-card.error .toast-copy svg {
   color: #ff9a9a;
 }

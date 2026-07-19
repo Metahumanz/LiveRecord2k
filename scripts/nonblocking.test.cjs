@@ -351,6 +351,7 @@ test(
   async () => {
     const service = new LiveRecordService();
     let finishPicker;
+    service.resolvePathPickerInitialPath = async (currentPath) => currentPath;
     service.runWindowsPathPicker = () =>
       new Promise((resolve) => {
         finishPicker = resolve;
@@ -370,6 +371,138 @@ test(
     assert.equal(service.pathPickerPromise, null);
   }
 );
+
+test(
+  'path pickers replace a disconnected initial drive before opening the Windows dialog',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const service = new LiveRecordService();
+    let pickerEnvironment;
+    service.getLocalFallbackDirectory = () => 'C:\\';
+    service.probePathAvailability = async () => ({ kind: 'timeout', path: 'J:\\recordings', existingPath: '' });
+    service.runWindowsPathPicker = (_script, environment) => {
+      pickerEnvironment = environment;
+      return Promise.resolve({ status: 2, stdout: '', stderr: '' });
+    };
+
+    const result = await service.selectPath({ type: 'directory', currentPath: 'J:\\recordings' });
+
+    assert.deepEqual(result, { ok: false, cancelled: true });
+    assert.equal(pickerEnvironment.BR2K_CURRENT_PATH, 'C:\\');
+    assert.match(service.logs.at(-1).message, /盘符已断开/);
+  }
+);
+
+test(
+  'Windows path picker processes are terminated after the interactive timeout',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const service = new LiveRecordService();
+    const startedAt = Date.now();
+    const result = await service.runWindowsPathPicker('Start-Sleep -Seconds 30', {}, { timeoutMs: 1000 });
+
+    assert.equal(result.status, null);
+    assert.match(result.error.message, /已自动关闭/);
+    assert.ok(Date.now() - startedAt < 5000, 'hung picker should be terminated promptly');
+  }
+);
+
+test(
+  'Windows path picker script pins the native dialog above the browser window',
+  { skip: process.platform !== 'win32' },
+  async () => {
+    const service = new LiveRecordService();
+    let pickerScript = '';
+    service.resolvePathPickerInitialPath = async (currentPath) => currentPath;
+    service.runWindowsPathPicker = (script) => {
+      pickerScript = script;
+      return Promise.resolve({ status: 2, stdout: '', stderr: '' });
+    };
+
+    await service.selectPath({ type: 'directory', currentPath: 'C:\\' });
+
+    assert.match(pickerScript, /HWND_TOPMOST/);
+    assert.match(pickerScript, /PinVisibleDialog/);
+    assert.match(pickerScript, /System\.Windows\.Forms\.Timer/);
+    const typeDefinition = pickerScript.match(/Add-Type -TypeDefinition @'\r?\n([\s\S]*?)\r?\n'@/);
+    assert.ok(typeDefinition, 'native foreground helper should be embedded in the picker script');
+    const compileResult = await runCapturedProcess(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `Add-Type -TypeDefinition @'\n${typeDefinition[1]}\n'@`],
+      { timeoutMs: 10000 }
+    );
+    assert.equal(compileResult.status, 0, compileResult.stderr || compileResult.stdout);
+  }
+);
+
+test('opening an unavailable directory falls back without creating the missing path', async () => {
+  const service = new LiveRecordService();
+  const openedPaths = [];
+  service.settings.outputDir = 'J:\\recordings';
+  service.getLocalFallbackDirectory = () => 'C:\\';
+  service.probePathAvailability = async () => ({ kind: 'timeout', path: 'J:\\recordings', existingPath: '' });
+  service.openSystemPath = (targetPath) => openedPaths.push(targetPath);
+
+  const result = await service.openOutputDir();
+
+  assert.deepEqual(openedPaths, ['C:\\']);
+  assert.equal(result.operationNotice.kind, 'warning');
+  assert.match(result.operationNotice.message, /J:\\recordings/);
+  assert.match(result.operationNotice.message, /C:\\/);
+});
+
+test('saving a newly selected unavailable directory keeps the previous settings intact', async () => {
+  const service = new LiveRecordService();
+  const originalOutputDir = service.settings.outputDir;
+  const originalPollIntervalSec = service.settings.pollIntervalSec;
+  service.probePathAvailability = async () => ({ kind: 'timeout', path: 'J:\\recordings', existingPath: '' });
+  service.saveStore = async () => {
+    throw new Error('saveStore should not run for an unavailable replacement directory');
+  };
+
+  await assert.rejects(
+    service.saveSettings({ outputDir: 'J:\\recordings', pollIntervalSec: originalPollIntervalSec + 5 }),
+    /盘符可能已断开/
+  );
+  assert.equal(service.settings.outputDir, originalOutputDir);
+  assert.equal(service.settings.pollIntervalSec, originalPollIntervalSec);
+});
+
+test('reachable missing directories can still be created through the bounded path helper', async () => {
+  const service = new LiveRecordService();
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-path-create-'));
+  const targetDir = path.join(tempDir, 'new-recording-directory');
+  try {
+    await service.ensureDirectoryReady(targetDir, { label: '测试目录' });
+    assert.equal((await fsp.stat(targetDir)).isDirectory(), true);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('recording scans retain the library when the configured drive is disconnected', async () => {
+  const service = new LiveRecordService();
+  service.settings.outputDir = 'J:\\recordings';
+  service.recordings = [{ id: 'existing', cleanPath: 'J:\\recordings\\existing.clean.mp4' }];
+  service.probePathAvailability = async () => ({ kind: 'timeout', path: service.settings.outputDir, existingPath: '' });
+  service.saveStore = async () => {
+    throw new Error('saveStore should not run when a scan is skipped');
+  };
+
+  await service.performRecordingLibraryRefresh();
+
+  assert.equal(service.recordings.length, 1);
+  assert.equal(service.recordings[0].id, 'existing');
+  assert.match(service.logs.at(-1).message, /已保留现有录像列表/);
+});
+
+test('the settings directory picker sends the current draft path instead of the last saved path', () => {
+  const appSource = fs.readFileSync(path.join(projectRoot, 'src/client/App.tsx'), 'utf8');
+  const clientSource = fs.readFileSync(path.join(projectRoot, 'src/client/recorderClient.ts'), 'utf8');
+
+  assert.match(appSource, /recorder\.chooseOutputDir\(settingsDraft\?\.outputDir \|\| ''\)/);
+  assert.match(clientSource, /currentPath\.trim\(\) \|\| latestState\?\.settings\.outputDir/);
+});
 
 test('runtime server code does not reintroduce synchronous child processes', () => {
   const serviceSource = fs.readFileSync(path.join(projectRoot, 'src/server/app/service.cjs'), 'utf8');

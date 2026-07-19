@@ -284,13 +284,18 @@ export type AppState = {
   storePath?: string;
   appRoot?: string;
   distRoot?: string;
+  operationNotice?: {
+    kind: 'success' | 'warning' | 'error';
+    title: string;
+    message?: string;
+  };
 };
 
 export type RecorderApi = {
   getInitialState: () => Promise<AppState>;
   startQrLogin: () => Promise<AppState>;
   cancelQrLogin: () => Promise<AppState>;
-  chooseOutputDir: () => Promise<string | undefined>;
+  chooseOutputDir: (currentPath?: string) => Promise<string | undefined>;
   selectPath: (request: SelectPathRequest) => Promise<SelectPathResult>;
   saveSettings: (settings: Partial<AppSettings>) => Promise<AppState>;
   addRoom: (roomId: string) => Promise<AppState>;
