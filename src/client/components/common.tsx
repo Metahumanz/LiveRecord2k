@@ -175,7 +175,7 @@ export type ToastItem = {
   id: number;
   title: string;
   message?: string;
-  kind?: 'success' | 'error';
+  kind?: 'success' | 'warning' | 'error';
 };
 
 export function ToastHost({ toasts, onClose }: { toasts: ToastItem[]; onClose: (id: number) => void }) {
@@ -187,7 +187,7 @@ export function ToastHost({ toasts, onClose }: { toasts: ToastItem[]; onClose: (
       {toasts.map((toast) => (
         <div className={`toast-card ${toast.kind || 'success'}`} key={toast.id}>
           <div className="toast-copy">
-            {toast.kind === 'error' ? <CircleAlert size={19} /> : <CheckCircle2 size={19} />}
+            {toast.kind === 'error' || toast.kind === 'warning' ? <CircleAlert size={19} /> : <CheckCircle2 size={19} />}
             <div>
               <strong>{toast.title}</strong>
               {toast.message ? <span>{toast.message}</span> : null}

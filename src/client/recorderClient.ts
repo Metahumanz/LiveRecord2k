@@ -12,8 +12,8 @@ export const recorder: RecorderApi = {
   },
   startQrLogin: () => api<AppState>('/api/auth/qr/start', {}),
   cancelQrLogin: () => api<AppState>('/api/auth/qr/cancel', {}),
-  async chooseOutputDir() {
-    const current = latestState?.settings.outputDir || '';
+  async chooseOutputDir(currentPath = '') {
+    const current = currentPath.trim() || latestState?.settings.outputDir || '';
     const result = await api<{ path?: string; cancelled?: boolean; message?: string }>(
       '/api/settings/choose-output-dir',
       { currentPath: current },

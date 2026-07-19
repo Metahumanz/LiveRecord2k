@@ -209,6 +209,9 @@ const DEFAULT_UPDATE_MANIFEST_URL =
   'https://github.com/Metahumanz/LiveRecord2k/releases/latest/download/update.json';
 const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/Metahumanz/LiveRecord2k/releases/latest';
 const UPDATE_CHECK_TIMEOUT_MS = 12000;
+const PATH_PROBE_TIMEOUT_MS = 2500;
+const PATH_CREATE_TIMEOUT_MS = 8000;
+const PATH_PICKER_TIMEOUT_MS = 5 * 60 * 1000;
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
@@ -279,6 +282,7 @@ class LiveRecordService {
     this.wbiCache = null;
     this.pathPickerPromise = null;
     this.pathPickerProcess = null;
+    this.pathPickerStarting = false;
     this.startupEnabled = false;
     this.updateState = {
       status: 'idle',
@@ -365,7 +369,14 @@ class LiveRecordService {
   }
 
   async initializeRecordingLibrary() {
-    await fsp.mkdir(this.settings.outputDir, { recursive: true });
+    const outputReady = await this.ensureDirectoryReady(this.settings.outputDir, {
+      label: '录像保存目录',
+      allowUnavailable: true
+    });
+    if (!outputReady) {
+      this.log('warn', `录像保存目录当前不可用，已跳过启动扫描：${this.settings.outputDir}`);
+      return;
+    }
     await this.refreshRecordingLibrary({ silent: true });
   }
 
@@ -770,6 +781,214 @@ class LiveRecordService {
     return result.path ? { path: result.path } : result;
   }
 
+  getLocalFallbackDirectory() {
+    const systemDrive = String(process.env.SystemDrive || '').trim();
+    if (/^[a-z]:$/i.test(systemDrive)) {
+      return `${systemDrive}\\`;
+    }
+    return path.parse(process.execPath).root || path.parse(os.tmpdir()).root || os.tmpdir();
+  }
+
+  async probePathAvailability(targetPath, options = {}) {
+    const rawPath = String(targetPath || '').trim();
+    if (!rawPath) {
+      return { kind: 'unavailable', path: '', existingPath: '' };
+    }
+    const resolved = path.resolve(rawPath);
+    const timeoutMs = Math.max(250, Number(options.timeoutMs || PATH_PROBE_TIMEOUT_MS));
+    if (process.platform !== 'win32') {
+      try {
+        const stat = await withTimeout(fsp.stat(resolved), timeoutMs, '路径检测超时');
+        return { kind: stat.isDirectory() ? 'directory' : 'file', path: resolved, existingPath: resolved };
+      } catch (error) {
+        if (/超时/.test(error.message || '')) {
+          return { kind: 'timeout', path: resolved, existingPath: '' };
+        }
+        let cursor = path.dirname(resolved);
+        const root = path.parse(resolved).root;
+        while (cursor) {
+          try {
+            const stat = await withTimeout(fsp.stat(cursor), timeoutMs, '路径检测超时');
+            if (stat.isDirectory()) {
+              return { kind: 'missing', path: resolved, existingPath: cursor };
+            }
+          } catch (ancestorError) {
+            if (/超时/.test(ancestorError.message || '')) {
+              return { kind: 'timeout', path: resolved, existingPath: '' };
+            }
+          }
+          if (cursor === root) {
+            break;
+          }
+          const parent = path.dirname(cursor);
+          if (parent === cursor) {
+            break;
+          }
+          cursor = parent;
+        }
+        return { kind: 'unavailable', path: resolved, existingPath: '' };
+      }
+    }
+
+    const script = `
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
+$target = $env:BR2K_PATH_PROBE_TARGET
+$result = [ordered]@{ kind = 'unavailable'; path = $target; existingPath = '' }
+try {
+  if ([System.IO.Directory]::Exists($target)) {
+    $result.kind = 'directory'
+    $result.existingPath = [System.IO.Path]::GetFullPath($target)
+  } elseif ([System.IO.File]::Exists($target)) {
+    $result.kind = 'file'
+    $result.existingPath = [System.IO.Path]::GetFullPath($target)
+  } else {
+    $cursor = $target
+    while ($cursor) {
+      try { $parent = [System.IO.Directory]::GetParent($cursor) } catch { $parent = $null }
+      if (-not $parent) { break }
+      $cursor = $parent.FullName
+      if ([System.IO.Directory]::Exists($cursor)) {
+        $result.kind = 'missing'
+        $result.existingPath = $cursor
+        break
+      }
+    }
+  }
+} catch {}
+$result | ConvertTo-Json -Compress
+`;
+    const result = await runCapturedProcess(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      {
+        timeoutMs,
+        maxOutputBytes: 32 * 1024,
+        env: { ...process.env, BR2K_PATH_PROBE_TARGET: resolved }
+      }
+    );
+    if (result.timedOut) {
+      return { kind: 'timeout', path: resolved, existingPath: '' };
+    }
+    if (result.status !== 0) {
+      return { kind: 'unavailable', path: resolved, existingPath: '' };
+    }
+    try {
+      const parsed = JSON.parse(String(result.stdout || '').trim());
+      return {
+        kind: ['directory', 'file', 'missing'].includes(parsed.kind) ? parsed.kind : 'unavailable',
+        path: resolved,
+        existingPath: String(parsed.existingPath || '')
+      };
+    } catch {
+      return { kind: 'unavailable', path: resolved, existingPath: '' };
+    }
+  }
+
+  async createDirectoryWithTimeout(directoryPath, options = {}) {
+    const rawPath = String(directoryPath || '').trim();
+    if (!rawPath) {
+      throw new Error('要创建的目录为空。');
+    }
+    const resolved = path.resolve(rawPath);
+    const timeoutMs = Math.max(500, Number(options.timeoutMs || PATH_CREATE_TIMEOUT_MS));
+    if (process.platform !== 'win32') {
+      await withTimeout(fsp.mkdir(resolved, { recursive: true }), timeoutMs, `创建目录超时：${resolved}`);
+      return resolved;
+    }
+    const script = `
+$ErrorActionPreference = 'Stop'
+$target = $env:BR2K_CREATE_DIRECTORY_TARGET
+[System.IO.Directory]::CreateDirectory($target) | Out-Null
+`;
+    const result = await runCapturedProcess(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      {
+        timeoutMs,
+        maxOutputBytes: 32 * 1024,
+        env: { ...process.env, BR2K_CREATE_DIRECTORY_TARGET: resolved }
+      }
+    );
+    if (result.timedOut) {
+      throw new Error(`创建目录超时，盘符可能已断开：${resolved}`);
+    }
+    if (result.status !== 0) {
+      throw new Error(`无法创建目录 ${resolved}：${compactLogLine(result.stderr || result.stdout || '路径不可用')}`);
+    }
+    return resolved;
+  }
+
+  async ensureDirectoryReady(directoryPath, options = {}) {
+    const rawPath = String(directoryPath || '').trim();
+    if (!rawPath) {
+      throw new Error(`${String(options.label || '目录')}为空。`);
+    }
+    const resolved = path.resolve(rawPath);
+    const label = String(options.label || '目录');
+    const probe = await this.probePathAvailability(resolved, options);
+    if (probe.kind === 'directory') {
+      return true;
+    }
+    if (probe.kind === 'file') {
+      throw new Error(`${label}指向了文件而不是文件夹：${resolved}`);
+    }
+    if (probe.kind === 'missing' && options.create !== false) {
+      await this.createDirectoryWithTimeout(resolved, options);
+      return true;
+    }
+    if (options.allowUnavailable) {
+      return false;
+    }
+    const reason = probe.kind === 'timeout' ? '检测超时，盘符可能已断开' : '盘符或上级目录不可用';
+    throw new Error(`${label}${reason}：${resolved}`);
+  }
+
+  async resolveAvailableDirectory(targetPath, label = '目录') {
+    const rawPath = String(targetPath || '').trim();
+    if (!rawPath) {
+      return {
+        directory: this.getLocalFallbackDirectory(),
+        fallback: true,
+        reason: `${label}为空`
+      };
+    }
+    const resolved = path.resolve(rawPath);
+    const probe = await this.probePathAvailability(resolved);
+    if (probe.kind === 'directory') {
+      return { directory: resolved, fallback: false, reason: '' };
+    }
+    if (probe.kind === 'file') {
+      return { directory: path.dirname(resolved), fallback: false, reason: '' };
+    }
+    if (probe.kind === 'missing' && probe.existingPath) {
+      return {
+        directory: probe.existingPath,
+        fallback: true,
+        reason: `${label}不存在，已回退到最近可用的上级目录`
+      };
+    }
+    return {
+      directory: this.getLocalFallbackDirectory(),
+      fallback: true,
+      reason: probe.kind === 'timeout' ? `${label}检测超时或盘符已断开` : `${label}所在盘符不可用`
+    };
+  }
+
+  async resolvePathPickerInitialPath(currentPath, dialogType) {
+    const current = String(currentPath || '').trim();
+    if (!current) {
+      return this.getLocalFallbackDirectory();
+    }
+    const isFileDialog = dialogType !== 'directory';
+    const candidateDirectory = isFileDialog && path.extname(current) ? path.dirname(current) : current;
+    const resolved = await this.resolveAvailableDirectory(candidateDirectory, '原始选择路径');
+    if (resolved.fallback) {
+      this.log('warn', `${resolved.reason}：${current} -> ${resolved.directory}`);
+      return resolved.directory;
+    }
+    return isFileDialog && path.extname(current) ? current : resolved.directory;
+  }
+
   async selectPath(options = {}) {
     const type = String(options.type || 'directory');
     const currentPath = String(options.currentPath || options.path || '').trim();
@@ -781,12 +1000,20 @@ class LiveRecordService {
         message: '当前系统暂不支持原生路径选择，请直接在输入框中填写路径。'
       };
     }
-    if (this.pathPickerPromise) {
+    if (this.pathPickerPromise || this.pathPickerStarting) {
       return {
         ok: false,
         cancelled: false,
         message: '已有系统路径选择器打开，请先完成选择或取消。'
       };
+    }
+    this.pathPickerStarting = true;
+    let safeCurrentPath;
+    try {
+      safeCurrentPath = await this.resolvePathPickerInitialPath(currentPath, dialogType);
+    } catch (error) {
+      this.pathPickerStarting = false;
+      throw error;
     }
     const filters = {
       video: '视频文件 (*.mp4;*.mkv;*.mov;*.m4v;*.webm)|*.mp4;*.mkv;*.mov;*.m4v;*.webm|所有文件 (*.*)|*.*',
@@ -803,20 +1030,111 @@ class LiveRecordService {
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class BiliRecordWindowTools
+{
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_SHOWWINDOW = 0x0040;
+    private const int SW_SHOW = 5;
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(
+        IntPtr hWnd,
+        IntPtr hWndInsertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags
+    );
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int command);
+
+    public static void PinOwner(IntPtr ownerHandle)
+    {
+        SetWindowPos(ownerHandle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        BringWindowToTop(ownerHandle);
+        SetForegroundWindow(ownerHandle);
+    }
+
+    public static bool PinVisibleDialog(int processId, IntPtr ownerHandle)
+    {
+        bool found = false;
+        EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+        {
+            uint windowProcessId;
+            GetWindowThreadProcessId(hWnd, out windowProcessId);
+            if (
+                windowProcessId == (uint)processId &&
+                hWnd != ownerHandle &&
+                IsWindowVisible(hWnd)
+            )
+            {
+                ShowWindow(hWnd, SW_SHOW);
+                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                BringWindowToTop(hWnd);
+                SetForegroundWindow(hWnd);
+                found = true;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+'@
 $type = $env:BR2K_DIALOG_TYPE
 $current = $env:BR2K_CURRENT_PATH
 $owner = New-Object System.Windows.Forms.Form
 $owner.ShowInTaskbar = $false
-$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+$owner.ShowIcon = $false
+$owner.Text = $env:BR2K_DIALOG_TITLE
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Size = New-Object System.Drawing.Size(2, 2)
 $owner.Location = [System.Windows.Forms.Cursor]::Position
-$owner.Opacity = 0
+$owner.Opacity = 0.01
 $owner.TopMost = $true
 $dialog = $null
+$foregroundTimer = $null
 try {
   $owner.Show()
+  [BiliRecordWindowTools]::PinOwner($owner.Handle)
+  $owner.BringToFront()
   $owner.Activate()
+  $processId = [System.Diagnostics.Process]::GetCurrentProcess().Id
+  $foregroundTimer = New-Object System.Windows.Forms.Timer
+  $foregroundTimer.Interval = 100
+  $foregroundTimer.Add_Tick({
+    if ([BiliRecordWindowTools]::PinVisibleDialog($processId, $owner.Handle)) {
+      $foregroundTimer.Stop()
+    } else {
+      [BiliRecordWindowTools]::PinOwner($owner.Handle)
+    }
+  })
+  $foregroundTimer.Start()
   if ($type -eq 'directory') {
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
     $dialog.Description = $env:BR2K_DIALOG_TITLE
@@ -849,18 +1167,33 @@ try {
   }
   exit 2
 } finally {
+  if ($foregroundTimer) {
+    $foregroundTimer.Stop()
+    $foregroundTimer.Dispose()
+  }
   if ($dialog) { $dialog.Dispose() }
   $owner.Close()
   $owner.Dispose()
 }
 `;
-    const pickerPromise = this.runWindowsPathPicker(script, {
-      BR2K_DIALOG_TYPE: dialogType,
-      BR2K_CURRENT_PATH: currentPath,
-      BR2K_DIALOG_TITLE: titles[dialogType],
-      BR2K_FILE_FILTER: filters[dialogType] || ''
-    });
+    let pickerPromise;
+    try {
+      pickerPromise = this.runWindowsPathPicker(
+        script,
+        {
+          BR2K_DIALOG_TYPE: dialogType,
+          BR2K_CURRENT_PATH: safeCurrentPath,
+          BR2K_DIALOG_TITLE: titles[dialogType],
+          BR2K_FILE_FILTER: filters[dialogType] || ''
+        },
+        { timeoutMs: Number(options.timeoutMs || PATH_PICKER_TIMEOUT_MS) }
+      );
+    } catch (error) {
+      this.pathPickerStarting = false;
+      throw error;
+    }
     this.pathPickerPromise = pickerPromise;
+    this.pathPickerStarting = false;
     let result;
     try {
       result = await pickerPromise;
@@ -869,6 +1202,7 @@ try {
         this.pathPickerPromise = null;
         this.pathPickerProcess = null;
       }
+      this.pathPickerStarting = false;
     }
     if (result.status === 0) {
       const selectedPath = String(result.stdout || '').trim();
@@ -886,16 +1220,18 @@ try {
     };
   }
 
-  runWindowsPathPicker(script, environment) {
+  runWindowsPathPicker(script, environment, options = {}) {
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
       let settled = false;
+      let timer = null;
       const finish = (status, error = null) => {
         if (settled) {
           return;
         }
         settled = true;
+        clearTimeout(timer);
         resolve({ status, stdout, stderr, error });
       };
 
@@ -920,14 +1256,19 @@ try {
       });
       child.on('error', (error) => finish(null, error));
       child.on('close', (status) => finish(status));
+      const timeoutMs = Math.max(1000, Number(options.timeoutMs || PATH_PICKER_TIMEOUT_MS));
+      timer = setTimeout(() => {
+        const error = new Error(`系统路径选择器等待超过 ${Math.round(timeoutMs / 1000)} 秒，已自动关闭。`);
+        error.code = 'PATH_PICKER_TIMEOUT';
+        forceKillProcess(child);
+        finish(null, error);
+      }, timeoutMs);
+      timer.unref?.();
     });
   }
 
   async openOutputDir() {
-    await fsp.mkdir(this.settings.outputDir, { recursive: true });
-    openPath(this.settings.outputDir);
-    this.log('info', `已打开输出目录：${this.settings.outputDir}`);
-    return this.getState();
+    return this.openDirectoryWithFallback(this.settings.outputDir, { label: '录像保存目录' });
   }
 
   async openPathDir(filePath, options = {}) {
@@ -936,12 +1277,32 @@ try {
       throw new Error('路径为空。');
     }
     const resolved = path.resolve(targetPath);
-    const stat = await fsp.stat(resolved).catch(() => null);
-    const dir = options.asDirectory || stat?.isDirectory() ? resolved : path.dirname(resolved);
-    await fsp.mkdir(dir, { recursive: true });
-    openPath(dir);
-    this.log('info', `已打开所在目录：${dir}`);
-    return this.getState();
+    return this.openDirectoryWithFallback(resolved, {
+      label: options.asDirectory ? '指定目录' : '文件所在目录'
+    });
+  }
+
+  openSystemPath(targetPath) {
+    openPath(targetPath);
+  }
+
+  async openDirectoryWithFallback(targetPath, options = {}) {
+    const resolved = await this.resolveAvailableDirectory(targetPath, options.label || '目录');
+    this.openSystemPath(resolved.directory);
+    if (!resolved.fallback) {
+      this.log('info', `已打开目录：${resolved.directory}`);
+      return this.getState();
+    }
+    const message = `${resolved.reason}，已打开 ${resolved.directory}。原路径：${path.resolve(String(targetPath || ''))}`;
+    this.log('warn', message);
+    return {
+      ...this.getState(),
+      operationNotice: {
+        kind: 'warning',
+        title: '原目录不可用，已回退',
+        message
+      }
+    };
   }
 
   async startQrLogin() {
@@ -1096,19 +1457,30 @@ try {
     if (options.preserveCookie) {
       delete settingsUpdate.cookie;
     }
-    this.settings = this.normalizeSettings({
+    const normalizedSettings = this.normalizeSettings({
       ...this.settings,
       ...settingsUpdate
     });
-    await fsp.mkdir(this.settings.outputDir, { recursive: true });
-    if (oldOutputDir !== this.settings.outputDir && !this.hasActiveJobs()) {
+    const outputDirChanged = oldOutputDir !== normalizedSettings.outputDir;
+    const outputReady = await this.ensureDirectoryReady(normalizedSettings.outputDir, {
+      label: '录像保存目录',
+      allowUnavailable: !outputDirChanged
+    });
+    this.settings = normalizedSettings;
+    if (!outputReady) {
+      this.log(
+        'warn',
+        `录像保存目录当前不可用，其他设置仍已保存；恢复挂载或改用新目录后才能开始新录制：${this.settings.outputDir}`
+      );
+    }
+    if (outputDirChanged && !this.hasActiveJobs()) {
       setImmediate(() => {
         this.refreshRecordingLibrary({ silent: true }).catch((error) => {
           this.log('warn', `后台刷新录像库失败：${error.message}`);
           this.emitState();
         });
       });
-    } else if (oldOutputDir !== this.settings.outputDir) {
+    } else if (outputDirChanged) {
       this.log('info', '当前有录制或处理任务，已保留现有录像库；新保存目录会从下一次新录制开始使用。');
     }
     await this.saveStore();
@@ -1971,7 +2343,7 @@ try {
       const roomFolder = sanitizeFilename(`${room.realRoomId || room.id}-${room.anchor || 'anchor'}`) || `room-${room.id}`;
       const liveFolder = sanitizeFilename(`${timestamp}-${room.title || 'live'}`) || timestamp;
       const outputDir = String(options.outputDir || path.join(outputRoot, roomFolder, liveFolder)).trim() || outputRoot;
-      await fsp.mkdir(outputDir, { recursive: true });
+      await this.ensureDirectoryReady(outputDir, { label: '本场录像保存目录' });
 
       const baseName = sanitizeFilename(
         `${room.realRoomId || room.id}_${room.anchor || 'anchor'}_${room.title || 'live'}_${timestamp}`
@@ -2779,6 +3151,15 @@ try {
   }
 
   async performRecordingLibraryRefresh(options = {}) {
+    const outputProbe = await this.probePathAvailability(this.settings.outputDir);
+    if (outputProbe.kind !== 'directory') {
+      if (!options.silent) {
+        const reason = outputProbe.kind === 'timeout' ? '检测超时或盘符已断开' : '目录不存在或不可用';
+        this.log('warn', `录像库未扫描：保存目录${reason}，已保留现有录像列表。${this.settings.outputDir}`);
+        this.emitState();
+      }
+      return this.getState();
+    }
     const discovered = await discoverRecordingFiles(this.settings.outputDir, {
       ffmpegPath: this.ffmpegPath,
       segmentDurationSec: this.getSegmentDurationSec()
@@ -3579,7 +3960,7 @@ try {
         deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime)
     );
     this.assertExportOutputPath(outputDir, outputPath);
-    await fsp.mkdir(outputDir, { recursive: true });
+    await this.ensureDirectoryReady(outputDir, { label: '剪辑输出目录' });
     const id = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const startTimeText = formatFfmpegSeconds(startTime);
     const endTimeText = formatFfmpegSeconds(endTime);
@@ -3692,7 +4073,7 @@ try {
     }
     const duration = endTime - startTime;
     const outputDir = String(options.outputDir || path.dirname(recording.cleanPath));
-    await fsp.mkdir(outputDir, { recursive: true });
+    await this.ensureDirectoryReady(outputDir, { label: '剪辑输出目录' });
     const outputPath =
       options.outputPath ||
       deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime);
@@ -4452,10 +4833,11 @@ try {
     this.clearLoginTimer();
     clearTimeout(this.queuedUpdateTimer);
     if (this.pathPickerProcess) {
-      this.pathPickerProcess.kill('SIGKILL');
+      forceKillProcess(this.pathPickerProcess);
       this.pathPickerProcess = null;
       this.pathPickerPromise = null;
     }
+    this.pathPickerStarting = false;
     for (const timer of this.monitorTimers.values()) {
       clearInterval(timer);
     }

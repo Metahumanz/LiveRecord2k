@@ -94,6 +94,9 @@ export default function App() {
       if (isAppState(result)) {
         setState(result);
         setSettingsDraft(result.settings);
+        if (result.operationNotice) {
+          showToast(result.operationNotice);
+        }
       }
       return true;
     } catch (error) {
@@ -141,7 +144,7 @@ export default function App() {
   async function chooseOutputDir() {
     setBusy('choose-output-dir');
     try {
-      const selected = await recorder.chooseOutputDir();
+      const selected = await recorder.chooseOutputDir(settingsDraft?.outputDir || '');
       if (selected && settingsDraft) {
         setSettingsDraft({ ...settingsDraft, outputDir: selected });
       }
