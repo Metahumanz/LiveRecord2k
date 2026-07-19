@@ -30,6 +30,9 @@ const {
   createRepairTranscodeArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
+  createConcatTranscodeArgs,
+  selectHighestResolutionVideoInfo,
+  shouldTranscodeConcat,
   writeConcatFile,
   escapeConcatPath,
   mergeDanmakuFiles,
@@ -1903,7 +1906,6 @@ try {
     ).sort((a, b) => b - a);
     if (Number(this.settings.targetQn || 0) >= 10000 && Number(room.stream.qn || 0) < Number(this.settings.targetQn)) {
       room.qualityWarning = `请求 ${this.settings.targetQn}，接口实际选中 ${room.stream.qn}，可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先扫码登录或刷新 Cookie。`;
-      const capturePathExists = capturePath !== session.cleanPath && (await isExistingFile(capturePath));
       this.log(
         'warn',
         `${roomLabel(room)} 未拿到请求的高画质清晰度 ${this.settings.targetQn}，实际选中 ${room.stream.qn}，接口可选 ${availableQn.join('/') || '未知'}。如果直播间确认有 2K/4K，请先到设置页扫码登录，或重新扫码刷新 Cookie 后再试。`
@@ -2464,6 +2466,7 @@ try {
       await this.startNextSegmentNow(room, session);
     }
     const capturePath = session.capturePath || session.cleanPath;
+    const capturePathExists = capturePath !== session.cleanPath && (await isExistingFile(capturePath));
     const fileSizeBeforeFinalize = await getFileSize(capturePath);
     const validBeforeFinalize = isRecordingFileLikelyPlayable({
       fileSize: fileSizeBeforeFinalize,
@@ -2861,6 +2864,25 @@ try {
     const assPath = deriveSiblingPath(outputPath, 'danmaku', 'ass');
     const burnedPath = deriveBurnedPath(outputPath, this.settings.burnOverlayMode);
     const mergeDurationSec = segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0);
+    const segmentMediaInfos = [];
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, segment.cleanPath, { timeoutMs: 15000 });
+      if (!mediaInfo.videoInfo) {
+        throw new Error(`无法读取分段视频信息：${path.basename(segment.cleanPath)}`);
+      }
+      segmentMediaInfos.push({
+        ...mediaInfo,
+        durationSec:
+          Number(mediaInfo.durationSec) || Number(segment.durationSec) || getSegmentDurationForMerge(segment, segments[index + 1])
+      });
+    }
+    const targetVideoInfo = selectHighestResolutionVideoInfo(segmentMediaInfos);
+    if (!targetVideoInfo) {
+      throw new Error('没有找到可用于合并的目标分辨率。');
+    }
+    const requiresTranscode = shouldTranscodeConcat(segmentMediaInfos);
+    const mergeVideoCodec = isHevcCodec(targetVideoInfo.codec) ? 'libx265' : 'libx264';
     const progress = createFfmpegJobProgress({
       kind: 'merge',
       label: `合并续录分段：${path.basename(outputPath)}`,
@@ -2870,14 +2892,37 @@ try {
     });
     room.mergeProgress = progress;
 
-    this.log('info', `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}`);
+    this.log(
+      'info',
+      `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}。${
+        requiresTranscode
+          ? `检测到分辨率、帧率或编码规格变化，将全部统一为 ${targetVideoInfo.width}x${targetVideoInfo.height} 后合并`
+          : '各分段规格一致，使用快速无损合并'
+      }`
+    );
     this.emitState();
     try {
-      await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
       await fsp.rm(tmpPath, { force: true });
+      let mergeArgs;
+      if (requiresTranscode) {
+        mergeArgs = createConcatTranscodeArgs({
+          segments: segments.map((segment, index) => ({
+            filePath: segment.cleanPath,
+            durationSec: segmentMediaInfos[index].durationSec,
+            hasAudio: Boolean(segmentMediaInfos[index].audioInfo)
+          })),
+          outputPath: tmpPath,
+          container,
+          targetVideoInfo,
+          videoCodec: mergeVideoCodec
+        });
+      } else {
+        await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
+        mergeArgs = createConcatCopyArgs({ concatPath, outputPath: tmpPath, container });
+      }
       await runFfmpegJob(
         this.ffmpegPath,
-        createConcatCopyArgs({ concatPath, outputPath: tmpPath, container }),
+        mergeArgs,
         (line) => {
           if (room.mergeProgress?.id === progress.id && updateFfmpegJobProgress(room.mergeProgress, line)) {
             this.emitState();
@@ -2896,6 +2941,10 @@ try {
       await fsp.rm(outputPath, { force: true });
       await fsp.rename(tmpPath, outputPath);
       await fsp.rm(concatPath, { force: true });
+      const mergedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, outputPath, { timeoutMs: 15000 });
+      if (!mergedMediaInfo.videoInfo) {
+        throw new Error('合并文件生成后没有检测到视频流。');
+      }
       await mergeDanmakuFiles(segments, danmakuPath);
       await copyFirstExistingFile(segments.map((segment) => segment.cssPath).filter(Boolean), cssPath, createDefaultDanmakuCss());
 
@@ -2914,7 +2963,7 @@ try {
         mergeSequence: 0,
         mergeOutputPath: outputPath,
         mergedFrom: segments.map((segment) => segment.cleanPath),
-        durationSec: mergeDurationSec,
+        durationSec: Number(mergedMediaInfo.durationSec) || mergeDurationSec,
         fileSize: await getFileSize(outputPath),
         valid: true,
         eventCount: segments.reduce((sum, segment) => sum + Number(segment.eventCount || 0), 0),
@@ -2925,7 +2974,7 @@ try {
         ),
         ignoredDanmakuCount: segments.reduce((sum, segment) => sum + Number(segment.ignoredDanmakuCount || 0), 0),
         danmakuCommandCounts: mergeCommandCounts(segments.map((segment) => segment.danmakuCommandCounts)),
-        videoInfo: segments[0].videoInfo || null
+        videoInfo: mergedMediaInfo.videoInfo
       });
       const outputPathKey = path.resolve(outputPath).toLowerCase();
       const segmentPathKeys = new Set(segments.map((segment) => path.resolve(segment.cleanPath).toLowerCase()));

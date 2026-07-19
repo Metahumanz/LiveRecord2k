@@ -17,7 +17,7 @@ function formatFfmpegSeconds(value) {
 
 function isHevcCodec(codec) {
   const value = String(codec || '').toLowerCase();
-  return value.includes('hevc') || value.includes('h265');
+  return value.includes('hevc') || value.includes('h265') || value.includes('x265');
 }
 
 function escapeFilterPath(filePath) {
@@ -295,6 +295,148 @@ function createConcatCopyArgs({ concatPath, outputPath, container }) {
   return args;
 }
 
+function createConcatTranscodeArgs({ segments, outputPath, container, targetVideoInfo, videoCodec }) {
+  const width = makeEvenDimension(targetVideoInfo?.width);
+  const height = makeEvenDimension(targetVideoInfo?.height);
+  if (!Array.isArray(segments) || segments.length < 2) {
+    throw new Error('统一规格合并至少需要两个视频分段。');
+  }
+  if (!width || !height) {
+    throw new Error('统一规格合并缺少有效的目标分辨率。');
+  }
+
+  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  for (const segment of segments) {
+    args.push('-i', segment.filePath);
+  }
+
+  const targetFps = normalizeMergeFps(targetVideoInfo?.fps);
+  const filters = [];
+  const concatInputs = [];
+  segments.forEach((segment, index) => {
+    const fpsFilter = targetFps ? `,fps=${targetFps}` : '';
+    filters.push(
+      `[${index}:v:0]settb=AVTB,setpts=PTS-STARTPTS,` +
+        `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
+        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=yuv420p[v${index}]`
+    );
+    if (segment.hasAudio) {
+      filters.push(
+        `[${index}:a:0]aresample=48000:async=1:first_pts=0,` +
+          `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${index}]`
+      );
+    } else {
+      const durationSec = Math.max(0.001, Number(segment.durationSec) || 0.001);
+      filters.push(
+        `anullsrc=r=48000:cl=stereo,atrim=duration=${formatFfmpegSeconds(durationSec)},` +
+          `asetpts=PTS-STARTPTS[a${index}]`
+      );
+    }
+    concatInputs.push(`[v${index}][a${index}]`);
+  });
+  filters.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=1[vout][aout]`);
+
+  const codec = String(videoCodec || '').trim() || 'libx264';
+  args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-map', '[aout]', '-c:v', codec);
+  if (codec.includes('nvenc')) {
+    args.push('-preset', 'p5', '-cq', isHevcCodec(codec) ? '24' : '20', '-b:v', '0');
+  } else if (codec.includes('qsv')) {
+    args.push('-global_quality', isHevcCodec(codec) ? '24' : '20');
+  } else if (codec.includes('amf')) {
+    const qp = isHevcCodec(codec) ? '24' : '20';
+    args.push('-quality', 'balanced', '-qp_i', qp, '-qp_p', qp);
+  } else {
+    args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20');
+  }
+  args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-dn', '-sn', '-avoid_negative_ts', 'make_zero');
+  if (container === 'mp4') {
+    if (isHevcCodec(codec)) {
+      args.push('-tag:v', 'hvc1');
+    }
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
+  return args;
+}
+
+function selectHighestResolutionVideoInfo(mediaInfos) {
+  const candidates = (mediaInfos || [])
+    .map((mediaInfo) => mediaInfo?.videoInfo || mediaInfo)
+    .filter((videoInfo) => Number(videoInfo?.width) > 0 && Number(videoInfo?.height) > 0);
+  if (!candidates.length) {
+    return null;
+  }
+  const highestResolution = candidates.reduce((best, candidate) => {
+    const bestPixels = Number(best.width) * Number(best.height);
+    const candidatePixels = Number(candidate.width) * Number(candidate.height);
+    if (candidatePixels !== bestPixels) {
+      return candidatePixels > bestPixels ? candidate : best;
+    }
+    if (Number(candidate.width) !== Number(best.width)) {
+      return Number(candidate.width) > Number(best.width) ? candidate : best;
+    }
+    return Number(candidate.height) > Number(best.height) ? candidate : best;
+  });
+  const highestFps = candidates.reduce((maximum, videoInfo) => Math.max(maximum, Number(videoInfo.fps) || 0), 0);
+  return {
+    ...highestResolution,
+    width: makeEvenDimension(highestResolution.width),
+    height: makeEvenDimension(highestResolution.height),
+    fps: highestFps || highestResolution.fps
+  };
+}
+
+function shouldTranscodeConcat(mediaInfos) {
+  const infos = Array.isArray(mediaInfos) ? mediaInfos : [];
+  if (infos.length < 2 || infos.some((mediaInfo) => !mediaInfo?.videoInfo)) {
+    return infos.length >= 2;
+  }
+  const signatures = new Set(infos.map(createConcatStreamSignature));
+  return signatures.size > 1;
+}
+
+function createConcatStreamSignature(mediaInfo) {
+  const videoInfo = mediaInfo?.videoInfo || {};
+  const audioInfo = mediaInfo?.audioInfo || null;
+  const videoCodec = normalizeCodecFamily(videoInfo.codec);
+  const audioCodec = audioInfo ? normalizeCodecFamily(audioInfo.codec) : 'none';
+  return [
+    videoCodec,
+    `${Number(videoInfo.width) || 0}x${Number(videoInfo.height) || 0}`,
+    normalizeMergeFps(videoInfo.fps) || 'unknown-fps',
+    audioCodec,
+    Number(audioInfo?.sampleRate) || 0,
+    String(audioInfo?.channelLayout || '')
+  ].join('|');
+}
+
+function normalizeCodecFamily(codec) {
+  const value = String(codec || '').toLowerCase();
+  if (isHevcCodec(value)) {
+    return 'hevc';
+  }
+  if (value.includes('h264') || value.includes('avc')) {
+    return 'h264';
+  }
+  if (value.includes('aac')) {
+    return 'aac';
+  }
+  return value.split(/[\s,(]/)[0] || 'unknown';
+}
+
+function makeEvenDimension(value) {
+  const dimension = Math.floor(Number(value) || 0);
+  return dimension > 0 ? dimension - (dimension % 2) : 0;
+}
+
+function normalizeMergeFps(value) {
+  const fps = Number(value);
+  if (!Number.isFinite(fps) || fps <= 0) {
+    return 0;
+  }
+  return Number(fps.toFixed(3));
+}
+
 async function writeConcatFile(concatPath, filePaths) {
   const body = filePaths.map((filePath) => `file '${escapeConcatPath(filePath)}'`).join('\n');
   await fsp.writeFile(concatPath, `${body}\n`, 'utf8');
@@ -353,6 +495,10 @@ module.exports = {
   createRepairTranscodeArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
+  createConcatTranscodeArgs,
+  selectHighestResolutionVideoInfo,
+  shouldTranscodeConcat,
+  createConcatStreamSignature,
   writeConcatFile,
   escapeConcatPath,
   mergeDanmakuFiles,

@@ -897,11 +897,11 @@ async function readDanmakuDurationSec(danmakuPath) {
 
 async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
   if (!ffmpegPath || !filePath) {
-    return { durationSec: 0, videoInfo: null };
+    return { durationSec: 0, videoInfo: null, audioInfo: null };
   }
   const exists = await fsp.stat(filePath).then((stat) => stat.isFile()).catch(() => false);
   if (!exists) {
-    return { durationSec: 0, videoInfo: null };
+    return { durationSec: 0, videoInfo: null, audioInfo: null };
   }
   const probe = await runFfmpegProbe(ffmpegPath, ['-hide_banner', '-i', filePath], {
     timeoutMs: Number(options.timeoutMs || 8000)
@@ -913,7 +913,8 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
   }
   return {
     durationSec: parseFfmpegDuration(probe.output),
-    videoInfo: parseFfmpegVideoInfo(probe.output)
+    videoInfo: parseFfmpegVideoInfo(probe.output),
+    audioInfo: parseFfmpegAudioInfo(probe.output)
   };
 }
 
@@ -992,6 +993,23 @@ function parseFfmpegVideoInfo(text) {
     width: Number(sizeMatch[1]),
     height: Number(sizeMatch[2]),
     fps: Number.isFinite(fps) && fps > 0 ? fps : undefined
+  };
+}
+
+function parseFfmpegAudioInfo(text) {
+  const line = String(text || '')
+    .split(/\r?\n/)
+    .find((item) => /Audio:/i.test(item));
+  if (!line) {
+    return null;
+  }
+  const codecMatch = line.match(/Audio:\s*([^,\r\n]+)/i);
+  const sampleRateMatch = line.match(/,\s*(\d+)\s*Hz/i);
+  const channelLayoutMatch = line.match(/,\s*(mono|stereo|(?:\d+\.\d+)(?:\([^)]*\))?)(?:,|\s|$)/i);
+  return {
+    codec: codecMatch ? codecMatch[1].trim() : '',
+    sampleRate: sampleRateMatch ? Number(sampleRateMatch[1]) : undefined,
+    channelLayout: channelLayoutMatch ? channelLayoutMatch[1].trim().toLowerCase() : undefined
   };
 }
 
@@ -2047,6 +2065,7 @@ module.exports = {
   escapeFilterPath,
   compactLogLine,
   parseFfmpegVideoInfo,
+  parseFfmpegAudioInfo,
   buildActualQualityWarning,
   clamp,
   roomLabel,
