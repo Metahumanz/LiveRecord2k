@@ -98,10 +98,13 @@ const DEFAULT_DANMAKU_STYLE = {
   danmakuDuration: 8,
   danmakuTop: 36,
   danmakuLineHeight: 46,
-  boxFontSize: 30,
-  panelLeft: 34,
+  boxFontSize: 29,
+  panelLeft: 5,
   superChatLanes: 3,
-  superChatBottom: 618,
+  superChatBottom: 1070,
+  superChatWidth: 375,
+  superChatGap: 5,
+  messageDuration: 5,
   giftLanes: 4,
   giftBottom: 922,
   giftWidth: 540,
@@ -114,6 +117,9 @@ const DEFAULT_DANMAKU_STYLE = {
 };
 
 const LEGACY_DEFAULT_DANMAKU_STYLE = {
+  boxFontSize: 30,
+  panelLeft: 34,
+  superChatBottom: 618,
   giftBottom: 934,
   giftWidth: 460,
   giftHeight: 46,
@@ -123,21 +129,14 @@ const LEGACY_DEFAULT_DANMAKU_STYLE = {
   giftFontSize: 18
 };
 
-const SUPERCHAT_CARD = {
-  minWidth: 300,
-  maxWidth: 500,
-  headerHeight: 34,
-  bodyHeight: 70,
-  rowGap: 108,
-  radius: 10,
-  titleFontSize: 23,
-  textFontSize: 20,
-  paddingX: 16,
-  titleOffsetY: 6,
-  textOffsetY: 42,
-  defaultDuration: 10,
-  minDuration: 5,
-  maxDuration: 15
+// Match DanmakuFactory's lower-left SC/guard hierarchy while keeping this renderer's ASS pipeline.
+// Reference: https://github.com/hihkm/DanmakuFactory/blob/master/src/AssFile/AssFile.c
+const MESSAGE_CARD = {
+  maxBodyLines: 3,
+  metaFontScale: 0.8,
+  animationDuration: 0.25,
+  defaultDuration: 5,
+  maxDuration: 86400
 };
 
 const DANMAKU_DISPLAY_AREAS = {
@@ -225,10 +224,13 @@ function createDefaultDanmakuCss() {
   --danmaku-duration: 8;
   --danmaku-top: 36;
   --danmaku-line-height: 46;
-  --box-font-size: 30;
-  --panel-left: 34;
+  --box-font-size: 29;
+  --panel-left: 5;
   --superchat-lanes: 3;
-  --superchat-bottom: 618;
+  --superchat-bottom: 1070;
+  --superchat-width: 375;
+  --superchat-gap: 5;
+  --message-duration: 5;
   --gift-lanes: 4;
   --gift-bottom: 922;
   --gift-width: 540;
@@ -279,10 +281,19 @@ function normalizeDanmakuStyle(values = {}) {
     danmakuDuration: pickNumber('danmaku-duration', DEFAULT_DANMAKU_STYLE.danmakuDuration, 2, 20),
     danmakuTop: pickNumber('danmaku-top', DEFAULT_DANMAKU_STYLE.danmakuTop, 0, 2000),
     danmakuLineHeight: pickNumber('danmaku-line-height', DEFAULT_DANMAKU_STYLE.danmakuLineHeight, 16, 180),
-    boxFontSize: pickNumber('box-font-size', DEFAULT_DANMAKU_STYLE.boxFontSize, 12, 80),
-    panelLeft: pickNumber('panel-left', DEFAULT_DANMAKU_STYLE.panelLeft, 0, 2000),
+    boxFontSize: pickNumber('box-font-size', DEFAULT_DANMAKU_STYLE.boxFontSize, 12, 80, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.boxFontSize
+    }),
+    panelLeft: pickNumber('panel-left', DEFAULT_DANMAKU_STYLE.panelLeft, 0, 2000, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.panelLeft
+    }),
     superChatLanes: Math.round(pickNumber('superchat-lanes', DEFAULT_DANMAKU_STYLE.superChatLanes, 1, 10)),
-    superChatBottom: pickNumber('superchat-bottom', DEFAULT_DANMAKU_STYLE.superChatBottom, 0, 4000),
+    superChatBottom: pickNumber('superchat-bottom', DEFAULT_DANMAKU_STYLE.superChatBottom, 0, 4000, {
+      upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.superChatBottom
+    }),
+    superChatWidth: pickNumber('superchat-width', DEFAULT_DANMAKU_STYLE.superChatWidth, 220, 1200),
+    superChatGap: pickNumber('superchat-gap', DEFAULT_DANMAKU_STYLE.superChatGap, 0, 100),
+    messageDuration: pickNumber('message-duration', DEFAULT_DANMAKU_STYLE.messageDuration, 0, 3600),
     giftLanes: Math.round(pickNumber('gift-lanes', DEFAULT_DANMAKU_STYLE.giftLanes, 1, 16)),
     giftBottom: pickNumber('gift-bottom', DEFAULT_DANMAKU_STYLE.giftBottom, 0, 4000, {
       upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftBottom
@@ -324,7 +335,9 @@ function prepareAssEvents(events, options = {}) {
         return false;
       }
       const eventStart = Number(event.time || 0);
-      const eventEnd = eventStart + getDanmakuEventDuration(event);
+      const eventEnd = eventStart + getDanmakuEventDuration(event, {
+        messageDuration: options.messageDuration
+      });
       if (hasStart && eventEnd < startTime) {
         return false;
       }
@@ -340,48 +353,22 @@ function prepareAssEvents(events, options = {}) {
     .sort((a, b) => a.time - b.time);
 }
 
-function getDanmakuEventDuration(event) {
-  if (event.type === 'superchat') {
-    return clamp(
-      Number(event.duration) || SUPERCHAT_CARD.defaultDuration,
-      SUPERCHAT_CARD.minDuration,
-      SUPERCHAT_CARD.maxDuration
-    );
-  }
+function getDanmakuEventDuration(event, options = {}) {
   if (event.type === 'danmaku') {
     return 8;
   }
-  return event.type === 'guard' ? 8 : 5;
-}
-
-function mergeGiftCombos(events) {
-  const result = [];
-  const lastByKey = new Map();
-  for (const event of events) {
-    if (event.type !== 'gift' && event.type !== 'guard') {
-      result.push(event);
-      continue;
+  if (['gift', 'superchat', 'guard'].includes(event.type)) {
+    const eventOverride = Number(event.cardDuration);
+    if (Number.isFinite(eventOverride) && eventOverride > 0) {
+      return clamp(eventOverride, 0.01, MESSAGE_CARD.maxDuration);
     }
-    const key = `${event.type}|${event.uid || event.user || ''}|${event.giftName || ''}`;
-    const last = lastByKey.get(key);
-    if (last && Number(event.time || 0) - Number(last.lastComboTime || last.time || 0) <= 6) {
-      const count = Number(event.count || 1);
-      last.count = Number(last.count || 1) + count;
-      last.totalPrice = Number(last.totalPrice || 0) + resolveGiftTotalPrice(event);
-      last.comboCount = Number(last.comboCount || 1) + 1;
-      last.lastComboTime = Number(event.time || 0);
-      continue;
+    const globalOverride = Number(options.messageDuration);
+    if (Number.isFinite(globalOverride) && globalOverride > 0) {
+      return clamp(globalOverride, 0.01, MESSAGE_CARD.maxDuration);
     }
-    const next = {
-      ...event,
-      totalPrice: resolveGiftTotalPrice(event),
-      comboCount: 1,
-      lastComboTime: Number(event.time || 0)
-    };
-    result.push(next);
-    lastByKey.set(key, next);
+    return clamp(Number(event.duration) || MESSAGE_CARD.defaultDuration, 0.01, MESSAGE_CARD.maxDuration);
   }
-  return result.sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
+  return MESSAGE_CARD.defaultDuration;
 }
 
 function resolveGiftTotalPrice(event) {
@@ -398,12 +385,13 @@ function createAss(events, options = {}) {
   const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
   const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea);
   const style = normalizeDanmakuStyle(options.style);
-  const sorted = mergeGiftCombos(prepareAssEvents(events, {
+  const sorted = prepareAssEvents(events, {
     overlayMode,
     startTime: options.startTime,
     endTime: options.endTime,
-    shiftTime: options.shiftTime
-  }));
+    shiftTime: options.shiftTime,
+    messageDuration: style.messageDuration
+  });
   const lines = [
     '[Script Info]',
     'ScriptType: v4.00+',
@@ -424,9 +412,6 @@ function createAss(events, options = {}) {
 
   const danmakuLayout = getDanmakuLayoutMetrics(style, danmakuArea);
   const danmakuRows = Array(danmakuLayout.lanes).fill(0);
-  const scRows = Array(style.superChatLanes).fill(0);
-  const giftScroll = getGiftScrollMetrics(style);
-  let nextGiftStart = 0;
 
   for (const event of sorted) {
     if (event.type === 'danmaku') {
@@ -448,166 +433,499 @@ function createAss(events, options = {}) {
       );
       continue;
     }
+  }
 
-    if (event.type === 'superchat') {
-      const duration = clamp(
-        Number(event.duration) || SUPERCHAT_CARD.defaultDuration,
-        SUPERCHAT_CARD.minDuration,
-        SUPERCHAT_CARD.maxDuration
-      );
-      const row = chooseLane(scRows, event.time, duration);
-      const x = style.panelLeft;
-      const y = style.superChatBottom - row * SUPERCHAT_CARD.rowGap;
-      const palette = superChatPalette(event.price || 0);
-      const title = `${event.user || '用户'}  ￥${event.price || 0}`;
-      const cardWidth = resolveSuperChatWidth(title, event.text);
-      const textWidth = cardWidth - SUPERCHAT_CARD.paddingX * 2;
-      lines.push(
-        drawRoundedRect(
-          7,
-          event.time,
-          event.time + duration,
-          x,
-          y,
-          cardWidth,
-          SUPERCHAT_CARD.headerHeight,
-          SUPERCHAT_CARD.radius,
-          palette.header,
-          { corners: { tl: true, tr: true, br: false, bl: false } }
-        )
-      );
-      lines.push(
-        drawRoundedRect(
-          6,
-          event.time,
-          event.time + duration,
-          x,
-          y + SUPERCHAT_CARD.headerHeight,
-          cardWidth,
-          SUPERCHAT_CARD.bodyHeight,
-          SUPERCHAT_CARD.radius,
-          palette.body,
-          { corners: { tl: false, tr: false, br: true, bl: true } }
-        )
-      );
-      lines.push(
-        dialogue(
-          8,
-          event.time,
-          event.time + duration,
-          'BoxText',
-          `{\\fad(120,260)\\pos(${x + SUPERCHAT_CARD.paddingX},${y + SUPERCHAT_CARD.titleOffsetY})\\fs${
-            SUPERCHAT_CARD.titleFontSize
-          }\\b1}${assEscape(title)}`
-        )
-      );
-      lines.push(
-        dialogue(
-          8,
-          event.time,
-          event.time + duration,
-          'BoxText',
-          `{\\fad(120,260)\\pos(${x + SUPERCHAT_CARD.paddingX},${y + SUPERCHAT_CARD.textOffsetY})\\fs${
-            SUPERCHAT_CARD.textFontSize
-          }\\b0}${assEscape(wrapTextToWidth(event.text, textWidth, SUPERCHAT_CARD.textFontSize, 2))}`
-        )
-      );
-      continue;
-    }
-
-    if (event.type === 'gift' || event.type === 'guard') {
-      const duration = giftScroll.duration;
-      const displayStart = Math.max(event.time, nextGiftStart);
-      const displayEnd = displayStart + duration;
-      nextGiftStart = displayStart + giftScroll.minStartGap;
-      const x = style.panelLeft;
-      const totalPrice = resolveGiftTotalPrice(event);
-      const priceLabel = totalPrice > 0 ? `￥${formatGiftPrice(totalPrice)}` : '';
-      const comboLabel = Number(event.comboCount || 0) > 1 ? ` COMBO ${event.comboCount}` : '';
-      const label =
-        event.type === 'guard'
-          ? `${event.user || '用户'} 开通 ${event.giftName || guardName(event.guardLevel)} x${event.count || 1}${comboLabel}`
-          : `${event.user || '用户'} 送出 ${event.giftName || '礼物'} x${event.count || 1}${comboLabel}`;
-      const subLabel = priceLabel || (event.type === 'guard' ? '大航海' : '礼物互动');
-      const avatarSize = clamp(style.giftHeight - 18, 32, 44);
-      const avatarInset = Math.max(7, Math.round((style.giftHeight - avatarSize) / 2));
-      const textX = x + avatarInset + avatarSize + 12;
-      const titleOffsetY = Math.max(6, Math.round(style.giftHeight * 0.12));
-      const subOffsetY = Math.max(titleOffsetY + style.giftFontSize + 4, Math.round(style.giftHeight * 0.58));
-      const giftWidth = resolveGiftWidth(style, textX - x, label, subLabel);
-      const giftRadius = Math.min(style.giftRadius, Math.floor(style.giftHeight / 4));
-      const textWidth = giftWidth - (textX - x) - 18;
-      lines.push(
-        drawRoundedRect(
-          5,
-          displayStart,
-          displayEnd,
-          x,
-          giftScroll.startY,
-          giftWidth,
-          style.giftHeight,
-          giftRadius,
-          event.type === 'guard' ? '&HB8422514&' : '&HAE2A1B12&',
-          {
-            clip: giftScroll.clip,
-            move: { x1: x, y1: giftScroll.startY, x2: x, y2: giftScroll.endY },
-            popIn: true
-          }
-        )
-      );
-      lines.push(
-        drawRoundedRect(
-          6,
-          displayStart,
-          displayEnd,
-          x + avatarInset,
-          giftScroll.startY + avatarInset,
-          avatarSize,
-          avatarSize,
-          avatarSize / 2,
-          event.type === 'guard' ? '&H00D8C36E&' : '&H0079DED5&',
-          {
-            clip: giftScroll.clip,
-            move: {
-              x1: x + avatarInset,
-              y1: giftScroll.startY + avatarInset,
-              x2: x + avatarInset,
-              y2: giftScroll.endY + avatarInset
-            },
-            popIn: true
-          }
-        )
-      );
-      lines.push(
-        dialogue(
-          7,
-          displayStart,
-          displayEnd,
-          'BoxText',
-          `{\\fad(120,260)${clipTag(giftScroll.clip)}${popInTag()}\\move(${assNumber(textX)},${assNumber(
-            giftScroll.startY + titleOffsetY
-          )},${assNumber(textX)},${assNumber(giftScroll.endY + titleOffsetY)})\\fs${assNumber(
-            style.giftFontSize
-          )}\\b1}${assEscape(truncateTextToWidth(label, textWidth, style.giftFontSize))}`
-        )
-      );
-      lines.push(
-        dialogue(
-          7,
-          displayStart,
-          displayEnd,
-          'BoxText',
-          `{\\fad(120,260)${clipTag(giftScroll.clip)}${popInTag()}\\move(${assNumber(textX)},${assNumber(
-            giftScroll.startY + subOffsetY
-          )},${assNumber(textX)},${assNumber(giftScroll.endY + subOffsetY)})\\fs${assNumber(
-            Math.max(12, style.giftFontSize - 4)
-          )}\\1c&H00D8C36E&}${assEscape(truncateTextToWidth(subLabel, textWidth, style.giftFontSize - 4))}`
-        )
-      );
-    }
+  if (overlayMode === 'danmaku-gift') {
+    lines.push(...renderMessageStack(sorted.filter((event) => event.type !== 'danmaku'), style));
   }
 
   return `${lines.join('\n')}\n`;
+}
+
+function createMessageItems(events, style) {
+  const items = [];
+  const liveGiftByKey = new Map();
+  const sorted = [...events].sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
+
+  for (const sourceEvent of sorted) {
+    if (!['gift', 'superchat', 'guard'].includes(sourceEvent.type)) {
+      continue;
+    }
+    const time = Math.max(0, Number(sourceEvent.time) || 0);
+    const duration = getDanmakuEventDuration(sourceEvent, { messageDuration: style.messageDuration });
+    if (sourceEvent.type === 'gift') {
+      const key = `${sourceEvent.uid || sourceEvent.user || ''}|${sourceEvent.giftName || ''}`;
+      const previous = liveGiftByKey.get(key);
+      if (previous && time <= previous.end + 0.0001) {
+        const lastVersion = previous.versions[previous.versions.length - 1].event;
+        const count = Math.max(1, Number(lastVersion.count) || 1) + Math.max(1, Number(sourceEvent.count) || 1);
+        const versionEvent = {
+          ...sourceEvent,
+          time,
+          count,
+          comboCount: Math.max(1, Number(lastVersion.comboCount) || 1) + 1,
+          totalPrice: resolveGiftTotalPrice(lastVersion) + resolveGiftTotalPrice(sourceEvent)
+        };
+        const lastVersionTime = previous.versions[previous.versions.length - 1].time;
+        if (Math.abs(lastVersionTime - time) < 0.0001) {
+          previous.versions[previous.versions.length - 1] = { time, event: versionEvent };
+        } else {
+          previous.versions.push({ time, event: versionEvent });
+        }
+        previous.event = versionEvent;
+        previous.end = Math.max(previous.end, time + duration);
+        continue;
+      }
+    }
+
+    const event = {
+      ...sourceEvent,
+      time,
+      count: Math.max(1, Number(sourceEvent.count) || 1),
+      comboCount: 1,
+      totalPrice: resolveGiftTotalPrice(sourceEvent)
+    };
+    const item = {
+      id: `message-${items.length}`,
+      order: items.length,
+      type: event.type,
+      start: time,
+      end: time + duration,
+      height: getMessageItemHeight(event, style),
+      event,
+      versions: [{ time, event }]
+    };
+    items.push(item);
+    if (event.type === 'gift') {
+      const key = `${event.uid || event.user || ''}|${event.giftName || ''}`;
+      liveGiftByKey.set(key, item);
+    }
+  }
+
+  return items;
+}
+
+function getMessageItemHeight(event, style) {
+  if (event.type === 'superchat') {
+    return getMessageCardMetrics(style, event.text).height;
+  }
+  if (event.type === 'guard') {
+    return getGuardCardMetrics(style).height;
+  }
+  return getGuardCardMetrics(style).height;
+}
+
+function createMessageTimeline(events, styleValues = {}) {
+  const style = Object.prototype.hasOwnProperty.call(styleValues, 'playWidth')
+    ? { ...DEFAULT_DANMAKU_STYLE, ...styleValues }
+    : normalizeDanmakuStyle(styleValues);
+  const items = createMessageItems(events, style);
+  const boundaries = new Map();
+  const addBoundary = (time, kind, item) => {
+    if (!boundaries.has(time)) {
+      boundaries.set(time, { time, starts: [], ends: [] });
+    }
+    boundaries.get(time)[kind].push(item);
+  };
+  for (const item of items) {
+    addBoundary(item.start, 'starts', item);
+    addBoundary(item.end, 'ends', item);
+  }
+
+  const active = new Map();
+  const changesById = new Map(items.map((item) => [item.id, []]));
+  const orderedBoundaries = [...boundaries.values()].sort((a, b) => a.time - b.time);
+  for (const boundary of orderedBoundaries) {
+    const before = layoutMessageItems([...active.values()], style);
+    for (const item of boundary.ends) {
+      active.delete(item.id);
+    }
+    for (const item of boundary.starts) {
+      active.set(item.id, item);
+    }
+    const after = layoutMessageItems([...active.values()], style);
+    const startedIds = new Set(boundary.starts.map((item) => item.id));
+    for (const item of active.values()) {
+      const toY = after.get(item.id);
+      if (startedIds.has(item.id)) {
+        changesById.get(item.id).push({
+          time: boundary.time,
+          fromY: style.superChatBottom,
+          toY,
+          reason: 'entry'
+        });
+        continue;
+      }
+      const fromY = before.get(item.id);
+      if (Number.isFinite(fromY) && Math.abs(fromY - toY) > 0.001) {
+        changesById.get(item.id).push({
+          time: boundary.time,
+          fromY,
+          toY,
+          reason: boundary.starts.length ? 'push' : 'reflow'
+        });
+      }
+    }
+  }
+
+  for (const item of items) {
+    item.changes = changesById.get(item.id);
+    item.segments = buildMessageMotionSegments(item, item.changes, style);
+  }
+  return { style, items };
+}
+
+function layoutMessageItems(items, style) {
+  const positions = new Map();
+  const gap = Math.max(0, Number(style.superChatGap) || 0);
+  let cursor = Number(style.superChatBottom) || DEFAULT_DANMAKU_STYLE.superChatBottom;
+  const ordered = [...items].sort((a, b) => a.start - b.start || a.order - b.order);
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const item = ordered[index];
+    cursor -= item.height;
+    positions.set(item.id, cursor);
+    cursor -= gap;
+  }
+  return positions;
+}
+
+function buildMessageMotionSegments(item, changes, style) {
+  if (!changes.length || item.end <= item.start) {
+    return [];
+  }
+  const animationDuration = MESSAGE_CARD.animationDuration;
+  const first = changes[0];
+  let cursor = item.start;
+  let state = {
+    start: first.time,
+    end: first.time + animationDuration,
+    fromY: first.fromY,
+    toY: first.toY
+  };
+  const ySegments = [];
+  const stateY = (time) => {
+    if (time <= state.start) return state.fromY;
+    if (time >= state.end) return state.toY;
+    return state.fromY + ((state.toY - state.fromY) * (time - state.start)) / (state.end - state.start);
+  };
+  const appendUntil = (limit) => {
+    const safeLimit = Math.min(limit, item.end);
+    if (safeLimit <= cursor) return;
+    if (cursor < state.end) {
+      const movingEnd = Math.min(safeLimit, state.end);
+      ySegments.push({ start: cursor, end: movingEnd, y1: stateY(cursor), y2: stateY(movingEnd) });
+      cursor = movingEnd;
+    }
+    if (cursor < safeLimit) {
+      ySegments.push({ start: cursor, end: safeLimit, y1: state.toY, y2: state.toY });
+      cursor = safeLimit;
+    }
+  };
+
+  for (const change of changes.slice(1)) {
+    appendUntil(change.time);
+    const currentY = stateY(change.time);
+    state = {
+      start: change.time,
+      end: change.time + animationDuration,
+      fromY: currentY,
+      toY: change.toY
+    };
+  }
+  appendUntil(item.end);
+
+  const splitTimes = [
+    ...item.versions.slice(1).map((version) => version.time),
+    Math.max(item.start, item.end - animationDuration)
+  ];
+  const splitSegments = splitMotionSegments(ySegments, splitTimes);
+  const exitStart = Math.max(item.start, item.end - animationDuration);
+  const panelLeft = Number(style.panelLeft) || 0;
+  const exitWidth = Math.max(1, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const xAt = (time) => {
+    if (time <= exitStart) return panelLeft;
+    if (time >= item.end) return panelLeft - exitWidth;
+    return panelLeft - (exitWidth * (time - exitStart)) / (item.end - exitStart);
+  };
+  return splitSegments.map((segment) => ({
+    ...segment,
+    x1: xAt(segment.start),
+    x2: xAt(segment.end),
+    event: messageVersionAt(item, segment.start)
+  }));
+}
+
+function splitMotionSegments(segments, splitTimes) {
+  const output = [];
+  for (const segment of segments) {
+    const cuts = splitTimes
+      .filter((time) => time > segment.start + 0.0001 && time < segment.end - 0.0001)
+      .sort((a, b) => a - b);
+    const points = [segment.start, ...cuts, segment.end];
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const start = points[index];
+      const end = points[index + 1];
+      const ratioAt = (time) => (segment.end === segment.start ? 1 : (time - segment.start) / (segment.end - segment.start));
+      output.push({
+        start,
+        end,
+        y1: segment.y1 + (segment.y2 - segment.y1) * ratioAt(start),
+        y2: segment.y1 + (segment.y2 - segment.y1) * ratioAt(end)
+      });
+    }
+  }
+  return output;
+}
+
+function messageVersionAt(item, time) {
+  let event = item.versions[0].event;
+  for (const version of item.versions) {
+    if (version.time > time + 0.0001) break;
+    event = version.event;
+  }
+  return event;
+}
+
+function renderMessageStack(events, style) {
+  const timeline = createMessageTimeline(events, style);
+  const clip = {
+    x1: style.panelLeft,
+    y1: 0,
+    x2: style.panelLeft + style.superChatWidth,
+    y2: style.superChatBottom
+  };
+  const lines = [];
+  for (const item of timeline.items) {
+    for (const segment of item.segments) {
+      if (segment.end - segment.start < 0.001) continue;
+      if (item.type === 'superchat') {
+        lines.push(...renderSuperChatCardSegment(segment.event, style, segment, clip));
+      } else if (item.type === 'guard') {
+        lines.push(...renderGuardCardSegment(segment.event, style, segment, clip));
+      } else {
+        lines.push(...renderGiftCardSegment(segment.event, style, segment, clip));
+      }
+    }
+  }
+  return lines;
+}
+
+function segmentPositionTag(segment, offsetX = 0, offsetY = 0) {
+  const x1 = segment.x1 + offsetX;
+  const y1 = segment.y1 + offsetY;
+  const x2 = segment.x2 + offsetX;
+  const y2 = segment.y2 + offsetY;
+  if (Math.abs(x1 - x2) < 0.001 && Math.abs(y1 - y2) < 0.001) {
+    return `\\pos(${assNumber(x1)},${assNumber(y1)})`;
+  }
+  return `\\move(${assNumber(x1)},${assNumber(y1)},${assNumber(x2)},${assNumber(y2)})`;
+}
+
+function segmentShapeOptions(segment, clip, offsetX = 0, offsetY = 0, corners) {
+  const x1 = segment.x1 + offsetX;
+  const y1 = segment.y1 + offsetY;
+  const x2 = segment.x2 + offsetX;
+  const y2 = segment.y2 + offsetY;
+  return {
+    clip,
+    fade: false,
+    corners,
+    move:
+      Math.abs(x1 - x2) < 0.001 && Math.abs(y1 - y2) < 0.001
+        ? undefined
+        : { x1, y1, x2, y2 }
+  };
+}
+
+function renderSuperChatCardSegment(event, style, segment, clip) {
+  const metrics = getMessageCardMetrics(style, event.text);
+  const palette = superChatPalette(event.price || 0);
+  const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
+  const price = formatSuperChatPrice(event.price);
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  const shapeX = segment.x1;
+  const shapeY = segment.y1;
+  return [
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      shapeX,
+      shapeY,
+      metrics.width,
+      metrics.headerHeight,
+      metrics.radius,
+      palette.header,
+      segmentShapeOptions(segment, clip, 0, 0, { tl: true, tr: true, br: false, bl: false })
+    ),
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      shapeX,
+      shapeY + metrics.headerHeight,
+      metrics.width,
+      metrics.bodyHeight,
+      metrics.radius,
+      palette.body,
+      segmentShapeOptions(segment, clip, 0, metrics.headerHeight, { tl: false, tr: false, br: true, bl: true })
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
+        metrics.fontSize
+      )}\\1c${palette.username}\\b1}${assEscape(username)}`
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
+        metrics.metaFontSize
+      )}\\1c&H00313131&\\b0}${assEscape(`SuperChat CNY ${price}`)}`
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.headerHeight)}\\fs${assNumber(
+        metrics.fontSize
+      )}\\1c&H00FFFFFF&\\b0}${assEscape(metrics.wrappedText)}`
+    )
+  ];
+}
+
+function renderGuardCardSegment(event, style, segment, clip) {
+  const metrics = getGuardCardMetrics(style);
+  const palette = guardCardPalette(event.guardLevel, resolveGiftTotalPrice(event));
+  const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
+  const role = event.giftName || guardName(event.guardLevel);
+  const count = Math.max(1, Number(event.count) || 1);
+  const welcome = `Welcome new ${role}${count > 1 ? ` x${count}` : ''}!`;
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  return [
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1,
+      metrics.width,
+      metrics.height,
+      metrics.radius,
+      palette.background,
+      segmentShapeOptions(segment, clip)
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
+        metrics.fontSize
+      )}\\1c${palette.username}\\b0}${assEscape(username)}`
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
+        metrics.metaFontSize
+      )}\\1c&H00313131&\\b0}${assEscape(
+        truncateTextToWidth(welcome, metrics.textWidth, metrics.metaFontSize)
+      )}`
+    )
+  ];
+}
+
+function renderGiftCardSegment(event, style, segment, clip) {
+  const metrics = getGuardCardMetrics(style);
+  const palette = giftCardPalette(resolveGiftTotalPrice(event));
+  const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
+  const count = Math.max(1, Number(event.count) || 1);
+  const giftText = `赠送 ${event.giftName || '礼物'} x${count}`;
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  return [
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1,
+      metrics.width,
+      metrics.height,
+      metrics.radius,
+      palette.background,
+      segmentShapeOptions(segment, clip)
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
+        metrics.fontSize
+      )}\\1c${palette.username}\\b0}${assEscape(username)}`
+    ),
+    dialogue(
+      7,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
+        metrics.metaFontSize
+      )}\\1c${palette.detail}\\b0}${assEscape(
+        truncateTextToWidth(giftText, metrics.textWidth, metrics.metaFontSize)
+      )}`
+    )
+  ];
+}
+
+function getMessageCardMetrics(style, text, maxLines = MESSAGE_CARD.maxBodyLines) {
+  const fontSize = Math.max(12, Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize);
+  const radius = fontSize / 2;
+  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const insetX = radius / 2;
+  const metaFontSize = Math.max(12, Math.floor(fontSize * MESSAGE_CARD.metaFontScale));
+  const headerHeight = fontSize + metaFontSize + radius / 2;
+  const textWidth = width - insetX * 2;
+  const wrappedLines = wrapTextToWidthLines(text, textWidth, fontSize / 1.25, maxLines);
+  const bodyLines = wrappedLines.length ? wrappedLines : [''];
+  const bodyHeight = bodyLines.length * fontSize + radius / 2;
+  return {
+    width,
+    height: headerHeight + bodyHeight,
+    radius,
+    insetX,
+    fontSize,
+    metaFontSize,
+    headerHeight,
+    bodyHeight,
+    textWidth,
+    wrappedText: bodyLines.join('\\N')
+  };
+}
+
+function getGuardCardMetrics(style) {
+  const fontSize = Math.max(12, Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize);
+  const radius = fontSize / 2;
+  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const metaFontSize = Math.max(12, Math.floor(fontSize * MESSAGE_CARD.metaFontScale));
+  return {
+    width,
+    height: fontSize + metaFontSize + radius,
+    radius,
+    insetX: radius / 2,
+    fontSize,
+    metaFontSize,
+    textWidth: width - radius
+  };
 }
 
 function drawRect(layer, start, end, x, y, width, height, color) {
@@ -628,13 +946,13 @@ function drawRoundedRect(layer, start, end, x, y, width, height, radius, color, 
         options.move.y2
       )})`
     : `\\pos(${assNumber(x)},${assNumber(y)})`;
-  const popIn = options.popIn ? popInTag() : '';
+  const fade = options.fade === false ? '' : '\\fad(120,260)';
   return dialogue(
     layer,
     start,
     end,
     'Shape',
-    `{\\fad(120,260)${clipTag(options.clip)}${popIn}\\p1${position}\\bord0\\shad0${assShapeColorTags(color)}}${shape}`
+    `{${fade}${clipTag(options.clip)}\\p1${position}\\bord0\\shad0${assShapeColorTags(color)}}${shape}`
   );
 }
 
@@ -675,53 +993,6 @@ function roundedRectPath(width, height, radius, corners = {}) {
   ].join(' ');
 }
 
-function resolveSuperChatWidth(title, text) {
-  const maxTextWidth = SUPERCHAT_CARD.maxWidth - SUPERCHAT_CARD.paddingX * 2;
-  const desiredTextWidth = Math.min(estimateTextWidth(text, SUPERCHAT_CARD.textFontSize), maxTextWidth);
-  const desiredTitleWidth = Math.min(estimateTextWidth(title, SUPERCHAT_CARD.titleFontSize), maxTextWidth);
-  return clamp(
-    Math.ceil(Math.max(desiredTitleWidth, desiredTextWidth) + SUPERCHAT_CARD.paddingX * 2),
-    SUPERCHAT_CARD.minWidth,
-    SUPERCHAT_CARD.maxWidth
-  );
-}
-
-function resolveGiftWidth(style, textOffsetX, label, subLabel) {
-  const maxWidth = Math.max(180, Number(style.giftWidth) || DEFAULT_DANMAKU_STYLE.giftWidth);
-  const minWidth = Math.min(maxWidth, Math.max(280, Math.round(Number(style.giftHeight || 0) * 5.2)));
-  const labelWidth = estimateTextWidth(label, style.giftFontSize);
-  const subLabelWidth = estimateTextWidth(subLabel, Math.max(12, style.giftFontSize - 4));
-  return clamp(Math.ceil(textOffsetX + Math.max(labelWidth, subLabelWidth) + 18), minWidth, maxWidth);
-}
-
-function getGiftScrollMetrics(style) {
-  const width = Math.max(1, Number(style.giftWidth) || DEFAULT_DANMAKU_STYLE.giftWidth);
-  const height = Math.max(1, Number(style.giftHeight) || DEFAULT_DANMAKU_STYLE.giftHeight);
-  const gap = Math.max(0, Number(style.giftGap) || 0);
-  const areaHeight = Math.max(height + gap, Number(style.giftAreaHeight) || DEFAULT_DANMAKU_STYLE.giftAreaHeight);
-  const duration = Math.max(0.1, Number(style.giftScrollDuration) || DEFAULT_DANMAKU_STYLE.giftScrollDuration);
-  const x = Number(style.panelLeft) || DEFAULT_DANMAKU_STYLE.panelLeft;
-  const areaBottom = Number(style.giftBottom || 0) + height;
-  const areaTop = Math.max(0, areaBottom - areaHeight);
-  const startY = areaBottom;
-  const endY = areaTop - height;
-  const travel = Math.max(1, startY - endY);
-  const minStartGap = ((height + gap) / travel) * duration;
-  return {
-    startY,
-    endY,
-    duration,
-    minStartGap,
-    textOffsetY: Math.max(3, Math.round((height - Number(style.giftFontSize || 0)) / 2) - 1),
-    clip: {
-      x1: x,
-      y1: areaTop,
-      x2: x + width,
-      y2: areaBottom
-    }
-  };
-}
-
 function getDanmakuLayoutMetrics(style, areaValue) {
   const area = DANMAKU_DISPLAY_AREAS[normalizeDanmakuDisplayArea(areaValue)];
   const top = Number(style.danmakuTop) || 0;
@@ -742,10 +1013,6 @@ function clipTag(clip) {
     return '';
   }
   return `\\clip(${assNumber(clip.x1)},${assNumber(clip.y1)},${assNumber(clip.x2)},${assNumber(clip.y2)})`;
-}
-
-function popInTag() {
-  return '\\fscx88\\fscy88\\t(0,130,0.45,\\fscx110\\fscy110)\\t(130,420,1.8,\\fscx100\\fscy100)';
 }
 
 function assNumber(value) {
@@ -797,30 +1064,55 @@ function hex2(value) {
 }
 
 function superChatPalette(price) {
+  if (price >= 2000) {
+    return { header: '&H00D8D8FF&', body: '&H00321AAB&', username: '&H001B0E5E&' };
+  }
   if (price >= 1000) {
-    return { header: '&H002D35E5&', body: '&H00503D8B&' };
+    return { header: '&H00E4E7FF&', body: '&H004D4DE5&', username: '&H00333398&' };
   }
   if (price >= 500) {
-    return { header: '&H00344BD9&', body: '&H00475AAE&' };
+    return { header: '&H00D2EAFF&', body: '&H004394E0&', username: '&H002C6193&' };
   }
   if (price >= 100) {
-    return { header: '&H0000A5FF&', body: '&H002B8FE6&' };
+    return { header: '&H00C5F1FF&', body: '&H002BB5E2&', username: '&H001C7795&' };
   }
   if (price >= 50) {
-    return { header: '&H0000C8B8&', body: '&H0033B9B0&' };
+    return { header: '&H00FDFFDB&', body: '&H009E7D42&', username: '&H00514022&' };
   }
-  return { header: '&H00D88B2D&', body: '&H00B87931&' };
+  return { header: '&H00FFF5ED&', body: '&H00B2602A&', username: '&H00653617&' };
 }
 
-function formatGiftPrice(value) {
+function guardCardPalette(level, price) {
+  const rank = Number(level) || 0;
+  if (rank === 1) {
+    return { background: '&H00E5E5FF&', username: '&H000F0F75&' };
+  }
+  if (rank === 2) {
+    return { background: '&H00CAF9F8&', username: '&H001A8B87&' };
+  }
+  if (rank >= 3) {
+    return { background: '&H00FCE8D8&', username: '&H008A3619&' };
+  }
+  if (Number(price) >= 19998) {
+    return { background: '&H00E5E5FF&', username: '&H000F0F75&' };
+  }
+  if (Number(price) >= 1998) {
+    return { background: '&H00CAF9F8&', username: '&H001A8B87&' };
+  }
+  return { background: '&H00FCE8D8&', username: '&H008A3619&' };
+}
+
+function giftCardPalette() {
+  return {
+    background: '&H00F4F0FF&',
+    username: '&H006B4EB5&',
+    detail: '&H004F3B43&'
+  };
+}
+
+function formatSuperChatPrice(value) {
   const amount = Math.max(0, Number(value) || 0);
-  if (amount >= 10000) {
-    return `${(amount / 10000).toFixed(amount >= 100000 ? 0 : 1).replace(/\.0$/, '')}万`;
-  }
-  if (amount >= 100) {
-    return amount.toFixed(0);
-  }
-  return amount.toFixed(2).replace(/\.00$/, '');
+  return Number.isInteger(amount) ? String(amount) : amount.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 function chooseLane(lanes, start, duration) {
@@ -856,9 +1148,37 @@ function chooseLaneWithoutOverlap(lanes, start, duration) {
 
 function estimateTextWidth(text, fontSize) {
   const length = Array.from(String(text || '')).reduce((sum, char) => {
-    return sum + (/[\u4e00-\u9fa5]/.test(char) ? 1 : 0.58);
+    return sum + glyphWidthFactor(char);
   }, 0);
   return Math.ceil(length * fontSize);
+}
+
+function glyphWidthFactor(char) {
+  const codePoint = String(char || '').codePointAt(0) || 0;
+  if (
+    (codePoint >= 0x0300 && codePoint <= 0x036f) ||
+    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) ||
+    codePoint === 0x200d
+  ) {
+    return 0;
+  }
+  if (/\s/u.test(char)) {
+    return 0.35;
+  }
+  if (
+    codePoint >= 0x2e80 ||
+    (codePoint >= 0x1100 && codePoint <= 0x11ff) ||
+    (codePoint >= 0x2600 && codePoint <= 0x27ff)
+  ) {
+    return 1;
+  }
+  if (/[A-Z]/.test(char)) {
+    return 0.66;
+  }
+  if (/[ilI1.,'`:;|!]/.test(char)) {
+    return 0.32;
+  }
+  return 0.58;
 }
 
 function truncateText(text, max) {
@@ -870,18 +1190,21 @@ function truncateText(text, max) {
 }
 
 function truncateTextToWidth(text, maxWidth, fontSize) {
-  const chars = Array.from(String(text || ''));
+  const original = String(text || '');
   const safeWidth = Math.max(20, Number(maxWidth) || 20);
+  if (estimateTextWidth(original, fontSize) <= safeWidth) {
+    return original;
+  }
+  const chars = Array.from(original.replace(/…+$/u, ''));
   let output = '';
-  for (let index = 0; index < chars.length; index += 1) {
-    const suffix = index < chars.length - 1 ? '…' : '';
-    const next = `${output}${chars[index]}`;
-    if (estimateTextWidth(`${next}${suffix}`, fontSize) > safeWidth) {
+  for (const char of chars) {
+    const next = `${output}${char}`;
+    if (estimateTextWidth(`${next}…`, fontSize) > safeWidth) {
       return output ? `${output}…` : '…';
     }
     output = next;
   }
-  return output;
+  return `${output}…`;
 }
 
 function wrapText(text, maxCharsPerLine, maxLines) {
@@ -899,32 +1222,53 @@ function wrapText(text, maxCharsPerLine, maxLines) {
 }
 
 function wrapTextToWidth(text, maxWidth, fontSize, maxLines) {
+  return wrapTextToWidthLines(text, maxWidth, fontSize, maxLines).join('\\N');
+}
+
+function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
   const chars = Array.from(String(text || ''));
   const safeWidth = Math.max(20, Number(maxWidth) || 20);
+  const safeMaxLines = Math.max(1, Math.floor(Number(maxLines) || 1));
   const lines = [];
   let current = '';
-  for (const char of chars) {
+  let truncated = false;
+  let index = 0;
+  for (; index < chars.length; index += 1) {
+    const char = chars[index];
+    if (char === '\n' || char === '\r') {
+      if (char === '\r' && chars[index + 1] === '\n') {
+        index += 1;
+      }
+      lines.push(current);
+      current = '';
+      if (lines.length >= safeMaxLines) {
+        truncated = index < chars.length - 1;
+        break;
+      }
+      continue;
+    }
     const next = `${current}${char}`;
     if (current && estimateTextWidth(next, fontSize) > safeWidth) {
       lines.push(current);
       current = char;
-      if (lines.length >= maxLines) {
+      if (lines.length >= safeMaxLines) {
+        truncated = true;
         break;
       }
       continue;
     }
     current = next;
   }
-  if (lines.length < maxLines && current) {
+  if (!truncated && lines.length < safeMaxLines && current) {
     lines.push(current);
   }
-  if (lines.length > maxLines) {
-    lines.length = maxLines;
+  if (index < chars.length - 1) {
+    truncated = true;
   }
-  if (chars.length > lines.join('').length && lines.length > 0) {
+  if (truncated && lines.length > 0) {
     lines[lines.length - 1] = truncateTextToWidth(`${lines[lines.length - 1]}…`, safeWidth, fontSize);
   }
-  return lines.join('\\N');
+  return lines;
 }
 
 module.exports = {
@@ -942,12 +1286,12 @@ module.exports = {
   normalizeDanmakuStyle,
   prepareAssEvents,
   getDanmakuEventDuration,
+  createMessageTimeline,
   createAss,
   drawRect,
   drawRoundedRect,
   roundedRectPath,
   getDanmakuLayoutMetrics,
-  getGiftScrollMetrics,
   dialogue,
   assTime,
   assEscape,
@@ -955,10 +1299,14 @@ module.exports = {
   assShapeColorTags,
   hex2,
   superChatPalette,
+  guardCardPalette,
+  giftCardPalette,
   chooseLane,
   chooseLaneWithoutOverlap,
   estimateTextWidth,
   truncateText,
   truncateTextToWidth,
-  wrapText
+  wrapText,
+  wrapTextToWidth,
+  wrapTextToWidthLines
 };
