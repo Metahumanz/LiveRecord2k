@@ -128,6 +128,10 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(source, /\.platform == "linux"/);
   assert.match(source, /sha256sum "\$PACKAGE_PATH"/);
   assert.match(source, /BILI_RECORD_AUTH_PASSWORD/);
+  assert.match(source, /BILI_RECORD_DOWNLOAD_MIRROR/);
+  assert.match(source, /https:\/\/gh-proxy\.com\//);
+  assert.match(source, /MIRROR_PACKAGE_URL=.*\$PACKAGE_URL/);
+  assert.match(source, /download_and_verify "GitHub 官方源"/);
   assert.match(source, /systemctl restart bili-record-2k\.service/);
   assert.match(source, /api\/state/);
   assert.doesNotMatch(source, /\beval\b/);

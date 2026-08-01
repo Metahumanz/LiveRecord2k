@@ -173,6 +173,18 @@ curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/script
 
 脚本只会交互询问并确认一次 WebUI 管理密码，其余步骤自动完成：识别发行版和 CPU 架构、安装依赖、读取最新 Release、选择 Deb 或通用包、验证 SHA-256、写入鉴权配置、启用 systemd、启动服务并检查 `/api/state`。默认监听 `0.0.0.0:3263`，完成后会打印访问地址。
 
+安装包默认通过 `https://gh-proxy.com/` 镜像下载；版本与 SHA-256 仍取自 GitHub 官方发布清单，镜像下载失败或校验不通过时会自动回退 GitHub 官方源。可以指定其他兼容的 GitHub 代理前缀，或关闭镜像直连：
+
+```bash
+# 改用其他镜像
+curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh \
+  | sudo env BILI_RECORD_DOWNLOAD_MIRROR=https://ghfast.top/ sh
+
+# 关闭镜像，直接从 GitHub 下载
+curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh \
+  | sudo env BILI_RECORD_DOWNLOAD_MIRROR=direct sh
+```
+
 脚本不会擅自修改云厂商安全组或主机防火墙；外部无法访问时，需要自行放行对应 TCP 端口。公网长期使用仍应配置 HTTPS 反向代理。
 
 无人值守安装可以预先传入密码：
