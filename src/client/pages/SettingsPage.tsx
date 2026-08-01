@@ -1,9 +1,10 @@
+import { useEffect, useState } from 'react';
 import { Bell, FileCode2, FolderOpen, HardDrive, LogIn, QrCode, Save, Video } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, SettingPanel, Toggle } from '../components/common';
-import type { AppSettings, AppState } from '../types';
+import type { AppSettings, AppState, DiskSpaceState } from '../types';
 import { containerOptions, danmakuAreaOptions, overlayModeOptions, qnOptions } from '../ui/options';
-import { burnCodecOptions, burnCodecSummary } from '../utils';
+import { burnCodecOptions, burnCodecSummary, formatFileSize } from '../utils';
 
 export function SettingsPage({
   state,
@@ -31,6 +32,41 @@ export function SettingsPage({
   const unavailableHardwareText = unavailableHardware
     .map((option) => `${option.label}：${option.reason || '不可用'}`)
     .join('；');
+  const [diskSpace, setDiskSpace] = useState<DiskSpaceState | null>(state.outputDiskSpace || null);
+
+  useEffect(() => {
+    const targetPath = settingsDraft.outputDir.trim();
+    if (!targetPath) {
+      setDiskSpace(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      recorder
+        .getDiskSpace(targetPath)
+        .then((result) => {
+          if (!cancelled) setDiskSpace(result);
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setDiskSpace({
+              requestedPath: targetPath,
+              checkedPath: '',
+              totalBytes: 0,
+              freeBytes: 0,
+              usedBytes: 0,
+              usedPercent: 0,
+              checkedAt: Date.now(),
+              error: error instanceof Error ? error.message : '磁盘空间检查失败'
+            });
+          }
+        });
+    }, 450);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [settingsDraft.outputDir]);
 
   return (
     <>
@@ -101,7 +137,13 @@ export function SettingsPage({
               </button>
             </div>
           </label>
-          <p className="field-help">建议选择空间充足的磁盘。原始录像、弹幕记录和弹幕视频都会保存在这里。</p>
+          <p className={diskSpace?.error ? 'field-help disk-space error' : 'field-help disk-space'}>
+            {diskSpace?.error
+              ? `剩余空间暂时无法读取：${diskSpace.error}`
+              : diskSpace && diskSpace.totalBytes > 0
+                ? `剩余 ${formatFileSize(diskSpace.freeBytes)} / 共 ${formatFileSize(diskSpace.totalBytes)}（已用 ${diskSpace.usedPercent.toFixed(1)}%）`
+                : '正在读取剩余磁盘空间…'}
+          </p>
 
           <button
             className="wide-button fill primary"
@@ -272,14 +314,20 @@ export function SettingsPage({
         <SettingPanel title="通知和启动" icon={<Bell size={18} />} className="settings-panel-notifications">
           <div className="setting-row startup-row">
             <span className={state.startupEnabled ? 'badge on' : 'badge'}>
-              {state.startupEnabled ? '开机自启已开启' : '开机自启未开启'}
+              {state.platform === 'linux'
+                ? state.startupEnabled
+                  ? 'systemd 服务已启用'
+                  : 'systemd 服务未启用'
+                : state.startupEnabled
+                  ? '开机自启已开启'
+                  : '开机自启未开启'}
             </span>
           </div>
           <div className="toggle-list">
             <Toggle
-              label="开机自启"
+              label={state.platform === 'linux' ? '由 systemd 管理开机启动' : '开机自启'}
               checked={state.startupEnabled}
-              disabled={busy === 'startup'}
+              disabled={state.platform === 'linux' || busy === 'startup'}
               onChange={(checked) => run('startup', () => recorder.setStartup(checked))}
             />
             <Toggle
@@ -291,14 +339,14 @@ export function SettingsPage({
               <span>监听间隔（秒）</span>
               <input
                 type="number"
-                min={5}
+                min={1}
                 max={300}
                 value={settingsDraft.pollIntervalSec}
                 onChange={(event) =>
                   setSettingsDraft({ ...settingsDraft, pollIntervalSec: Number(event.target.value) })
                 }
               />
-              <p className="field-help">开启监听后，应用会按这个间隔刷新直播间状态。</p>
+              <p className="field-help">HTTP 轮询是推送断线时的兜底；正常情况下会由直播弹幕连接即时触发开播。</p>
             </label>
             <Toggle
               label="总览页显示下一步提示"

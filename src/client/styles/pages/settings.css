@@ -111,3 +111,13 @@
 .startup-row {
   justify-content: flex-start;
 }
+
+.disk-space {
+  margin-top: -4px;
+  color: #9fe6cf;
+  font-variant-numeric: tabular-nums;
+}
+
+.disk-space.error {
+  color: #ffb4bd;
+}

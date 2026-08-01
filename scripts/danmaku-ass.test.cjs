@@ -80,9 +80,10 @@ test('ordinary gifts share the message stack and use the compact two-line card r
     { type: 'superchat', time: 2, duration: 4, user: '观众B', price: 30, text: '测试消息' }
   ]);
 
-  assert.match(ass, /\\1c&HF4F0FF&/);
-  assert.match(ass, /\\1c&H006B4EB5&\\b0}观众A/);
-  assert.match(ass, /\\1c&H004F3B43&\\b0}赠送 小花花 x2/);
+  assert.match(ass, /\\1c&HF7F3FF&\\1a&H18&/);
+  assert.match(ass, /\\1c&HC46CFF&\\1a&H00&/);
+  assert.match(ass, /\\1c&H00502980&\\b1}观众A/);
+  assert.match(ass, /\\1c&H0054434B&\\b0}赠送 小花花 x2/);
   assert.match(ass, /\\clip\(5,0,380,1070\)/);
   assert.match(ass, /\\move\(5,1003\.5,5,903\)/);
   assert.doesNotMatch(ass, /观众A:|礼物互动|COMBO|￥/);
@@ -147,7 +148,9 @@ test('message palettes retain all price and membership tiers', () => {
   assert.equal(guardCardPalette(2, 0).background, '&H00CAF9F8&');
   assert.equal(guardCardPalette(3, 0).background, '&H00FCE8D8&');
   assert.equal(guardCardPalette(3, 3000).background, '&H00FCE8D8&');
-  assert.equal(giftCardPalette().background, '&H00F4F0FF&');
+  assert.equal(giftCardPalette().background, '&H18F7F3FF&');
+  assert.equal(giftCardPalette(200).accent, '&H00D45BFF&');
+  assert.equal(giftCardPalette(2000).accent, '&H003CA3FF&');
 });
 
 test('width-aware wrapping treats CJK and emoji as full-width glyphs', () => {

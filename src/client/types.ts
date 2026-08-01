@@ -65,6 +65,25 @@ export type RecordingState = {
     height: number;
     fps?: number;
   } | null;
+  timingInfo?: {
+    containerDurationSec?: number;
+    videoDurationSec: number;
+    audioDurationSec: number;
+    avDeltaSec: number;
+    measuredAvDeltaSec?: number;
+    videoReorderAllowanceSec?: number;
+    containerDeltaSec?: number;
+    timingSafeForCopy?: boolean;
+    error?: string;
+    sourceSegments?: Array<{
+      index: number;
+      videoDurationSec: number;
+      audioDurationSec: number;
+      avDeltaSec: number;
+      timingSafeForCopy?: boolean;
+      error?: string;
+    }>;
+  } | null;
 };
 
 export type DanmakuArea = 'quarter' | 'half' | 'three-quarter' | 'no-overlap' | 'unlimited';
@@ -91,9 +110,13 @@ export type AppSettings = {
   notifyBurnEnded: boolean;
   openBrowserOnStart: boolean;
   hideOverviewNextStep: boolean;
+  autoUpdateEnabled: boolean;
   updateManifestUrl: string;
   serverHost: '127.0.0.1' | '0.0.0.0' | 'localhost' | '::';
   serverPort: number;
+  accessUsername: string;
+  accessPassword: string;
+  accessAuthConfigured: boolean;
 };
 
 export type UpdateState = {
@@ -120,10 +143,11 @@ export type UpdateState = {
   packagePath?: string;
   queued?: boolean;
   activeJobs?: boolean;
+  autoApplySupported?: boolean;
   manifest?: {
     version: string;
     tagName?: string;
-    packageType?: 'installer' | 'portable';
+    packageType?: 'installer' | 'portable' | 'deb' | 'tarball';
     packageUrl: string;
     sha256?: string;
     installerArgs?: string[] | string;
@@ -239,6 +263,25 @@ export type ExportQueueItem = {
   createdAt: number;
 };
 
+export type BurnQueueItem = {
+  id: string;
+  roomId: string;
+  label: string;
+  cleanPath: string;
+  createdAt: number;
+};
+
+export type DiskSpaceState = {
+  requestedPath: string;
+  checkedPath: string;
+  totalBytes: number;
+  freeBytes: number;
+  usedBytes: number;
+  usedPercent: number;
+  checkedAt: number;
+  error?: string;
+};
+
 export type ExportClipRequest = {
   mode: 'clean' | 'burn';
   cleanPath: string;
@@ -271,14 +314,23 @@ export type AppState = {
   logs: LogEntry[];
   login?: LoginState;
   version: string;
+  platform?: string;
   update: UpdateState;
   ffmpegPath?: string;
   ffmpegCapabilities?: FfmpegCapabilities;
   exportProgress?: FfmpegJobProgress | null;
   exportQueue?: ExportQueueItem[];
+  burnQueue?: BurnQueueItem[];
   previewProgress?: FfmpegJobProgress | null;
   previewProxy?: PreviewProxyState | null;
   startupEnabled: boolean;
+  outputDiskSpace?: DiskSpaceState | null;
+  access?: {
+    required: boolean;
+    configured: boolean;
+    authenticated: boolean;
+    username: string;
+  };
   currentHost: string;
   currentPort: number;
   storePath?: string;
@@ -297,6 +349,7 @@ export type RecorderApi = {
   cancelQrLogin: () => Promise<AppState>;
   chooseOutputDir: (currentPath?: string) => Promise<string | undefined>;
   selectPath: (request: SelectPathRequest) => Promise<SelectPathResult>;
+  getDiskSpace: (path?: string) => Promise<DiskSpaceState>;
   saveSettings: (settings: Partial<AppSettings>) => Promise<AppState>;
   addRoom: (roomId: string) => Promise<AppState>;
   removeRoom: (roomId: string) => Promise<AppState>;

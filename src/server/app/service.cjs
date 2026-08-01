@@ -26,8 +26,6 @@ const {
   createMp4FinalizeArgs,
   createBurnArgs,
   createPreviewHlsArgs,
-  createRepairRemuxArgs,
-  createRepairTranscodeArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
   createConcatTranscodeArgs,
@@ -103,6 +101,7 @@ const {
   parseFfmpegProgressTime,
   parseFfmpegTime,
   probeMediaFileInfo,
+  probeMediaTimelineInfo,
   resolveReliableDurationSec,
   readDanmakuDurationSec,
   isHevcCodec,
@@ -169,6 +168,7 @@ const {
   openPath,
   mimeType
 } = require('../shared/helpers.cjs');
+const { AccessAuthManager, hashAccessPassword } = require('./auth.cjs');
 
 
 
@@ -209,6 +209,8 @@ const DEFAULT_UPDATE_MANIFEST_URL =
   'https://github.com/Metahumanz/LiveRecord2k/releases/latest/download/update.json';
 const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/Metahumanz/LiveRecord2k/releases/latest';
 const UPDATE_CHECK_TIMEOUT_MS = 12000;
+const AUTO_UPDATE_INITIAL_DELAY_MS = 60 * 1000;
+const AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const PATH_PROBE_TIMEOUT_MS = 2500;
 const PATH_CREATE_TIMEOUT_MS = 8000;
 const PATH_PICKER_TIMEOUT_MS = 5 * 60 * 1000;
@@ -223,7 +225,6 @@ const RECORDING_MEDIA_FILE_PATTERN =
   /(?:\.(?:clean|merged|danmaku|danmaku-only)|\.clip_[^.]+\.(?:clean|danmaku|danmaku-only))\.(?:mp4|mkv)$/i;
 const EXPORT_PREVIEW_EXTENSIONS = new Set(['.m3u8', '.ts']);
 const PREVIEW_CACHE_VERSION = 'v1';
-const REPAIR_CACHE_VERSION = 'v1';
 const BURN_CODEC_CANDIDATES = [
   { value: 'libx265', label: 'H.265 软件编码', kind: 'software' },
   { value: 'libx264', label: 'H.264 软件编码', kind: 'software' },
@@ -236,6 +237,11 @@ const BURN_CODEC_CANDIDATES = [
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 
+function isPublicServerHost(value) {
+  const host = String(value || '').trim().toLowerCase();
+  return host === '0.0.0.0' || host === '::';
+}
+
 function createDanmakuAssSuffix(overlayMode, danmakuArea) {
   const base = normalizeBurnOverlayMode(overlayMode) === 'danmaku' ? 'danmaku-only' : 'danmaku';
   return `${base}.${normalizeDanmakuDisplayArea(danmakuArea)}`;
@@ -247,19 +253,26 @@ function createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea
 
 class LiveRecordService {
   constructor() {
-    const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+    const appData =
+      process.env.BILI_RECORD_CONFIG_DIR ||
+      (process.platform === 'win32'
+        ? process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
+        : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
     this.storePath = path.join(appData, 'BiliRecord2K', STORE_FILE);
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
-    this.repairCacheDir = path.join(appData, 'BiliRecord2K', 'repair-cache');
     this.settings = this.createDefaultSettings();
     this.rooms = new Map();
     this.logs = [];
     this.monitorTimers = new Map();
+    this.livePushMonitors = new Map();
     this.roomTickLocks = new Set();
     this.recordingSessions = new Map();
     this.recordingStartLocks = new Set();
     this.reconnectPendingRooms = new Set();
     this.burnSessions = new Map();
+    this.burnQueue = [];
+    this.burnQueueRunning = false;
+    this.activeBurnQueueItem = null;
     this.burnCancelRequests = new Set();
     this.pendingSegmentCleanups = new Map();
     this.previewSessions = new Map();
@@ -284,6 +297,8 @@ class LiveRecordService {
     this.pathPickerProcess = null;
     this.pathPickerStarting = false;
     this.startupEnabled = false;
+    this.outputDiskSpace = null;
+    this.accessAuth = new AccessAuthManager();
     this.updateState = {
       status: 'idle',
       currentVersion: APP_VERSION,
@@ -300,6 +315,7 @@ class LiveRecordService {
       manifest: null
     };
     this.queuedUpdateTimer = null;
+    this.autoUpdateTimer = null;
     this.ffmpegPath = findFfmpegPath();
     this.ffmpegCapabilities = {
       burnCodecs: BURN_CODEC_CANDIDATES.filter((codec) => codec.kind === 'software'),
@@ -314,7 +330,7 @@ class LiveRecordService {
 
   createDefaultSettings() {
     return {
-      outputDir: path.join(os.homedir(), 'Videos', '哔哩录播2K'),
+      outputDir: process.env.BILI_RECORD_OUTPUT_DIR || path.join(os.homedir(), 'Videos', '哔哩录播2K'),
       cookie: '',
       pollIntervalSec: 15,
       targetQn: 15000,
@@ -335,23 +351,34 @@ class LiveRecordService {
       notifyBurnEnded: true,
       openBrowserOnStart: true,
       hideOverviewNextStep: false,
+      autoUpdateEnabled: process.platform === 'linux' && process.env.BILI_RECORD_AUTO_UPDATE === '1',
       updateManifestUrl: DEFAULT_UPDATE_MANIFEST_URL,
       serverHost: DEFAULT_HOST,
-      serverPort: DEFAULT_PORT
+      serverPort: DEFAULT_PORT,
+      accessUsername: 'admin',
+      accessPasswordHash: ''
     };
   }
 
   async init() {
     await this.loadStore();
+    await this.accessAuth.initFromEnvironment();
     await this.loadLastUpdateStatus();
     await fsp.mkdir(this.previewCacheDir, { recursive: true });
-    await fsp.mkdir(this.repairCacheDir, { recursive: true });
     this.settings = this.normalizeSettings(this.settings);
     for (const room of this.rooms.values()) {
       if (room.monitoring) {
         this.startMonitorTimer(room.id);
+        setImmediate(() => {
+          this.startLivePushMonitor(room.id).catch((error) => {
+            this.log('warn', `${roomLabel(room)} 开播推送监听启动失败：${error.message}`);
+          });
+        });
       }
     }
+    setImmediate(() => {
+      this.refreshOutputDiskSpace().catch(() => {});
+    });
     this.log('success', `WebUI 后端已启动，ffmpeg: ${this.ffmpegPath}`);
     this.log('info', '正在后台探测 ffmpeg、显卡能力和录像库。');
     setImmediate(() => {
@@ -366,6 +393,7 @@ class LiveRecordService {
         this.emitState();
       });
     });
+    this.scheduleAutomaticUpdateCheck(AUTO_UPDATE_INITIAL_DELAY_MS);
   }
 
   async initializeRecordingLibrary() {
@@ -433,7 +461,7 @@ class LiveRecordService {
       ...settings,
       outputContainer: normalizeContainer(settings.outputContainer),
       burnCodec,
-      pollIntervalSec: clamp(Number(settings.pollIntervalSec || 15), 5, 300),
+      pollIntervalSec: clamp(Number(settings.pollIntervalSec || 15), 1, 300),
       segmentMinutes: clamp(Number(settings.segmentMinutes || 60), 0.05, 1440),
       targetQn: normalizeTargetQn(settings.targetQn),
       burnCrf: clamp(Number(settings.burnCrf || 24), 16, 35),
@@ -450,9 +478,12 @@ class LiveRecordService {
       notifyBurnEnded: settings.notifyBurnEnded !== false,
       openBrowserOnStart: settings.openBrowserOnStart !== false,
       hideOverviewNextStep: Boolean(settings.hideOverviewNextStep),
+      autoUpdateEnabled: Boolean(settings.autoUpdateEnabled),
       updateManifestUrl: String(settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL).trim(),
       serverHost: normalizeServerHost(settings.serverHost || DEFAULT_HOST),
-      serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535)
+      serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535),
+      accessUsername: String(settings.accessUsername || 'admin').trim().slice(0, 64) || 'admin',
+      accessPasswordHash: String(settings.accessPasswordHash || '')
     };
   }
 
@@ -549,7 +580,8 @@ class LiveRecordService {
       danmakuStatus: recording.danmakuStatus,
       danmakuMessage: recording.danmakuMessage,
       danmakuPopularity: Number(recording.danmakuPopularity || 0),
-      videoInfo: recording.videoInfo || null
+      videoInfo: recording.videoInfo || null,
+      timingInfo: recording.timingInfo || null
     };
   }
 
@@ -571,6 +603,9 @@ class LiveRecordService {
 
   getState(options = {}) {
     const settings = { ...this.settings };
+    delete settings.accessPasswordHash;
+    settings.accessPassword = '';
+    settings.accessAuthConfigured = this.accessAuth.isConfigured(this.settings);
     if (options.redactCookie) {
       settings.cookie = '';
     }
@@ -586,11 +621,20 @@ class LiveRecordService {
       ffmpegCapabilities: this.ffmpegCapabilities,
       exportProgress: this.exportProgress ? { ...this.exportProgress } : null,
       exportQueue: this.exportQueue.map((item) => this.getPublicExportQueueItem(item)),
+      burnQueue: this.burnQueue.map((item) => this.getPublicBurnQueueItem(item)),
       previewProgress: this.exportPreviewProgress ? { ...this.exportPreviewProgress } : null,
       previewProxy: this.exportPreview ? { ...this.exportPreview } : null,
       startupEnabled: this.startupEnabled,
+      outputDiskSpace: this.outputDiskSpace ? { ...this.outputDiskSpace } : null,
+      access: {
+        required: isPublicServerHost(this.currentHost || this.settings.serverHost),
+        configured: this.accessAuth.isConfigured(this.settings),
+        authenticated: Boolean(options.accessAuthenticated),
+        username: this.settings.accessUsername
+      },
       currentPort: this.currentPort || DEFAULT_PORT,
       currentHost: this.currentHost || DEFAULT_HOST,
+      platform: process.platform,
       storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT
@@ -624,6 +668,33 @@ class LiveRecordService {
       endTime: item.endTime,
       createdAt: item.createdAt
     };
+  }
+
+  getPublicBurnQueueItem(item) {
+    return {
+      id: item.id,
+      roomId: item.roomId,
+      label: item.label,
+      cleanPath: item.recording?.cleanPath || '',
+      createdAt: item.createdAt
+    };
+  }
+
+  async loginAccess(username, password, remoteKey) {
+    return this.accessAuth.login({
+      username,
+      password,
+      settings: this.settings,
+      remoteKey
+    });
+  }
+
+  authenticateAccess(token) {
+    return this.accessAuth.authenticate(token);
+  }
+
+  logoutAccess(token) {
+    this.accessAuth.logout(token);
   }
 
   getCurrentRecordingStateFromSession(session) {
@@ -684,7 +755,8 @@ class LiveRecordService {
     return {
       ...this.updateState,
       currentVersion: APP_VERSION,
-      activeJobs: this.hasActiveJobs()
+      activeJobs: this.hasActiveJobs(),
+      autoApplySupported: this.supportsManagedLinuxUpdate()
     };
   }
 
@@ -779,6 +851,72 @@ class LiveRecordService {
   async chooseOutputDir(currentPath = '') {
     const result = await this.selectPath({ type: 'directory', currentPath: currentPath || this.settings.outputDir });
     return result.path ? { path: result.path } : result;
+  }
+
+  async getDiskSpace(targetPath = this.settings.outputDir) {
+    const rawPath = String(targetPath || this.settings.outputDir || '').trim();
+    if (!rawPath) {
+      throw new Error('请先填写录像保存目录。');
+    }
+    let candidate = path.resolve(rawPath);
+    let stat = await withTimeout(fsp.stat(candidate), PATH_PROBE_TIMEOUT_MS, '磁盘路径检查超时').catch(() => null);
+    if (stat?.isFile()) {
+      candidate = path.dirname(candidate);
+    }
+    while (!stat) {
+      const parent = path.dirname(candidate);
+      if (parent === candidate) {
+        break;
+      }
+      candidate = parent;
+      stat = await withTimeout(fsp.stat(candidate), PATH_PROBE_TIMEOUT_MS, '磁盘路径检查超时').catch(() => null);
+    }
+    if (!stat) {
+      throw new Error(`找不到可用于检查磁盘空间的上级目录：${rawPath}`);
+    }
+    if (typeof fsp.statfs !== 'function') {
+      throw new Error('当前 Node.js 版本不支持磁盘空间检查。');
+    }
+    const fsInfo = await withTimeout(
+      fsp.statfs(candidate, { bigint: true }),
+      PATH_PROBE_TIMEOUT_MS,
+      '磁盘空间检查超时'
+    );
+    const blockSize = fsInfo.bsize || fsInfo.frsize || 0n;
+    const totalBytes = blockSize * fsInfo.blocks;
+    const freeBytes = blockSize * (fsInfo.bavail ?? fsInfo.bfree);
+    const result = {
+      requestedPath: rawPath,
+      checkedPath: candidate,
+      totalBytes: Number(totalBytes),
+      freeBytes: Number(freeBytes),
+      usedBytes: Number(totalBytes - freeBytes),
+      usedPercent: totalBytes > 0n ? Number(((totalBytes - freeBytes) * 10000n) / totalBytes) / 100 : 0,
+      checkedAt: Date.now()
+    };
+    if (path.resolve(rawPath).toLowerCase() === path.resolve(this.settings.outputDir).toLowerCase()) {
+      this.outputDiskSpace = result;
+    }
+    return result;
+  }
+
+  async refreshOutputDiskSpace() {
+    try {
+      this.outputDiskSpace = await this.getDiskSpace(this.settings.outputDir);
+    } catch (error) {
+      this.outputDiskSpace = {
+        requestedPath: String(this.settings.outputDir || ''),
+        checkedPath: '',
+        totalBytes: 0,
+        freeBytes: 0,
+        usedBytes: 0,
+        usedPercent: 0,
+        checkedAt: Date.now(),
+        error: error.message
+      };
+    }
+    this.emitState();
+    return this.outputDiskSpace;
   }
 
   getLocalFallbackDirectory() {
@@ -1453,20 +1591,40 @@ try {
   async saveSettings(nextSettings, options = {}) {
     const oldPollInterval = this.settings.pollIntervalSec;
     const oldOutputDir = this.settings.outputDir;
+    const oldAccessUsername = this.settings.accessUsername;
+    const oldAccessPasswordHash = this.settings.accessPasswordHash;
+    const oldAutoUpdateEnabled = this.settings.autoUpdateEnabled;
     const settingsUpdate = { ...(nextSettings || {}) };
     if (options.preserveCookie) {
       delete settingsUpdate.cookie;
+    }
+    const accessPassword = String(settingsUpdate.accessPassword || '');
+    delete settingsUpdate.accessPassword;
+    delete settingsUpdate.accessAuthConfigured;
+    delete settingsUpdate.accessPasswordHash;
+    if (accessPassword) {
+      settingsUpdate.accessPasswordHash = await hashAccessPassword(accessPassword);
     }
     const normalizedSettings = this.normalizeSettings({
       ...this.settings,
       ...settingsUpdate
     });
+    if (isPublicServerHost(normalizedSettings.serverHost) && !this.accessAuth.isConfigured(normalizedSettings)) {
+      throw new Error('监听 0.0.0.0/:: 前必须先设置至少 8 位远程访问密码，或设置 BILI_RECORD_AUTH_PASSWORD。');
+    }
     const outputDirChanged = oldOutputDir !== normalizedSettings.outputDir;
     const outputReady = await this.ensureDirectoryReady(normalizedSettings.outputDir, {
       label: '录像保存目录',
       allowUnavailable: !outputDirChanged
     });
     this.settings = normalizedSettings;
+    if (
+      oldAccessUsername !== this.settings.accessUsername ||
+      oldAccessPasswordHash !== this.settings.accessPasswordHash
+    ) {
+      this.accessAuth.clearSessions();
+      this.log('info', '远程访问凭据已更新，已有远程会话已退出。');
+    }
     if (!outputReady) {
       this.log(
         'warn',
@@ -1490,6 +1648,10 @@ try {
           this.startMonitorTimer(room.id);
         }
       }
+    }
+    await this.refreshOutputDiskSpace().catch(() => {});
+    if (oldAutoUpdateEnabled !== this.settings.autoUpdateEnabled) {
+      this.scheduleAutomaticUpdateCheck(this.settings.autoUpdateEnabled ? 5000 : 0);
     }
     this.log('success', '设置已保存。');
     this.emitState();
@@ -1522,6 +1684,7 @@ try {
       await this.stopRecording(room.id);
     }
     this.stopMonitorTimer(room.id);
+    this.stopLivePushMonitor(room.id);
     this.rooms.delete(room.id);
     await this.saveStore();
     this.log('info', `已移除房间 ${room.id}。`);
@@ -1573,10 +1736,14 @@ try {
     room.monitoring = Boolean(enabled);
     if (room.monitoring) {
       this.startMonitorTimer(room.id);
+      this.startLivePushMonitor(room.id).catch((error) => {
+        this.log('warn', `${roomLabel(room)} 开播推送监听启动失败：${error.message}`);
+      });
       this.log('info', `${roomLabel(room)} 已开始监听。`);
       this.tickRoom(room.id);
     } else {
       this.stopMonitorTimer(room.id);
+      this.stopLivePushMonitor(room.id);
       this.log('info', `${roomLabel(room)} 已停止监听。`);
     }
     await this.saveStore();
@@ -1607,7 +1774,9 @@ try {
     }
     this.roomTickLocks.add(roomId);
     try {
-      await this.refreshRoom(room.id);
+      const status = await this.fetchRoomLiveStatus(room.id);
+      room.realRoomId = status.realRoomId || room.realRoomId;
+      await this.applyDetectedLiveStatus(room, status.liveStatus, '轮询');
       if (room.liveStatus === 1 && !this.isRoomRecording(room)) {
         await this.startRecording(room.id, true);
       }
@@ -1616,6 +1785,169 @@ try {
     } finally {
       this.roomTickLocks.delete(roomId);
     }
+  }
+
+  async fetchRoomLiveStatus(roomId) {
+    const roomInit = await this.fetchBiliJson(
+      `https://api.live.bilibili.com/room/v1/Room/room_init?id=${encodeURIComponent(roomId)}`
+    );
+    if (roomInit.code !== 0) {
+      throw createBiliError('开播状态检查', roomInit);
+    }
+    return {
+      realRoomId: Number(roomInit.data?.room_id || 0),
+      liveStatus: Number(roomInit.data?.live_status || 0)
+    };
+  }
+
+  async applyDetectedLiveStatus(room, liveStatus, source) {
+    const previousLiveStatus = room.liveStatus;
+    room.liveStatus = Number(liveStatus || 0);
+    room.lastCheckedAt = Date.now();
+    room.lastError = undefined;
+    if (previousLiveStatus !== undefined && previousLiveStatus !== room.liveStatus) {
+      this.log(
+        room.liveStatus === 1 ? 'success' : 'info',
+        `${roomLabel(room)}：${room.liveStatus === 1 ? '开播' : '下播'}（${source}）`
+      );
+      if (room.liveStatus === 1 && this.settings.notifyLiveStarted) {
+        this.notify('开播提醒', `${roomLabel(room)} 已开播`);
+      }
+      if (previousLiveStatus === 1 && room.liveStatus !== 1 && this.settings.notifyLiveEnded) {
+        this.notify('下播提醒', `${roomLabel(room)} 已下播`);
+      }
+      await this.saveStore().catch((error) => {
+        this.log('warn', `${roomLabel(room)} 保存开播状态失败：${error.message}`);
+      });
+    }
+    this.emitState();
+  }
+
+  async startLivePushMonitor(roomId) {
+    const room = this.rooms.get(String(roomId));
+    if (!room || !room.monitoring || this.livePushMonitors.has(room.id)) {
+      return;
+    }
+    const monitor = {
+      roomId: room.id,
+      client: null,
+      retryTimer: null,
+      retryDelayMs: 2000,
+      stopped: false,
+      authenticated: false
+    };
+    this.livePushMonitors.set(room.id, monitor);
+    await this.connectLivePushMonitor(room, monitor);
+  }
+
+  async connectLivePushMonitor(room, monitor) {
+    if (monitor.stopped || !room.monitoring || this.livePushMonitors.get(room.id) !== monitor) {
+      return;
+    }
+    try {
+      if (!room.realRoomId) {
+        const status = await this.fetchRoomLiveStatus(room.id);
+        room.realRoomId = status.realRoomId || room.realRoomId;
+        await this.applyDetectedLiveStatus(room, status.liveStatus, '推送监听初始化');
+      }
+      const info = await this.fetchDanmuInfo(room.realRoomId || room.id);
+      if (info.code !== 0) {
+        throw createBiliError('开播推送服务器', info);
+      }
+      const client = new DanmakuClient({
+        roomId: Number(room.realRoomId || room.id),
+        uid: Number(getCookieValue(this.settings.cookie, 'DedeUserID') || 0),
+        buvid: getCookieValue(this.settings.cookie, 'buvid3') || getCookieValue(this.settings.cookie, 'buvid4') || '',
+        token: info.data?.token || '',
+        hosts: info.data?.host_list || [],
+        onAuthReply: (reply) => {
+          if (Number(reply?.code || 0) === 0) {
+            monitor.authenticated = true;
+            monitor.retryDelayMs = 2000;
+            this.log('info', `${roomLabel(room)} 开播推送监听已连接。`);
+            return;
+          }
+          this.log('warn', `${roomLabel(room)} 开播推送认证失败：${reply?.message || reply?.code || '未知错误'}`);
+          client.close('auth failed');
+        },
+        onCommand: (command) => {
+          this.handleLivePushCommand(room, monitor, command).catch((error) => {
+            this.log('warn', `${roomLabel(room)} 处理开播推送失败：${error.message}`);
+          });
+        },
+        onError: (error) => {
+          if (!monitor.stopped) {
+            this.log('warn', `${roomLabel(room)} 开播推送连接错误：${error.message}`);
+          }
+        },
+        onClose: (reason) => {
+          if (monitor.client === client) {
+            monitor.client = null;
+          }
+          monitor.authenticated = false;
+          if (!monitor.stopped) {
+            this.scheduleLivePushReconnect(room, monitor, reason);
+          }
+        }
+      });
+      monitor.client = client;
+      client.connect();
+    } catch (error) {
+      this.scheduleLivePushReconnect(room, monitor, error.message);
+    }
+  }
+
+  async handleLivePushCommand(room, monitor, command) {
+    if (monitor.stopped || !room.monitoring) {
+      return;
+    }
+    const commandType = String(command?.cmd || '').split(':')[0].toUpperCase();
+    if (commandType === 'LIVE') {
+      await this.applyDetectedLiveStatus(room, 1, '弹幕服务器推送');
+      if (!this.isRoomRecording(room)) {
+        await this.startRecording(room.id, true);
+      }
+      setImmediate(() => {
+        this.refreshRoom(room.id, { silent: true }).catch(() => {});
+      });
+      return;
+    }
+    if (commandType === 'PREPARING') {
+      await this.applyDetectedLiveStatus(room, 0, '弹幕服务器推送');
+      return;
+    }
+    if (commandType === 'ROOM_CHANGE') {
+      const data = command?.data || {};
+      room.title = String(data.title || room.title || '');
+      this.emitState();
+    }
+  }
+
+  scheduleLivePushReconnect(room, monitor, reason) {
+    if (monitor.stopped || monitor.retryTimer || !room.monitoring) {
+      return;
+    }
+    const delayMs = Math.min(60000, Math.max(2000, monitor.retryDelayMs || 2000));
+    monitor.retryDelayMs = Math.min(60000, delayMs * 2);
+    if (monitor.authenticated || delayMs >= 10000) {
+      this.log('warn', `${roomLabel(room)} 开播推送已断开，${Math.round(delayMs / 1000)} 秒后重连：${reason || '连接关闭'}`);
+    }
+    monitor.retryTimer = setTimeout(() => {
+      monitor.retryTimer = null;
+      this.connectLivePushMonitor(room, monitor).catch(() => {});
+    }, delayMs);
+    monitor.retryTimer.unref?.();
+  }
+
+  stopLivePushMonitor(roomId) {
+    const monitor = this.livePushMonitors.get(String(roomId));
+    if (!monitor) {
+      return;
+    }
+    monitor.stopped = true;
+    clearTimeout(monitor.retryTimer);
+    monitor.client?.close('停止监听');
+    this.livePushMonitors.delete(String(roomId));
   }
 
   async fetchRoomInfo(roomId) {
@@ -2201,10 +2533,12 @@ try {
     room.qualityWarning = undefined;
 
     const qnProbes = createQnProbeList(this.settings.targetQn);
+    const attemptedQns = [];
     const candidates = [];
     const seenUrls = new Set();
     let lastPlayError = null;
     for (const requestedQn of qnProbes) {
+      attemptedQns.push(requestedQn);
       const params = new URLSearchParams({
         room_id: String(room.realRoomId),
         protocol: '0,1',
@@ -2257,6 +2591,11 @@ try {
           }
         }
       }
+      // A successful play-info response already includes the selected quality and accept_qn list.
+      // Avoid repeating the same heavy request for every lower quality during the critical start path.
+      if (candidates.length > 0) {
+        break;
+      }
     }
 
     const selectableCandidates = options.requireHls ? candidates.filter(isHlsPreviewCandidate) : candidates;
@@ -2287,7 +2626,7 @@ try {
       'success',
       `${roomLabel(room)} ${options.purpose || '录制'}选中直播流：编码 ${displayCodecName(room.stream.codec)}，清晰度码 ${
         room.stream.qn
-      }，请求 ${qnProbes.join('/')}, 协议 ${room.stream.protocol}/${room.stream.format}，接口可选 ${
+      }，请求 ${attemptedQns.join('/')}, 协议 ${room.stream.protocol}/${room.stream.format}，接口可选 ${
         availableQn.join('/') || '未知'
       }`
     );
@@ -2340,14 +2679,15 @@ try {
       }
       const timestamp = formatTimestamp(new Date());
       const outputRoot = String(this.settings.outputDir || '').trim() || this.settings.outputDir;
-      const roomFolder = sanitizeFilename(`${room.realRoomId || room.id}-${room.anchor || 'anchor'}`) || `room-${room.id}`;
-      const liveFolder = sanitizeFilename(`${timestamp}-${room.title || 'live'}`) || timestamp;
+      const roomFolder =
+        sanitizeFilename(`${room.realRoomId || room.id}-${room.anchor || 'anchor'}`).slice(0, 48) || `room-${room.id}`;
+      const liveFolder = sanitizeFilename(`${timestamp}-${room.title || 'live'}`).slice(0, 72) || timestamp;
       const outputDir = String(options.outputDir || path.join(outputRoot, roomFolder, liveFolder)).trim() || outputRoot;
       await this.ensureDirectoryReady(outputDir, { label: '本场录像保存目录' });
 
       const baseName = sanitizeFilename(
-        `${room.realRoomId || room.id}_${room.anchor || 'anchor'}_${room.title || 'live'}_${timestamp}`
-      );
+        `${room.realRoomId || room.id}_${room.anchor || 'anchor'}_${timestamp}`
+      ).slice(0, process.platform === 'win32' ? Math.max(24, 220 - path.resolve(outputDir).length) : 120);
       const container = normalizeContainer(options.outputContainer || this.settings.outputContainer);
       const cleanPath = path.join(outputDir, `${baseName}.clean.${container}`);
       const capturePath = container === 'mp4' ? path.join(outputDir, `${baseName}.recording.mkv`) : cleanPath;
@@ -3206,7 +3546,7 @@ try {
     const recording = await this.mergeReconnectGroupIfNeeded(room, mergeGroup, fallbackRecording);
     if (this.settings.autoBurnDanmaku && recording?.valid !== false && Number(recording?.eventCount || 0) > 0) {
       setTimeout(() => {
-        this.startBurnRecording(room, recording).catch((error) => {
+        this.enqueueBurnRecording(room, recording, { automatic: true }).catch((error) => {
           this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
         });
       }, 500);
@@ -3246,6 +3586,7 @@ try {
     const burnedPath = deriveBurnedPath(outputPath, this.settings.burnOverlayMode);
     const mergeDurationSec = segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0);
     const segmentMediaInfos = [];
+    const segmentTimelineInfos = [];
     for (let index = 0; index < segments.length; index += 1) {
       const segment = segments[index];
       const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, segment.cleanPath, { timeoutMs: 15000 });
@@ -3257,12 +3598,45 @@ try {
         durationSec:
           Number(mediaInfo.durationSec) || Number(segment.durationSec) || getSegmentDurationForMerge(segment, segments[index + 1])
       });
+      try {
+        const timingInfo = await probeMediaTimelineInfo(this.ffmpegPath, segment.cleanPath, mediaInfo, {
+          timeoutMs: 120000
+        });
+        segmentTimelineInfos.push(timingInfo);
+        segment.timingInfo = timingInfo;
+        this.log(
+          Math.abs(timingInfo.avDeltaSec) > 0.08 ? 'warn' : 'info',
+          `${roomLabel(room)} 合并前时轴检查 #${index + 1}：视频 ${timingInfo.videoDurationSec.toFixed(
+            3
+          )}s，音频 ${timingInfo.audioDurationSec.toFixed(3)}s，音频${timingInfo.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
+            timingInfo.avDeltaSec
+          ).toFixed(3)}s。`
+        );
+      } catch (error) {
+        segmentTimelineInfos.push({
+          videoDurationSec: Number(mediaInfo.durationSec || segment.durationSec || 0),
+          audioDurationSec: 0,
+          avDeltaSec: 0,
+          containerDeltaSec: 0,
+          timingSafeForCopy: false,
+          error: error.message
+        });
+        this.log('warn', `${roomLabel(room)} 合并前时轴检查 #${index + 1} 失败，将使用安全转码合并：${error.message}`);
+      }
     }
     const targetVideoInfo = selectHighestResolutionVideoInfo(segmentMediaInfos);
     if (!targetVideoInfo) {
       throw new Error('没有找到可用于合并的目标分辨率。');
     }
-    const requiresTranscode = shouldTranscodeConcat(segmentMediaInfos);
+    const streamSpecsChanged = shouldTranscodeConcat(segmentMediaInfos);
+    const cumulativeAvDeltaSec = segmentTimelineInfos.reduce(
+      (sum, timingInfo) => sum + Number(timingInfo.avDeltaSec || 0),
+      0
+    );
+    const timingNeedsRepair =
+      segmentTimelineInfos.some((timingInfo) => !timingInfo.timingSafeForCopy) ||
+      Math.abs(cumulativeAvDeltaSec) > 0.1;
+    const requiresTranscode = streamSpecsChanged || timingNeedsRepair;
     const mergeVideoCodec = isHevcCodec(targetVideoInfo.codec) ? 'libx265' : 'libx264';
     const progress = createFfmpegJobProgress({
       kind: 'merge',
@@ -3277,7 +3651,7 @@ try {
       'info',
       `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}。${
         requiresTranscode
-          ? `检测到分辨率、帧率或编码规格变化，将全部统一为 ${targetVideoInfo.width}x${targetVideoInfo.height} 后合并`
+          ? `${streamSpecsChanged ? '检测到分辨率、帧率或编码规格变化' : '检测到分段音视频时长差'}，将重建各段时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height} 后合并`
           : '各分段规格一致，使用快速无损合并'
       }`
     );
@@ -3289,7 +3663,8 @@ try {
         mergeArgs = createConcatTranscodeArgs({
           segments: segments.map((segment, index) => ({
             filePath: segment.cleanPath,
-            durationSec: segmentMediaInfos[index].durationSec,
+            durationSec:
+              Number(segmentTimelineInfos[index]?.videoDurationSec) || Number(segmentMediaInfos[index].durationSec),
             hasAudio: Boolean(segmentMediaInfos[index].audioInfo)
           })),
           outputPath: tmpPath,
@@ -3319,13 +3694,39 @@ try {
         room.mergeProgress.updatedAt = Date.now();
         this.emitState();
       }
-      await fsp.rm(outputPath, { force: true });
-      await fsp.rename(tmpPath, outputPath);
-      await fsp.rm(concatPath, { force: true });
-      const mergedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, outputPath, { timeoutMs: 15000 });
+      const mergedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 15000 });
       if (!mergedMediaInfo.videoInfo) {
         throw new Error('合并文件生成后没有检测到视频流。');
       }
+      let mergedTimingInfo = null;
+      try {
+        if (room.mergeProgress?.id === progress.id) {
+          room.mergeProgress.message = '正在检查合并后的音画时间轴';
+          room.mergeProgress.percent = 99.7;
+          room.mergeProgress.updatedAt = Date.now();
+          this.emitState();
+        }
+        mergedTimingInfo = await probeMediaTimelineInfo(this.ffmpegPath, tmpPath, mergedMediaInfo, {
+          timeoutMs: 120000
+        });
+        this.log(
+          Math.abs(mergedTimingInfo.avDeltaSec) > 0.08 ? 'warn' : 'success',
+          `${roomLabel(room)} 合并后时轴检查：视频 ${mergedTimingInfo.videoDurationSec.toFixed(
+            3
+          )}s，音频 ${mergedTimingInfo.audioDurationSec.toFixed(3)}s，音频${mergedTimingInfo.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
+            mergedTimingInfo.avDeltaSec
+          ).toFixed(3)}s。`
+        );
+        if (!mergedTimingInfo.timingSafeForCopy) {
+          throw new Error(`合并后的音视频时长仍相差 ${Math.round(Math.abs(mergedTimingInfo.avDeltaSec) * 1000)}ms`);
+        }
+      } catch (error) {
+        this.log('warn', `${roomLabel(room)} 合并后时轴检查失败：${error.message}`);
+        throw error;
+      }
+      await fsp.rm(outputPath, { force: true });
+      await fsp.rename(tmpPath, outputPath);
+      await fsp.rm(concatPath, { force: true });
       await mergeDanmakuFiles(segments, danmakuPath);
       await copyFirstExistingFile(segments.map((segment) => segment.cssPath).filter(Boolean), cssPath, createDefaultDanmakuCss());
 
@@ -3355,7 +3756,20 @@ try {
         ),
         ignoredDanmakuCount: segments.reduce((sum, segment) => sum + Number(segment.ignoredDanmakuCount || 0), 0),
         danmakuCommandCounts: mergeCommandCounts(segments.map((segment) => segment.danmakuCommandCounts)),
-        videoInfo: mergedMediaInfo.videoInfo
+        videoInfo: mergedMediaInfo.videoInfo,
+        timingInfo: mergedTimingInfo
+          ? {
+              ...mergedTimingInfo,
+              sourceSegments: segmentTimelineInfos.map((timingInfo, index) => ({
+                index: index + 1,
+                videoDurationSec: Number(timingInfo.videoDurationSec || 0),
+                audioDurationSec: Number(timingInfo.audioDurationSec || 0),
+                avDeltaSec: Number(timingInfo.avDeltaSec || 0),
+                timingSafeForCopy: Boolean(timingInfo.timingSafeForCopy),
+                error: timingInfo.error || ''
+              }))
+            }
+          : null
       });
       const outputPathKey = path.resolve(outputPath).toLowerCase();
       const segmentPathKeys = new Set(segments.map((segment) => path.resolve(segment.cleanPath).toLowerCase()));
@@ -3544,121 +3958,97 @@ try {
     return this.getState();
   }
 
-  async prepareRepairedBurnSource(recording, options = {}) {
-    const sourcePath = path.resolve(String(recording?.cleanPath || '').trim());
-    if (!sourcePath || !(await isExistingFile(sourcePath))) {
-      throw new Error('烧录源文件不存在。');
-    }
-    const stat = await fsp.stat(sourcePath);
-    const mediaInfo = options.mediaInfo || (await probeMediaFileInfo(this.ffmpegPath, sourcePath));
-    const durationSec = Number(options.durationSec || mediaInfo.durationSec || recording.durationSec || 0);
-    const container = getContainerFromPath(sourcePath);
-    const id = this.createFileCacheId(sourcePath, stat, REPAIR_CACHE_VERSION);
-    const repairDir = path.join(this.repairCacheDir, id);
-    const remuxPath = path.join(repairDir, `source.remux.${container}`);
-    const transcodePath = path.join(repairDir, 'source.repaired.mp4');
-    const reuseChecks = await Promise.all([remuxPath, transcodePath].map((candidate) => isExistingFile(candidate)));
-    const reuseCandidate = [remuxPath, transcodePath].find((_candidate, index) => reuseChecks[index]);
-    if (reuseCandidate) {
-      this.log('info', `已复用源文件修复副本：${path.basename(reuseCandidate)}`);
-      return reuseCandidate;
-    }
-    await fsp.rm(repairDir, { recursive: true, force: true }).catch(() => {});
-    await fsp.mkdir(repairDir, { recursive: true });
-
-    const progress = createFfmpegJobProgress({
-      kind: 'repair',
-      label: options.label || `修复源文件：${path.basename(sourcePath)}`,
-      outputPath: sourcePath,
-      durationSec
-    });
-    options.assignProgress?.(progress);
-    this.emitState();
-
-    const runRepairJob = async (args, phaseMessage) => {
-      if (progress.status === 'running') {
-        progress.message = phaseMessage;
-        progress.updatedAt = Date.now();
-        this.emitState();
-      }
-      await runFfmpegJob(
-        this.ffmpegPath,
-        args,
-        (line) => {
-          if (updateFfmpegJobProgress(progress, line)) {
-            this.emitState();
-          }
-          if (/error|failed|invalid|non-monotonous|corrupt/i.test(line)) {
-            this.log('warn', `源文件修复：${compactLogLine(line)}`);
-          }
-        },
-        {
-          onChild: (child) => {
-            options.onChild?.(child);
-          }
-        }
-      );
-    };
-
-    try {
-      await runRepairJob(
-        createRepairRemuxArgs({
-          inputPath: sourcePath,
-          outputPath: remuxPath,
-          container,
-          streamCodec: mediaInfo.videoInfo?.codec || recording.videoInfo?.codec
-        }),
-        '正在 remux 修复时间戳'
-      );
-      finishFfmpegJobProgress(progress, 'completed', '源文件修复完成');
-      options.onChild?.(null);
-      this.emitState();
-      return remuxPath;
-    } catch (remuxError) {
-      await fsp.rm(remuxPath, { force: true }).catch(() => {});
-      if (options.isCancelled?.()) {
-        finishFfmpegJobProgress(progress, 'cancelled', '源文件修复已取消');
-        options.onChild?.(null);
-        this.emitState();
-        throw remuxError;
-      }
-      this.log('warn', `remux 修复失败，改用转码修复：${remuxError.message}`);
-      try {
-        await runRepairJob(
-          createRepairTranscodeArgs({ inputPath: sourcePath, outputPath: transcodePath, container: 'mp4' }),
-          'remux 失败，正在转码修复'
-        );
-        finishFfmpegJobProgress(progress, 'completed', '源文件修复完成');
-        options.onChild?.(null);
-        this.emitState();
-        return transcodePath;
-      } catch (transcodeError) {
-        await fsp.rm(transcodePath, { force: true }).catch(() => {});
-        finishFfmpegJobProgress(
-          progress,
-          options.isCancelled?.() ? 'cancelled' : 'error',
-          options.isCancelled?.() ? '源文件修复已取消' : `源文件修复失败：${transcodeError.message}`
-        );
-        options.onChild?.(null);
-        this.emitState();
-        throw transcodeError;
-      }
-    }
-  }
-
   async startBurnDanmaku(roomId, options = {}) {
     const room = this.getRoom(roomId);
-    if (this.isRoomBurning(room)) {
-      return this.getState();
-    }
     const recording = room.currentRecording;
     if (!recording?.cleanPath || !recording?.danmakuPath) {
       this.log('warn', `${roomLabel(room)} 没有可烧录的最近录像。`);
       return this.getState();
     }
 
-    await this.startBurnRecording(room, recording, options);
+    await this.enqueueBurnRecording(room, recording, options);
     return this.getState();
+  }
+
+  async enqueueBurnRecording(room, recording, options = {}) {
+    if (!recording?.cleanPath || !recording?.danmakuPath || recording.valid === false) {
+      throw new Error(`${roomLabel(room)} 没有可烧录的有效录像。`);
+    }
+    const cleanPathKey = path.resolve(recording.cleanPath).toLowerCase();
+    const duplicate = [this.activeBurnQueueItem, ...this.burnQueue].filter(Boolean).find(
+      (item) => item.roomId === room.id && path.resolve(item.recording.cleanPath).toLowerCase() === cleanPathKey
+    );
+    if (duplicate) {
+      this.log('warn', `${roomLabel(room)} 这场录像已经在烧录队列中。`);
+      return duplicate;
+    }
+    if (this.isRoomBurning(room)) {
+      const activePath = path.resolve(room.currentRecording?.cleanPath || '').toLowerCase();
+      if (activePath === cleanPathKey) {
+        this.log('warn', `${roomLabel(room)} 这场录像已经在生成弹幕视频。`);
+        return null;
+      }
+    }
+    const item = {
+      id: crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      roomId: room.id,
+      room,
+      recording: cloneRecordingState(recording),
+      options: { ...options },
+      label: `${roomLabel(room)}：${path.basename(recording.cleanPath)}`,
+      createdAt: Date.now()
+    };
+    this.burnQueue.push(item);
+    const position = this.burnQueue.length;
+    this.log('info', `已加入烧录队列 #${position}：${item.label}`);
+    this.emitState();
+    this.pumpBurnQueue();
+    return item;
+  }
+
+  pumpBurnQueue() {
+    if (this.burnQueueRunning || this.burnSessions.size > 0) {
+      return;
+    }
+    const item = this.burnQueue.shift();
+    if (!item) {
+      this.emitState();
+      this.scheduleQueuedUpdateCheck();
+      return;
+    }
+    this.burnQueueRunning = true;
+    this.activeBurnQueueItem = item;
+    this.emitState();
+    setImmediate(async () => {
+      try {
+        const started = await this.startBurnRecording(item.room, item.recording, item.options);
+        if (started) {
+          await this.waitForBurnIdle(item.roomId);
+        }
+      } catch (error) {
+        this.log('error', `烧录队列任务失败：${item.label}，${error.message || String(error)}`);
+      } finally {
+        this.activeBurnQueueItem = null;
+        this.burnQueueRunning = false;
+        this.emitState();
+        this.pumpBurnQueue();
+      }
+    });
+  }
+
+  waitForBurnIdle(roomId) {
+    return new Promise((resolve) => {
+      const check = () => {
+        const room = this.rooms.get(String(roomId));
+        if (!room || !this.isRoomBurning(room)) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(check, 500);
+        timer.unref?.();
+      };
+      check();
+    });
   }
 
   async prepareDanmakuForRoom(roomId, options = {}) {
@@ -3707,27 +4097,7 @@ try {
       const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
       recording.burnedPath = burnedPath;
       const codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
-      room.burning = true;
-      const burnSourcePath = await this.prepareRepairedBurnSource(recording, {
-        mediaInfo,
-        durationSec,
-        label: `修复烧录源文件：${path.basename(recording.cleanPath)}`,
-        assignProgress: (progress) => {
-          room.burnProgress = progress;
-          room.burning = true;
-        },
-        onChild: (child) => {
-          if (child) {
-            this.burnSessions.set(room.id, child);
-          } else if (this.burnSessions.has(room.id) && room.burnProgress?.kind === 'repair') {
-            this.burnSessions.delete(room.id);
-          }
-        },
-        isCancelled: () => this.burnCancelRequests.has(room.id)
-      });
-      if (this.burnCancelRequests.has(room.id)) {
-        throw new Error('弹幕视频生成已取消');
-      }
+      const burnSourcePath = recording.cleanPath;
 
       const args = createBurnArgs({
         cleanPath: burnSourcePath,
@@ -3735,7 +4105,8 @@ try {
         burnedPath,
         codec: this.settings.burnCodec,
         crf: this.settings.burnCrf,
-        container: getContainerFromPath(burnedPath)
+        container: getContainerFromPath(burnedPath),
+        fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps
       });
       const ffmpeg = spawn(this.ffmpegPath, args, {
         windowsHide: true,
@@ -3775,6 +4146,10 @@ try {
         }
       });
       ffmpeg.on('error', (error) => {
+        if (this.burnSessions.get(room.id) === ffmpeg) {
+          this.burnSessions.delete(room.id);
+          room.burning = false;
+        }
         finishFfmpegJobProgress(room.burnProgress, 'error', `启动失败：${error.message}`);
         this.log('error', `${roomLabel(room)} 烧录进程启动失败：${error.message}`);
         this.emitState();
@@ -3882,7 +4257,7 @@ try {
       throw new Error('请选择录像文件。');
     }
     if (recording.valid === false) {
-      throw new Error('这个录像文件被标记为无效，请换一个源文件。');
+      throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
     this.assertExportSourcePath(recording.cleanPath);
     const startTime = parseTimeInput(options.startTime ?? options.start);
@@ -3933,7 +4308,7 @@ try {
       throw new Error('请选择录像文件。');
     }
     if (recording.valid === false) {
-      throw new Error('这个录像文件被标记为无效，请换一个源文件。');
+      throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
     this.assertExportSourcePath(recording.cleanPath);
     if (!(await isExistingFile(recording.cleanPath))) {
@@ -4043,7 +4418,7 @@ try {
       throw new Error('请选择录像文件。');
     }
     if (recording.valid === false) {
-      throw new Error('这个录像文件被标记为无效，请换一个源文件。');
+      throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
     this.assertExportSourcePath(recording.cleanPath);
     if (!(await isExistingFile(recording.cleanPath))) {
@@ -4085,44 +4460,8 @@ try {
     let args;
     let codecInfo = null;
     if (mode === 'clean') {
-      let cleanSourcePath;
-      try {
-        cleanSourcePath = await this.prepareRepairedBurnSource(recording, {
-          mediaInfo,
-          durationSec,
-          label: `修复导出源文件：${path.basename(recording.cleanPath)}`,
-          assignProgress: (progress) => {
-            clearTimeout(this.exportProgressClearTimer);
-            this.exportProgress = progress;
-            this.exportProcess = null;
-            this.emitState();
-          },
-          onChild: (child) => {
-            this.exportProcess = child || null;
-          },
-          isCancelled: () => this.exportCancelRequested
-        });
-      } catch (error) {
-        if (this.exportCancelRequested) {
-          return {
-            ok: false,
-            mode,
-            cleanPath: recording.cleanPath,
-            cssPath
-          };
-        }
-        throw error;
-      }
-      if (this.exportCancelRequested) {
-        return {
-          ok: false,
-          mode,
-          cleanPath: recording.cleanPath,
-          cssPath
-        };
-      }
       args = createClipCopyArgs({
-        cleanPath: cleanSourcePath,
+        cleanPath: recording.cleanPath,
         outputPath,
         startTime,
         duration,
@@ -4143,44 +4482,16 @@ try {
       cssPath = assets.cssPath;
       assPath = assets.assPath;
       codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
-      let burnSourcePath;
-      try {
-        burnSourcePath = await this.prepareRepairedBurnSource(recording, {
-          mediaInfo,
-          durationSec,
-          label: `修复导出源文件：${path.basename(recording.cleanPath)}`,
-          assignProgress: (progress) => {
-            clearTimeout(this.exportProgressClearTimer);
-            this.exportProgress = progress;
-            this.exportProcess = null;
-            this.emitState();
-          },
-          onChild: (child) => {
-            this.exportProcess = child || null;
-          },
-          isCancelled: () => this.exportCancelRequested
-        });
-      } catch (error) {
-        await fsp.rm(temporaryAssDir, { recursive: true, force: true }).catch(() => {});
-        if (this.exportCancelRequested) {
-          return {
-            ok: false,
-            mode,
-            cleanPath: recording.cleanPath,
-            cssPath
-          };
-        }
-        throw error;
-      }
       args = createBurnArgs({
-        cleanPath: burnSourcePath,
+        cleanPath: recording.cleanPath,
         assPath,
         burnedPath: outputPath,
         codec: this.settings.burnCodec,
         crf: this.settings.burnCrf,
         container: getContainerFromPath(outputPath),
         startTime,
-        duration
+        duration,
+        fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps
       });
     }
 
@@ -4396,7 +4707,9 @@ try {
       ...this.updateState,
       status: 'queued',
       queued: true,
-      message: `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动下载安装器。安装会中断监听和录制，请确认空闲后手动安装。`
+      message: this.supportsManagedLinuxUpdate()
+        ? `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后将自动校验、安装并重启服务。`
+        : `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动下载更新包。`
     };
     this.log('info', this.updateState.message);
     this.emitState();
@@ -4466,7 +4779,7 @@ try {
         ...this.updateState,
         status: 'blocked',
         queued: false,
-        message: '当前仍有录制或烧录任务，暂不准备更新。安装会中断监听和录制，请任务结束后再手动安装。'
+        message: '当前仍有录制或烧录任务，暂不安装更新；可以排队等待任务结束。'
       };
       this.emitState();
       return this.getState();
@@ -4499,6 +4812,20 @@ try {
       this.emitState();
 
       const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
+      if (process.platform === 'linux' && this.supportsManagedLinuxUpdate()) {
+        await this.requestManagedLinuxUpdate(manifest, packagePath);
+        this.updateState = {
+          ...this.updateState,
+          status: 'applying',
+          queued: false,
+          message: `已验证 ${manifest.version} 更新包，systemd 更新服务将自动安装并重启后台服务。`,
+          downloadProgress: 100,
+          packagePath
+        };
+        this.log('success', this.updateState.message);
+        this.emitState();
+        return this.getState();
+      }
       this.updateState = {
         ...this.updateState,
         status: 'available',
@@ -4725,7 +5052,7 @@ try {
       const name = entry.name.toLowerCase();
       if (
         name.endsWith('.tmp') ||
-        (/^bili-record-2k-/.test(name) && /\.(?:exe|zip)$/i.test(name))
+        (/^bili-record-2k[-_]/.test(name) && /\.(?:exe|zip|deb|tar\.gz|tgz)$/i.test(name))
       ) {
         targets.add(path.join(updateDir, entry.name));
       }
@@ -4777,12 +5104,64 @@ try {
     this.queuedUpdateTimer.unref?.();
   }
 
+  supportsManagedLinuxUpdate() {
+    return process.platform === 'linux' && process.env.BILI_RECORD_MANAGED_UPDATE === '1';
+  }
+
+  async requestManagedLinuxUpdate(manifest, packagePath) {
+    const sha256 = String(manifest?.sha256 || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      throw new Error('Linux 自动安装要求更新清单提供有效的 SHA-256；当前包只能手动安装。');
+    }
+    const resolvedPackagePath = path.resolve(packagePath);
+    if (!isPathInsideDirectory(resolvedPackagePath, this.getUpdateDir())) {
+      throw new Error('更新包不在受控下载目录中，拒绝交给系统更新服务。');
+    }
+    const requestPath = path.join(this.getUpdateDir(), 'apply-request.json');
+    const tmpPath = `${requestPath}.${process.pid}.tmp`;
+    const request = {
+      schemaVersion: 1,
+      app: 'bili-record-2k',
+      version: normalizeVersion(manifest.version),
+      packageType: String(manifest.packageType || ''),
+      packagePath: resolvedPackagePath,
+      sha256,
+      requestedAt: new Date().toISOString()
+    };
+    await fsp.mkdir(this.getUpdateDir(), { recursive: true });
+    await fsp.writeFile(tmpPath, `${JSON.stringify(request, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await fsp.rename(tmpPath, requestPath);
+  }
+
+  scheduleAutomaticUpdateCheck(delayMs = AUTO_UPDATE_INTERVAL_MS) {
+    clearTimeout(this.autoUpdateTimer);
+    this.autoUpdateTimer = null;
+    if (!this.settings.autoUpdateEnabled || process.platform !== 'linux' || delayMs <= 0) {
+      return;
+    }
+    this.autoUpdateTimer = setTimeout(async () => {
+      try {
+        await this.checkUpdate();
+        if (this.updateState.manifest && compareVersions(this.updateState.latestVersion, APP_VERSION) > 0) {
+          await this.queueUpdateAfterJobs();
+        }
+      } catch (error) {
+        this.log('warn', `自动检查更新失败：${error.message}`);
+      } finally {
+        this.scheduleAutomaticUpdateCheck(AUTO_UPDATE_INTERVAL_MS);
+      }
+    }, delayMs);
+    this.autoUpdateTimer.unref?.();
+  }
+
   hasActiveJobs() {
     return (
       this.recordingSessions.size > 0 ||
       this.recordingStartLocks.size > 0 ||
       this.reconnectPendingRooms.size > 0 ||
       this.burnSessions.size > 0 ||
+      this.burnQueueRunning ||
+      this.burnQueue.length > 0 ||
       Boolean(this.exportProcess) ||
       Boolean(this.exportPreviewProcess) ||
       this.exportQueueRunning ||
@@ -4832,6 +5211,7 @@ try {
   shutdown() {
     this.clearLoginTimer();
     clearTimeout(this.queuedUpdateTimer);
+    clearTimeout(this.autoUpdateTimer);
     if (this.pathPickerProcess) {
       forceKillProcess(this.pathPickerProcess);
       this.pathPickerProcess = null;
@@ -4842,6 +5222,9 @@ try {
       clearInterval(timer);
     }
     this.monitorTimers.clear();
+    for (const roomId of Array.from(this.livePushMonitors.keys())) {
+      this.stopLivePushMonitor(roomId);
+    }
     for (const room of this.rooms.values()) {
       const session = this.recordingSessions.get(room.id);
       clearTimeout(session?.rotateTimer);
@@ -4895,9 +5278,10 @@ async function isExistingFile(filePath) {
 }
 
 async function runAssWorkerJob(payload) {
+  const managedServerEntry = String(process.env.BILI_RECORD_SERVER_ENTRY || '').trim();
   const args = isSingleExecutableRuntime()
     ? ['--ass-worker']
-    : [path.join(APP_ROOT, 'src', 'server', 'index.cjs'), '--ass-worker'];
+    : [managedServerEntry || path.join(APP_ROOT, 'src', 'server', 'index.cjs'), '--ass-worker'];
   const result = await runCapturedProcess(process.execPath, args, {
     input: JSON.stringify(payload),
     timeoutMs: 180000,

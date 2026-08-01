@@ -20,7 +20,7 @@ export function UpdateNotice({
     return null;
   }
 
-  const activeJobs = stats.recording > 0 || stats.burning > 0;
+  const activeJobs = Boolean(update.activeJobs) || stats.recording > 0 || stats.burning > 0;
   const busyUpdating = ['checking', 'downloading', 'ready', 'applying'].includes(update.status);
   const canInstall = update.status === 'available' || update.status === 'blocked';
   const showQueue = canInstall && activeJobs;
@@ -60,17 +60,17 @@ export function UpdateNotice({
             onClick={() => run('update-queue', recorder.queueUpdate)}
           >
             <Clock3 size={18} />
-            结束后下载
+            结束后更新
           </button>
         ) : null}
         {canInstall ? (
           <button
             className="wide-button"
-            disabled={busy === 'update-download' || update.status === 'downloading'}
-            onClick={() => run('update-download', recorder.downloadUpdate)}
+            disabled={busy === 'update-apply' || update.status === 'downloading'}
+            onClick={() => run('update-apply', recorder.applyUpdate)}
           >
             <Download size={18} />
-            下载安装器
+            {update.autoApplySupported ? '自动安装' : '下载更新包'}
           </button>
         ) : null}
         {update.status === 'error' ? (

@@ -293,6 +293,25 @@ export function RoomCard({
                 <FileVideo size={15} />
                 最终 {filename(room.currentRecording.cleanPath)}
               </span>
+              {room.currentRecording.timingInfo ? (
+                <span
+                  title={`合并后：视频 ${room.currentRecording.timingInfo.videoDurationSec.toFixed(3)}s，音频 ${room.currentRecording.timingInfo.audioDurationSec.toFixed(3)}s${
+                    room.currentRecording.timingInfo.sourceSegments?.length
+                      ? `；合并前：${room.currentRecording.timingInfo.sourceSegments
+                          .map((item) => `#${item.index} ${Math.round(item.avDeltaSec * 1000)}ms`)
+                          .join('，')}`
+                      : ''
+                  }`}
+                >
+                  <Activity size={15} />
+                  {room.currentRecording.timingInfo.sourceSegments?.length
+                    ? `合并前最差 ${Math.round(
+                        Math.max(...room.currentRecording.timingInfo.sourceSegments.map((item) => Math.abs(item.avDeltaSec))) *
+                          1000
+                      )}ms · 合并后 ${Math.round(room.currentRecording.timingInfo.avDeltaSec * 1000)}ms`
+                    : `音画时长差 ${Math.round(room.currentRecording.timingInfo.avDeltaSec * 1000)}ms`}
+                </span>
+              ) : null}
             </div>
           ) : (
             <p className="technical-empty">开始录制后会显示源流、分辨率、弹幕通道和输出文件信息。</p>

@@ -100,7 +100,7 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
   return args;
 }
 
-function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration }) {
+function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration, fps }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
@@ -111,7 +111,11 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
   if (hasDuration) {
     args.push('-t', formatFfmpegSeconds(duration));
   }
-  const videoFilter = `setpts=PTS-STARTPTS,ass='${escapeFilterPath(assPath)}'`;
+  const targetFps = normalizeMergeFps(fps);
+  const fpsFilter = targetFps ? `,fps=${targetFps}:start_time=0` : '';
+  const videoFilter =
+    `settb=AVTB,setpts=PTS-STARTPTS,select='if(isnan(prev_selected_t)\\,key\\,1)'${fpsFilter},` +
+    `ass='${escapeFilterPath(assPath)}'`;
   args.push('-map', '0:v:0', '-map', '0:a?', '-vf', videoFilter, '-c:v', codec || 'libx265');
 
   if ((codec || '').includes('nvenc')) {
@@ -179,81 +183,6 @@ function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern }) {
   ];
 }
 
-function createRepairRemuxArgs({ inputPath, outputPath, container, streamCodec }) {
-  const args = [
-    '-hide_banner',
-    '-y',
-    '-fflags',
-    '+genpts+discardcorrupt',
-    '-err_detect',
-    'ignore_err',
-    '-i',
-    inputPath,
-    '-ignore_unknown',
-    '-map',
-    '0:v:0',
-    '-map',
-    '0:a?',
-    '-c',
-    'copy',
-    '-dn',
-    '-sn',
-    '-avoid_negative_ts',
-    'make_zero'
-  ];
-  if (container === 'mp4') {
-    if (isHevcCodec(streamCodec)) {
-      args.push('-tag:v', 'hvc1');
-    }
-    args.push('-movflags', '+faststart');
-  }
-  args.push(outputPath);
-  return args;
-}
-
-function createRepairTranscodeArgs({ inputPath, outputPath, container }) {
-  const args = [
-    '-hide_banner',
-    '-y',
-    '-fflags',
-    '+genpts+discardcorrupt',
-    '-err_detect',
-    'ignore_err',
-    '-i',
-    inputPath,
-    '-ignore_unknown',
-    '-map',
-    '0:v:0',
-    '-map',
-    '0:a?',
-    '-vf',
-    'setpts=PTS-STARTPTS,format=yuv420p',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '20',
-    '-af',
-    'aresample=async=1:first_pts=0',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '160k',
-    '-ac',
-    '2',
-    '-dn',
-    '-sn',
-    '-avoid_negative_ts',
-    'make_zero'
-  ];
-  if (container === 'mp4') {
-    args.push('-movflags', '+faststart');
-  }
-  args.push(outputPath);
-  return args;
-}
-
 function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, container }) {
   const args = [
     '-hide_banner',
@@ -315,14 +244,20 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
   const concatInputs = [];
   segments.forEach((segment, index) => {
     const fpsFilter = targetFps ? `,fps=${targetFps}` : '';
+    const videoDurationFilter = Number(segment.durationSec) > 0
+      ? `trim=duration=${formatFfmpegSeconds(segment.durationSec)},`
+      : '';
+    const audioDurationFilter = Number(segment.durationSec) > 0
+      ? `apad,atrim=duration=${formatFfmpegSeconds(segment.durationSec)},`
+      : '';
     filters.push(
-      `[${index}:v:0]settb=AVTB,setpts=PTS-STARTPTS,` +
+      `[${index}:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
         `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
         `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=yuv420p[v${index}]`
     );
     if (segment.hasAudio) {
       filters.push(
-        `[${index}:a:0]aresample=48000:async=1:first_pts=0,` +
+        `[${index}:a:0]aresample=48000:async=1:first_pts=0,${audioDurationFilter}` +
           `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${index}]`
       );
     } else {
@@ -491,8 +426,6 @@ module.exports = {
   createMp4FinalizeArgs,
   createBurnArgs,
   createPreviewHlsArgs,
-  createRepairRemuxArgs,
-  createRepairTranscodeArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
   createConcatTranscodeArgs,

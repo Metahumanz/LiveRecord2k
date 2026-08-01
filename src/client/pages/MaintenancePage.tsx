@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Save, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
-import { PageHeader, PathLine, SettingPanel, UpdateProgress } from '../components/common';
+import { PageHeader, PathLine, SettingPanel, Toggle, UpdateProgress } from '../components/common';
 import type { AppSettings, AppState } from '../types';
 import {
   ffmpegCodecSummary,
@@ -31,7 +31,7 @@ export function MaintenancePage({
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
   const importInputRef = useRef<HTMLInputElement | null>(null);
-  const hasActiveJobs = state.rooms.some((room) => room.recording || room.burning);
+  const hasActiveJobs = Boolean(state.update.activeJobs);
   const currentCodec = state.ffmpegCapabilities?.burnCodecs.find((codec) => codec.value === state.settings.burnCodec);
   const unavailableCodecText = (state.ffmpegCapabilities?.unavailableBurnCodecs || [])
     .filter((codec) => codec.kind === 'hardware')
@@ -140,6 +140,15 @@ export function MaintenancePage({
           <PathLine label="最新版本" value={state.update.latestVersion || '尚未检查'} />
           <PathLine label="更新状态" value={state.update.message || '尚未检查更新'} />
           <UpdateProgress update={state.update} />
+          {state.platform === 'linux' ? (
+            <div className="toggle-list">
+              <Toggle
+                label="自动更新（每 6 小时检查，任务结束后安装）"
+                checked={settingsDraft.autoUpdateEnabled}
+                onChange={(checked) => setSettingsDraft({ ...settingsDraft, autoUpdateEnabled: checked })}
+              />
+            </div>
+          ) : null}
           <div className="split-buttons">
             <button
               className="wide-button fill"
@@ -154,13 +163,13 @@ export function MaintenancePage({
               className="wide-button fill"
               type="button"
               disabled={
-                busy === 'update-download' ||
+                busy === 'update-apply' ||
                 ['checking', 'queued', 'downloading', 'ready', 'applying'].includes(state.update.status)
               }
-              onClick={() => run('update-download', recorder.downloadUpdate)}
+              onClick={() => run('update-apply', recorder.applyUpdate)}
             >
               <Download size={18} />
-              下载安装器
+              {state.update.autoApplySupported ? '自动安装更新' : '下载更新包'}
             </button>
             {(state.update.status === 'available' || state.update.status === 'blocked') && hasActiveJobs ? (
               <button
@@ -170,7 +179,7 @@ export function MaintenancePage({
                 onClick={() => run('update-queue', recorder.queueUpdate)}
               >
                 <Clock3 size={18} />
-                结束后下载
+                结束后更新
               </button>
             ) : null}
           </div>
@@ -215,9 +224,9 @@ export function MaintenancePage({
                 }
               >
                 <option value="127.0.0.1">仅本机 127.0.0.1</option>
-                <option value="0.0.0.0">局域网 0.0.0.0</option>
+                <option value="0.0.0.0">外部网络 0.0.0.0</option>
               </select>
-              <p className="field-help">选择 0.0.0.0 后，其它电脑可用本机局域网 IP 加端口访问；可能需要放行 Windows 防火墙。</p>
+              <p className="field-help">选择 0.0.0.0 后，局域网或公网入口都会先要求登录；云服务器还应配合 HTTPS 反向代理。</p>
             </label>
             <label className="field">
               <span>服务端口（重启生效）</span>
@@ -233,6 +242,28 @@ export function MaintenancePage({
               <p className="field-help">端口只在保存并重启后台服务后生效。</p>
             </label>
             <label className="field">
+              <span>远程访问用户名</span>
+              <input
+                value={settingsDraft.accessUsername}
+                maxLength={64}
+                autoComplete="username"
+                onChange={(event) => setSettingsDraft({ ...settingsDraft, accessUsername: event.target.value })}
+              />
+              <p className="field-help">默认 admin；只用于 WebUI 远程管理登录。</p>
+            </label>
+            <label className="field">
+              <span>设置新的远程访问密码</span>
+              <input
+                type="password"
+                minLength={8}
+                value={settingsDraft.accessPassword}
+                autoComplete="new-password"
+                placeholder={settingsDraft.accessAuthConfigured ? '已配置；留空表示不修改' : '至少 8 个字符'}
+                onChange={(event) => setSettingsDraft({ ...settingsDraft, accessPassword: event.target.value })}
+              />
+              <p className="field-help">密码只提交一次，服务端使用 scrypt 加盐哈希保存，不会回传明文。</p>
+            </label>
+            <label className="field">
               <span>更新源</span>
               <input
                 value={settingsDraft.updateManifestUrl}
@@ -241,6 +272,10 @@ export function MaintenancePage({
             </label>
           </div>
           <PathLine label="当前监听" value={`${state.currentHost || '127.0.0.1'}:${state.currentPort || ''}`} />
+          <PathLine
+            label="远程鉴权"
+            value={state.access?.configured ? `已配置（用户 ${state.access.username}）` : '未配置'}
+          />
           <PathLine label="当前端口" value={String(state.currentPort || '')} />
           <PathLine label="配置文件" value={state.storePath || ''} />
           <PathLine label="应用目录" value={state.appRoot || ''} />
@@ -257,6 +292,13 @@ export function MaintenancePage({
           <PathLine label="状态文件" value={state.update.statusPath || ''} />
           <PathLine label="下载文件" value={state.update.packagePath || ''} />
           <div className="split-buttons">
+            {state.access?.required && state.access.authenticated ? (
+              <form method="post" action="/api/access/logout">
+                <button className="wide-button fill" type="submit">
+                  退出远程登录
+                </button>
+              </form>
+            ) : null}
             <button
               className="wide-button fill"
               type="button"
