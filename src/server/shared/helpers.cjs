@@ -613,7 +613,8 @@ function deriveSiblingPath(filePath, suffix, extension) {
   const parsed = path.parse(filePath);
   const ext = extension || parsed.ext.replace(/^\./, '') || 'mp4';
   const base = parsed.name.replace(/\.clean$/i, '');
-  return path.join(parsed.dir, `${base}.${suffix}.${ext}`);
+  const tail = `.${suffix}.${ext}`;
+  return path.join(parsed.dir, `${fitOutputBaseName(parsed.dir, base, tail)}${tail}`);
 }
 
 function deriveBurnedPath(filePath, overlayMode) {
@@ -625,7 +626,22 @@ function deriveClipPath(cleanPath, outputDir, mode, startTime, endTime) {
   const container = parsed.ext.replace(/^\./, '') || 'mp4';
   const base = parsed.name.replace(/\.clean$/i, '');
   const suffix = createClipSuffix(startTime, endTime, mode);
-  return path.join(outputDir, `${base}.${suffix}.${container}`);
+  const tail = `.${suffix}.${container}`;
+  return path.join(outputDir, `${fitOutputBaseName(outputDir, base, tail)}${tail}`);
+}
+
+function fitOutputBaseName(directory, baseName, tail) {
+  const base = String(baseName || 'recording');
+  if (process.platform !== 'win32') {
+    return base;
+  }
+  const directoryLength = path.resolve(String(directory || '.')).length;
+  const budget = Math.max(20, 240 - directoryLength - 1 - String(tail || '').length);
+  if (base.length <= budget) {
+    return base;
+  }
+  const hash = crypto.createHash('sha1').update(base).digest('hex').slice(0, 8);
+  return `${base.slice(0, Math.max(8, budget - hash.length - 1)).trimEnd()}-${hash}`;
 }
 
 function replaceExtension(filePath, extension) {
@@ -918,6 +934,64 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
   };
 }
 
+async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
+  const timeoutMs = Number(options.timeoutMs || 90000);
+  const scanStream = async (selector) => {
+    const result = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-nostdin',
+        '-loglevel',
+        'error',
+        '-i',
+        filePath,
+        '-map',
+        selector,
+        '-c',
+        'copy',
+        '-f',
+        'null',
+        '-',
+        '-progress',
+        'pipe:1'
+      ],
+      { timeoutMs }
+    );
+    if (result.timedOut) {
+      throw new Error(`媒体时间轴扫描超时：${path.basename(filePath)}`);
+    }
+    if (result.status !== 0) {
+      throw new Error(`媒体时间轴扫描失败：${path.basename(filePath)}（${compactLogLine(result.stderr)}）`);
+    }
+    const values = Array.from(String(result.stdout || '').matchAll(/out_time_us=(-?\d+)/g))
+      .map((match) => Number(match[1]) / 1_000_000)
+      .filter(Number.isFinite);
+    return values.length ? Math.max(0, values.at(-1)) : 0;
+  };
+
+  const videoDurationSec = await scanStream('0:v:0');
+  const audioDurationSec = mediaInfo.audioInfo ? await scanStream('0:a:0') : 0;
+  const measuredAvDeltaSec = mediaInfo.audioInfo ? audioDurationSec - videoDurationSec : 0;
+  // Stream-copy progress reports video DTS, which can trail presentation time by several B-frames.
+  // Discount that known positive-only reorder gap before deciding whether the streams really drift.
+  const fps = Number(mediaInfo.videoInfo?.fps || 0);
+  const videoReorderAllowanceSec = fps > 0 ? Math.min(0.15, 3 / fps) : 0.12;
+  const avDeltaSec = measuredAvDeltaSec > 0 ? Math.max(0, measuredAvDeltaSec - videoReorderAllowanceSec) : measuredAvDeltaSec;
+  const containerDurationSec = Number(mediaInfo.durationSec || 0);
+  const streamDurationSec = Math.max(videoDurationSec, audioDurationSec);
+  return {
+    containerDurationSec,
+    videoDurationSec,
+    audioDurationSec,
+    avDeltaSec,
+    measuredAvDeltaSec,
+    videoReorderAllowanceSec,
+    containerDeltaSec: containerDurationSec && streamDurationSec ? containerDurationSec - streamDurationSec : 0,
+    timingSafeForCopy: !mediaInfo.audioInfo || Math.abs(avDeltaSec) <= 0.08
+  };
+}
+
 function isHevcCodec(codec) {
   const value = String(codec || '').toLowerCase();
   return value.includes('hevc') || value.includes('h265') || value.includes('x265');
@@ -1060,8 +1134,8 @@ function getRuntimePort(settingsPort) {
   if (portIndex >= 0 && argv[portIndex + 1]) {
     return clamp(Number(argv[portIndex + 1]), 1, 65535);
   }
-  if (process.env.PORT) {
-    return clamp(Number(process.env.PORT), 1, 65535);
+  if (process.env.BILI_RECORD_PORT || process.env.PORT) {
+    return clamp(Number(process.env.BILI_RECORD_PORT || process.env.PORT), 1, 65535);
   }
   return clamp(Number(settingsPort || DEFAULT_PORT), 1, 65535);
 }
@@ -1084,13 +1158,17 @@ function getRuntimeHost(settingsHost) {
   if (hostIndex >= 0 && argv[hostIndex + 1]) {
     return normalizeServerHost(argv[hostIndex + 1]);
   }
-  if (process.env.HOST) {
-    return normalizeServerHost(process.env.HOST);
+  if (process.env.BILI_RECORD_HOST || process.env.HOST) {
+    return normalizeServerHost(process.env.BILI_RECORD_HOST || process.env.HOST);
   }
   return normalizeServerHost(settingsHost || '127.0.0.1');
 }
 
 function getAppRoot() {
+  const configuredRoot = String(process.env.BILI_RECORD_APP_ROOT || '').trim();
+  if (configuredRoot) {
+    return path.resolve(configuredRoot);
+  }
   const execDir = path.dirname(process.execPath);
   if (process.pkg || fs.existsSync(path.join(execDir, 'dist'))) {
     return execDir;
@@ -1679,49 +1757,47 @@ function isDefaultUpdateSource(source, defaultSource = '') {
   return (fallback && normalized === fallback) || normalized.endsWith('/releases/latest/download/update.json');
 }
 
-function normalizeUpdateManifest(payload) {
+function normalizeUpdateManifest(payload, options = {}) {
   if (!payload || typeof payload !== 'object') {
     throw new Error('更新源不是有效 JSON。');
   }
+  const platform = normalizeUpdatePlatform(options.platform || process.platform);
+  const arch = normalizeUpdateArch(options.arch || process.arch);
+  const preferredPackageType = normalizeUpdatePackageType(options.packageType || getAppPackageType(), platform);
   if (Array.isArray(payload.assets)) {
-    const installerAsset = payload.assets.find((asset) => isInstallerFileName(asset.name || asset.browser_download_url || ''));
-    const zipAsset = payload.assets.find((asset) => /\.zip$/i.test(asset.name || asset.browser_download_url || ''));
-    const packageAsset = installerAsset || zipAsset;
+    const files = payload.assets.map((asset) => ({
+      name: asset.name || packageFileNameFromUrl(asset.browser_download_url || asset.url || ''),
+      url: asset.browser_download_url || asset.url || '',
+      sha256: String(asset.digest || '').replace(/^sha256:/i, '')
+    }));
+    const packageAsset = selectUpdatePackageFile(files, { platform, arch, preferredPackageType });
     return {
       version: normalizeVersion(payload.version || payload.tag_name || ''),
       tagName: payload.tag_name || '',
-      packageType: installerAsset ? 'installer' : 'portable',
-      packageUrl: packageAsset?.browser_download_url || packageAsset?.url || '',
-      sha256: payload.sha256 || '',
+      packageType: packageAsset?.packageType || preferredPackageType,
+      packageUrl: packageAsset?.url || '',
+      sha256: packageAsset?.sha256 || payload.sha256 || '',
       releaseUrl: payload.html_url || '',
       notes: payload.body || ''
     };
   }
   const files = Array.isArray(payload.files) ? payload.files : [];
-  const installerFile =
-    files.find((file) => String(file.kind || file.type || '').toLowerCase() === 'installer') ||
-    files.find((file) => isInstallerFileName(file.name || file.url || ''));
-  const zipFile =
-    files.find((file) => String(file.kind || file.type || '').toLowerCase() === 'portable') ||
-    files.find((file) => /\.zip$/i.test(file.name || file.url || ''));
-  const packageFile = installerFile || zipFile;
-  const packageUrl =
-    payload.installerUrl ||
-    payload.packageUrl ||
-    payload.url ||
-    payload.downloadUrl ||
-    packageFile?.url ||
-    '';
-  const packageType = normalizeUpdatePackageType(payload.packageType || packageFile?.kind || packageFile?.type || packageUrl);
+  const packageFile = selectUpdatePackageFile(files, { platform, arch, preferredPackageType });
+  const legacyPackageUrl = payload.installerUrl || payload.packageUrl || payload.url || payload.downloadUrl || '';
+  const legacyPackageType = normalizeUpdatePackageType(payload.packageType || legacyPackageUrl, platform);
+  const legacyPlatform = inferUpdatePlatform(payload.platform || legacyPackageUrl, legacyPackageType);
+  const canUseLegacyPackage = !packageFile && (!legacyPlatform || legacyPlatform === platform);
+  const packageUrl = packageFile?.url || (canUseLegacyPackage ? legacyPackageUrl : '');
+  const packageType = packageFile?.packageType || legacyPackageType;
   return {
     version: normalizeVersion(payload.version || payload.tagName || ''),
     tagName: payload.tagName || payload.tag_name || '',
     packageType,
     packageUrl,
     sha256:
-      payload.sha256 ||
-      (packageType === 'installer' ? payload.installerSha256 : payload.portableSha256) ||
       packageFile?.sha256 ||
+      payload.sha256 ||
+      (packageType === 'installer' ? payload.installerSha256 : packageType === 'portable' ? payload.portableSha256 : '') ||
       '',
     installerArgs: payload.installerArgs,
     releaseUrl: payload.releaseUrl || payload.htmlUrl || '',
@@ -1733,12 +1809,99 @@ function normalizeVersion(value) {
   return String(value || '').trim().replace(/^v/i, '');
 }
 
-function normalizeUpdatePackageType(value) {
+function normalizeUpdatePlatform(value) {
   const text = String(value || '').trim().toLowerCase();
+  if (text === 'windows' || text === 'win32') return 'win32';
+  if (text === 'linux') return 'linux';
+  if (text === 'darwin' || text === 'macos' || text === 'mac') return 'darwin';
+  return text;
+}
+
+function normalizeUpdateArch(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'amd64' || text === 'x86_64') return 'x64';
+  if (text === 'aarch64') return 'arm64';
+  if (text === 'any' || text === 'noarch') return 'all';
+  return text;
+}
+
+function normalizeUpdatePackageType(value, platform = process.platform) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'deb' || /\.deb(?:$|[?#])/i.test(text)) {
+    return 'deb';
+  }
+  if (text === 'tarball' || text === 'linux-tar' || /\.(?:tar\.gz|tgz)(?:$|[?#])/i.test(text)) {
+    return 'tarball';
+  }
   if (text === 'installer' || isInstallerFileName(text)) {
     return 'installer';
   }
+  if (text === 'portable') {
+    return 'portable';
+  }
+  if (/\.zip(?:$|[?#])/i.test(text)) {
+    return 'portable';
+  }
+  if (normalizeUpdatePlatform(platform) === 'linux') {
+    return 'deb';
+  }
   return 'portable';
+}
+
+function inferUpdatePlatform(value, packageType = '') {
+  const explicit = normalizeUpdatePlatform(value);
+  if (explicit === 'win32' || explicit === 'linux' || explicit === 'darwin') {
+    return explicit;
+  }
+  const text = String(value || '').toLowerCase();
+  if (packageType === 'deb' || packageType === 'tarball' || /\.(?:deb|tar\.gz|tgz)(?:$|[?#])/i.test(text)) return 'linux';
+  if (packageType === 'installer' || packageType === 'portable' || /\.(?:exe|msi|msix|zip)(?:$|[?#])/i.test(text)) return 'win32';
+  return '';
+}
+
+function selectUpdatePackageFile(files, { platform, arch, preferredPackageType }) {
+  const candidates = files
+    .map((file) => {
+      const nameOrUrl = file.name || file.url || '';
+      const packageType = normalizeUpdatePackageType(file.kind || file.type || nameOrUrl, platform);
+      return {
+        ...file,
+        packageType,
+        platform: inferUpdatePlatform(file.platform || nameOrUrl, packageType),
+        arch: normalizeUpdateArch(file.arch || 'all') || 'all'
+      };
+    })
+    .filter((file) => file.url)
+    .filter((file) => !file.platform || file.platform === platform)
+    .filter((file) => file.arch === 'all' || !arch || file.arch === arch);
+  const typeOrder = platform === 'linux' ? ['deb', 'tarball'] : platform === 'win32' ? ['installer', 'portable'] : [];
+  candidates.sort((left, right) => {
+    const score = (file) => {
+      if (file.packageType === preferredPackageType) return 0;
+      const index = typeOrder.indexOf(file.packageType);
+      return index >= 0 ? index + 1 : 50;
+    };
+    return score(left) - score(right);
+  });
+  return candidates[0] || null;
+}
+
+function getAppPackageType() {
+  const configured = String(process.env.BILI_RECORD_PACKAGE_TYPE || '').trim();
+  if (configured) {
+    return normalizeUpdatePackageType(configured, process.platform);
+  }
+  for (const candidate of [path.join(APP_ROOT, 'version.json'), path.join(APP_ROOT, 'package.json')]) {
+    try {
+      const payload = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      if (payload.packageType) {
+        return normalizeUpdatePackageType(payload.packageType, process.platform);
+      }
+    } catch {
+      // Keep looking.
+    }
+  }
+  return normalizeUpdatePackageType('', process.platform);
 }
 
 function isInstallerFileName(value) {
@@ -1803,11 +1966,21 @@ function splitCommandLineArgs(value) {
 }
 
 function updatePackageLabel(manifest) {
+  const packageType = normalizeUpdatePackageType(manifest?.packageType || manifest?.packageUrl, process.platform);
+  if (packageType === 'deb') return 'Debian 安装包';
+  if (packageType === 'tarball') return 'Linux 更新包';
   return isInstallerUpdatePackage(manifest, manifest?.packageUrl) ? '安装器' : '更新包';
 }
 
 function updatePackageFileName(manifest) {
   const version = sanitizeFilename(manifest?.version || 'latest');
+  const packageType = normalizeUpdatePackageType(manifest?.packageType || manifest?.packageUrl, process.platform);
+  if (packageType === 'deb') {
+    return `bili-record-2k_${version}_all.deb`;
+  }
+  if (packageType === 'tarball') {
+    return `bili-record-2k_${version}_linux_all.tar.gz`;
+  }
   const urlName = packageFileNameFromUrl(manifest?.packageUrl || '');
   const extension = path.extname(urlName).toLowerCase();
   if (extension) {
@@ -1845,7 +2018,7 @@ async function downloadFile(url, targetPath, onProgress) {
   await fsp.rm(tmpPath, { force: true });
   const body = await requestUrlBuffer(url, {
     headers: {
-      Accept: 'application/x-msdownload, application/vnd.microsoft.portable-executable, application/zip, application/octet-stream, */*',
+      Accept: 'application/x-msdownload, application/vnd.microsoft.portable-executable, application/vnd.debian.binary-package, application/gzip, application/zip, application/octet-stream, */*',
       'User-Agent': `${APP_NAME}/${APP_VERSION}`
     },
     onProgress,
@@ -1873,6 +2046,9 @@ async function fileSha256(filePath) {
 }
 
 async function isStartupEnabled() {
+  if (process.platform === 'linux') {
+    return process.env.BILI_RECORD_SYSTEMD === '1';
+  }
   if (process.platform !== 'win32') {
     return false;
   }
@@ -2057,6 +2233,7 @@ module.exports = {
   estimateRecordingDurationFromStats,
   readDanmakuDurationSec,
   probeMediaFileInfo,
+  probeMediaTimelineInfo,
   isHevcCodec,
   formatTimestamp,
   formatDurationSeconds,
@@ -2108,7 +2285,11 @@ module.exports = {
   isDefaultUpdateSource,
   normalizeUpdateManifest,
   normalizeVersion,
+  normalizeUpdatePlatform,
+  normalizeUpdateArch,
   normalizeUpdatePackageType,
+  selectUpdatePackageFile,
+  getAppPackageType,
   isInstallerFileName,
   isInstallerUpdatePackage,
   normalizeInstallerArgs,

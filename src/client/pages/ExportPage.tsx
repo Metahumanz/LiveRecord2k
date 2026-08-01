@@ -72,8 +72,22 @@ export function ExportPage({
     ? clampNumber(draftEnd, 0, canUseTimeline ? timelineDuration : 0)
     : timelineDuration;
   const selectedValid = selectedRecording?.valid !== false;
+  const requiresDanmaku = draft.mode !== 'clean';
+  const exportBlockReason = !selectedRecording
+    ? '请先从录像列表中选择一个源视频。'
+    : !selectedValid
+      ? selectedRecording.validReason || '这个源视频未通过完整性检查，不能加入导出队列。'
+      : !draft.cleanPath
+        ? '源视频路径为空。'
+        : requiresDanmaku && !draft.danmakuPath
+          ? '这场录像没有找到弹幕数据；可以改为“纯净片段”，或先检查同名 .danmaku.jsonl 文件。'
+          : !Number.isFinite(draftStart) || draftStart < 0
+            ? '开始时间无效，请输入 00:00:00 或秒数。'
+            : !Number.isFinite(draftEnd) || draftEnd <= draftStart
+              ? '结束时间必须大于开始时间。'
+              : '';
   const canExport = Boolean(
-    selectedValid && draft.cleanPath && Number.isFinite(draftStart) && Number.isFinite(draftEnd) && draftEnd > draftStart
+    !exportBlockReason
   );
   const canPrepare = Boolean(canExport && draft.danmakuPath);
   const mediaSource = draft.cleanPath ? mediaUrl(draft.cleanPath) : '';
@@ -699,6 +713,7 @@ export function ExportPage({
             </button>
             <button
               className="wide-button fill primary"
+              title={exportBlockReason || (hasExportBacklog ? '任务会排在现有任务之后' : '开始导出')}
               disabled={!canExport || busy === 'export-clip'}
               onClick={exportClip}
             >
@@ -706,6 +721,12 @@ export function ExportPage({
               {hasExportBacklog ? '加入导出队列' : '导出片段'}
             </button>
           </div>
+          {exportBlockReason ? (
+            <div className="warning-line">
+              <CircleAlert size={16} />
+              <span>暂时不能加入队列：{exportBlockReason}</span>
+            </div>
+          ) : null}
           {state.exportProgress ? <JobProgress progress={state.exportProgress} /> : null}
           {state.exportProgress?.status === 'running' ? (
             <button

@@ -25,6 +25,7 @@ export const recorder: RecorderApi = {
     return result.path?.trim() || undefined;
   },
   selectPath: (request) => api('/api/shell/select-path', request, { timeoutMs: 0 }),
+  getDiskSpace: (path) => api('/api/system/disk-space', { path }),
   saveSettings: (settings) => api<AppState>('/api/settings/save', { settings }, { timeoutMs: 120000 }),
   addRoom: (roomId) => api<AppState>('/api/rooms/add', { roomId }, { timeoutMs: 75000 }),
   removeRoom: (roomId) => api<AppState>('/api/rooms/remove', { roomId }),

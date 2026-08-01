@@ -76,7 +76,7 @@ https://live.bilibili.com/22625025
 
 ### 开启监听
 
-监听开启后，应用会按录制配置中的间隔刷新直播状态。开播、下播、开始录制、结束录制等事件可以通过 Windows 通知提醒。
+监听开启后，应用会保持直播弹幕服务器连接，并在收到开播推送时立即准备录制；设置中的 HTTP 轮询间隔只作为推送断线或漏消息时的兜底。开播、下播、开始录制、结束录制等事件可以通过 Windows 通知提醒。
 
 ### 开始录制
 
@@ -116,6 +116,7 @@ https://live.bilibili.com/22625025
 - 开播初期暂时没有目标清晰度时，会先录制当前能拿到的最佳画质，并周期性检查和切换到后续出现的 2K/4K。
 - 开启 `H.265 优先` 后，应用会优先选择 H.265 源流；实际编码仍以 B 站返回结果为准。
 - 规格一致的无弹幕分段会快速无损合并；如果前后分段的分辨率、帧率或编码不同，会保留全部内容并统一到本场出现过的最高分辨率后合并。
+- 合并前会逐段扫描视频和音频时间轴，合并后再复查一次。发现某段音视频时长差或累计漂移时，会改用安全转码，并把每段音频补齐或裁到对应视频长度；检查结果会写入日志和录像技术详情。
 - 带弹幕视频需要重新编码，因为弹幕已经画进画面。
 
 ## 通知和后台
@@ -141,9 +142,10 @@ http://127.0.0.1:3263
 如果要从同一局域网的其它电脑打开 WebUI：
 
 1. 进入 `软件维护` -> `运行信息`。
-2. 将 `监听地址` 改为 `局域网 0.0.0.0`。
-3. 保存运行配置并重启后台服务。
-4. 在其它电脑浏览器中打开：
+2. 设置至少 8 位的远程访问密码；用户名默认是 `admin`。
+3. 将 `监听地址` 改为 `外部网络 0.0.0.0`。
+4. 保存运行配置并重启后台服务。
+5. 在其它电脑浏览器中打开：
 
 ```text
 http://本机局域网IP:3263
@@ -155,7 +157,91 @@ http://本机局域网IP:3263
 http://192.168.1.23:3263
 ```
 
-如果其它电脑无法打开，请检查 Windows 防火墙是否允许该端口入站访问。局域网访问会暴露录制控制接口，请只在可信网络中开启。
+如果其它电脑无法打开，请检查 Windows 防火墙是否允许该端口入站访问。远端会先看到独立登录页；会话使用 HttpOnly Cookie，连续登录失败会被临时限速。公网使用时仍必须在前面配置 HTTPS 反向代理，不建议直接暴露明文 HTTP 端口。
+
+## Linux 云服务器安装
+
+正式发布会同时提供 Debian 安装包和通用 systemd 压缩包。两种包都自带 Node.js 运行时，服务器只需要能安装 `ffmpeg` 等系统依赖。
+
+### 一键自动安装
+
+在支持 systemd 的 Linux 云服务器执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh
+```
+
+脚本只会交互询问并确认一次 WebUI 管理密码，其余步骤自动完成：识别发行版和 CPU 架构、安装依赖、读取最新 Release、选择 Deb 或通用包、验证 SHA-256、写入鉴权配置、启用 systemd、启动服务并检查 `/api/state`。默认监听 `0.0.0.0:3263`，完成后会打印访问地址。
+
+脚本不会擅自修改云厂商安全组或主机防火墙；外部无法访问时，需要自行放行对应 TCP 端口。公网长期使用仍应配置 HTTPS 反向代理。
+
+无人值守安装可以预先传入密码：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh \
+  | sudo env BILI_RECORD_AUTH_PASSWORD='替换成至少8位的密码' sh
+```
+
+如果只通过本机反向代理或 SSH 隧道访问：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh \
+  | sudo env BILI_RECORD_HOST=127.0.0.1 sh
+```
+
+### Debian / Ubuntu
+
+从 GitHub Release 下载与服务器架构一致的 `.deb`，然后运行：
+
+```bash
+sudo apt install ./bili-record-2k_版本_amd64.deb
+sudo systemctl status bili-record-2k
+```
+
+### 其他使用 systemd 的 Linux
+
+```bash
+mkdir bili-record-2k-install
+tar -xzf bili-record-2k_版本_linux_x64.tar.gz -C bili-record-2k-install
+cd bili-record-2k-install
+sudo ./install.sh
+sudo systemctl status bili-record-2k
+```
+
+安装器会创建无登录权限的 `bili-record-2k` 系统用户，程序安装到 `/usr/lib/bili-record-2k`，配置保存在 `/etc/bili-record-2k`，录像和运行状态保存在 `/var/lib/bili-record-2k`。第一次安装会生成随机管理员密码：
+
+```bash
+sudo cat /etc/bili-record-2k/initial-admin-password
+```
+
+服务默认只监听 `127.0.0.1:3263`。可以通过 SSH 端口转发访问，也可以让 Caddy/Nginx 反向代理到这个地址并提供 HTTPS。运行参数位于：
+
+```text
+/etc/bili-record-2k/environment
+```
+
+修改后重启：
+
+```bash
+sudo systemctl restart bili-record-2k
+sudo journalctl -u bili-record-2k -f
+```
+
+如果确实要直接监听所有网卡，把 `BILI_RECORD_HOST` 改成 `0.0.0.0`；这时仍应只通过防火墙开放 HTTPS 反向代理端口，不应把明文 WebUI 直接暴露到公网。录像目录改到挂载盘时，需要让 `bili-record-2k` 用户拥有目标目录写权限。
+
+### systemd 与自动更新
+
+安装包会启用以下单元：
+
+```text
+bili-record-2k.service         主录制服务
+bili-record-2k-update.path     监听经过校验的更新请求
+bili-record-2k-update.service  使用 root 安装更新并重启主服务
+```
+
+Linux 安装版默认每 6 小时检查一次更新。存在录制、合并、烧录或导出任务时会等待任务全部结束；空闲后下载与当前平台、架构和安装方式匹配的包，校验 SHA-256，再由独立的 systemd 更新单元复查包路径、包名、版本和摘要后安装。可以在“软件维护”页面关闭自动更新，也可以手动检查和安装。
+
+卸载 Debian 包时使用 `sudo apt remove bili-record-2k`。通用包使用解压目录中的 `sudo ./uninstall.sh`。两种卸载方式都会保留 `/etc/bili-record-2k` 和 `/var/lib/bili-record-2k`，避免误删配置与录像。
 
 ## 常见问题
 
@@ -197,6 +283,13 @@ npm run dev
 npm run build
 ```
 
+Linux 构建必须在 Linux x64/arm64 构建机运行：
+
+```bash
+npm ci
+npm run build:linux
+```
+
 构建产物：
 
 ```text
@@ -206,6 +299,10 @@ release/webui/BiliRecord2K.exe
 release/webui/BiliRecord2K.Service.exe
 release/bili-record-2k-setup.exe
 release/bili-record-2k-webui.zip
+release/bili-record-2k_版本_amd64.deb
+release/bili-record-2k_版本_linux_x64.tar.gz
+release/install-linux.sh
+release/update.json
 ```
 
 如果不想构建结束后自动打开资源管理器，可以设置：

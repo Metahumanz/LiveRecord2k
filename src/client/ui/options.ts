@@ -41,9 +41,11 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'notifyBurnEnded',
   'openBrowserOnStart',
   'hideOverviewNextStep',
+  'autoUpdateEnabled',
   'updateManifestUrl',
   'serverHost',
-  'serverPort'
+  'serverPort',
+  'accessUsername'
 ];
 
 export const KEYFRAME_IMAGE_REFRESH_MS = 5000;

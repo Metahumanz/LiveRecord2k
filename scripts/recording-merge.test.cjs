@@ -6,17 +6,25 @@ const test = require('node:test');
 const ffmpegPath = require('ffmpeg-static');
 
 const { LiveRecordService } = require('../src/server/app/service.cjs');
+const { createAss } = require('../src/server/danmaku/ass.cjs');
 const {
+  createBurnArgs,
   createConcatTranscodeArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat
 } = require('../src/server/recording/ffmpeg.cjs');
-const { parseFfmpegAudioInfo, probeMediaFileInfo, runCapturedProcess } = require('../src/server/shared/helpers.cjs');
+const {
+  parseFfmpegAudioInfo,
+  probeMediaFileInfo,
+  probeMediaTimelineInfo,
+  runCapturedProcess
+} = require('../src/server/shared/helpers.cjs');
 
 test('a lower quality stream remains usable while the requested quality is unavailable', async () => {
   const service = new LiveRecordService();
   service.settings.targetQn = 15000;
   service.log = () => {};
+  let playInfoCalls = 0;
   service.fetchBiliJson = async () => ({
     code: 0,
     data: {
@@ -45,11 +53,17 @@ test('a lower quality stream remains usable while the requested quality is unava
       }
     }
   });
+  const fetchPlayInfo = service.fetchBiliJson;
+  service.fetchBiliJson = async (...args) => {
+    playInfoCalls += 1;
+    return fetchPlayInfo(...args);
+  };
 
   const room = { id: '123', realRoomId: '123', title: 'test', anchor: 'anchor' };
   const stream = await service.resolvePlayStream(room);
 
   assert.equal(stream.qn, 10000);
+  assert.equal(playInfoCalls, 1);
   assert.match(room.qualityWarning, /实际选中 10000/);
 });
 
@@ -86,6 +100,7 @@ test('mixed segment specifications select the highest resolution and require tra
   });
   const filter = args[args.indexOf('-filter_complex') + 1];
   assert.match(filter, /scale=w=3840:h=2160/);
+  assert.match(filter, /aresample=48000:async=1:first_pts=0,apad,atrim=duration=1/);
   assert.match(filter, /anullsrc=r=48000:cl=stereo/);
   assert.match(filter, /concat=n=2:v=1:a=1/);
   assert.ok(args.includes('hvc1'));
@@ -96,6 +111,102 @@ test('ffmpeg audio probing reads the stream properties used by merge compatibili
     'Stream #0:1: Audio: aac (LC), 48000 Hz, stereo, fltp, 160 kb/s'
   );
   assert.deepEqual(audioInfo, { codec: 'aac (LC)', sampleRate: 48000, channelLayout: 'stereo' });
+});
+
+test('timeline audit detects A/V drift before a segment is copied into a merge', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-timeline-audit-'));
+  const filePath = path.join(tempDir, 'drifted.mp4');
+  try {
+    const generated = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=320x180:rate=30:duration=1',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=440:sample_rate=48000:duration=0.55',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        filePath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(generated.status, 0, generated.stderr);
+    const mediaInfo = await probeMediaFileInfo(ffmpegPath, filePath);
+    const timing = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo);
+
+    assert.ok(timing.videoDurationSec >= 0.85, JSON.stringify(timing));
+    assert.ok(timing.audioDurationSec < 0.7, JSON.stringify(timing));
+    assert.ok(timing.avDeltaSec < -0.25, JSON.stringify(timing));
+    assert.equal(timing.timingSafeForCopy, false);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('burn filter waits for the first decodable keyframe and still produces valid A/V output', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-safe-burn-'));
+  const inputPath = path.join(tempDir, 'input.mp4');
+  const assPath = path.join(tempDir, 'overlay.ass');
+  const outputPath = path.join(tempDir, 'output.mp4');
+  try {
+    const generated = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=320x180:rate=30:duration=0.8',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=660:sample_rate=48000:duration=0.8',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        inputPath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(generated.status, 0, generated.stderr);
+    await fsp.writeFile(assPath, createAss([{ type: 'danmaku', time: 0.1, text: 'test' }]), 'utf8');
+    const args = createBurnArgs({
+      cleanPath: inputPath,
+      assPath,
+      burnedPath: outputPath,
+      codec: 'libx264',
+      crf: 24,
+      container: 'mp4',
+      fps: 30
+    });
+    const filter = args[args.indexOf('-vf') + 1];
+    assert.match(filter, /select='if\(isnan\(prev_selected_t\)\\,key\\,1\)'/);
+    const burned = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
+    assert.equal(burned.status, 0, burned.stderr);
+    const info = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.ok(info.videoInfo);
+    assert.ok(info.audioInfo);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('different-resolution segments are retained in a highest-resolution merged file', async () => {
@@ -158,6 +269,8 @@ test('different-resolution segments are retained in a highest-resolution merged 
     assert.equal(mergedInfo.videoInfo.width, 640);
     assert.equal(mergedInfo.videoInfo.height, 360);
     assert.ok(mergedInfo.durationSec >= 1.1, `expected both segments, got ${mergedInfo.durationSec}s`);
+    const mergedTiming = await probeMediaTimelineInfo(ffmpegPath, outputPath, mergedInfo);
+    assert.equal(mergedTiming.timingSafeForCopy, true, JSON.stringify(mergedTiming));
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }

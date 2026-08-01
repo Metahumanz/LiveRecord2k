@@ -7,7 +7,7 @@ const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
 const { LiveRecordService } = require('../src/server/app/service.cjs');
-const { fetchWithTimeout, runCapturedProcess, runFfmpegProbe } = require('../src/server/shared/helpers.cjs');
+const { deriveClipPath, fetchWithTimeout, runCapturedProcess, runFfmpegProbe } = require('../src/server/shared/helpers.cjs');
 const { createDefaultDanmakuCss, inspectDanmakuFile } = require('../src/server/danmaku/ass.cjs');
 const {
   handleRequest,
@@ -18,6 +18,17 @@ const {
 } = require('../src/server/app/routes.cjs');
 
 const projectRoot = path.resolve(__dirname, '..');
+
+test('long Windows recording titles are shortened before adding an export suffix', () => {
+  const outputDir = 'C:\\recordings\\room';
+  const cleanPath = path.join(outputDir, `${'原神特别节目'.repeat(30)}.clean.mp4`);
+  const outputPath = deriveClipPath(cleanPath, outputDir, 'danmaku-gift', 0, 3600);
+
+  assert.match(path.basename(outputPath), /\.clip_0-3600\.danmaku\.mp4$/);
+  if (process.platform === 'win32') {
+    assert.ok(outputPath.length <= 240, `expected a conservative Windows path, got ${outputPath.length}`);
+  }
+});
 
 async function invokeApi({ remoteAddress = '127.0.0.1', method = 'GET', pathname, body, service }) {
   const request = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]);
@@ -210,20 +221,21 @@ test('recording scans and room ticks are single-flight', async () => {
   finishScan({ ok: true });
   await Promise.all([firstScan, secondScan]);
 
-  let finishRefresh;
-  let refreshCount = 0;
+  let finishStatusCheck;
+  let statusCheckCount = 0;
   service.rooms.set('1', { id: '1', monitoring: true, liveStatus: 0 });
-  service.refreshRoom = () => {
-    refreshCount += 1;
+  service.fetchRoomLiveStatus = () => {
+    statusCheckCount += 1;
     return new Promise((resolve) => {
-      finishRefresh = resolve;
+      finishStatusCheck = resolve;
     });
   };
+  service.applyDetectedLiveStatus = async () => {};
   const firstTick = service.tickRoom('1');
   await new Promise((resolve) => setImmediate(resolve));
   await service.tickRoom('1');
-  assert.equal(refreshCount, 1);
-  finishRefresh();
+  assert.equal(statusCheckCount, 1);
+  finishStatusCheck({ liveStatus: 0 });
   await firstTick;
 });
 
@@ -269,6 +281,19 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
   });
   assert.deepEqual(saveOptions, { preserveCookie: true });
   assert.equal(saveResponse.body.settings.cookie, '');
+});
+
+test('external network binding gates the WebUI API before any recorder action runs', async () => {
+  const service = new LiveRecordService();
+  service.currentHost = '0.0.0.0';
+  const response = await invokeApi({
+    remoteAddress: '203.0.113.8',
+    pathname: '/api/state',
+    service
+  });
+
+  assert.equal(response.statusCode, 401);
+  assert.equal(response.body.code, 'ACCESS_AUTH_REQUIRED');
 });
 
 test('media and export paths stay inside the recording library and match recording names', () => {

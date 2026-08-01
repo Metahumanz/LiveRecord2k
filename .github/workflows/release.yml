@@ -7,27 +7,26 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: '要发布的标签，例如 v0.0.2。留空时仅适合由 v* tag 自动触发。'
-        required: false
+        description: '要发布的标签，例如 v0.2.8。'
+        required: true
         default: ''
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
   build-windows:
-    name: Build Windows Package
+    name: Build Windows packages
     runs-on: windows-latest
     defaults:
       run:
         shell: pwsh
-
     steps:
-      - name: Checkout
+      - name: Checkout release source
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
@@ -48,8 +47,8 @@ jobs:
       - name: Add MinGW to PATH
         run: |
           $mingwPath = "C:\msys64\mingw64\bin"
-          $env:Path = "$mingwPath;$env:Path"
           $mingwPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:Path = "$mingwPath;$env:Path"
           gcc --version
           windres --version
 
@@ -57,110 +56,143 @@ jobs:
         run: |
           choco install nsis -y --no-progress
           $nsisPath = "C:\Program Files (x86)\NSIS"
-          $env:Path = "$nsisPath;$env:Path"
           $nsisPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:Path = "$nsisPath;$env:Path"
           makensis /VERSION
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: Build
+      - name: Build Windows packages
         env:
           BUILD_INSTALLER_REQUIRED: '1'
+          BUILD_NO_OPEN: '1'
         run: npm run build
 
-      - name: Generate Update Manifest
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-        run: |
-          $tag = "$env:RELEASE_TAG".Trim()
-          if (-not $tag.StartsWith("v")) {
-            throw "Release tag must start with v, for example v0.0.2."
-          }
-          $version = $tag -replace '^v', ''
-          $zipPath = "release\bili-record-2k-webui.zip"
-          $setupPath = "release\bili-record-2k-setup.exe"
-          $zipSha256 = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          $setupSha256 = (Get-FileHash -Path $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          $zipUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/bili-record-2k-webui.zip"
-          $setupUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/bili-record-2k-setup.exe"
-          $manifest = [ordered]@{
-            name = "BiliRecord2K"
-            version = $version
-            tagName = $tag
-            packageType = "installer"
-            packageUrl = $setupUrl
-            sha256 = $setupSha256
-            installerUrl = $setupUrl
-            installerSha256 = $setupSha256
-            portableUrl = $zipUrl
-            portableSha256 = $zipSha256
-            releasedAt = (Get-Date).ToUniversalTime().ToString("o")
-            files = @(
-              [ordered]@{
-                name = "bili-record-2k-setup.exe"
-                kind = "installer"
-                url = $setupUrl
-                sha256 = $setupSha256
-              },
-              [ordered]@{
-                name = "bili-record-2k-webui.zip"
-                kind = "portable"
-                url = $zipUrl
-                sha256 = $zipSha256
-              }
-            )
-          }
-          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path "release\update.json" -Encoding UTF8
-          Get-Content "release\update.json"
-
-      - name: Upload Build Artifact
+      - name: Upload Windows packages
         uses: actions/upload-artifact@v4
         with:
-          name: bili-record-2k-webui-${{ inputs.release_tag || github.ref_name }}
+          name: release-windows
           path: |
             release/bili-record-2k-setup.exe
             release/bili-record-2k-webui.zip
-            release/update.json
           if-no-files-found: error
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+  build-linux:
+    name: Build Linux packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Linux packages
+        run: npm run build:linux
+
+      - name: Validate Linux packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find release -maxdepth 1 -name 'bili-record-2k_*_amd64.deb' -print -quit)
+          tarball=$(find release -maxdepth 1 -name 'bili-record-2k_*_linux_x64.tar.gz' -print -quit)
+          test -n "$deb"
+          test -n "$tarball"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          tar -tzf "$tarball"
+          temp_dir=$(mktemp -d)
+          trap 'rm -rf "$temp_dir"' EXIT
+          dpkg-deb --extract "$deb" "$temp_dir"
+          for script in packaging/linux/*.sh packaging/linux/postinst packaging/linux/prerm packaging/linux/postrm; do
+            sh -n "$script"
+          done
+          "$temp_dir/usr/lib/bili-record-2k/bin/node" --check "$temp_dir/usr/lib/bili-record-2k/server.bundle.cjs"
+          "$temp_dir/usr/lib/bili-record-2k/bin/node" --check "$temp_dir/usr/lib/bili-record-2k/linux-update.cjs"
+          unit_output=$(systemd-analyze verify "$temp_dir"/usr/lib/systemd/system/*.service "$temp_dir"/usr/lib/systemd/system/*.path 2>&1 || true)
+          echo "$unit_output"
+          if grep -Eiq 'unknown lvalue|failed to parse|bad unit file setting' <<<"$unit_output"; then
+            exit 1
+          fi
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            release/*.deb
+            release/*_linux_*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Generate platform-aware update manifest
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          cp scripts/install-linux.sh release/install-linux.sh
+          node scripts/generate-update-manifest.cjs "$RELEASE_TAG"
+
+      - name: Upload combined release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bili-record-2k-${{ inputs.release_tag || github.ref_name }}
+          path: release/
+          if-no-files-found: error
+
+      - name: Publish release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          $tag = "$env:RELEASE_TAG".Trim()
-          if (-not $tag.StartsWith("v")) {
-            throw "Release tag must start with v, for example v0.0.2."
-          }
-          $title = "BiliRecord2K $tag"
-          $notes = @(
-            'Windows 用户下载说明：',
-            '',
-            '- 新用户推荐下载 bili-record-2k-setup.exe，双击安装后从开始菜单或桌面入口启动。',
-            '- 不想安装、想放在固定文件夹里手动运行的用户，下载 bili-record-2k-webui.zip，解压后运行 BiliRecord2K.exe。',
-            '- update.json 是应用内更新检测用的清单文件，不需要手动下载或打开。',
-            '',
-            '发布附件：',
-            '- bili-record-2k-setup.exe：Windows 安装器，也是应用内更新下载的包。',
-            '- bili-record-2k-webui.zip：完整免安装运行包。',
-            '- update.json：应用内更新检测 manifest。'
-          ) -join [Environment]::NewLine
-          $assets = @(
-            "release\bili-record-2k-setup.exe",
-            "release\bili-record-2k-webui.zip",
-            "release\update.json"
+          set -euo pipefail
+          tag=${RELEASE_TAG//[[:space:]]/}
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          title="BiliRecord2K $tag"
+          notes=$(cat <<'EOF'
+          Windows：新用户使用 `bili-record-2k-setup.exe`；免安装使用 `bili-record-2k-webui.zip`。
+
+          Debian/Ubuntu x64：下载 `.deb` 后运行 `sudo apt install ./bili-record-2k_版本_amd64.deb`。
+
+          其他使用 systemd 的 x64 Linux：下载 `_linux_x64.tar.gz`，解压后运行 `sudo ./install.sh`。
+
+          Linux 包会安装 systemd 主服务和独立的受控更新服务。`update.json` 由应用自动读取，不需要手动下载。
+
+          Linux 一键安装：`curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh`
+          EOF
           )
-          $releaseExists = $false
-          try {
-            gh release view $tag *> $null
-            $releaseExists = $LASTEXITCODE -eq 0
-          } catch {
-            $releaseExists = $false
-          }
-          if ($releaseExists) {
-            gh release upload $tag @assets --clobber
-          } else {
-            gh release create $tag @assets --verify-tag --title $title --notes $notes
-          }
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+            gh release edit "$tag" --title "$title" --notes "$notes"
+          else
+            gh release create "$tag" release/* --verify-tag --title "$title" --notes "$notes"
+          fi

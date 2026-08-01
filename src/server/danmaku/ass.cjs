@@ -864,23 +864,35 @@ function renderGiftCardSegment(event, style, segment, clip) {
       palette.background,
       segmentShapeOptions(segment, clip)
     ),
-    dialogue(
+    drawRoundedRect(
       7,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1,
+      Math.max(5, metrics.radius / 2.4),
+      metrics.height,
+      Math.max(2, metrics.radius / 3),
+      palette.accent,
+      segmentShapeOptions(segment, clip, 0, 0, { tl: true, tr: false, br: false, bl: true })
+    ),
+    dialogue(
+      8,
       segment.start,
       segment.end,
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c${palette.username}\\b0}${assEscape(username)}`
+      )}\\fsp0.2\\1c${palette.username}\\b1}${assEscape(username)}`
     ),
     dialogue(
-      7,
+      8,
       segment.start,
       segment.end,
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
         metrics.metaFontSize
-      )}\\1c${palette.detail}\\b0}${assEscape(
+      )}\\fsp0.15\\1c${palette.detail}\\b0}${assEscape(
         truncateTextToWidth(giftText, metrics.textWidth, metrics.metaFontSize)
       )}`
     )
@@ -1102,11 +1114,29 @@ function guardCardPalette(level, price) {
   return { background: '&H00FCE8D8&', username: '&H008A3619&' };
 }
 
-function giftCardPalette() {
+function giftCardPalette(price = 0) {
+  const amount = Number(price) || 0;
+  if (amount >= 1000) {
+    return {
+      background: '&H12FFF3DF&',
+      accent: '&H003CA3FF&',
+      username: '&H00562E08&',
+      detail: '&H00544336&'
+    };
+  }
+  if (amount >= 100) {
+    return {
+      background: '&H12F8F1FF&',
+      accent: '&H00D45BFF&',
+      username: '&H006A238F&',
+      detail: '&H00544350&'
+    };
+  }
   return {
-    background: '&H00F4F0FF&',
-    username: '&H006B4EB5&',
-    detail: '&H004F3B43&'
+    background: '&H18F7F3FF&',
+    accent: '&H00C46CFF&',
+    username: '&H00502980&',
+    detail: '&H0054434B&'
   };
 }
 

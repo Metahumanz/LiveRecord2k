@@ -1,6 +1,7 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { DIST_ROOT, writeJson, writeText, mimeType } = require('./service.cjs');
+const { parseCookieHeader, SESSION_TTL_MS } = require('./auth.cjs');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const DEFAULT_PORT = 3263;
@@ -12,6 +13,7 @@ const LOCAL_ONLY_API_PATHS = new Set([
   '/api/shell/open-config'
 ]);
 const LOCAL_ONLY_ERROR = '此操作只能在服务端电脑上执行，请在服务端电脑操作。';
+const ACCESS_COOKIE = 'br2k_access';
 
 async function createViteMiddleware() {
   const { createServer } = await import('vite');
@@ -24,8 +26,31 @@ async function createViteMiddleware() {
 
 async function handleRequest(service, vite, port, request, response) {
   const parsed = new URL(request.url || '/', `http://${request.headers.host || `127.0.0.1:${port}`}`);
+  const access = getAccessContext(service, request);
+  if (parsed.pathname === '/api/access/login' && request.method === 'POST') {
+    await handleAccessLogin(service, request, response);
+    return;
+  }
+  if (parsed.pathname === '/api/access/logout' && request.method === 'POST') {
+    service.logoutAccess(access.token);
+    response.writeHead(303, {
+      Location: '/',
+      'Set-Cookie': `${ACCESS_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
+      'Cache-Control': 'no-store'
+    });
+    response.end();
+    return;
+  }
+  if (access.required && !access.authenticated) {
+    if (parsed.pathname.startsWith('/api/')) {
+      writeJson(response, 401, { error: '请先登录远程管理页面。', code: 'ACCESS_AUTH_REQUIRED' });
+    } else {
+      serveAccessLoginPage(service, response);
+    }
+    return;
+  }
   if (parsed.pathname.startsWith('/api/')) {
-    await handleApi(service, parsed, port, request, response);
+    await handleApi(service, parsed, port, request, response, access);
     return;
   }
 
@@ -37,13 +62,14 @@ async function handleRequest(service, vite, port, request, response) {
   await serveStatic(parsed.pathname, response);
 }
 
-async function handleApi(service, parsed, port, request, response) {
+async function handleApi(service, parsed, port, request, response, access) {
   const pathname = parsed.pathname;
   if (!isTrustedApiRequest(request, port)) {
     writeJson(response, 403, { error: 'Forbidden' });
     return;
   }
-  const stateOptions = { redactCookie: !isLocalRequest(request) };
+  const localConsole = isLocalConsoleRequest(request);
+  const stateOptions = { redactCookie: !localConsole, accessAuthenticated: access.authenticated };
   if (request.method === 'GET' && pathname === '/api/state') {
     writeJson(response, 200, service.getState(stateOptions));
     return;
@@ -91,7 +117,7 @@ async function handleApi(service, parsed, port, request, response) {
     return;
   }
 
-  if (LOCAL_ONLY_API_PATHS.has(pathname) && !isLocalRequest(request)) {
+  if (LOCAL_ONLY_API_PATHS.has(pathname) && !localConsole) {
     writeJson(response, 403, { error: LOCAL_ONLY_ERROR });
     return;
   }
@@ -102,6 +128,7 @@ async function handleApi(service, parsed, port, request, response) {
     '/api/auth/qr/cancel': () => service.cancelQrLogin(),
     '/api/settings/choose-output-dir': () => service.chooseOutputDir(body.currentPath),
     '/api/settings/save': () => service.saveSettings(body.settings || body, { preserveCookie: stateOptions.redactCookie }),
+    '/api/system/disk-space': () => service.getDiskSpace(body.path),
     '/api/rooms/add': () => service.addRoom(body.roomId),
     '/api/rooms/remove': () => service.removeRoom(body.roomId),
     '/api/rooms/refresh': () => service.refreshRoom(body.roomId, { silent: Boolean(body.silent) }),
@@ -148,7 +175,97 @@ async function handleApi(service, parsed, port, request, response) {
   }
 }
 
-async function readJsonBody(request) {
+async function handleAccessLogin(service, request, response) {
+  const contentType = String(request.headers['content-type'] || '').toLowerCase();
+  const raw = await readRequestBody(request);
+  let body = {};
+  if (contentType.includes('application/json')) {
+    try {
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      writeJson(response, 400, { error: '请求体不是有效 JSON。' });
+      return;
+    }
+  } else {
+    body = Object.fromEntries(new URLSearchParams(raw));
+  }
+  try {
+    const session = await service.loginAccess(body.username, body.password, getRemoteKey(request));
+    const secure = request.socket?.encrypted || String(request.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+    response.writeHead(303, {
+      Location: '/',
+      'Set-Cookie': `${ACCESS_COOKIE}=${encodeURIComponent(session.token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(
+        SESSION_TTL_MS / 1000
+      )}${secure ? '; Secure' : ''}`,
+      'Cache-Control': 'no-store'
+    });
+    response.end();
+  } catch (error) {
+    serveAccessLoginPage(service, response, error.message || '登录失败。', error.statusCode || 401);
+  }
+}
+
+function getAccessContext(service, request) {
+  const host = String(service.currentHost || service.settings?.serverHost || '').toLowerCase();
+  const exposed = host === '0.0.0.0' || host === '::';
+  const required = exposed && !isLocalConsoleRequest(request);
+  const token = parseCookieHeader(request.headers.cookie)[ACCESS_COOKIE] || '';
+  return {
+    required,
+    token,
+    authenticated: !required || service.authenticateAccess(token)
+  };
+}
+
+function serveAccessLoginPage(service, response, errorMessage = '', statusCode = 200) {
+  const configured = service.accessAuth.isConfigured(service.settings);
+  const username = escapeHtml(service.settings?.accessUsername || 'admin');
+  const message = errorMessage
+    ? `<div class="notice error">${escapeHtml(errorMessage)}</div>`
+    : configured
+      ? '<div class="notice">此服务正在监听外部网络，登录后才能进入管理界面。</div>'
+      : '<div class="notice error">远程访问密码尚未配置。请在服务端本机设置，或通过 BILI_RECORD_AUTH_PASSWORD 环境变量启动。</div>';
+  const html = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>远程访问登录 · 哔哩录播 2K</title>
+  <style>
+    :root{color-scheme:dark;font-family:Inter,"Microsoft YaHei UI",system-ui,sans-serif;background:#0b1017;color:#edf3fb}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 20% 0,#19324a 0,transparent 38%),#0b1017}
+    main{width:min(420px,100%);padding:32px;border:1px solid #2a3b4d;border-radius:22px;background:rgba(17,25,35,.94);box-shadow:0 24px 80px rgba(0,0,0,.45)}
+    .eyebrow{margin:0 0 8px;color:#63d4ff;font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}h1{margin:0 0 10px;font-size:27px}p{color:#aebccc;line-height:1.65}
+    .notice{margin:20px 0;padding:12px 14px;border-radius:12px;background:#152b3a;color:#bfeaff;font-size:14px}.notice.error{background:#3b2025;color:#ffd3d8}
+    label{display:grid;gap:8px;margin-top:16px;color:#cbd6e2;font-size:14px;font-weight:650}input{width:100%;padding:12px 13px;border:1px solid #34475a;border-radius:11px;background:#0d151f;color:#fff;font:inherit;outline:none}input:focus{border-color:#56c9f5;box-shadow:0 0 0 3px rgba(86,201,245,.14)}
+    button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#0ea5e9);color:#061019;font:inherit;font-weight:800;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}.foot{margin:18px 0 0;text-align:center;font-size:12px;color:#75869a}
+  </style>
+</head>
+<body><main><p class="eyebrow">BiliRecord2K</p><h1>远程管理登录</h1>${message}<form method="post" action="/api/access/login"><label>用户名<input name="username" autocomplete="username" value="${username}" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button type="submit"${configured ? '' : ' disabled'}>进入管理界面</button></form><p class="foot">会话 12 小时后失效；连续失败会触发临时限速。</p></main></body></html>`;
+  response.writeHead(statusCode, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer'
+  });
+  response.end(html);
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function getRemoteKey(request) {
+  return String(request.socket?.remoteAddress || request.connection?.remoteAddress || 'unknown').toLowerCase();
+}
+
+async function readRequestBody(request) {
   const chunks = [];
   let totalBytes = 0;
   for await (const chunk of request) {
@@ -160,7 +277,11 @@ async function readJsonBody(request) {
     }
     chunks.push(chunk);
   }
-  const raw = Buffer.concat(chunks).toString('utf8').trim();
+  return Buffer.concat(chunks).toString('utf8').trim();
+}
+
+async function readJsonBody(request) {
+  const raw = await readRequestBody(request);
   if (!raw) {
     return {};
   }
@@ -201,6 +322,10 @@ function isAllowedWebOrigin(value, hostHeader, port) {
     return false;
   }
   const originPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+  const rawHost = String(hostHeader || '').trim().toLowerCase();
+  if (rawHost && target.host.toLowerCase() === rawHost) {
+    return true;
+  }
   const requestHost = normalizeHostHeader(hostHeader);
   if (requestHost.hostname && target.hostname.toLowerCase() === requestHost.hostname && originPort === requestHost.port) {
     return true;
@@ -232,6 +357,14 @@ function isLoopbackHost(hostname) {
 function isLocalRequest(request) {
   const remoteAddress = String(request.socket?.remoteAddress || request.connection?.remoteAddress || '').toLowerCase();
   return remoteAddress === '127.0.0.1' || remoteAddress === '::1' || remoteAddress === '::ffff:127.0.0.1';
+}
+
+function isLocalConsoleRequest(request) {
+  if (!isLocalRequest(request)) {
+    return false;
+  }
+  const host = normalizeHostHeader(request.headers.host);
+  return isLoopbackHost(host.hostname);
 }
 
 function redactRemoteState(result, options = {}) {
