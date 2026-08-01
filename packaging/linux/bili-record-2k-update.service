@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply a verified BiliRecord2K update
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=BILI_RECORD_CONFIG_DIR=/var/lib/bili-record-2k
+ExecStart=/usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/linux-update.cjs
+PrivateTmp=true
+ProtectHome=true

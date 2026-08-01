@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+/usr/lib/bili-record-2k/provision.sh deb
+exit 0
