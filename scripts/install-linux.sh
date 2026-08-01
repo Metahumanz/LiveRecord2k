@@ -9,6 +9,7 @@ SERVER_PORT=${BILI_RECORD_PORT:-3263}
 ADMIN_USERNAME=${BILI_RECORD_AUTH_USERNAME:-admin}
 ADMIN_PASSWORD=${BILI_RECORD_AUTH_PASSWORD:-}
 AUTO_UPDATE=${BILI_RECORD_AUTO_UPDATE:-1}
+DOWNLOAD_MIRROR=${BILI_RECORD_DOWNLOAD_MIRROR-https://gh-proxy.com/}
 TEMP_ROOT=
 TTY_STATE=
 
@@ -26,6 +27,9 @@ BiliRecord2K Linux 一键安装器
   BILI_RECORD_PORT           监听端口，默认 3263
   BILI_RECORD_AUTO_UPDATE    1 开启自动更新，0 关闭
   BILI_RECORD_MANIFEST_URL   自定义 update.json 地址
+  BILI_RECORD_DOWNLOAD_MIRROR
+                             GitHub 下载镜像前缀，默认 https://gh-proxy.com/
+                             设置为 direct、off 或空值可关闭镜像
 EOF
 }
 
@@ -74,6 +78,12 @@ esac
 case "$AUTO_UPDATE" in
   0|1) ;;
   *) fail 'BILI_RECORD_AUTO_UPDATE 只能是 0 或 1。' ;;
+esac
+case "$DOWNLOAD_MIRROR" in
+  ''|direct|off) DOWNLOAD_MIRROR= ;;
+  *[[:space:]]*) fail 'BILI_RECORD_DOWNLOAD_MIRROR 不能包含空白字符。' ;;
+  https://*) ;;
+  *) fail 'BILI_RECORD_DOWNLOAD_MIRROR 必须是 HTTPS 地址，或设置为 direct 关闭。' ;;
 esac
 
 read_password() {
@@ -172,10 +182,45 @@ PACKAGE_SHA256=$(printf '%s' "$PACKAGE_SHA256" | tr 'A-F' 'a-f')
 
 printf '\n[3/6] 下载并校验 BiliRecord2K %s...\n' "$LATEST_VERSION"
 PACKAGE_PATH=$TEMP_ROOT/$PACKAGE_NAME
-curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 1800 \
-  "$PACKAGE_URL" -o "$PACKAGE_PATH"
-ACTUAL_SHA256=$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')
-[ "$ACTUAL_SHA256" = "$PACKAGE_SHA256" ] || fail "安装包 SHA-256 校验失败，已拒绝安装。"
+
+download_and_verify() {
+  download_source=$1
+  download_url=$2
+  rm -f -- "$PACKAGE_PATH"
+  printf '  尝试%s...\n' "$download_source"
+  if ! curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 1800 \
+    "$download_url" -o "$PACKAGE_PATH"; then
+    printf '  %s下载失败。\n' "$download_source" >&2
+    rm -f -- "$PACKAGE_PATH"
+    return 1
+  fi
+  ACTUAL_SHA256=$(sha256sum "$PACKAGE_PATH" | awk '{print $1}')
+  if [ "$ACTUAL_SHA256" != "$PACKAGE_SHA256" ]; then
+    printf '  %s返回的文件未通过官方 SHA-256 校验。\n' "$download_source" >&2
+    rm -f -- "$PACKAGE_PATH"
+    return 1
+  fi
+  PACKAGE_DOWNLOAD_SOURCE=$download_source
+  return 0
+}
+
+PACKAGE_DOWNLOADED=0
+if [ -n "$DOWNLOAD_MIRROR" ]; then
+  case "$PACKAGE_URL" in
+    https://github.com/*)
+      MIRROR_PACKAGE_URL=${DOWNLOAD_MIRROR%/}/$PACKAGE_URL
+      if download_and_verify "GitHub 镜像 $DOWNLOAD_MIRROR" "$MIRROR_PACKAGE_URL"; then
+        PACKAGE_DOWNLOADED=1
+      else
+        printf '  镜像不可用或内容异常，自动回退 GitHub 官方源。\n' >&2
+      fi
+      ;;
+  esac
+fi
+if [ "$PACKAGE_DOWNLOADED" -ne 1 ]; then
+  download_and_verify "GitHub 官方源" "$PACKAGE_URL" || fail '安装包下载失败或 SHA-256 校验不通过，已拒绝安装。'
+fi
+printf '  下载完成，来源：%s；SHA-256 校验通过。\n' "$PACKAGE_DOWNLOAD_SOURCE"
 
 escape_environment_value() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
