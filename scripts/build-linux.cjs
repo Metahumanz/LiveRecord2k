@@ -35,16 +35,15 @@ async function main() {
   await fsp.rm(tarPath, { force: true });
 
   const serverBundle = path.join(buildRoot, 'server.bundle.cjs');
-  runNodeScript(path.join(root, 'node_modules', 'esbuild', 'bin', 'esbuild'), [
-    path.join(root, 'src', 'server', 'index.cjs'),
-    '--bundle',
-    '--platform=node',
-    '--target=node24',
-    '--format=cjs',
-    '--external:vite',
-    '--external:ffmpeg-static',
-    `--outfile=${serverBundle}`
-  ]);
+  await require('esbuild').build({
+    entryPoints: [path.join(root, 'src', 'server', 'index.cjs')],
+    bundle: true,
+    platform: 'node',
+    target: 'node24',
+    format: 'cjs',
+    external: ['vite', 'ffmpeg-static'],
+    outfile: serverBundle
+  });
 
   const debRoot = path.join(buildRoot, 'deb-root');
   await populatePayload(debRoot, { version, packageType: 'deb', arch: nodeArch, serverBundle });
