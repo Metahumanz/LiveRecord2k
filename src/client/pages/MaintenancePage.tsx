@@ -31,6 +31,9 @@ export function MaintenancePage({
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const isLinux = state.platform === 'linux';
+  const canOpenServerPath = state.uiCapabilities?.openServerPath ?? !isLinux;
+  const canShutdownService = state.uiCapabilities?.serviceShutdown ?? !isLinux;
   const hasActiveJobs = Boolean(state.update.activeJobs);
   const currentCodec = state.ffmpegCapabilities?.burnCodecs.find((codec) => codec.value === state.settings.burnCodec);
   const unavailableCodecText = (state.ffmpegCapabilities?.unavailableBurnCodecs || [])
@@ -79,7 +82,9 @@ export function MaintenancePage({
     <>
       <PageHeader
         title="软件维护"
-        subtitle="备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。"
+        subtitle={isLinux
+          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。'
+          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。'}
         actions={
           <button
             className="wide-button primary"
@@ -183,7 +188,7 @@ export function MaintenancePage({
               </button>
             ) : null}
           </div>
-          {state.update.packagePath ? (
+          {state.update.packagePath && canOpenServerPath ? (
             <button
               className="wide-button fill"
               type="button"
@@ -291,6 +296,14 @@ export function MaintenancePage({
           <PathLine label="更新日志" value={state.update.updateLogPath || ''} />
           <PathLine label="状态文件" value={state.update.statusPath || ''} />
           <PathLine label="下载文件" value={state.update.packagePath || ''} />
+          {isLinux ? (
+            <p className="panel-intro">
+              Linux 安装版由 systemd 管理。需要重启、停止或查看日志时，请在 SSH 中使用
+              {' '}<code>sudo systemctl restart bili-record-2k</code>、
+              {' '}<code>sudo systemctl stop bili-record-2k</code> 和
+              {' '}<code>journalctl -u bili-record-2k -f</code>。
+            </p>
+          ) : null}
           <div className="split-buttons">
             {state.access?.required && state.access.authenticated ? (
               <form method="post" action="/api/access/logout">
@@ -299,30 +312,34 @@ export function MaintenancePage({
                 </button>
               </form>
             ) : null}
-            <button
-              className="wide-button fill"
-              type="button"
-              onClick={() => run('open-config', recorder.openConfigDir)}
-            >
-              <FolderOpen size={18} />
-              打开配置目录
-            </button>
-            <button
-              className="wide-button fill danger"
-              type="button"
-              disabled={busy === 'shutdown'}
-              onClick={() => {
-                const message = hasActiveJobs
-                  ? '当前有录制或生成弹幕视频任务，确定退出后台服务？'
-                  : '确定退出后台服务？';
-                if (window.confirm(message)) {
-                  run('shutdown', recorder.shutdown);
-                }
-              }}
-            >
-              <Power size={18} />
-              退出后台服务
-            </button>
+            {canOpenServerPath ? (
+              <button
+                className="wide-button fill"
+                type="button"
+                onClick={() => run('open-config', recorder.openConfigDir)}
+              >
+                <FolderOpen size={18} />
+                打开配置目录
+              </button>
+            ) : null}
+            {canShutdownService ? (
+              <button
+                className="wide-button fill danger"
+                type="button"
+                disabled={busy === 'shutdown'}
+                onClick={() => {
+                  const message = hasActiveJobs
+                    ? '当前有录制或生成弹幕视频任务，确定退出后台服务？'
+                    : '确定退出后台服务？';
+                  if (window.confirm(message)) {
+                    run('shutdown', recorder.shutdown);
+                  }
+                }}
+              >
+                <Power size={18} />
+                退出后台服务
+              </button>
+            ) : null}
           </div>
         </SettingPanel>
       </section>

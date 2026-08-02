@@ -39,6 +39,8 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'notifyRecordingEnded',
   'notifyBurnStarted',
   'notifyBurnEnded',
+  'webhookEnabled',
+  'webhookUrl',
   'openBrowserOnStart',
   'hideOverviewNextStep',
   'autoUpdateEnabled',

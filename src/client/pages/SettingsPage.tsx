@@ -4,7 +4,7 @@ import { recorder } from '../recorderClient';
 import { PageHeader, SettingPanel, Toggle } from '../components/common';
 import type { AppSettings, AppState, DiskSpaceState } from '../types';
 import { containerOptions, danmakuAreaOptions, overlayModeOptions, qnOptions } from '../ui/options';
-import { burnCodecOptions, burnCodecSummary, formatFileSize } from '../utils';
+import { burnCodecOptions, burnCodecSummary, formatFileSize, isBilibiliLoggedIn } from '../utils';
 
 export function SettingsPage({
   state,
@@ -23,7 +23,12 @@ export function SettingsPage({
   chooseOutputDir: () => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
-  const loggedIn = settingsDraft.cookie.includes('SESSDATA=');
+  const loggedIn = isBilibiliLoggedIn(state);
+  const isLinux = state.platform === 'linux';
+  const canPickServerPath = state.uiCapabilities?.nativePathPicker ?? !isLinux;
+  const canOpenServerPath = state.uiCapabilities?.openServerPath ?? !isLinux;
+  const canUseNativeNotifications = state.uiCapabilities?.nativeNotifications ?? !isLinux;
+  const canControlStartup = state.uiCapabilities?.startupControl ?? !isLinux;
   const codecOptions = burnCodecOptions(state.ffmpegCapabilities?.burnCodecs, settingsDraft.burnCodec);
   const selectedCodec = codecOptions.find((option) => option.value === settingsDraft.burnCodec);
   const unavailableHardware = (state.ffmpegCapabilities?.unavailableBurnCodecs || []).filter(
@@ -72,7 +77,9 @@ export function SettingsPage({
     <>
       <PageHeader
         title="录制配置"
-        subtitle="先完成登录和输出目录；画质、弹幕视频和通知按需要再调整。"
+        subtitle={isLinux
+          ? '先完成登录和服务端录像目录；画质、弹幕视频和监听参数按需要再调整。'
+          : '先完成登录和输出目录；画质、弹幕视频和通知按需要再调整。'}
         actions={
           <button
             className="wide-button primary"
@@ -87,7 +94,11 @@ export function SettingsPage({
 
       <section className="settings-page-grid">
         <SettingPanel title="开始使用" icon={<LogIn size={18} />} className="settings-panel-start">
-          <p className="panel-intro">第一次使用只需要完成扫码登录、选择输出目录，然后保存配置。</p>
+          <p className="panel-intro">
+            {isLinux
+              ? '第一次使用只需要完成扫码登录、填写服务端录像目录，然后保存配置。'
+              : '第一次使用只需要完成扫码登录、选择输出目录，然后保存配置。'}
+          </p>
           <div className="setting-row">
             <span className={loggedIn ? 'badge on' : 'badge'}>{loggedIn ? '已登录' : '未登录'}</span>
             <button
@@ -99,16 +110,29 @@ export function SettingsPage({
               扫码登录
             </button>
           </div>
-          <p className="field-help">登录用于请求更高画质源流。扫码成功后，登录凭证会自动写入下面的输入框。</p>
-          <label className="field">
-            <span>登录凭证 Cookie</span>
-            <textarea
-              rows={4}
-              value={settingsDraft.cookie}
-              onChange={(event) => setSettingsDraft({ ...settingsDraft, cookie: event.target.value })}
-              placeholder="扫码成功后自动写入"
-            />
-          </label>
+          <p className="field-help">
+            登录用于请求更高画质源流。
+            {state.bilibiliCookieVisible === false
+              ? '远程访问时凭证由服务端安全保存，页面只显示登录状态，不回传 Cookie 明文。'
+              : '扫码成功后，登录凭证会自动写入下面的输入框。'}
+          </p>
+          {state.bilibiliCookieVisible === false ? (
+            <p className="inline-status">
+              {loggedIn
+                ? '登录凭证已安全保存在服务端；需要更新凭证时请重新扫码。'
+                : '服务端尚未保存登录凭证，请点击扫码登录。'}
+            </p>
+          ) : (
+            <label className="field">
+              <span>登录凭证 Cookie</span>
+              <textarea
+                rows={4}
+                value={settingsDraft.cookie}
+                onChange={(event) => setSettingsDraft({ ...settingsDraft, cookie: event.target.value })}
+                placeholder="扫码成功后自动写入"
+              />
+            </label>
+          )}
           {state.login ? <p className="inline-status">{state.login.message}</p> : null}
 
           <label className="field">
@@ -117,26 +141,31 @@ export function SettingsPage({
               <input
                 value={settingsDraft.outputDir}
                 onChange={(event) => setSettingsDraft({ ...settingsDraft, outputDir: event.target.value })}
-                placeholder="例如 C:\Users\你的用户名\Videos\哔哩录播2K"
+                placeholder={isLinux ? '/var/lib/bili-record-2k/recordings' : '例如 C:\\Users\\你的用户名\\Videos\\哔哩录播2K'}
               />
-              <button
-                className="icon-button"
-                title="选择目录"
-                disabled={busy === 'choose-output-dir'}
-                onClick={chooseOutputDir}
-              >
-                <FolderOpen size={18} />
-              </button>
-              <button
-                className="icon-button"
-                title="打开目录"
-                disabled={!settingsDraft.outputDir.trim() || busy === 'open-output-draft'}
-                onClick={() => run('open-output-draft', () => recorder.openPathDir(settingsDraft.outputDir, { asDirectory: true }))}
-              >
-                <HardDrive size={18} />
-              </button>
+              {canPickServerPath ? (
+                <button
+                  className="icon-button"
+                  title="选择目录"
+                  disabled={busy === 'choose-output-dir'}
+                  onClick={chooseOutputDir}
+                >
+                  <FolderOpen size={18} />
+                </button>
+              ) : null}
+              {canOpenServerPath ? (
+                <button
+                  className="icon-button"
+                  title="打开目录"
+                  disabled={!settingsDraft.outputDir.trim() || busy === 'open-output-draft'}
+                  onClick={() => run('open-output-draft', () => recorder.openPathDir(settingsDraft.outputDir, { asDirectory: true }))}
+                >
+                  <HardDrive size={18} />
+                </button>
+              ) : null}
             </div>
           </label>
+          {isLinux ? <p className="field-help">请填写 Linux 服务端绝对路径；目录选择器不会操作你当前浏览器所在的电脑。</p> : null}
           <p className={diskSpace?.error ? 'field-help disk-space error' : 'field-help disk-space'}>
             {diskSpace?.error
               ? `剩余空间暂时无法读取：${diskSpace.error}`
@@ -311,7 +340,11 @@ export function SettingsPage({
           </div>
         </SettingPanel>
 
-        <SettingPanel title="通知和启动" icon={<Bell size={18} />} className="settings-panel-notifications">
+        <SettingPanel
+          title={isLinux ? '监听与 systemd' : '通知和启动'}
+          icon={<Bell size={18} />}
+          className="settings-panel-notifications"
+        >
           <div className="setting-row startup-row">
             <span className={state.startupEnabled ? 'badge on' : 'badge'}>
               {state.platform === 'linux'
@@ -323,18 +356,30 @@ export function SettingsPage({
                   : '开机自启未开启'}
             </span>
           </div>
+          {isLinux ? (
+            <p className="panel-intro">
+              Linux 安装版由 systemd 管理进程和开机启动；浏览器可以关闭，录制与监听仍会在服务端继续运行。
+            </p>
+          ) : null}
+          <p className="panel-intro">
+            通知事件可发送到通用 Webhook；Windows 桌面版还会同时显示系统通知。Webhook 由服务端直接发送，浏览器关闭后仍然有效。
+          </p>
           <div className="toggle-list">
-            <Toggle
-              label={state.platform === 'linux' ? '由 systemd 管理开机启动' : '开机自启'}
-              checked={state.startupEnabled}
-              disabled={state.platform === 'linux' || busy === 'startup'}
-              onChange={(checked) => run('startup', () => recorder.setStartup(checked))}
-            />
-            <Toggle
-              label="启动时打开浏览器"
-              checked={settingsDraft.openBrowserOnStart}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, openBrowserOnStart: checked })}
-            />
+            {canControlStartup ? (
+              <Toggle
+                label="开机自启"
+                checked={state.startupEnabled}
+                disabled={busy === 'startup'}
+                onChange={(checked) => run('startup', () => recorder.setStartup(checked))}
+              />
+            ) : null}
+            {!isLinux ? (
+              <Toggle
+                label="启动时打开浏览器"
+                checked={settingsDraft.openBrowserOnStart}
+                onChange={(checked) => setSettingsDraft({ ...settingsDraft, openBrowserOnStart: checked })}
+              />
+            ) : null}
             <label className="field">
               <span>监听间隔（秒）</span>
               <input
@@ -353,6 +398,65 @@ export function SettingsPage({
               checked={!settingsDraft.hideOverviewNextStep}
               onChange={(checked) => setSettingsDraft({ ...settingsDraft, hideOverviewNextStep: !checked })}
             />
+            <Toggle
+              label="启用通用 Webhook"
+              checked={settingsDraft.webhookEnabled}
+              onChange={(checked) => setSettingsDraft({ ...settingsDraft, webhookEnabled: checked })}
+            />
+            <label className="field">
+              <span>Webhook 接收地址</span>
+              <input
+                type="url"
+                inputMode="url"
+                placeholder="https://example.com/webhook"
+                value={settingsDraft.webhookUrl}
+                onChange={(event) => setSettingsDraft({ ...settingsDraft, webhookUrl: event.target.value })}
+              />
+              <p className="field-help">
+                公网地址必须使用 HTTPS；本机和私有 IP 可使用 HTTP。接收端需以 2xx 状态码确认成功。
+              </p>
+            </label>
+            <label className="field">
+              <span>Bearer Token（可选）</span>
+              <input
+                type="password"
+                autoComplete="new-password"
+                disabled={settingsDraft.webhookBearerTokenClear}
+                placeholder={
+                  settingsDraft.webhookBearerTokenConfigured
+                    ? '已安全保存在服务端；留空表示不修改'
+                    : '接收端不需要鉴权时留空'
+                }
+                value={settingsDraft.webhookBearerToken}
+                onChange={(event) =>
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    webhookBearerToken: event.target.value,
+                    webhookBearerTokenClear: false
+                  })
+                }
+              />
+              <p className="field-help">
+                发送时使用 Authorization: Bearer &lt;Token&gt;；Token 不会回传到页面或写入设置导出文件。
+              </p>
+            </label>
+            {settingsDraft.webhookBearerTokenConfigured ? (
+              <Toggle
+                label="保存时清除已配置的 Bearer Token"
+                checked={settingsDraft.webhookBearerTokenClear}
+                onChange={(checked) =>
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    webhookBearerToken: '',
+                    webhookBearerTokenClear: checked
+                  })
+                }
+              />
+            ) : null}
+            <p className="field-help">
+              事件类型：live.started / live.ended / recording.started / recording.completed / recording.failed /
+              burn.started / burn.completed / burn.failed。
+            </p>
             <Toggle
               label="开播通知"
               checked={settingsDraft.notifyLiveStarted}
@@ -385,22 +489,34 @@ export function SettingsPage({
             />
           </div>
           <div className="split-buttons">
+            {canUseNativeNotifications ? (
+              <button
+                className="wide-button fill"
+                type="button"
+                onClick={() => run('test-notification', recorder.testNotification)}
+              >
+                <Bell size={18} />
+                测试 Windows 通知
+              </button>
+            ) : null}
             <button
               className="wide-button fill"
               type="button"
-              onClick={() => run('test-notification', recorder.testNotification)}
+              disabled={busy === 'test-webhook' || !state.settings.webhookEnabled || !state.settings.webhookUrl}
+              onClick={() => run('test-webhook', recorder.testWebhook)}
+              title="测试使用已保存的 Webhook 配置；修改后请先保存"
             >
               <Bell size={18} />
-              测试 Windows 通知
+              发送 Webhook 测试
             </button>
             <button
               className="wide-button fill primary"
               type="button"
               disabled={busy === 'save-settings'}
-              onClick={() => saveSettings(settingsDraft, '通知和启动配置已保存')}
+              onClick={() => saveSettings(settingsDraft, isLinux ? '监听与通知配置已保存' : '通知和启动配置已保存')}
             >
               <Save size={18} />
-              保存通知配置
+              {isLinux ? '保存监听与通知' : '保存通知配置'}
             </button>
           </div>
         </SettingPanel>

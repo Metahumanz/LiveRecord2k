@@ -108,6 +108,11 @@ export type AppSettings = {
   notifyRecordingEnded: boolean;
   notifyBurnStarted: boolean;
   notifyBurnEnded: boolean;
+  webhookEnabled: boolean;
+  webhookUrl: string;
+  webhookBearerToken: string;
+  webhookBearerTokenConfigured: boolean;
+  webhookBearerTokenClear: boolean;
   openBrowserOnStart: boolean;
   hideOverviewNextStep: boolean;
   autoUpdateEnabled: boolean;
@@ -313,8 +318,18 @@ export type AppState = {
   recordings: RecordingState[];
   logs: LogEntry[];
   login?: LoginState;
+  bilibiliLoggedIn?: boolean;
+  bilibiliCookieVisible?: boolean;
   version: string;
   platform?: string;
+  uiCapabilities?: {
+    nativePathPicker: boolean;
+    openServerPath: boolean;
+    nativeNotifications: boolean;
+    startupControl: boolean;
+    managedService: boolean;
+    serviceShutdown: boolean;
+  };
   update: UpdateState;
   ffmpegPath?: string;
   ffmpegCapabilities?: FfmpegCapabilities;
@@ -384,6 +399,7 @@ export type RecorderApi = {
   queueUpdate: () => Promise<AppState>;
   setStartup: (enabled: boolean) => Promise<AppState>;
   testNotification: () => Promise<AppState>;
+  testWebhook: () => Promise<AppState>;
   shutdown: () => Promise<void>;
   onStateChanged: (callback: (state: AppState) => void) => () => void;
 };

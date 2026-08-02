@@ -1,12 +1,13 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
-const { LiveRecordService } = require('../src/server/app/service.cjs');
+const { LiveRecordService, createUiCapabilities } = require('../src/server/app/service.cjs');
 const { deriveClipPath, fetchWithTimeout, runCapturedProcess, runFfmpegProbe } = require('../src/server/shared/helpers.cjs');
 const { createDefaultDanmakuCss, inspectDanmakuFile } = require('../src/server/danmaku/ass.cjs');
 const {
@@ -242,10 +243,31 @@ test('recording scans and room ticks are single-flight', async () => {
 test('LAN state and SSE never expose the Bilibili cookie', async () => {
   const service = new LiveRecordService();
   service.settings.cookie = 'SESSDATA=secret-cookie';
+  service.settings.webhookBearerToken = 'secret-webhook-token';
 
   assert.equal(service.getState().settings.cookie, 'SESSDATA=secret-cookie');
+  assert.equal(service.getState().settings.webhookBearerToken, '');
+  assert.equal(service.getState().settings.webhookBearerTokenConfigured, true);
+  assert.doesNotMatch(JSON.stringify(service.getState()), /secret-webhook-token/);
+  assert.equal(service.getState().bilibiliLoggedIn, true);
+  assert.equal(service.getState().bilibiliCookieVisible, true);
   assert.equal(service.getState({ redactCookie: true }).settings.cookie, '');
-  assert.equal(redactRemoteState({ settings: { cookie: 'SESSDATA=secret-cookie' } }, { redactCookie: true }).settings.cookie, '');
+  assert.equal(service.getState({ redactCookie: true }).bilibiliLoggedIn, true);
+  assert.equal(service.getState({ redactCookie: true }).bilibiliCookieVisible, false);
+  const redacted = redactRemoteState(
+    {
+      settings: { cookie: 'SESSDATA=secret-cookie' },
+      bilibiliLoggedIn: true,
+      bilibiliCookieVisible: true,
+      uiCapabilities: { nativePathPicker: true, openServerPath: true }
+    },
+    { redactCookie: true, localConsole: false }
+  );
+  assert.equal(redacted.settings.cookie, '');
+  assert.equal(redacted.bilibiliLoggedIn, true);
+  assert.equal(redacted.bilibiliCookieVisible, false);
+  assert.equal(redacted.uiCapabilities.nativePathPicker, false);
+  assert.equal(redacted.uiCapabilities.openServerPath, false);
 
   let ssePayload = '';
   const response = {
@@ -257,6 +279,7 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
   service.addClient(response, { redactCookie: true });
   service.emitState();
   assert.doesNotMatch(ssePayload, /secret-cookie/);
+  assert.doesNotMatch(ssePayload, /secret-webhook-token/);
 
   const stateResponse = await invokeApi({
     remoteAddress: '192.168.1.20',
@@ -265,6 +288,8 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
   });
   assert.equal(stateResponse.statusCode, 200);
   assert.equal(stateResponse.body.settings.cookie, '');
+  assert.equal(stateResponse.body.bilibiliLoggedIn, true);
+  assert.equal(stateResponse.body.bilibiliCookieVisible, false);
 
   let saveOptions;
   const saveResponse = await invokeApi({
@@ -281,6 +306,119 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
   });
   assert.deepEqual(saveOptions, { preserveCookie: true });
   assert.equal(saveResponse.body.settings.cookie, '');
+});
+
+test('generic Webhook posts event JSON with Bearer auth and retries transient failures', async () => {
+  let requestCount = 0;
+  const received = [];
+  const receiver = http.createServer((request, response) => {
+    let raw = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      raw += chunk;
+    });
+    request.on('end', () => {
+      requestCount += 1;
+      received.push({
+        method: request.method,
+        headers: request.headers,
+        body: JSON.parse(raw)
+      });
+      response.writeHead(requestCount === 1 ? 503 : 204);
+      response.end();
+    });
+  });
+  await new Promise((resolve) => receiver.listen(0, '127.0.0.1', resolve));
+  const address = receiver.address();
+  const service = new LiveRecordService();
+  service.settings.webhookUrl = `http://127.0.0.1:${address.port}/events`;
+  service.settings.webhookBearerToken = 'receiver-secret';
+
+  try {
+    const payload = await service.sendWebhookNotification(
+      {
+        id: 'event-1',
+        event: 'recording.completed',
+        title: '录制结束',
+        message: '测试直播间录制完成',
+        time: Date.UTC(2026, 7, 2, 12, 0, 0),
+        data: { roomId: '123', eventCount: 456 }
+      },
+      { retryDelays: [0, 1] }
+    );
+
+    assert.equal(requestCount, 2);
+    assert.equal(received[0].method, 'POST');
+    assert.equal(received[1].headers.authorization, 'Bearer receiver-secret');
+    assert.equal(received[1].headers['x-bilirecord2k-event'], 'recording.completed');
+    assert.equal(received[1].body.event, 'recording.completed');
+    assert.equal(received[1].body.occurredAt, '2026-08-02T12:00:00.000Z');
+    assert.equal(received[1].body.data.roomId, '123');
+    assert.equal(received[1].body.data.eventCount, 456);
+    assert.equal(payload.source.name, 'BiliRecord2K');
+  } finally {
+    await new Promise((resolve, reject) => receiver.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test('saving Webhook settings preserves an undisclosed token and can explicitly clear it', async () => {
+  const service = new LiveRecordService();
+  service.settings.webhookBearerToken = 'stored-secret';
+  service.ensureDirectoryReady = async () => true;
+  service.saveStore = async () => {};
+  service.refreshOutputDiskSpace = async () => {};
+
+  const preserved = await service.saveSettings({
+    webhookEnabled: true,
+    webhookUrl: 'https://notify.example.com/hook',
+    webhookBearerToken: '',
+    webhookBearerTokenConfigured: true,
+    webhookBearerTokenClear: false
+  });
+  assert.equal(service.settings.webhookBearerToken, 'stored-secret');
+  assert.equal(preserved.settings.webhookBearerToken, '');
+  assert.equal(preserved.settings.webhookBearerTokenConfigured, true);
+
+  const cleared = await service.saveSettings({
+    webhookBearerToken: '',
+    webhookBearerTokenConfigured: true,
+    webhookBearerTokenClear: true
+  });
+  assert.equal(service.settings.webhookBearerToken, '');
+  assert.equal(cleared.settings.webhookBearerTokenConfigured, false);
+});
+
+test('Linux cloud UI capabilities exclude desktop-only Windows actions', () => {
+  assert.deepEqual(createUiCapabilities('linux', { BILI_RECORD_SYSTEMD: '1' }, { localConsole: false }), {
+    nativePathPicker: false,
+    openServerPath: false,
+    nativeNotifications: false,
+    startupControl: false,
+    managedService: true,
+    serviceShutdown: false
+  });
+  assert.deepEqual(createUiCapabilities('linux', { DISPLAY: ':0' }, { localConsole: true }), {
+    nativePathPicker: false,
+    openServerPath: true,
+    nativeNotifications: false,
+    startupControl: false,
+    managedService: false,
+    serviceShutdown: true
+  });
+});
+
+test('client login badges and Linux pages use server state and platform capabilities', () => {
+  const settingsSource = fs.readFileSync(path.join(projectRoot, 'src/client/pages/SettingsPage.tsx'), 'utf8');
+  const overviewSource = fs.readFileSync(path.join(projectRoot, 'src/client/pages/OverviewPage.tsx'), 'utf8');
+  const exportSource = fs.readFileSync(path.join(projectRoot, 'src/client/pages/ExportPage.tsx'), 'utf8');
+  const maintenanceSource = fs.readFileSync(path.join(projectRoot, 'src/client/pages/MaintenancePage.tsx'), 'utf8');
+
+  assert.match(settingsSource, /isBilibiliLoggedIn\(state\)/);
+  assert.match(overviewSource, /isBilibiliLoggedIn\(state\)/);
+  assert.doesNotMatch(settingsSource, /settingsDraft\.cookie\.includes\(['"]SESSDATA=/);
+  assert.match(settingsSource, /uiCapabilities\?\.nativeNotifications/);
+  assert.match(exportSource, /uiCapabilities\?\.nativePathPicker/);
+  assert.match(maintenanceSource, /uiCapabilities\?\.serviceShutdown/);
 });
 
 test('external network binding gates the WebUI API before any recorder action runs', async () => {
