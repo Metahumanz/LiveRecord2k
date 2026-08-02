@@ -49,6 +49,9 @@ export function ExportPage({
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   const recordings = state.recordings.filter((recording) => recording.cleanPath);
+  const isLinux = state.platform === 'linux';
+  const canPickServerPath = state.uiCapabilities?.nativePathPicker ?? !isLinux;
+  const canOpenServerPath = state.uiCapabilities?.openServerPath ?? !isLinux;
   const validRecordingCount = recordings.filter((recording) => recording.valid !== false).length;
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mediaDuration, setMediaDuration] = useState(0);
@@ -308,10 +311,12 @@ export function ExportPage({
               <RefreshCw size={18} />
               刷新历史
             </button>
-            <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
-              <FolderOpen size={18} />
-              打开目录
-            </button>
+            {canOpenServerPath ? (
+              <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
+                <FolderOpen size={18} />
+                打开目录
+              </button>
+            ) : null}
           </>
         }
       />
@@ -366,17 +371,19 @@ export function ExportPage({
               <input
                 value={draft.cleanPath}
                 onChange={(event) => setDraft({ ...draft, cleanPath: event.target.value })}
-                placeholder="C:\Videos\xxx.clean.mp4"
+                placeholder={isLinux ? '/var/lib/bili-record-2k/recordings/xxx.clean.mp4' : 'C:\\Videos\\xxx.clean.mp4'}
               />
-              <button
-                className="icon-button"
-                type="button"
-                title="选择原始录像文件"
-                disabled={pathPickerBusy}
-                onClick={() => chooseDraftPath('video', draft.cleanPath || state.settings.outputDir, (nextPath) => setDraft({ ...draft, cleanPath: nextPath }))}
-              >
-                <FileVideo size={18} />
-              </button>
+              {canPickServerPath ? (
+                <button
+                  className="icon-button"
+                  type="button"
+                  title="选择原始录像文件"
+                  disabled={pathPickerBusy}
+                  onClick={() => chooseDraftPath('video', draft.cleanPath || state.settings.outputDir, (nextPath) => setDraft({ ...draft, cleanPath: nextPath }))}
+                >
+                  <FileVideo size={18} />
+                </button>
+              ) : null}
             </div>
             <p className="field-help">从上面的历史录像选择时通常会自动填好。</p>
           </label>
@@ -387,21 +394,23 @@ export function ExportPage({
               <input
                 value={draft.danmakuPath}
                 onChange={(event) => setDraft({ ...draft, danmakuPath: event.target.value })}
-                placeholder="C:\Videos\xxx.danmaku.jsonl"
+                placeholder={isLinux ? '/var/lib/bili-record-2k/recordings/xxx.danmaku.jsonl' : 'C:\\Videos\\xxx.danmaku.jsonl'}
               />
-              <button
-                className="icon-button"
-                type="button"
-                title="选择弹幕记录文件"
-                disabled={pathPickerBusy}
-                onClick={() =>
-                  chooseDraftPath('danmaku', draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
-                    setDraft({ ...draft, danmakuPath: nextPath })
-                  )
-                }
-              >
-                <FileCode2 size={18} />
-              </button>
+              {canPickServerPath ? (
+                <button
+                  className="icon-button"
+                  type="button"
+                  title="选择弹幕记录文件"
+                  disabled={pathPickerBusy}
+                  onClick={() =>
+                    chooseDraftPath('danmaku', draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
+                      setDraft({ ...draft, danmakuPath: nextPath })
+                    )
+                  }
+                >
+                  <FileCode2 size={18} />
+                </button>
+              ) : null}
             </div>
             <p className="field-help">导出弹幕视频或字幕时需要这个文件；纯净片段可以不填。</p>
           </label>
@@ -414,19 +423,21 @@ export function ExportPage({
                 onChange={(event) => setDraft({ ...draft, cssPath: event.target.value })}
                 placeholder="留空则自动生成 .danmaku.css"
               />
-              <button
-                className="icon-button"
-                type="button"
-                title="选择弹幕样式文件"
-                disabled={pathPickerBusy}
-                onClick={() =>
-                  chooseDraftPath('css', draft.cssPath || draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
-                    setDraft({ ...draft, cssPath: nextPath })
-                  )
-                }
-              >
-                <FileCode2 size={18} />
-              </button>
+              {canPickServerPath ? (
+                <button
+                  className="icon-button"
+                  type="button"
+                  title="选择弹幕样式文件"
+                  disabled={pathPickerBusy}
+                  onClick={() =>
+                    chooseDraftPath('css', draft.cssPath || draft.danmakuPath || draft.cleanPath || state.settings.outputDir, (nextPath) =>
+                      setDraft({ ...draft, cssPath: nextPath })
+                    )
+                  }
+                >
+                  <FileCode2 size={18} />
+                </button>
+              ) : null}
             </div>
             <p className="field-help">留空时会自动生成默认样式。</p>
           </label>
@@ -638,20 +649,23 @@ export function ExportPage({
                 onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
                 placeholder={state.settings.outputDir}
               />
-              <button
-                className="icon-button"
-                type="button"
-                title="选择输出目录"
-                disabled={pathPickerBusy}
-                onClick={() =>
-                  chooseDraftPath('directory', draft.outputDir || state.settings.outputDir, (nextPath) =>
-                    setDraft({ ...draft, outputDir: nextPath })
-                  )
-                }
-              >
-                <FolderOpen size={18} />
-              </button>
+              {canPickServerPath ? (
+                <button
+                  className="icon-button"
+                  type="button"
+                  title="选择输出目录"
+                  disabled={pathPickerBusy}
+                  onClick={() =>
+                    chooseDraftPath('directory', draft.outputDir || state.settings.outputDir, (nextPath) =>
+                      setDraft({ ...draft, outputDir: nextPath })
+                    )
+                  }
+                >
+                  <FolderOpen size={18} />
+                </button>
+              ) : null}
             </div>
+            {isLinux ? <p className="field-help">请填写 Linux 服务端绝对路径。</p> : null}
           </label>
 
           <div className="settings-grid">
@@ -783,15 +797,17 @@ export function ExportPage({
               {!result.queued && result.mode === 'subtitles' && typeof result.eventCount === 'number' ? (
                 <PathLine label="事件数量" value={String(result.eventCount)} />
               ) : null}
-              <button
-                className="wide-button fill"
-                type="button"
-                disabled={!(result.outputPath || result.assPath || result.cssPath)}
-                onClick={() => run('open-result-dir', () => recorder.openPathDir(result.outputPath || result.assPath || result.cssPath || ''))}
-              >
-                <FolderOpen size={18} />
-                打开所在目录
-              </button>
+              {canOpenServerPath ? (
+                <button
+                  className="wide-button fill"
+                  type="button"
+                  disabled={!(result.outputPath || result.assPath || result.cssPath)}
+                  onClick={() => run('open-result-dir', () => recorder.openPathDir(result.outputPath || result.assPath || result.cssPath || ''))}
+                >
+                  <FolderOpen size={18} />
+                  打开所在目录
+                </button>
+              ) : null}
             </div>
           ) : (
             <div className="empty-state compact-empty">

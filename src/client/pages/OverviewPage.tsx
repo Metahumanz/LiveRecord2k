@@ -3,7 +3,7 @@ import { recorder } from '../recorderClient';
 import { BigMetric, HelpBox, PageHeader, UpdateNotice } from '../components/common';
 import { RoomCard } from '../components/rooms';
 import type { AppState, Page } from '../types';
-import { getStats } from '../utils';
+import { getStats, isBilibiliLoggedIn } from '../utils';
 
 export function OverviewPage({
   state,
@@ -21,7 +21,8 @@ export function OverviewPage({
   openPreview: (roomId: string) => void;
 }) {
   const activeRooms = state.rooms.filter((room) => room.liveStatus === 1 || room.recording);
-  const loggedIn = state.settings.cookie.includes('SESSDATA=');
+  const loggedIn = isBilibiliLoggedIn(state);
+  const canOpenServerPath = state.uiCapabilities?.openServerPath ?? state.platform !== 'linux';
   const hasOutputDir = Boolean(state.settings.outputDir.trim());
   const anyMonitoring = state.rooms.some((room) => room.monitoring);
   const liveRooms = state.rooms.filter((room) => room.liveStatus === 1);
@@ -38,7 +39,7 @@ export function OverviewPage({
     if (!hasOutputDir) {
       return {
         title: '配置录像保存位置',
-        body: '选择一个空间充足的文件夹，后续录像、弹幕记录和弹幕视频都会放在那里。',
+        body: '填写或选择一个空间充足的目录，后续录像、弹幕记录和弹幕视频都会放在那里。',
         action: '去录制配置',
         page: 'settings' as Page
       };
@@ -98,10 +99,12 @@ export function OverviewPage({
               <RefreshCw size={18} />
               检查更新
             </button>
-            <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
-              <HardDrive size={18} />
-              打开目录
-            </button>
+            {canOpenServerPath ? (
+              <button className="wide-button" onClick={() => run('open-output', recorder.openOutputDir)}>
+                <HardDrive size={18} />
+                打开目录
+              </button>
+            ) : null}
             <button className="wide-button primary" onClick={() => setPage('rooms')}>
               <Plus size={18} />
               添加直播间

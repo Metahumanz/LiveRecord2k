@@ -15,6 +15,13 @@ export function getStats(rooms: RoomState[]) {
   };
 }
 
+export function isBilibiliLoggedIn(state: AppState) {
+  if (typeof state.bilibiliLoggedIn === 'boolean') {
+    return state.bilibiliLoggedIn;
+  }
+  return /(?:^|;\s*)SESSDATA=[^;]+/i.test(state.settings.cookie);
+}
+
 export function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft {
   const recordings = state.recordings.filter((recording) => recording.cleanPath);
   const currentRecording = current.cleanPath

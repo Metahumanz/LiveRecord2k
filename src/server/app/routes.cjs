@@ -69,7 +69,11 @@ async function handleApi(service, parsed, port, request, response, access) {
     return;
   }
   const localConsole = isLocalConsoleRequest(request);
-  const stateOptions = { redactCookie: !localConsole, accessAuthenticated: access.authenticated };
+  const stateOptions = {
+    redactCookie: !localConsole,
+    localConsole,
+    accessAuthenticated: access.authenticated
+  };
   if (request.method === 'GET' && pathname === '/api/state') {
     writeJson(response, 200, service.getState(stateOptions));
     return;
@@ -157,6 +161,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/update/queue': () => service.queueUpdateAfterJobs(),
     '/api/system/startup': () => service.setStartup(body.enabled),
     '/api/system/test-notification': () => service.testNotification(),
+    '/api/system/test-webhook': () => service.testWebhook(),
     '/api/system/shutdown': () => service.requestShutdown()
   };
 
@@ -368,13 +373,22 @@ function isLocalConsoleRequest(request) {
 }
 
 function redactRemoteState(result, options = {}) {
-  if (!options.redactCookie || !result || typeof result !== 'object' || !result.settings) {
+  if (!result || typeof result !== 'object') {
     return result;
   }
-  return {
-    ...result,
-    settings: { ...result.settings, cookie: '' }
-  };
+  const next = { ...result };
+  if (options.redactCookie && result.settings) {
+    next.settings = { ...result.settings, cookie: '' };
+    next.bilibiliCookieVisible = false;
+  }
+  if (options.localConsole === false && result.uiCapabilities) {
+    next.uiCapabilities = {
+      ...result.uiCapabilities,
+      nativePathPicker: false,
+      openServerPath: false
+    };
+  }
+  return next;
 }
 
 async function serveVite(vite, pathname, request, response) {

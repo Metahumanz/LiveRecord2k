@@ -76,7 +76,7 @@ https://live.bilibili.com/22625025
 
 ### 开启监听
 
-监听开启后，应用会保持直播弹幕服务器连接，并在收到开播推送时立即准备录制；设置中的 HTTP 轮询间隔只作为推送断线或漏消息时的兜底。开播、下播、开始录制、结束录制等事件可以通过 Windows 通知提醒。
+监听开启后，应用会保持直播弹幕服务器连接，并在收到开播推送时立即准备录制；设置中的 HTTP 轮询间隔只作为推送断线或漏消息时的兜底。开播、下播、开始录制、结束录制等事件可以通过 Windows 通知或通用 Webhook 提醒。
 
 ### 开始录制
 
@@ -121,7 +121,7 @@ https://live.bilibili.com/22625025
 
 ## 通知和后台
 
-应用会通过本地后台服务产生事件，再由托盘程序显示 Windows 通知。
+应用会通过后台服务产生事件。Windows 桌面版可由托盘程序显示系统通知；Windows 和 Linux 都可由服务端发送通用 Webhook，浏览器关闭后仍然有效。
 
 托盘图标支持：
 
@@ -130,6 +130,42 @@ https://live.bilibili.com/22625025
 - 鼠标悬停：查看监听、录制、弹幕视频生成和端口状态。
 
 开机自启可以在 `录制配置` 里开启。开启后会写入当前用户的 Windows Run 注册表项，并以后台方式启动。
+
+### 通用 Webhook
+
+在 `录制配置` 的“监听与通知”区域填写接收地址、按需填写 Bearer Token，启用并保存后，再点击 `发送 Webhook 测试`。公网接收地址必须使用 HTTPS；本机和私有 IP 地址可使用 HTTP。
+
+服务端按事件发生顺序发送 `POST application/json`。接收端返回任意 2xx 状态码即视为成功；超时或非 2xx 会有限重试，最终失败会写入应用日志，但不会阻塞录制、合并或烧录任务。可用事件类型：
+
+- `live.started` / `live.ended`
+- `recording.started` / `recording.completed` / `recording.failed`
+- `burn.started` / `burn.completed` / `burn.failed`
+- `test`（只在手动测试时发送）
+
+示例请求体：
+
+```json
+{
+  "id": "1722600000000-1",
+  "event": "recording.completed",
+  "title": "录制结束",
+  "message": "主播 / 直播标题 可烧录事件 1234 条",
+  "occurredAt": "2026-08-02T12:00:00.000Z",
+  "source": {
+    "name": "BiliRecord2K",
+    "version": "0.3.2"
+  },
+  "data": {
+    "roomId": "123456",
+    "roomTitle": "直播标题",
+    "anchor": "主播",
+    "fileName": "123456_anchor_title.clean.mp4",
+    "eventCount": 1234
+  }
+}
+```
+
+配置了 Token 时，请求会带上 `Authorization: Bearer <Token>`。Token 只保存在服务端配置中，不会通过 WebUI 状态接口回传，也不会写入设置导出文件。各通知事件开关同时控制 Windows 通知和 Webhook。
 
 ## 局域网访问
 
@@ -186,6 +222,8 @@ curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/script
 ```
 
 脚本不会擅自修改云厂商安全组或主机防火墙；外部无法访问时，需要自行放行对应 TCP 端口。公网长期使用仍应配置 HTTPS 反向代理。
+
+无桌面环境的 Linux WebUI 会隐藏原生目录选择、打开文件管理器、Windows 通知和桌面进程退出等操作，并提供由服务端后台发送的通用 Webhook。路径需要填写服务器上的绝对路径，服务重启、停止和日志查看通过 `systemctl`、`journalctl` 完成。远程扫码登录成功后，页面只显示登录状态，不会把 Cookie 明文回传到浏览器。
 
 无人值守安装可以预先传入密码：
 

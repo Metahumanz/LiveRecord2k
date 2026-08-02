@@ -16,6 +16,7 @@ export function UpdateNotice({
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   const update = state.update;
+  const canOpenServerPath = state.uiCapabilities?.openServerPath ?? state.platform !== 'linux';
   if (!update || update.status === 'idle') {
     return null;
   }
@@ -73,7 +74,7 @@ export function UpdateNotice({
             {update.autoApplySupported ? '自动安装' : '下载更新包'}
           </button>
         ) : null}
-        {update.status === 'error' ? (
+        {update.status === 'error' && canOpenServerPath ? (
           <button
             className="wide-button"
             disabled={busy === 'update-check'}
@@ -89,7 +90,7 @@ export function UpdateNotice({
             配置目录
           </button>
         ) : null}
-        {update.packagePath ? (
+        {update.packagePath && canOpenServerPath ? (
           <button
             className="wide-button"
             disabled={busy === 'open-update-package'}

@@ -54,6 +54,7 @@ export const recorder: RecorderApi = {
   queueUpdate: () => api<AppState>('/api/update/queue', {}, { timeoutMs: 0 }),
   setStartup: (enabled) => api<AppState>('/api/system/startup', { enabled }),
   testNotification: () => api<AppState>('/api/system/test-notification', {}),
+  testWebhook: () => api<AppState>('/api/system/test-webhook', {}, { timeoutMs: 45000 }),
   shutdown: () => api('/api/system/shutdown', {}),
   onStateChanged(callback) {
     listeners.add(callback);

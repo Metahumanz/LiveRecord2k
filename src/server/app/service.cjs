@@ -201,6 +201,10 @@ const DEFAULT_HOST = '127.0.0.1';
 const PROD_MODE = process.argv.includes('--prod');
 const DEV_MODE = process.argv.includes('--dev') || !PROD_MODE;
 const OPEN_BROWSER = !process.argv.includes('--no-open') && process.env.BILI_RECORD_NO_OPEN !== '1';
+const DEV_PLATFORM_OVERRIDE = DEV_MODE ? String(process.env.BILI_RECORD_DEV_PLATFORM || '').trim().toLowerCase() : '';
+const UI_PLATFORM = ['win32', 'linux', 'darwin'].includes(DEV_PLATFORM_OVERRIDE)
+  ? DEV_PLATFORM_OVERRIDE
+  : process.platform;
 const APP_ROOT = getAppRoot();
 const DIST_ROOT = path.join(APP_ROOT, 'dist');
 const APP_VERSION = getAppVersion();
@@ -214,6 +218,9 @@ const AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const PATH_PROBE_TIMEOUT_MS = 2500;
 const PATH_CREATE_TIMEOUT_MS = 8000;
 const PATH_PICKER_TIMEOUT_MS = 5 * 60 * 1000;
+const WEBHOOK_TIMEOUT_MS = 10 * 1000;
+const WEBHOOK_MAX_QUEUE_SIZE = 100;
+const WEBHOOK_RETRY_DELAYS_MS = [0, 1000, 3000];
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
@@ -240,6 +247,88 @@ const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.val
 function isPublicServerHost(value) {
   const host = String(value || '').trim().toLowerCase();
   return host === '0.0.0.0' || host === '::';
+}
+
+function createUiCapabilities(platform = process.platform, environment = process.env, options = {}) {
+  const normalizedPlatform = String(platform || '').trim().toLowerCase();
+  const localConsole = options.localConsole !== false;
+  const linuxDesktopSession =
+    normalizedPlatform === 'linux' && Boolean(environment.DISPLAY || environment.WAYLAND_DISPLAY);
+  const desktopPathIntegration =
+    normalizedPlatform === 'win32' || normalizedPlatform === 'darwin' || linuxDesktopSession;
+  const managedService = normalizedPlatform === 'linux' && environment.BILI_RECORD_SYSTEMD === '1';
+  return {
+    nativePathPicker: normalizedPlatform === 'win32' && localConsole,
+    openServerPath: desktopPathIntegration && localConsole,
+    nativeNotifications: normalizedPlatform === 'win32',
+    startupControl: normalizedPlatform === 'win32',
+    managedService,
+    serviceShutdown: !managedService
+  };
+}
+
+function isPrivateWebhookHostname(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host === '::1' || host.startsWith('fc') || host.startsWith('fd')) {
+    return true;
+  }
+  const octets = host.split('.').map(Number);
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  return (
+    octets[0] === 127 ||
+    octets[0] === 10 ||
+    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+    (octets[0] === 192 && octets[1] === 168)
+  );
+}
+
+function normalizeWebhookUrl(value, options = {}) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    if (options.required) {
+      throw new Error('启用 Webhook 前请填写接收地址。');
+    }
+    return '';
+  }
+  if (raw.length > 2048) {
+    throw new Error('Webhook 地址过长。');
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error('Webhook 地址格式无效。');
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('Webhook 地址只支持 HTTP 或 HTTPS。');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Webhook 地址不能包含用户名或密码，请使用 Bearer Token。');
+  }
+  if (parsed.protocol === 'http:' && !isPrivateWebhookHostname(parsed.hostname)) {
+    throw new Error('公网 Webhook 必须使用 HTTPS；HTTP 仅允许本机或私有 IP 地址。');
+  }
+  return parsed.toString();
+}
+
+function createWebhookPayload(notification) {
+  const payload = {
+    id: String(notification.webhookId || notification.id || crypto.randomUUID()),
+    event: String(notification.event || 'notification'),
+    title: String(notification.title || APP_NAME),
+    message: String(notification.message || ''),
+    occurredAt: new Date(Number(notification.time || Date.now())).toISOString(),
+    source: {
+      name: APP_NAME,
+      version: APP_VERSION
+    }
+  };
+  if (notification.data && Object.keys(notification.data).length) {
+    payload.data = notification.data;
+  }
+  return payload;
 }
 
 function createDanmakuAssSuffix(overlayMode, danmakuArea) {
@@ -291,6 +380,8 @@ class LiveRecordService {
     this.clients = new Map();
     this.notifications = [];
     this.notificationSeq = 0;
+    this.webhookQueue = [];
+    this.webhookQueueRunning = false;
     this.loginSession = null;
     this.wbiCache = null;
     this.pathPickerPromise = null;
@@ -349,6 +440,9 @@ class LiveRecordService {
       notifyRecordingEnded: true,
       notifyBurnStarted: true,
       notifyBurnEnded: true,
+      webhookEnabled: false,
+      webhookUrl: '',
+      webhookBearerToken: '',
       openBrowserOnStart: true,
       hideOverviewNextStep: false,
       autoUpdateEnabled: process.platform === 'linux' && process.env.BILI_RECORD_AUTO_UPDATE === '1',
@@ -476,6 +570,9 @@ class LiveRecordService {
       notifyRecordingEnded: settings.notifyRecordingEnded !== false,
       notifyBurnStarted: settings.notifyBurnStarted !== false,
       notifyBurnEnded: settings.notifyBurnEnded !== false,
+      webhookEnabled: Boolean(settings.webhookEnabled),
+      webhookUrl: String(settings.webhookUrl || '').trim().slice(0, 2048),
+      webhookBearerToken: String(settings.webhookBearerToken || '').trim().slice(0, 4096),
       openBrowserOnStart: settings.openBrowserOnStart !== false,
       hideOverviewNextStep: Boolean(settings.hideOverviewNextStep),
       autoUpdateEnabled: Boolean(settings.autoUpdateEnabled),
@@ -604,8 +701,13 @@ class LiveRecordService {
   getState(options = {}) {
     const settings = { ...this.settings };
     delete settings.accessPasswordHash;
+    const webhookBearerTokenConfigured = Boolean(settings.webhookBearerToken);
+    delete settings.webhookBearerToken;
     settings.accessPassword = '';
     settings.accessAuthConfigured = this.accessAuth.isConfigured(this.settings);
+    settings.webhookBearerToken = '';
+    settings.webhookBearerTokenConfigured = webhookBearerTokenConfigured;
+    settings.webhookBearerTokenClear = false;
     if (options.redactCookie) {
       settings.cookie = '';
     }
@@ -615,6 +717,8 @@ class LiveRecordService {
       recordings: this.recordings,
       logs: this.logs,
       login: this.getPublicLoginState(),
+      bilibiliLoggedIn: Boolean(getCookieValue(this.settings.cookie, 'SESSDATA')),
+      bilibiliCookieVisible: !options.redactCookie,
       version: APP_VERSION,
       update: this.getPublicUpdateState(),
       ffmpegPath: this.ffmpegPath,
@@ -634,7 +738,8 @@ class LiveRecordService {
       },
       currentPort: this.currentPort || DEFAULT_PORT,
       currentHost: this.currentHost || DEFAULT_HOST,
-      platform: process.platform,
+      platform: UI_PLATFORM,
+      uiCapabilities: createUiCapabilities(UI_PLATFORM, process.env, options),
       storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT
@@ -805,13 +910,16 @@ class LiveRecordService {
     this.emitState();
   }
 
-  notify(title, message) {
+  notify(title, message, event = 'notification', data = {}, options = {}) {
     const notification = {
       id: ++this.notificationSeq,
       time: Date.now(),
+      event: String(event || 'notification'),
       title: String(title || APP_NAME),
-      message: String(message || '')
+      message: String(message || ''),
+      data: data && typeof data === 'object' ? data : {}
     };
+    notification.webhookId = `${notification.time}-${notification.id}`;
     this.notifications.push(notification);
     if (this.notifications.length > 80) {
       this.notifications.splice(0, this.notifications.length - 80);
@@ -819,6 +927,108 @@ class LiveRecordService {
     if (process.env.BILI_RECORD_TRAY !== '1') {
       showWindowsToast(notification.title, notification.message);
     }
+    if (options.webhook !== false) {
+      this.enqueueWebhookNotification(notification);
+    }
+  }
+
+  enqueueWebhookNotification(notification) {
+    if (!this.settings.webhookEnabled || !this.settings.webhookUrl) {
+      return;
+    }
+    if (this.webhookQueue.length >= WEBHOOK_MAX_QUEUE_SIZE) {
+      this.webhookQueue.shift();
+      this.log('warn', 'Webhook 待发送队列已满，已丢弃最早的一条通知。');
+    }
+    this.webhookQueue.push({
+      notification,
+      config: {
+        url: this.settings.webhookUrl,
+        bearerToken: this.settings.webhookBearerToken
+      }
+    });
+    if (!this.webhookQueueRunning) {
+      setImmediate(() => {
+        this.processWebhookQueue().catch((error) => {
+          this.log('warn', `Webhook 队列异常：${error.message}`);
+        });
+      });
+    }
+  }
+
+  async processWebhookQueue() {
+    if (this.webhookQueueRunning) {
+      return;
+    }
+    this.webhookQueueRunning = true;
+    try {
+      while (this.webhookQueue.length) {
+        const item = this.webhookQueue.shift();
+        try {
+          await this.sendWebhookNotification(item.notification, { config: item.config });
+        } catch (error) {
+          this.log('warn', `Webhook 通知发送失败（${item.notification.event}）：${error.message}`);
+        }
+      }
+    } finally {
+      this.webhookQueueRunning = false;
+      if (this.webhookQueue.length) {
+        setImmediate(() => this.processWebhookQueue().catch(() => {}));
+      }
+    }
+  }
+
+  async sendWebhookNotification(notification, options = {}) {
+    const config = options.config || {
+      url: this.settings.webhookUrl,
+      bearerToken: this.settings.webhookBearerToken
+    };
+    const url = normalizeWebhookUrl(config.url, { required: true });
+    const bearerToken = String(config.bearerToken || '').trim();
+    if (/\r|\n/.test(bearerToken)) {
+      throw new Error('Webhook Bearer Token 不能包含换行。');
+    }
+    const payload = createWebhookPayload(notification);
+    const body = JSON.stringify(payload);
+    const headers = {
+      'Content-Type': 'application/json',
+      'User-Agent': `${APP_NAME}/${APP_VERSION}`,
+      'X-BiliRecord2K-Event': payload.event
+    };
+    if (bearerToken) {
+      headers.Authorization = `Bearer ${bearerToken}`;
+    }
+    const retryDelays = Array.isArray(options.retryDelays) ? options.retryDelays : WEBHOOK_RETRY_DELAYS_MS;
+    let lastError;
+    for (const retryDelay of retryDelays) {
+      if (retryDelay > 0) {
+        await delay(retryDelay);
+      }
+      try {
+        const response = await fetchWithTimeout(
+          url,
+          {
+            method: 'POST',
+            headers,
+            body,
+            redirect: 'error'
+          },
+          WEBHOOK_TIMEOUT_MS,
+          'Webhook 请求',
+          async (response) => {
+            await response.body?.cancel();
+            return response;
+          }
+        );
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return payload;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error('Webhook 请求失败。');
   }
 
   getTrayStateText(afterSeq) {
@@ -1599,15 +1809,34 @@ try {
       delete settingsUpdate.cookie;
     }
     const accessPassword = String(settingsUpdate.accessPassword || '');
+    const webhookBearerToken = String(settingsUpdate.webhookBearerToken || '').trim();
+    const clearWebhookBearerToken = Boolean(settingsUpdate.webhookBearerTokenClear);
     delete settingsUpdate.accessPassword;
     delete settingsUpdate.accessAuthConfigured;
     delete settingsUpdate.accessPasswordHash;
+    delete settingsUpdate.webhookBearerToken;
+    delete settingsUpdate.webhookBearerTokenConfigured;
+    delete settingsUpdate.webhookBearerTokenClear;
     if (accessPassword) {
       settingsUpdate.accessPasswordHash = await hashAccessPassword(accessPassword);
+    }
+    if (webhookBearerToken.length > 4096) {
+      throw new Error('Webhook Bearer Token 不能超过 4096 个字符。');
+    }
+    if (/\r|\n/.test(webhookBearerToken)) {
+      throw new Error('Webhook Bearer Token 不能包含换行。');
+    }
+    if (clearWebhookBearerToken) {
+      settingsUpdate.webhookBearerToken = '';
+    } else if (webhookBearerToken) {
+      settingsUpdate.webhookBearerToken = webhookBearerToken;
     }
     const normalizedSettings = this.normalizeSettings({
       ...this.settings,
       ...settingsUpdate
+    });
+    normalizedSettings.webhookUrl = normalizeWebhookUrl(normalizedSettings.webhookUrl, {
+      required: normalizedSettings.webhookEnabled
     });
     if (isPublicServerHost(normalizedSettings.serverHost) && !this.accessAuth.isConfigured(normalizedSettings)) {
       throw new Error('监听 0.0.0.0/:: 前必须先设置至少 8 位远程访问密码，或设置 BILI_RECORD_AUTH_PASSWORD。');
@@ -1709,10 +1938,18 @@ try {
           `${roomLabel(room)}：${room.liveStatus === 1 ? '开播' : '下播'}`
         );
         if (room.liveStatus === 1 && this.settings.notifyLiveStarted) {
-          this.notify('开播提醒', `${roomLabel(room)} 已开播`);
+          this.notify('开播提醒', `${roomLabel(room)} 已开播`, 'live.started', {
+            roomId: room.id,
+            roomTitle: room.title || '',
+            anchor: room.anchor || ''
+          });
         }
         if (previousLiveStatus === 1 && room.liveStatus !== 1 && this.settings.notifyLiveEnded) {
-          this.notify('下播提醒', `${roomLabel(room)} 已下播`);
+          this.notify('下播提醒', `${roomLabel(room)} 已下播`, 'live.ended', {
+            roomId: room.id,
+            roomTitle: room.title || '',
+            anchor: room.anchor || ''
+          });
         }
       } else if (!silent) {
         this.log(
@@ -1811,10 +2048,18 @@ try {
         `${roomLabel(room)}：${room.liveStatus === 1 ? '开播' : '下播'}（${source}）`
       );
       if (room.liveStatus === 1 && this.settings.notifyLiveStarted) {
-        this.notify('开播提醒', `${roomLabel(room)} 已开播`);
+        this.notify('开播提醒', `${roomLabel(room)} 已开播`, 'live.started', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || ''
+        });
       }
       if (previousLiveStatus === 1 && room.liveStatus !== 1 && this.settings.notifyLiveEnded) {
-        this.notify('下播提醒', `${roomLabel(room)} 已下播`);
+        this.notify('下播提醒', `${roomLabel(room)} 已下播`, 'live.ended', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || ''
+        });
       }
       await this.saveStore().catch((error) => {
         this.log('warn', `${roomLabel(room)} 保存开播状态失败：${error.message}`);
@@ -2813,7 +3058,12 @@ try {
       );
       this.log('info', `${roomLabel(room)} 录制临时路径：${capturePath}`);
       if (this.settings.notifyRecordingStarted && !options.silentNotify) {
-        this.notify('开始录制', `${roomLabel(room)} 正在写入 ${path.basename(cleanPath)}`);
+        this.notify('开始录制', `${roomLabel(room)} 正在写入 ${path.basename(cleanPath)}`, 'recording.started', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || '',
+          fileName: path.basename(cleanPath)
+        });
       }
 
       ffmpeg.stderr.on('data', (chunk) => {
@@ -3289,7 +3539,13 @@ try {
         `${roomLabel(room)} 录制结束：${path.basename(session.cleanPath)}，时长 ${elapsedText}，可烧录事件 ${session.eventCount} 条。`
       );
       if (this.settings.notifyRecordingEnded) {
-        this.notify('录制结束', `${roomLabel(room)} 可烧录事件 ${session.eventCount} 条`);
+        this.notify('录制结束', `${roomLabel(room)} 可烧录事件 ${session.eventCount} 条`, 'recording.completed', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || '',
+          fileName: path.basename(session.cleanPath),
+          eventCount: session.eventCount
+        });
       }
     } else if (code === 0) {
       this.log(
@@ -3301,7 +3557,13 @@ try {
     } else {
       this.log('error', `${roomLabel(room)} 录制进程异常退出：退出码 ${code}，信号 ${signal || '-'}`);
       if (this.settings.notifyRecordingEnded) {
-        this.notify('录制异常结束', `${roomLabel(room)} 退出码 ${code}`);
+        this.notify('录制异常结束', `${roomLabel(room)} 退出码 ${code}`, 'recording.failed', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || '',
+          fileName: path.basename(session.cleanPath),
+          exitCode: code
+        });
       }
     }
 
@@ -4133,7 +4395,12 @@ try {
         }）`
       );
       if (this.settings.notifyBurnStarted) {
-        this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`);
+        this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`, 'burn.started', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || '',
+          fileName: path.basename(burnedPath)
+        });
       }
 
       ffmpeg.stderr.on('data', (chunk) => {
@@ -4169,13 +4436,24 @@ try {
           finishFfmpegJobProgress(room.burnProgress, 'completed', '弹幕版已生成');
           this.log('success', `${roomLabel(room)} 有弹幕版已生成：${path.basename(burnedPath)}`);
           if (this.settings.notifyBurnEnded) {
-            this.notify('弹幕版已生成', `${roomLabel(room)} ${path.basename(burnedPath)}`);
+            this.notify('弹幕版已生成', `${roomLabel(room)} ${path.basename(burnedPath)}`, 'burn.completed', {
+              roomId: room.id,
+              roomTitle: room.title || '',
+              anchor: room.anchor || '',
+              fileName: path.basename(burnedPath)
+            });
           }
         } else {
           finishFfmpegJobProgress(room.burnProgress, 'error', `烧录失败：退出码 ${code}`);
           this.log('error', `${roomLabel(room)} 烧录失败：退出码 ${code}，信号 ${signal || '-'}`);
           if (this.settings.notifyBurnEnded) {
-            this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${code}`);
+            this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${code}`, 'burn.failed', {
+              roomId: room.id,
+              roomTitle: room.title || '',
+              anchor: room.anchor || '',
+              fileName: path.basename(burnedPath),
+              exitCode: code
+            });
           }
         }
         this.emitState();
@@ -5184,10 +5462,33 @@ try {
   }
 
   async testNotification() {
-    this.notify('测试通知', '哔哩录播 2K Windows 通知功能正常');
+    if (process.platform !== 'win32') {
+      throw new Error('系统通知测试目前只支持 Windows 桌面版。');
+    }
+    this.notify('测试通知', '哔哩录播 2K Windows 通知功能正常', 'test.windows', {}, { webhook: false });
     this.log('success', '已发送 Windows 测试通知。');
     this.emitState();
     return this.getState();
+  }
+
+  async testWebhook() {
+    const payload = await this.sendWebhookNotification({
+      id: `test-${Date.now()}`,
+      event: 'test',
+      title: 'Webhook 测试',
+      message: '哔哩录播 2K Webhook 通知功能正常',
+      time: Date.now(),
+      data: { test: true }
+    });
+    this.log('success', 'Webhook 测试发送成功。');
+    return {
+      ...this.getState(),
+      operationNotice: {
+        kind: 'success',
+        title: 'Webhook 可用',
+        message: `接收端已返回成功状态，事件 ID：${payload.id}`
+      }
+    };
   }
 
   async requestShutdown() {
@@ -5317,6 +5618,7 @@ function isSingleExecutableRuntime() {
 
 module.exports = {
   LiveRecordService,
+  createUiCapabilities,
   DEFAULT_HOST,
   DEV_MODE,
   OPEN_BROWSER,
