@@ -167,7 +167,7 @@ https://live.bilibili.com/22625025
   "occurredAt": "2026-08-02T12:00:00.000Z",
   "source": {
     "name": "BiliRecord2K",
-    "version": "0.3.2"
+    "version": "0.3.3"
   },
   "data": {
     "roomId": "123456",
