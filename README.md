@@ -109,6 +109,20 @@ https://live.bilibili.com/22625025
 
 如果某个源流无法封装成 MP4，可以在 `录制配置` 里把最终输出容器切换为 MKV 后再试。
 
+## 缓存和自动清理
+
+应用启动时会检查配置目录中的缓存版本标记。升级、降级、缓存格式变化，或者检测到旧版本未标记的缓存时，会自动清空 `preview-cache` 兼容预览缓存；同一版本正常重启会继续复用有效缓存。
+
+0.3.0 以前的“导出前修复源流”功能还可能遗留体积很大的 `repair-cache`，其中常见 `source.remux.*` 和 `source.repaired.mp4`。当前版本已经不再使用这项缓存，启动时只要检测到配置目录下这个精确的废弃目录，就会将其整体删除。
+
+默认配置目录如下：
+
+- Windows：`%APPDATA%\BiliRecord2K`
+- Linux systemd 安装：`/var/lib/bili-record-2k/BiliRecord2K`
+- Linux 手动运行：`$XDG_CONFIG_HOME/BiliRecord2K`，未设置时为 `~/.config/BiliRecord2K`
+
+自动清理不会扫描或删除录像保存目录，也不会删除 `.clean.mp4`、`.danmaku.mp4`、弹幕记录、字幕、设置和更新日志；这些文件不是缓存。
+
 ## 画质和登录
 
 - 高画质源流通常需要登录。
