@@ -231,6 +231,8 @@ const QUALITY_UPGRADE_CHECK_MS = 90 * 1000;
 const RECORDING_MEDIA_FILE_PATTERN =
   /(?:\.(?:clean|merged|danmaku|danmaku-only)|\.clip_[^.]+\.(?:clean|danmaku|danmaku-only))\.(?:mp4|mkv)$/i;
 const EXPORT_PREVIEW_EXTENSIONS = new Set(['.m3u8', '.ts']);
+const CACHE_STATE_FILE = 'cache-state.json';
+const CACHE_STATE_SCHEMA_VERSION = 1;
 const PREVIEW_CACHE_VERSION = 'v1';
 const BURN_CODEC_CANDIDATES = [
   { value: 'libx265', label: 'H.265 软件编码', kind: 'software' },
@@ -349,6 +351,7 @@ class LiveRecordService {
         : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
     this.storePath = path.join(appData, 'BiliRecord2K', STORE_FILE);
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
+    this.legacyRepairCacheDir = path.join(appData, 'BiliRecord2K', 'repair-cache');
     this.settings = this.createDefaultSettings();
     this.rooms = new Map();
     this.logs = [];
@@ -458,7 +461,12 @@ class LiveRecordService {
     await this.loadStore();
     await this.accessAuth.initFromEnvironment();
     await this.loadLastUpdateStatus();
-    await fsp.mkdir(this.previewCacheDir, { recursive: true });
+    try {
+      await this.prepareVersionedCaches();
+    } catch (error) {
+      this.log('warn', `自动清理旧版本缓存失败，不影响本次启动：${error.message}`);
+      await fsp.mkdir(this.previewCacheDir, { recursive: true });
+    }
     this.settings = this.normalizeSettings(this.settings);
     for (const room of this.rooms.values()) {
       if (room.monitoring) {
@@ -488,6 +496,95 @@ class LiveRecordService {
       });
     });
     this.scheduleAutomaticUpdateCheck(AUTO_UPDATE_INITIAL_DELAY_MS);
+  }
+
+  getCacheStatePath() {
+    return path.join(path.dirname(this.storePath), CACHE_STATE_FILE);
+  }
+
+  async prepareVersionedCaches() {
+    const configRoot = path.resolve(path.dirname(this.storePath));
+    const previewCacheRoot = path.resolve(this.previewCacheDir);
+    const legacyRepairCacheRoot = path.resolve(this.legacyRepairCacheDir);
+    if (!isPathInsideDirectory(previewCacheRoot, configRoot)) {
+      throw new Error(`兼容预览缓存目录不在配置目录内：${previewCacheRoot}`);
+    }
+    if (!isPathInsideDirectory(legacyRepairCacheRoot, configRoot)) {
+      throw new Error(`旧版源流修复缓存目录不在配置目录内：${legacyRepairCacheRoot}`);
+    }
+    await fsp.mkdir(configRoot, { recursive: true });
+
+    let previousState = null;
+    try {
+      const raw = await fsp.readFile(this.getCacheStatePath(), 'utf8');
+      previousState = JSON.parse(raw);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        previousState = null;
+      }
+    }
+
+    const entries = await fsp.readdir(previewCacheRoot, { withFileTypes: true }).catch(() => []);
+    const cacheStateMatches =
+      previousState?.schemaVersion === CACHE_STATE_SCHEMA_VERSION &&
+      previousState?.appVersion === APP_VERSION &&
+      previousState?.previewCacheVersion === PREVIEW_CACHE_VERSION;
+    const shouldClearPreviewCache = entries.length > 0 && !cacheStateMatches;
+    const legacyRepairCacheStat = await fsp.lstat(legacyRepairCacheRoot).catch((error) => {
+      if (error.code === 'ENOENT') {
+        return null;
+      }
+      throw error;
+    });
+    const legacyRepairEntries = legacyRepairCacheStat?.isDirectory()
+      ? await fsp.readdir(legacyRepairCacheRoot, { withFileTypes: true })
+      : [];
+    const shouldClearLegacyRepairCache = Boolean(legacyRepairCacheStat);
+
+    if (shouldClearPreviewCache) {
+      await fsp.rm(previewCacheRoot, { recursive: true, force: true });
+    }
+    if (shouldClearLegacyRepairCache) {
+      await fsp.rm(legacyRepairCacheRoot, { recursive: true, force: true });
+    }
+    await fsp.mkdir(previewCacheRoot, { recursive: true });
+
+    const nextState = {
+      schemaVersion: CACHE_STATE_SCHEMA_VERSION,
+      appVersion: APP_VERSION,
+      previewCacheVersion: PREVIEW_CACHE_VERSION,
+      updatedAt: new Date().toISOString()
+    };
+    await fsp.writeFile(this.getCacheStatePath(), `${JSON.stringify(nextState, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600
+    });
+
+    if (shouldClearPreviewCache || shouldClearLegacyRepairCache) {
+      const previousVersion = String(previousState?.appVersion || '未标记版本')
+        .replace(/[\r\n]/g, ' ')
+        .slice(0, 64);
+      const cleanedCaches = [];
+      if (shouldClearPreviewCache) {
+        cleanedCaches.push(`兼容预览缓存 ${entries.length} 项`);
+      }
+      if (shouldClearLegacyRepairCache) {
+        cleanedCaches.push(`旧版源流修复缓存 ${legacyRepairEntries.length} 项`);
+      }
+      this.log(
+        'info',
+        `检测到旧版本缓存（${previousVersion} → ${APP_VERSION}），已自动清理${cleanedCaches.join('、')}。`
+      );
+    }
+    return {
+      cleared: shouldClearPreviewCache || shouldClearLegacyRepairCache,
+      clearedPreviewCache: shouldClearPreviewCache,
+      previewEntriesRemoved: shouldClearPreviewCache ? entries.length : 0,
+      clearedLegacyRepairCache: shouldClearLegacyRepairCache,
+      legacyRepairEntriesRemoved: shouldClearLegacyRepairCache ? legacyRepairEntries.length : 0,
+      previousVersion: String(previousState?.appVersion || ''),
+      currentVersion: APP_VERSION
+    };
   }
 
   async initializeRecordingLibrary() {

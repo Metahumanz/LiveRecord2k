@@ -54,6 +54,77 @@ async function invokeApi({ remoteAddress = '127.0.0.1', method = 'GET', pathname
   return { statusCode, body: JSON.parse(responseBody) };
 }
 
+test('startup cache migration removes obsolete preview and source-repair caches only', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cache-migration-'));
+  const configRoot = path.join(tempDir, 'BiliRecord2K');
+  const previewCacheDir = path.join(configRoot, 'preview-cache');
+  const legacyRepairCacheDir = path.join(configRoot, 'repair-cache');
+  const recordingDir = path.join(tempDir, 'recordings');
+  const service = new LiveRecordService();
+  service.storePath = path.join(configRoot, 'settings.json');
+  service.previewCacheDir = previewCacheDir;
+  service.legacyRepairCacheDir = legacyRepairCacheDir;
+  const currentVersion = service.getState().version;
+
+  try {
+    await fsp.mkdir(path.join(previewCacheDir, 'preview-a'), { recursive: true });
+    await fsp.writeFile(path.join(previewCacheDir, 'preview-a', 'index.m3u8'), '#EXTM3U\n', 'utf8');
+    await fsp.mkdir(path.join(legacyRepairCacheDir, 'repair-a'), { recursive: true });
+    await fsp.writeFile(path.join(legacyRepairCacheDir, 'repair-a', 'source.remux.mkv'), 'old-remux', 'utf8');
+    await fsp.writeFile(
+      path.join(legacyRepairCacheDir, 'repair-a', 'source.repaired.mp4'),
+      'old-repaired-copy',
+      'utf8'
+    );
+    await fsp.mkdir(recordingDir, { recursive: true });
+    const recordingPath = path.join(recordingDir, 'keep.clean.mp4');
+    await fsp.writeFile(recordingPath, 'recording-must-not-be-deleted', 'utf8');
+    await fsp.writeFile(service.storePath, '{"rooms":[]}', 'utf8');
+    await fsp.writeFile(
+      service.getCacheStatePath(),
+      JSON.stringify({ schemaVersion: 1, appVersion: '0.2.0', previewCacheVersion: 1 }),
+      'utf8'
+    );
+
+    const migrated = await service.prepareVersionedCaches();
+    assert.equal(migrated.cleared, true);
+    assert.equal(migrated.clearedPreviewCache, true);
+    assert.equal(migrated.previewEntriesRemoved, 1);
+    assert.equal(migrated.clearedLegacyRepairCache, true);
+    assert.equal(migrated.legacyRepairEntriesRemoved, 1);
+    assert.deepEqual(await fsp.readdir(previewCacheDir), []);
+    await assert.rejects(fsp.stat(legacyRepairCacheDir), { code: 'ENOENT' });
+    assert.equal(await fsp.readFile(recordingPath, 'utf8'), 'recording-must-not-be-deleted');
+    assert.equal(await fsp.readFile(service.storePath, 'utf8'), '{"rooms":[]}');
+    const cacheState = JSON.parse(await fsp.readFile(service.getCacheStatePath(), 'utf8'));
+    assert.equal(cacheState.appVersion, currentVersion);
+    assert.match(service.logs.at(-1).message, /兼容预览缓存 1 项、旧版源流修复缓存 1 项/);
+
+    await fsp.mkdir(path.join(previewCacheDir, 'current-preview'), { recursive: true });
+    await fsp.writeFile(path.join(previewCacheDir, 'current-preview', 'index.m3u8'), '#EXTM3U\n', 'utf8');
+    const sameVersion = await service.prepareVersionedCaches();
+    assert.equal(sameVersion.cleared, false);
+    assert.equal(
+      await fsp.readFile(path.join(previewCacheDir, 'current-preview', 'index.m3u8'), 'utf8'),
+      '#EXTM3U\n'
+    );
+
+    await fsp.mkdir(path.join(legacyRepairCacheDir, 'late-repair'), { recursive: true });
+    await fsp.writeFile(path.join(legacyRepairCacheDir, 'late-repair', 'source.repaired.mp4'), 'obsolete', 'utf8');
+    const repairOnly = await service.prepareVersionedCaches();
+    assert.equal(repairOnly.cleared, true);
+    assert.equal(repairOnly.clearedPreviewCache, false);
+    assert.equal(repairOnly.clearedLegacyRepairCache, true);
+    await assert.rejects(fsp.stat(legacyRepairCacheDir), { code: 'ENOENT' });
+    assert.equal(
+      await fsp.readFile(path.join(previewCacheDir, 'current-preview', 'index.m3u8'), 'utf8'),
+      '#EXTM3U\n'
+    );
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('captured child processes do not block the Node event loop', async () => {
   let heartbeat = false;
   const heartbeatTimer = setTimeout(() => {
