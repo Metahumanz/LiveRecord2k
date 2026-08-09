@@ -5908,9 +5908,11 @@ try {
         this.updateState = {
           ...this.updateState,
           status: 'downloading',
-          message: `下载连接中断，正在重试 ${progress.attempt}/${Math.max(1, Number(progress.maxAttempts || 1) - 1)}：${
-            progress.error?.message || progress.error || '网络错误'
-          }`
+          message: progress.switchingSource
+            ? `GitHub 官方源下载过慢或失败，正在切换${progress.sourceLabel || '镜像源'}...`
+            : `下载连接中断，正在重试 ${progress.attempt}/${Math.max(1, Number(progress.maxAttempts || 1) - 1)}：${
+                progress.error?.message || progress.error || '网络错误'
+              }`
         };
         this.emitState();
         return;
@@ -5934,7 +5936,7 @@ try {
         lastEmitAt = now;
         this.emitState();
       }
-    });
+    }, { officialSource: manifest.officialSource === true });
     this.updateState = {
       ...this.updateState,
       message: manifest.sha256 ? `${updatePackageLabel(manifest)}下载完成，正在校验...` : `${updatePackageLabel(manifest)}下载完成。`,
