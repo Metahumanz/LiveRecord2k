@@ -144,6 +144,12 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File /r "${RELEASE_DIR}\*.*"
 
+  FileOpen $0 "$INSTDIR\install-type.json" w
+  IfErrors installTypeDone
+  FileWrite $0 "{$\r$\n  $\"packageType$\": $\"installer$\"$\r$\n}$\r$\n"
+  FileClose $0
+installTypeDone:
+
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "${REG_KEY}" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "${REG_KEY}" "Version" "${APP_VERSION}"
@@ -169,6 +175,7 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\dist"
   Delete "$INSTDIR\BiliRecord2K.exe"
   Delete "$INSTDIR\BiliRecord2K.Service.exe"
+  Delete "$INSTDIR\install-type.json"
   Delete "$INSTDIR\version.json"
   RMDir "$INSTDIR"
 

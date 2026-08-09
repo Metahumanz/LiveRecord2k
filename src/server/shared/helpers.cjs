@@ -1912,7 +1912,11 @@ function normalizeUpdateManifest(payload, options = {}) {
   }
   const platform = normalizeUpdatePlatform(options.platform || process.platform);
   const arch = normalizeUpdateArch(options.arch || process.arch);
-  const preferredPackageType = normalizeUpdatePackageType(options.packageType || getAppPackageType(), platform);
+  const preferredPackageType = normalizeUpdatePackageType(
+    options.packageType ||
+      getAppPackageType({ platform, appRoot: options.appRoot, configuredType: options.configuredType }),
+    platform
+  );
   if (Array.isArray(payload.assets)) {
     const files = payload.assets.map((asset) => ({
       name: asset.name || packageFileNameFromUrl(asset.browser_download_url || asset.url || ''),
@@ -2041,22 +2045,39 @@ function selectUpdatePackageFile(files, { platform, arch, preferredPackageType }
   return candidates[0] || null;
 }
 
-function getAppPackageType() {
-  const configured = String(process.env.BILI_RECORD_PACKAGE_TYPE || '').trim();
+function getAppPackageType(options = {}) {
+  const platform = normalizeUpdatePlatform(options.platform || process.platform);
+  const appRoot = path.resolve(String(options.appRoot || APP_ROOT));
+  const configured = String(
+    options.configuredType === undefined ? process.env.BILI_RECORD_PACKAGE_TYPE || '' : options.configuredType
+  ).trim();
   if (configured) {
-    return normalizeUpdatePackageType(configured, process.platform);
+    return normalizeUpdatePackageType(configured, platform);
   }
-  for (const candidate of [path.join(APP_ROOT, 'version.json'), path.join(APP_ROOT, 'package.json')]) {
+  for (const candidate of [
+    path.join(appRoot, 'install-type.json'),
+    path.join(appRoot, 'version.json'),
+    path.join(appRoot, 'package.json')
+  ]) {
     try {
       const payload = JSON.parse(fs.readFileSync(candidate, 'utf8'));
       if (payload.packageType) {
-        return normalizeUpdatePackageType(payload.packageType, process.platform);
+        return normalizeUpdatePackageType(payload.packageType, platform);
       }
     } catch {
       // Keep looking.
     }
   }
-  return normalizeUpdatePackageType('', process.platform);
+  if (platform === 'win32') {
+    try {
+      if (fs.statSync(path.join(appRoot, 'Uninstall.exe')).isFile()) {
+        return 'installer';
+      }
+    } catch {
+      // Portable builds do not include the NSIS uninstaller.
+    }
+  }
+  return normalizeUpdatePackageType('', platform);
 }
 
 function isInstallerFileName(value) {
