@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   compareVersions: compareAppVersions,
+  createUpdateDownloadSources,
   getAppPackageType,
   normalizeUpdateManifest,
   updatePackageFileName
@@ -110,6 +111,22 @@ test('legacy Windows setup installs select the EXE while portable folders keep t
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test('official update packages can fall back to gh-proxy without leaking custom sources', () => {
+  const officialUrl =
+    'https://github.com/Metahumanz/LiveRecord2k/releases/download/v0.4.1/bili-record-2k-setup.exe';
+  assert.deepEqual(createUpdateDownloadSources(officialUrl, { officialSource: true }), [
+    { url: officialUrl, label: 'GitHub 官方源' },
+    { url: `https://gh-proxy.com/${officialUrl}`, label: 'GitHub 镜像' }
+  ]);
+  assert.deepEqual(createUpdateDownloadSources(officialUrl, { officialSource: false }), [
+    { url: officialUrl, label: '更新源' }
+  ]);
+  const customUrl = 'https://downloads.example.test/private/setup.exe';
+  assert.deepEqual(createUpdateDownloadSources(customUrl, { officialSource: true }), [
+    { url: customUrl, label: '更新源' }
+  ]);
 });
 
 test('GitHub API asset fallback does not mistake Windows zip for a Linux package', () => {
