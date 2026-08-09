@@ -615,9 +615,10 @@ class LiveRecordService {
   }
 
   async initializeRecordingLibrary() {
-    const outputReady = await this.ensureDirectoryReady(this.settings.outputDir, {
+    const outputReady = await this.ensureRecordingOutputRootReady(this.settings.outputDir, {
       label: '录像保存目录',
-      allowUnavailable: true
+      allowUnavailable: true,
+      permissionsRequired: false
     });
     if (!outputReady) {
       this.log('warn', `录像保存目录当前不可用，已跳过启动扫描：${this.settings.outputDir}`);
@@ -1500,6 +1501,80 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
     throw new Error(`${label}${reason}：${resolved}`);
   }
 
+  async normalizeLinuxRecordingRootPermissions(directoryPath, options = {}) {
+    const runtimePlatform = String(options.platform || process.platform);
+    if (runtimePlatform !== 'linux') {
+      return false;
+    }
+    const fileSystem = options.fileSystem || fsp;
+    const resolved = path.resolve(String(directoryPath || '').trim());
+    const label = String(options.label || '录像保存根目录');
+    const filesystemRoot = path.parse(resolved).root;
+    if (resolved === filesystemRoot) {
+      throw new Error(`${label}不能直接使用文件系统根目录，已拒绝修改其权限：${resolved}`);
+    }
+    const currentUid = Number.isInteger(options.currentUid)
+      ? options.currentUid
+      : typeof process.getuid === 'function'
+        ? process.getuid()
+        : null;
+    const currentGid = Number.isInteger(options.currentGid)
+      ? options.currentGid
+      : typeof process.getgid === 'function'
+        ? process.getgid()
+        : null;
+    const initialStat = await fileSystem.stat(resolved);
+    if (!initialStat.isDirectory()) {
+      throw new Error(`${label}指向了文件而不是文件夹：${resolved}`);
+    }
+    const initialMode = initialStat.mode & 0o7777;
+    const groupMatches = currentGid === null || initialStat.gid === currentGid;
+    if (initialMode === 0o2770 && groupMatches) {
+      return false;
+    }
+    if (currentUid !== null && initialStat.uid !== currentUid) {
+      throw new Error(
+        `${label}不属于当前服务用户，无法安全规范为当前服务组的 2770：${resolved}。` +
+          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
+      );
+    }
+    try {
+      if (currentGid !== null && initialStat.gid !== currentGid) {
+        await fileSystem.chown(resolved, initialStat.uid, currentGid);
+      }
+      await fileSystem.chmod(resolved, 0o2770);
+      const normalizedStat = await fileSystem.stat(resolved);
+      const normalizedMode = normalizedStat.mode & 0o7777;
+      if (normalizedMode !== 0o2770 || (currentGid !== null && normalizedStat.gid !== currentGid)) {
+        throw new Error(`实际权限为 ${normalizedMode.toString(8)}，属组 ID 为 ${normalizedStat.gid}`);
+      }
+    } catch (error) {
+      throw new Error(
+        `${label}无法规范为当前服务组的 2770：${resolved}（${error.message}）。` +
+          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
+      );
+    }
+    this.log('info', `已将录像保存根目录规范为当前服务组的 2770（仅目录本身，不递归处理历史录像）：${resolved}`);
+    return true;
+  }
+
+  async ensureRecordingOutputRootReady(directoryPath, options = {}) {
+    const ready = await this.ensureDirectoryReady(directoryPath, options);
+    if (!ready) {
+      return false;
+    }
+    try {
+      await this.normalizeLinuxRecordingRootPermissions(directoryPath, options);
+    } catch (error) {
+      if (options.permissionsRequired === false) {
+        this.log('warn', error.message);
+        return true;
+      }
+      throw error;
+    }
+    return true;
+  }
+
   async resolveAvailableDirectory(targetPath, label = '目录') {
     const rawPath = String(targetPath || '').trim();
     if (!rawPath) {
@@ -2054,9 +2129,10 @@ try {
       throw new Error('监听 0.0.0.0/:: 前必须先在持久化配置中设置至少 8 位远程访问密码。');
     }
     const outputDirChanged = oldOutputDir !== normalizedSettings.outputDir;
-    const outputReady = await this.ensureDirectoryReady(normalizedSettings.outputDir, {
+    const outputReady = await this.ensureRecordingOutputRootReady(normalizedSettings.outputDir, {
       label: '录像保存目录',
-      allowUnavailable: !outputDirChanged
+      allowUnavailable: !outputDirChanged,
+      permissionsRequired: outputDirChanged
     });
     this.settings = normalizedSettings;
     if (
@@ -3144,6 +3220,7 @@ try {
       }
       const timestamp = formatTimestamp(new Date());
       const outputRoot = String(this.settings.outputDir || '').trim() || this.settings.outputDir;
+      await this.ensureRecordingOutputRootReady(outputRoot, { label: '录像保存根目录' });
       const roomFolder =
         sanitizeFilename(`${room.realRoomId || room.id}-${room.anchor || 'anchor'}`).slice(0, 48) || `room-${room.id}`;
       const liveFolder = sanitizeFilename(`${timestamp}-${room.title || 'live'}`).slice(0, 72) || timestamp;
