@@ -8,7 +8,16 @@ const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
 const { LiveRecordService, createUiCapabilities } = require('../src/server/app/service.cjs');
-const { deriveClipPath, fetchWithTimeout, runCapturedProcess, runFfmpegProbe } = require('../src/server/shared/helpers.cjs');
+const {
+  cookieHeadersFromLoginUrl,
+  deriveClipPath,
+  fetchWithTimeout,
+  getCookieValue,
+  mergeCookieString,
+  runCapturedProcess,
+  runFfmpegProbe,
+  shouldTestHardwareEncoder
+} = require('../src/server/shared/helpers.cjs');
 const { createDefaultDanmakuCss, inspectDanmakuFile } = require('../src/server/danmaku/ass.cjs');
 const {
   handleRequest,
@@ -19,6 +28,54 @@ const {
 } = require('../src/server/app/routes.cjs');
 
 const projectRoot = path.resolve(__dirname, '..');
+
+test('QR login recovers credentials from the successful callback URL and updates login state', () => {
+  const headers = cookieHeadersFromLoginUrl(
+    'https://passport.biligame.com/crossDomain?DedeUserID=42&SESSDATA=abc%2Cdef&bili_jct=csrf-token&gourl=https%3A%2F%2Fwww.bilibili.com'
+  );
+  const cookie = mergeCookieString('', headers);
+  assert.equal(getCookieValue(cookie, 'SESSDATA'), 'abc%2Cdef');
+  assert.equal(getCookieValue(cookie, 'bili_jct'), 'csrf-token');
+  assert.equal(cookieHeadersFromLoginUrl('https://evil.example/?SESSDATA=stolen').length, 0);
+  const service = new LiveRecordService();
+  service.settings.cookie = cookie;
+  assert.equal(service.getState().bilibiliLoggedIn, true);
+});
+
+test('Linux hardware encoders are decided by the real FFmpeg probe even when adapter enumeration is unavailable', () => {
+  const candidate = { vendor: 'nvidia' };
+  assert.equal(shouldTestHardwareEncoder(candidate, [], 'linux'), true);
+  assert.equal(shouldTestHardwareEncoder(candidate, [], 'win32'), false);
+  assert.equal(shouldTestHardwareEncoder(candidate, [{ vendor: 'nvidia' }], 'win32'), true);
+});
+
+test('bootstrap environment credentials cannot override persistent settings after the first migration', async () => {
+  const previousPassword = process.env.BILI_RECORD_AUTH_PASSWORD;
+  const previousOutput = process.env.BILI_RECORD_OUTPUT_DIR;
+  const previousAutoUpdate = process.env.BILI_RECORD_AUTO_UPDATE;
+  process.env.BILI_RECORD_AUTH_PASSWORD = 'must-not-return';
+  process.env.BILI_RECORD_OUTPUT_DIR = path.join(os.tmpdir(), 'must-not-return-output');
+  process.env.BILI_RECORD_AUTO_UPDATE = '1';
+  try {
+    const service = new LiveRecordService();
+    service.settings.configBootstrapVersion = 1;
+    service.settings.accessPasswordHash = '';
+    service.settings.outputDir = path.join(os.tmpdir(), 'persisted-output');
+    service.settings.autoUpdateEnabled = false;
+    service.saveStore = async () => {};
+    await service.bootstrapPersistentConfiguration();
+    assert.equal(service.settings.accessPasswordHash, '');
+    assert.equal(service.settings.outputDir, path.join(os.tmpdir(), 'persisted-output'));
+    assert.equal(service.settings.autoUpdateEnabled, false);
+  } finally {
+    if (previousPassword === undefined) delete process.env.BILI_RECORD_AUTH_PASSWORD;
+    else process.env.BILI_RECORD_AUTH_PASSWORD = previousPassword;
+    if (previousOutput === undefined) delete process.env.BILI_RECORD_OUTPUT_DIR;
+    else process.env.BILI_RECORD_OUTPUT_DIR = previousOutput;
+    if (previousAutoUpdate === undefined) delete process.env.BILI_RECORD_AUTO_UPDATE;
+    else process.env.BILI_RECORD_AUTO_UPDATE = previousAutoUpdate;
+  }
+});
 
 test('long Windows recording titles are shortened before adding an export suffix', () => {
   const outputDir = 'C:\\recordings\\room';
@@ -31,11 +88,11 @@ test('long Windows recording titles are shortened before adding an export suffix
   }
 });
 
-async function invokeApi({ remoteAddress = '127.0.0.1', method = 'GET', pathname, body, service }) {
+async function invokeApi({ remoteAddress = '127.0.0.1', method = 'GET', pathname, body, service, headers = {} }) {
   const request = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]);
   request.method = method;
   request.url = pathname;
-  request.headers = { host: '127.0.0.1:3263' };
+  request.headers = { host: '127.0.0.1:3263', ...headers };
   request.socket = { remoteAddress };
   let statusCode = 200;
   let responseBody = '';
@@ -315,6 +372,7 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
   const service = new LiveRecordService();
   service.settings.cookie = 'SESSDATA=secret-cookie';
   service.settings.webhookBearerToken = 'secret-webhook-token';
+  service.accessAuth.sessions.set('remote-test-session', { expiresAt: Date.now() + 60_000 });
 
   assert.equal(service.getState().settings.cookie, 'SESSDATA=secret-cookie');
   assert.equal(service.getState().settings.webhookBearerToken, '');
@@ -355,6 +413,7 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
   const stateResponse = await invokeApi({
     remoteAddress: '192.168.1.20',
     pathname: '/api/state',
+    headers: { cookie: 'br2k_access=remote-test-session' },
     service
   });
   assert.equal(stateResponse.statusCode, 200);
@@ -368,7 +427,10 @@ test('LAN state and SSE never expose the Bilibili cookie', async () => {
     method: 'POST',
     pathname: '/api/settings/save',
     body: { settings: { cookie: '', pollIntervalSec: 20 } },
+    headers: { cookie: 'br2k_access=remote-test-session' },
     service: {
+      settings: {},
+      authenticateAccess: (token) => token === 'remote-test-session',
       saveSettings(_settings, options) {
         saveOptions = options;
         return { settings: { cookie: 'SESSDATA=secret-cookie' } };
@@ -404,6 +466,7 @@ test('generic Webhook posts event JSON with Bearer auth and retries transient fa
   const service = new LiveRecordService();
   service.settings.webhookUrl = `http://127.0.0.1:${address.port}/events`;
   service.settings.webhookBearerToken = 'receiver-secret';
+  service.settings.webhookAllowPrivateNetwork = true;
 
   try {
     const payload = await service.sendWebhookNotification(
@@ -505,6 +568,20 @@ test('external network binding gates the WebUI API before any recorder action ru
   assert.equal(response.body.code, 'ACCESS_AUTH_REQUIRED');
 });
 
+test('a loopback reverse proxy cannot inherit the local-console authentication bypass', async () => {
+  const service = new LiveRecordService();
+  service.currentHost = '127.0.0.1';
+  service.settings.trustedProxies = ['loopback'];
+  const response = await invokeApi({
+    remoteAddress: '127.0.0.1',
+    pathname: '/api/state',
+    headers: { 'x-forwarded-for': '203.0.113.8', 'x-forwarded-proto': 'https' },
+    service
+  });
+  assert.equal(response.statusCode, 401);
+  assert.equal(response.body.code, 'ACCESS_AUTH_REQUIRED');
+});
+
 test('media and export paths stay inside the recording library and match recording names', () => {
   const service = new LiveRecordService();
   const libraryDir = path.join(os.tmpdir(), 'br2k-recording-library');
@@ -558,6 +635,8 @@ test('only the server computer can run system-level API actions', async () => {
     };
     let opened = false;
     const service = {
+      settings: {},
+      authenticateAccess: () => true,
       openOutputDir: () => {
         opened = true;
         return { ok: true };

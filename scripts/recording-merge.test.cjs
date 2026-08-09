@@ -11,10 +11,12 @@ const {
   createBurnArgs,
   createConcatTranscodeArgs,
   selectHighestResolutionVideoInfo,
-  shouldTranscodeConcat
+  shouldTranscodeConcat,
+  assertSafeMergeTargetProfile
 } = require('../src/server/recording/ffmpeg.cjs');
 const {
   parseFfmpegAudioInfo,
+  parseFfmpegVideoInfo,
   probeMediaFileInfo,
   probeMediaTimelineInfo,
   runCapturedProcess
@@ -104,6 +106,39 @@ test('mixed segment specifications select the highest resolution and require tra
   assert.match(filter, /anullsrc=r=48000:cl=stereo/);
   assert.match(filter, /concat=n=2:v=1:a=1/);
   assert.ok(args.includes('hvc1'));
+
+  const realProfileTarget = selectHighestResolutionVideoInfo([
+    { videoInfo: { codec: 'h264 (High)', width: 3840, height: 2160, fps: 30, pixelFormat: 'yuv420p10le', bitDepth: 10 } },
+    { videoInfo: { codec: 'h264 (High)', width: 1920, height: 1080, fps: 60, pixelFormat: 'yuv420p', bitDepth: 8 } }
+  ]);
+  assert.equal(realProfileTarget.fps, 30);
+  assert.equal(realProfileTarget.pixelFormat, 'yuv420p10le');
+  assert.equal(realProfileTarget.bitDepth, 10);
+  assert.equal(
+    shouldTranscodeConcat([
+      { videoInfo: { codec: 'hevc', width: 1920, height: 1080, fps: 30, pixelFormat: 'yuv420p10le', bitDepth: 10 } },
+      { videoInfo: { codec: 'hevc', width: 1920, height: 1080, fps: 30, pixelFormat: 'yuv420p', bitDepth: 8 } }
+    ]),
+    true
+  );
+});
+
+test('safe merge profiles refuse silent HDR, bit-depth, and chroma degradation', () => {
+  const hdr = { codec: 'hevc', width: 1920, height: 1080, fps: 30, pixelFormat: 'yuv420p10le', bitDepth: 10, hdr: true, colorTransfer: 'smpte2084' };
+  assert.equal(assertSafeMergeTargetProfile([{ videoInfo: hdr }, { videoInfo: { ...hdr } }], hdr), true);
+  assert.throws(
+    () => assertSafeMergeTargetProfile([{ videoInfo: hdr }, { videoInfo: { ...hdr, hdr: false, colorTransfer: 'bt709' } }], hdr),
+    /HDR 与 SDR/
+  );
+  const eightBitTarget = { codec: 'hevc', width: 3840, height: 2160, fps: 30, pixelFormat: 'yuv420p', bitDepth: 8, hdr: false };
+  assert.throws(
+    () => assertSafeMergeTargetProfile([{ videoInfo: eightBitTarget }, { videoInfo: { ...eightBitTarget, width: 1920, height: 1080, pixelFormat: 'yuv422p10le', bitDepth: 10 } }], eightBitTarget),
+    /拒绝静默降质/
+  );
+  assert.throws(
+    () => assertSafeMergeTargetProfile([{ videoInfo: hdr }, { videoInfo: { ...hdr } }], hdr, { requiresVideoTranscode: true }),
+    /mastering metadata/
+  );
 });
 
 test('ffmpeg audio probing reads the stream properties used by merge compatibility checks', () => {
@@ -150,6 +185,79 @@ test('timeline audit detects A/V drift before a segment is copied into a merge',
     assert.ok(timing.audioDurationSec < 0.7, JSON.stringify(timing));
     assert.ok(timing.avDeltaSec < -0.25, JSON.stringify(timing));
     assert.equal(timing.timingSafeForCopy, false);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('video probing retains the 10-bit HDR profile used by safe merge selection', () => {
+  const videoInfo = parseFfmpegVideoInfo(
+    'Stream #0:0: Video: hevc (Main 10), p010le(tv, bt2020nc/bt2020/smpte2084), 3840x2160, 60 fps'
+  );
+  assert.equal(videoInfo.profile, 'Main 10');
+  assert.equal(videoInfo.pixelFormat, 'p010le');
+  assert.equal(videoInfo.bitDepth, 10);
+  assert.equal(videoInfo.colorSpace, 'bt2020nc');
+  assert.equal(videoInfo.colorPrimaries, 'bt2020');
+  assert.equal(videoInfo.colorTransfer, 'smpte2084');
+  assert.equal(videoInfo.hdr, true);
+});
+
+test('a 900ms merged A/V gap is repaired and the verified output is kept', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-900ms-merge-'));
+  const firstPath = path.join(tempDir, 'first.clean.mp4');
+  const secondPath = path.join(tempDir, 'second.clean.mp4');
+  const outputPath = path.join(tempDir, 'session.merged.mp4');
+  const generate = async (output, audioDuration) => {
+    const result = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=1',
+        '-f', 'lavfi', '-i', `sine=frequency=440:sample_rate=48000:duration=${audioDuration}`,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', output
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(result.status, 0, result.stderr);
+  };
+
+  try {
+    await generate(firstPath, 1);
+    await generate(secondPath, 0.1);
+    const service = new LiveRecordService();
+    service.log = () => {};
+    service.emitState = () => {};
+    service.saveStore = async () => {};
+    service.writeRecordingMetadata = async () => {};
+    service.cleanupMergedSegmentFiles = async () => {};
+    service.getMergeEncoderPlan = () => ({ preferred: 'libx264', fallback: '' });
+    const room = { id: '900', title: 'drift', anchor: 'test', recording: false };
+    const segments = [firstPath, secondPath].map((cleanPath, index) => ({
+      id: `segment-${index}`,
+      roomId: room.id,
+      startedAt: Date.now() + index * 1000,
+      cleanPath,
+      danmakuPath: path.join(tempDir, `segment-${index}.jsonl`),
+      cssPath: '',
+      mergeGroup: 'drift-group',
+      mergeSequence: index + 1,
+      mergeOutputPath: outputPath,
+      durationSec: 1,
+      valid: true,
+      eventCount: 0
+    }));
+    service.recordings = segments;
+    const merged = await service.mergeReconnectGroupIfNeeded(room, 'drift-group', segments[1]);
+
+    assert.equal(merged.cleanPath, outputPath);
+    assert.equal(await fsp.stat(outputPath).then((stat) => stat.isFile()), true);
+    assert.equal(await fsp.stat(firstPath).then((stat) => stat.isFile()), true);
+    assert.equal(await fsp.stat(secondPath).then((stat) => stat.isFile()), true);
+    const mediaInfo = await probeMediaFileInfo(ffmpegPath, outputPath);
+    const timing = await probeMediaTimelineInfo(ffmpegPath, outputPath, mediaInfo);
+    assert.equal(timing.timingSafeForCopy, true, JSON.stringify(timing));
+    assert.ok(Math.abs(timing.avDeltaSec) <= 0.08, JSON.stringify(timing));
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }

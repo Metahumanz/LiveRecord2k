@@ -19,8 +19,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Test and media smoke check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run regression tests
+        run: npm test
+
+      - name: Type-check and build frontend
+        run: |
+          npx tsc --noEmit
+          npx vite build
+
+      - name: Run FFmpeg smoke test
+        run: node scripts/smoke-test.cjs
+
   build-windows:
     name: Build Windows packages
+    needs: verify
     runs-on: windows-latest
     defaults:
       run:
@@ -63,6 +93,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run Windows regression tests
+        run: npm test
+
       - name: Build Windows packages
         env:
           BUILD_INSTALLER_REQUIRED: '1'
@@ -79,8 +112,19 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    name: Build Linux packages
-    runs-on: ubuntu-latest
+    name: Build Linux ${{ matrix.arch }} packages
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            deb_arch: amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout release source
         uses: actions/checkout@v4
@@ -96,6 +140,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run Linux regression tests
+        run: npm test
+
       - name: Build Linux packages
         run: npm run build:linux
 
@@ -103,8 +150,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          deb=$(find release -maxdepth 1 -name 'bili-record-2k_*_amd64.deb' -print -quit)
-          tarball=$(find release -maxdepth 1 -name 'bili-record-2k_*_linux_x64.tar.gz' -print -quit)
+          deb=$(find release -maxdepth 1 -name 'bili-record-2k_*_${{ matrix.deb_arch }}.deb' -print -quit)
+          tarball=$(find release -maxdepth 1 -name 'bili-record-2k_*_linux_${{ matrix.arch }}.tar.gz' -print -quit)
           test -n "$deb"
           test -n "$tarball"
           dpkg-deb --info "$deb"
@@ -127,7 +174,7 @@ jobs:
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux
+          name: release-linux-${{ matrix.arch }}
           path: |
             release/*.deb
             release/*_linux_*.tar.gz
@@ -157,9 +204,26 @@ jobs:
       - name: Generate platform-aware update manifest
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          UPDATE_SIGNING_PRIVATE_KEY_B64: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY_B64 }}
         run: |
           cp scripts/install-linux.sh release/install-linux.sh
           node scripts/generate-update-manifest.cjs "$RELEASE_TAG"
+
+      - name: Verify signed update manifest and architecture coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '
+            .schemaVersion == 3 and
+            .signatureAlgorithm == "ed25519" and
+            ([.signed.files[] | select(.platform == "linux" and .arch == "x64") | .kind] | sort | unique) == ["deb", "tarball"] and
+            ([.signed.files[] | select(.platform == "linux" and .arch == "arm64") | .kind] | sort | unique) == ["deb", "tarball"]
+          ' release/update.json >/dev/null
+          jq -j -cS '.signed' release/update.json > release/update-signed.json
+          jq -r '.signature' release/update.json | openssl base64 -d -A > release/update-signature.bin
+          openssl pkeyutl -verify -pubin -inkey packaging/linux/update-public-key.pem -rawin \
+            -in release/update-signed.json -sigfile release/update-signature.bin
+          rm release/update-signed.json release/update-signature.bin
 
       - name: Upload combined release artifact
         uses: actions/upload-artifact@v4
@@ -181,11 +245,11 @@ jobs:
           notes=$(cat <<'EOF'
           Windows：新用户使用 `bili-record-2k-setup.exe`；免安装使用 `bili-record-2k-webui.zip`。
 
-          Debian/Ubuntu x64：下载 `.deb` 后运行 `sudo apt install ./bili-record-2k_版本_amd64.deb`。
+          Debian/Ubuntu x64 或 ARM64：下载架构匹配的 `.deb` 后运行 `sudo apt install ./bili-record-2k_版本_架构.deb`。
 
-          其他使用 systemd 的 x64 Linux：下载 `_linux_x64.tar.gz`，解压后运行 `sudo ./install.sh`。
+          其他使用 systemd 的 x64/ARM64 Linux：下载架构匹配的 `_linux_架构.tar.gz`，解压后运行 `sudo ./install.sh`。
 
-          Linux 包会安装 systemd 主服务和独立的受控更新服务。`update.json` 由应用自动读取，不需要手动下载。
+          Linux 包会安装 systemd 主服务和独立的受控更新服务。官方自动更新必须通过 Ed25519 签名验证；自定义更新源不会交给 root 自动安装。
 
           Linux 一键安装：`curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh`
           EOF
