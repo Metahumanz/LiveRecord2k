@@ -96,7 +96,9 @@ async function populatePayload(targetRoot, { version, packageType, arch, serverB
   await fsp.cp(path.join(root, 'assets'), path.join(appDir, 'assets'), { recursive: true });
   await fsp.copyFile(process.execPath, path.join(binDir, 'node'));
   await copyExecutable(path.join(packagingRoot, 'linux-update.cjs'), path.join(appDir, 'linux-update.cjs'));
+  await copyTextFile(path.join(packagingRoot, 'update-public-key.pem'), path.join(appDir, 'update-public-key.pem'), 0o644);
   await copyExecutable(path.join(packagingRoot, 'provision.sh'), path.join(appDir, 'provision.sh'));
+  await copyExecutable(path.join(packagingRoot, 'bootstrap-config.cjs'), path.join(appDir, 'bootstrap-config.cjs'));
   await copyExecutable(path.join(packagingRoot, 'bili-record-2k.sh'), path.join(systemBinDir, 'bili-record-2k'));
   await copyExecutable(path.join(packagingRoot, 'bili-record-2k-update.sh'), path.join(systemBinDir, 'bili-record-2k-update'));
   for (const name of ['bili-record-2k.service', 'bili-record-2k-update.service', 'bili-record-2k-update.path']) {
@@ -126,7 +128,7 @@ async function writeDebianMetadata(debRoot, { version, debArch }) {
     'Priority: optional',
     `Architecture: ${debArch}`,
     'Maintainer: Metahumanz',
-    'Depends: ffmpeg, ca-certificates, passwd, tar',
+    'Depends: ffmpeg, ca-certificates, openssl, passwd, util-linux, tar, fontconfig, fonts-noto-cjk',
     'Homepage: https://github.com/Metahumanz/LiveRecord2k',
     'Description: Bilibili live recording service with a WebUI',
     ' Records live streams and danmaku, and can render danmaku into exported video.',

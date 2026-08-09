@@ -85,6 +85,10 @@ case "$DOWNLOAD_MIRROR" in
   https://*) ;;
   *) fail 'BILI_RECORD_DOWNLOAD_MIRROR 必须是 HTTPS 地址，或设置为 direct 关闭。' ;;
 esac
+case "$MANIFEST_URL" in
+  https://*) ;;
+  *) fail 'BILI_RECORD_MANIFEST_URL 必须是 HTTPS 地址。' ;;
+esac
 
 read_password() {
   [ -r /dev/tty ] || fail '当前没有交互终端；请设置 BILI_RECORD_AUTH_PASSWORD 后重新运行。'
@@ -124,24 +128,30 @@ if command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
   PACKAGE_KIND=deb
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates curl jq ffmpeg
+  apt-get install -y ca-certificates curl jq openssl ffmpeg fonts-noto-cjk
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y ca-certificates curl jq tar shadow-utils
+  dnf install -y ca-certificates curl jq openssl tar shadow-utils util-linux fontconfig
+  dnf install -y google-noto-sans-cjk-fonts || dnf install -y google-noto-cjk-fonts || \
+    fail '当前软件源缺少 Noto Sans CJK 字体，请先启用相应字体软件源。'
   command -v ffmpeg >/dev/null 2>&1 || dnf install -y ffmpeg || fail '当前软件源没有 FFmpeg，请先为发行版启用 FFmpeg 软件源。'
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y ca-certificates curl jq tar shadow-utils
+  yum install -y ca-certificates curl jq openssl tar shadow-utils util-linux fontconfig
+  yum install -y google-noto-sans-cjk-fonts || yum install -y google-noto-cjk-fonts || \
+    fail '当前软件源缺少 Noto Sans CJK 字体，请先启用相应字体软件源。'
   command -v ffmpeg >/dev/null 2>&1 || yum install -y ffmpeg || fail '当前软件源没有 FFmpeg，请先为发行版启用 FFmpeg 软件源。'
 elif command -v zypper >/dev/null 2>&1; then
-  zypper --non-interactive install ca-certificates curl jq tar shadow ffmpeg
+  zypper --non-interactive install ca-certificates curl jq openssl tar shadow ffmpeg noto-sans-cjk-fonts
 elif command -v pacman >/dev/null 2>&1; then
-  pacman -Sy --noconfirm ca-certificates curl jq tar shadow ffmpeg
+  pacman -Sy --noconfirm ca-certificates curl jq openssl tar shadow ffmpeg noto-fonts-cjk
 else
   fail '不支持当前包管理器；请使用 Debian/Ubuntu、Fedora/RHEL、openSUSE 或 Arch Linux。'
 fi
 
-for required_command in curl jq sha256sum ffmpeg tar; do
+for required_command in curl jq openssl sha256sum ffmpeg tar fc-match; do
   command -v "$required_command" >/dev/null 2>&1 || fail "缺少必要命令：$required_command"
 done
+fc-match -f '%{family}' 'Noto Sans CJK SC' | grep -qi 'Noto Sans CJK SC' || \
+  fail '没有检测到可验证的 Noto Sans CJK SC 字体。'
 
 MACHINE_ARCH=$(uname -m)
 case "$MACHINE_ARCH" in
@@ -154,14 +164,26 @@ TEMP_ROOT=$(mktemp -d /tmp/bili-record-2k-install.XXXXXX)
 MANIFEST_PATH=$TEMP_ROOT/update.json
 
 printf '\n[2/6] 获取最新版本清单...\n'
-curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 120 \
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-filesize 2097152 \
+  --retry 3 --connect-timeout 15 --max-time 120 \
   "$MANIFEST_URL" -o "$MANIFEST_PATH"
-jq -e '.version and (.files | type == "array")' "$MANIFEST_PATH" >/dev/null || fail '更新清单格式无效。'
-LATEST_VERSION=$(jq -r '.version' "$MANIFEST_PATH")
+jq -e '.schemaVersion == 3 and .signatureAlgorithm == "ed25519" and (.signature | type == "string") and (.signed.files | type == "array")' "$MANIFEST_PATH" >/dev/null || fail '更新清单缺少官方签名。'
+PUBLIC_KEY_PATH=$TEMP_ROOT/update-public-key.pem
+SIGNED_PAYLOAD_PATH=$TEMP_ROOT/update-signed.json
+SIGNATURE_PATH=$TEMP_ROOT/update-signature.bin
+printf '%s\n' \
+  '-----BEGIN PUBLIC KEY-----' \
+  'MCowBQYDK2VwAyEAtw1n+yFGBOlnGb0ru4hmM7K7q2YK5jFJ0GnWW5BIiu0=' \
+  '-----END PUBLIC KEY-----' >"$PUBLIC_KEY_PATH"
+jq -j -cS '.signed' "$MANIFEST_PATH" >"$SIGNED_PAYLOAD_PATH" || fail '更新清单签名内容无效。'
+jq -r '.signature' "$MANIFEST_PATH" | openssl base64 -d -A >"$SIGNATURE_PATH" || fail '更新清单签名编码无效。'
+openssl pkeyutl -verify -pubin -inkey "$PUBLIC_KEY_PATH" -rawin -in "$SIGNED_PAYLOAD_PATH" -sigfile "$SIGNATURE_PATH" >/dev/null 2>&1 || \
+  fail '更新清单未通过官方 Ed25519 签名验证。'
+LATEST_VERSION=$(jq -r '.signed.version' "$MANIFEST_PATH")
 PACKAGE_ENTRY=$(jq -r \
   --arg kind "$PACKAGE_KIND" \
   --arg arch "$RELEASE_ARCH" \
-  '.files[] | select(.platform == "linux" and .kind == $kind and (.arch == $arch or .arch == "all")) | [.url, .sha256, .name] | @tsv' \
+  '.signed.files[] | select(.platform == "linux" and .kind == $kind and (.arch == $arch or .arch == "all")) | [.url, .sha256, .name] | @tsv' \
   "$MANIFEST_PATH" | head -n 1)
 [ -n "$PACKAGE_ENTRY" ] || fail "最新版本 $LATEST_VERSION 没有适用于 Linux $RELEASE_ARCH 的 $PACKAGE_KIND 安装包。"
 PACKAGE_URL=$(printf '%s\n' "$PACKAGE_ENTRY" | cut -f 1)
@@ -188,7 +210,8 @@ download_and_verify() {
   download_url=$2
   rm -f -- "$PACKAGE_PATH"
   printf '  尝试%s...\n' "$download_source"
-  if ! curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 1800 \
+  if ! curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-filesize 8589934592 \
+    --retry 3 --connect-timeout 15 --max-time 1800 \
     "$download_url" -o "$PACKAGE_PATH"; then
     printf '  %s下载失败。\n' "$download_source" >&2
     rm -f -- "$PACKAGE_PATH"

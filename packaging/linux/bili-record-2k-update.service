@@ -7,6 +7,19 @@ Type=oneshot
 User=root
 Group=root
 Environment=BILI_RECORD_CONFIG_DIR=/var/lib/bili-record-2k
+Environment=BILI_RECORD_UPDATE_DIR=/var/lib/bili-record-2k-updates
 ExecStart=/usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/linux-update.cjs
+TimeoutStartSec=15min
+UMask=0077
+NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+Restart=on-failure
+RestartSec=5s

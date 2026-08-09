@@ -5,9 +5,16 @@ PACKAGE_TYPE="${1:-deb}"
 SERVICE_USER=bili-record-2k
 SERVICE_GROUP=bili-record-2k
 STATE_ROOT=/var/lib/bili-record-2k
+UPDATE_ROOT=/var/lib/bili-record-2k-updates
 CONFIG_ROOT=/etc/bili-record-2k
 ENV_FILE="$CONFIG_ROOT/environment"
 INITIAL_PASSWORD_FILE="$CONFIG_ROOT/initial-admin-password"
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  if systemctl is-active --quiet bili-record-2k.service; then
+    systemctl stop bili-record-2k.service
+  fi
+fi
 
 if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
   groupadd --system "$SERVICE_GROUP"
@@ -21,10 +28,16 @@ for hardware_group in video render; do
   fi
 done
 
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT"
+install -d -m 0755 -o root -g root "$STATE_ROOT"
+for protected_child in "$STATE_ROOT/BiliRecord2K" "$STATE_ROOT/recordings"; do
+  if [ -L "$protected_child" ]; then
+    echo "Refusing unsafe symbolic-link state directory: $protected_child" >&2
+    exit 1
+  fi
+done
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT/BiliRecord2K"
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT/BiliRecord2K/updates"
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT/recordings"
+install -d -m 0770 -o root -g "$SERVICE_GROUP" "$UPDATE_ROOT"
+install -d -m 2770 -o root -g "$SERVICE_GROUP" "$STATE_ROOT/recordings"
 install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_ROOT"
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -45,26 +58,33 @@ if [ ! -f "$ENV_FILE" ]; then
     echo 'BILI_RECORD_MANAGED_UPDATE=1'
     echo 'BILI_RECORD_SYSTEMD=1'
   } >"$ENV_FILE"
-  printf '%s\n' "$INITIAL_PASSWORD" >"$INITIAL_PASSWORD_FILE"
   chmod 0640 "$ENV_FILE"
   chown root:"$SERVICE_GROUP" "$ENV_FILE"
-  chmod 0600 "$INITIAL_PASSWORD_FILE"
   echo "BiliRecord2K initial username: admin"
   echo "BiliRecord2K initial password: $INITIAL_PASSWORD"
-  echo "The password is also stored in $INITIAL_PASSWORD_FILE (root only)."
 fi
 
-if ! grep -q '^BILI_RECORD_MANAGED_UPDATE=' "$ENV_FILE"; then
-  printf '%s\n' 'BILI_RECORD_MANAGED_UPDATE=1' >>"$ENV_FILE"
-fi
-if ! grep -q '^BILI_RECORD_SYSTEMD=' "$ENV_FILE"; then
-  printf '%s\n' 'BILI_RECORD_SYSTEMD=1' >>"$ENV_FILE"
-fi
 chmod 0640 "$ENV_FILE"
 chown root:"$SERVICE_GROUP" "$ENV_FILE"
+if command -v runuser >/dev/null 2>&1; then
+  runuser -u "$SERVICE_USER" -- /usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/bootstrap-config.cjs
+else
+  su -s /bin/sh -c '/usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/bootstrap-config.cjs' "$SERVICE_USER"
+fi
+SANITIZED_ENV_FILE=$(mktemp "$CONFIG_ROOT/.environment.XXXXXXXX")
+umask 077
+{
+  echo 'BILI_RECORD_CONFIG_DIR=/var/lib/bili-record-2k'
+  echo 'BILI_RECORD_MANAGED_UPDATE=1'
+  echo 'BILI_RECORD_SYSTEMD=1'
+} >"$SANITIZED_ENV_FILE"
+chmod 0640 "$SANITIZED_ENV_FILE"
+chown root:"$SERVICE_GROUP" "$SANITIZED_ENV_FILE"
+mv -f "$SANITIZED_ENV_FILE" "$ENV_FILE"
+rm -f "$INITIAL_PASSWORD_FILE"
 
 chmod 0755 /usr/bin/bili-record-2k /usr/bin/bili-record-2k-update
-chmod 0755 /usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/linux-update.cjs /usr/lib/bili-record-2k/provision.sh
+chmod 0755 /usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/linux-update.cjs /usr/lib/bili-record-2k/provision.sh /usr/lib/bili-record-2k/bootstrap-config.cjs
 chown -R root:root /usr/lib/bili-record-2k
 
 if command -v systemctl >/dev/null 2>&1; then
