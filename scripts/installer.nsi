@@ -111,7 +111,11 @@ done:
 FunctionEnd
 
 Function StopRunningApp
-  DetailPrint "Stopping running ${APP_NAME} processes..."
+  DetailPrint "Requesting a graceful ${APP_NAME} shutdown..."
+  IfFileExists "$INSTDIR\BiliRecord2K.exe" 0 forceStop
+  nsExec::ExecToLog '"$INSTDIR\BiliRecord2K.exe" --request-shutdown'
+forceStop:
+  DetailPrint "Stopping any remaining ${APP_NAME} processes..."
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
   Sleep 1200
@@ -159,7 +163,11 @@ Section "Uninstall"
 SectionEnd
 
 Function un.StopRunningApp
-  DetailPrint "Stopping running ${APP_NAME} processes..."
+  DetailPrint "Requesting a graceful ${APP_NAME} shutdown..."
+  IfFileExists "$INSTDIR\BiliRecord2K.exe" 0 forceStop
+  nsExec::ExecToLog '"$INSTDIR\BiliRecord2K.exe" --request-shutdown'
+forceStop:
+  DetailPrint "Stopping any remaining ${APP_NAME} processes..."
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
   nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
   Sleep 1200

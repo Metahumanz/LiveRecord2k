@@ -179,6 +179,21 @@ static int resolve_port_from_args(void) {
   return port;
 }
 
+static int has_command_line_arg(const wchar_t *expected) {
+  int argc = 0;
+  LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (!argv) return 0;
+  int found = 0;
+  for (int index = 1; index < argc; index++) {
+    if (wcscmp(argv[index], expected) == 0) {
+      found = 1;
+      break;
+    }
+  }
+  LocalFree(argv);
+  return found;
+}
+
 static void open_main_ui(void) {
   DWORD now = GetTickCount();
   if (g_last_open_tick && now - g_last_open_tick < 1200) {
@@ -607,7 +622,7 @@ static void exit_program(HWND hwnd) {
   KillTimer(hwnd, TIMER_POLL);
   http_post_shutdown();
   if (g_service_process) {
-    WaitForSingleObject(g_service_process, 4000);
+    WaitForSingleObject(g_service_process, 120000);
     CloseHandle(g_service_process);
     g_service_process = NULL;
   }
@@ -789,6 +804,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command, int s
   (void)show;
   g_instance = instance;
   g_port = resolve_port_from_args();
+
+  if (has_command_line_arg(L"--request-shutdown")) {
+    http_post_shutdown();
+    for (int attempt = 0; attempt < 220; attempt++) {
+      char response[256];
+      Sleep(500);
+      if (!http_get_path(L"/api/state", response, sizeof(response))) {
+        return 0;
+      }
+    }
+    return 2;
+  }
 
   HANDLE mutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
   if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
