@@ -37,6 +37,10 @@ const BURN_CODEC_CANDIDATES = [
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 const APP_ROOT = getAppRoot();
 const APP_VERSION = getAppVersion();
+const OFFICIAL_RELEASE_DOWNLOAD_PREFIX = 'https://github.com/Metahumanz/LiveRecord2k/releases/download/';
+const UPDATE_DOWNLOAD_MIRROR_PREFIX = 'https://gh-proxy.com/';
+const UPDATE_DOWNLOAD_LOW_SPEED_BYTES_PER_SECOND = 64 * 1024;
+const UPDATE_DOWNLOAD_LOW_SPEED_WINDOW_MS = 20 * 1000;
 
 const danmakuClient = require('../danmaku/client.cjs');
 const danmakuAss = require('../danmaku/ass.cjs');
@@ -1381,11 +1385,12 @@ function isTransientNetworkError(error) {
   const code = String(error?.code || '').toUpperCase();
   const message = String(error?.message || '').toLowerCase();
   return (
-    ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_SOCKET'].includes(code) ||
+    ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_SOCKET', 'ESLOWDOWNLOAD'].includes(code) ||
     message.includes('econnreset') ||
     message.includes('socket hang up') ||
     message.includes('timeout') ||
     message.includes('请求超时') ||
+    message.includes('下载速度过慢') ||
     message.includes('tls') ||
     message.includes('代理请求超时') ||
     message.includes('代理 connect 超时')
@@ -2212,12 +2217,26 @@ function parseSemver(value) {
   };
 }
 
-async function downloadFile(url, targetPath, onProgress) {
+function createUpdateDownloadSources(rawUrl, options = {}) {
+  const url = String(rawUrl || '').trim();
+  const sources = [{ url, label: '更新源' }];
+  if (options.officialSource !== true || !url.startsWith(OFFICIAL_RELEASE_DOWNLOAD_PREFIX)) {
+    return sources;
+  }
+  sources[0].label = 'GitHub 官方源';
+  sources.push({
+    url: `${UPDATE_DOWNLOAD_MIRROR_PREFIX}${url}`,
+    label: 'GitHub 镜像'
+  });
+  return sources;
+}
+
+async function downloadFile(url, targetPath, onProgress, downloadOptions = {}) {
   if (!/^https?:\/\//i.test(String(url || ''))) {
     throw new Error('更新包下载地址无效。');
   }
   const tmpPath = `${targetPath}.tmp`;
-  const options = {
+  const requestOptions = {
     headers: {
       Accept: 'application/x-msdownload, application/vnd.microsoft.portable-executable, application/vnd.debian.binary-package, application/gzip, application/zip, application/octet-stream, */*',
       'User-Agent': `${APP_NAME}/${APP_VERSION}`
@@ -2225,31 +2244,57 @@ async function downloadFile(url, targetPath, onProgress) {
     onProgress,
     maxRedirects: 4,
     maxBytes: 8 * 1024 * 1024 * 1024,
+    lowSpeedBytesPerSecond: UPDATE_DOWNLOAD_LOW_SPEED_BYTES_PER_SECOND,
+    lowSpeedWindowMs: UPDATE_DOWNLOAD_LOW_SPEED_WINDOW_MS,
     validateUrl: (target) => validateRemoteUrl(target, { protocols: ['https:'] })
   };
+  const sources = createUpdateDownloadSources(url, downloadOptions);
   let lastError;
-  const maxAttempts = 4;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    await fsp.rm(tmpPath, { force: true });
-    try {
-      await downloadUrlToFile(url, tmpPath, options);
-      await fsp.rm(targetPath, { force: true });
-      await fsp.rename(tmpPath, targetPath);
-      return;
-    } catch (error) {
-      lastError = error;
-      await fsp.rm(tmpPath, { force: true }).catch(() => {});
-      if (attempt >= maxAttempts || !isTransientNetworkError(error)) break;
-      onProgress?.({
-        retrying: true,
-        attempt,
-        maxAttempts: maxAttempts,
-        error,
-        receivedBytes: 0,
-        totalBytes: 0,
-        done: false
-      });
-      await delay(Math.min(attempt * 800, 3000));
+  const maxAttemptsPerSource = sources.length > 1 ? 2 : 4;
+  for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+    const source = sources[sourceIndex];
+    for (let attempt = 1; attempt <= maxAttemptsPerSource; attempt += 1) {
+      await fsp.rm(tmpPath, { force: true });
+      try {
+        await downloadUrlToFile(source.url, tmpPath, requestOptions);
+        await fsp.rm(targetPath, { force: true });
+        await fsp.rename(tmpPath, targetPath);
+        return;
+      } catch (error) {
+        lastError = error;
+        await fsp.rm(tmpPath, { force: true }).catch(() => {});
+        const hasNextSource = sourceIndex + 1 < sources.length;
+        const switchImmediately = error?.code === 'ESLOWDOWNLOAD' && hasNextSource;
+        const shouldRetry = attempt < maxAttemptsPerSource && isTransientNetworkError(error) && !switchImmediately;
+        if (shouldRetry) {
+          onProgress?.({
+            retrying: true,
+            attempt,
+            maxAttempts: maxAttemptsPerSource,
+            sourceLabel: source.label,
+            error,
+            receivedBytes: 0,
+            totalBytes: 0,
+            done: false
+          });
+          await delay(Math.min(attempt * 800, 3000));
+          continue;
+        }
+        if (hasNextSource) {
+          onProgress?.({
+            retrying: true,
+            switchingSource: true,
+            sourceLabel: sources[sourceIndex + 1].label,
+            attempt,
+            maxAttempts: maxAttemptsPerSource,
+            error,
+            receivedBytes: 0,
+            totalBytes: 0,
+            done: false
+          });
+        }
+        break;
+      }
     }
   }
   throw lastError || new Error('更新包下载失败。');
@@ -2294,13 +2339,42 @@ async function downloadUrlToFile(rawUrl, temporaryPath, options, redirectCount =
         const output = fs.createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 });
         let receivedBytes = 0;
         let settled = false;
+        let speedWindowStartedAt = Date.now();
+        let speedWindowStartBytes = 0;
+        let speedTimer = null;
+        const clearSpeedTimer = () => {
+          if (speedTimer) {
+            clearInterval(speedTimer);
+            speedTimer = null;
+          }
+        };
         const fail = (error) => {
           if (settled) return;
           settled = true;
+          clearSpeedTimer();
           response.destroy();
           output.destroy();
           reject(error);
         };
+        const lowSpeedWindowMs = Math.max(0, Number(options.lowSpeedWindowMs || 0));
+        const lowSpeedBytesPerSecond = Math.max(0, Number(options.lowSpeedBytesPerSecond || 0));
+        if (lowSpeedWindowMs && lowSpeedBytesPerSecond) {
+          speedTimer = setInterval(() => {
+            const now = Date.now();
+            const elapsedMs = now - speedWindowStartedAt;
+            if (elapsedMs < lowSpeedWindowMs) return;
+            const bytesPerSecond = ((receivedBytes - speedWindowStartBytes) * 1000) / Math.max(1, elapsedMs);
+            if (bytesPerSecond < lowSpeedBytesPerSecond) {
+              const error = new Error('更新包下载速度过慢，正在尝试其他下载源。');
+              error.code = 'ESLOWDOWNLOAD';
+              fail(error);
+              return;
+            }
+            speedWindowStartedAt = now;
+            speedWindowStartBytes = receivedBytes;
+          }, Math.min(5000, lowSpeedWindowMs));
+          speedTimer.unref?.();
+        }
         response.on('data', (chunk) => {
           receivedBytes += chunk.length;
           if (maxBytes && receivedBytes > maxBytes) {
@@ -2314,6 +2388,7 @@ async function downloadUrlToFile(rawUrl, temporaryPath, options, redirectCount =
         output.on('finish', () => {
           if (settled) return;
           settled = true;
+          clearSpeedTimer();
           options.onProgress?.({ receivedBytes, totalBytes, done: true });
           resolve();
         });
@@ -2589,6 +2664,7 @@ module.exports = {
   updatePackageFileName,
   packageFileNameFromUrl,
   compareVersions,
+  createUpdateDownloadSources,
   downloadFile,
   fileSha256,
   isStartupEnabled,
