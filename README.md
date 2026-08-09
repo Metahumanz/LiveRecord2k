@@ -76,7 +76,7 @@ https://live.bilibili.com/22625025
 
 ### 开启监听
 
-监听开启后，应用会保持直播弹幕服务器连接，并在收到开播推送时立即准备录制；设置中的 HTTP 轮询间隔只作为推送断线或漏消息时的兜底。开播、下播、开始录制、结束录制等事件可以通过 Windows 通知或通用 Webhook 提醒。
+“监听”只负责保持直播弹幕服务器连接、刷新直播状态和发送通知；“自动录制”是独立开关，只有同时开启后，收到开播推送才会立即准备录制。设置中的 HTTP 轮询间隔只作为推送断线或漏消息时的兜底。
 
 ### 开始录制
 
@@ -121,7 +121,7 @@ https://live.bilibili.com/22625025
 - Linux systemd 安装：`/var/lib/bili-record-2k/BiliRecord2K`
 - Linux 手动运行：`$XDG_CONFIG_HOME/BiliRecord2K`，未设置时为 `~/.config/BiliRecord2K`
 
-自动清理不会扫描或删除录像保存目录，也不会删除 `.clean.mp4`、`.danmaku.mp4`、弹幕记录、字幕、设置和更新日志；这些文件不是缓存。
+自动清理不会扫描或删除录像保存目录，也不会删除 `.clean.mp4`、`.danmaku.mp4`、弹幕记录、字幕、设置和更新日志；这些文件不是缓存。0.4.0 新建的合并任务会用独立 `cleanupId` 记录自己产生的待清理分段，并在重启后安全重试；应用不会在启动时扫描历史 merged 残留，历史分段只能由用户在“软件维护”页手动触发清理。
 
 ## 画质和登录
 
@@ -147,7 +147,7 @@ https://live.bilibili.com/22625025
 
 ### 通用 Webhook
 
-在 `录制配置` 的“监听与通知”区域填写接收地址、按需填写 Bearer Token，启用并保存后，再点击 `发送 Webhook 测试`。公网接收地址必须使用 HTTPS；本机和私有 IP 地址可使用 HTTP。
+在 `录制配置` 的“监听与通知”区域填写接收地址、按需填写 Bearer Token，启用并保存后，再点击 `发送 Webhook 测试`。默认只允许公网 HTTPS 地址，并阻止 DNS 解析到本机、私网或保留地址；确实需要向内网接收器发通知时，必须显式开启“允许 Webhook 访问私有网络”。Webhook 不跟随重定向。
 
 服务端按事件发生顺序发送 `POST application/json`。接收端返回任意 2xx 状态码即视为成功；超时或非 2xx 会有限重试，最终失败会写入应用日志，但不会阻塞录制、合并或烧录任务。可用事件类型：
 
@@ -167,7 +167,7 @@ https://live.bilibili.com/22625025
   "occurredAt": "2026-08-02T12:00:00.000Z",
   "source": {
     "name": "BiliRecord2K",
-    "version": "0.3.3"
+    "version": "0.4.0"
   },
   "data": {
     "roomId": "123456",
@@ -207,7 +207,7 @@ http://本机局域网IP:3263
 http://192.168.1.23:3263
 ```
 
-如果其它电脑无法打开，请检查 Windows 防火墙是否允许该端口入站访问。远端会先看到独立登录页；会话使用 HttpOnly Cookie，连续登录失败会被临时限速。公网使用时仍必须在前面配置 HTTPS 反向代理，不建议直接暴露明文 HTTP 端口。
+如果其它电脑无法打开，请检查 Windows 防火墙是否允许该端口入站访问。远端会先看到独立登录页；会话使用 HttpOnly Cookie，连续登录失败会被临时限速。只有直接连接 loopback、使用 loopback Host 且没有任何转发 Header 的请求才免认证，本机反向代理也不会继承本机豁免。公网使用时必须在前面配置 HTTPS 反向代理，不建议直接暴露明文 HTTP 端口。
 
 ## Linux 云服务器安装
 
@@ -221,9 +221,9 @@ http://192.168.1.23:3263
 curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh
 ```
 
-脚本只会交互询问并确认一次 WebUI 管理密码，其余步骤自动完成：识别发行版和 CPU 架构、安装依赖、读取最新 Release、选择 Deb 或通用包、验证 SHA-256、写入鉴权配置、启用 systemd、启动服务并检查 `/api/state`。默认监听 `0.0.0.0:3263`，完成后会打印访问地址。
+脚本只会交互询问并确认一次 WebUI 管理密码，其余步骤自动完成：识别发行版和 CPU 架构、安装依赖、读取最新 Release、验证 Ed25519 官方签名、选择 Deb 或通用包、复验 SHA-256、写入首次鉴权配置、启用 systemd、启动服务并检查 `/api/state`。默认监听 `0.0.0.0:3263`，完成后会打印访问地址。
 
-安装包默认通过 `https://gh-proxy.com/` 镜像下载；版本与 SHA-256 仍取自 GitHub 官方发布清单，镜像下载失败或校验不通过时会自动回退 GitHub 官方源。可以指定其他兼容的 GitHub 代理前缀，或关闭镜像直连：
+安装包默认通过 `https://gh-proxy.com/` 镜像下载；版本、包名、架构与 SHA-256 必须匹配内置公钥验证过的官方签名清单，镜像下载失败或内容不匹配时会自动回退 GitHub 官方源。可以指定其他兼容的 GitHub 代理前缀，或关闭镜像直连：
 
 ```bash
 # 改用其他镜像
@@ -259,6 +259,7 @@ curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/script
 
 ```bash
 sudo apt install ./bili-record-2k_版本_amd64.deb
+# ARM64 服务器将 amd64 换成 arm64
 sudo systemctl status bili-record-2k
 ```
 
@@ -267,31 +268,30 @@ sudo systemctl status bili-record-2k
 ```bash
 mkdir bili-record-2k-install
 tar -xzf bili-record-2k_版本_linux_x64.tar.gz -C bili-record-2k-install
+# ARM64 服务器将 x64 换成 arm64
 cd bili-record-2k-install
 sudo ./install.sh
 sudo systemctl status bili-record-2k
 ```
 
-安装器会创建无登录权限的 `bili-record-2k` 系统用户，程序安装到 `/usr/lib/bili-record-2k`，配置保存在 `/etc/bili-record-2k`，录像和运行状态保存在 `/var/lib/bili-record-2k`。第一次安装会生成随机管理员密码：
+安装器会创建无登录权限的 `bili-record-2k` 系统用户，程序安装到 `/usr/lib/bili-record-2k`，配置保存在 `/etc/bili-record-2k`，录像和运行状态保存在 `/var/lib/bili-record-2k`，受控更新队列位于 `/var/lib/bili-record-2k-updates`。非一键安装第一次执行时会在安装日志中只显示一次随机管理员密码；不会长期保存明文密码文件。
 
-```bash
-sudo cat /etc/bili-record-2k/initial-admin-password
-```
-
-服务默认只监听 `127.0.0.1:3263`。可以通过 SSH 端口转发访问，也可以让 Caddy/Nginx 反向代理到这个地址并提供 HTTPS。运行参数位于：
+服务默认只监听 `127.0.0.1:3263`。可以通过 SSH 端口转发访问，也可以让 Caddy/Nginx 反向代理到这个地址并提供 HTTPS。首次安装环境文件位于：
 
 ```text
 /etc/bili-record-2k/environment
 ```
 
-修改后重启：
+Host、Port、管理用户名和密码只在首次 bootstrap 时从这个环境文件迁移；之后以 WebUI 持久化设置为准，密码只保留 scrypt hash，环境文件会删除这些明文项。修改持久化配置后可重启并查看日志：
 
 ```bash
 sudo systemctl restart bili-record-2k
 sudo journalctl -u bili-record-2k -f
 ```
 
-如果确实要直接监听所有网卡，把 `BILI_RECORD_HOST` 改成 `0.0.0.0`；这时仍应只通过防火墙开放 HTTPS 反向代理端口，不应把明文 WebUI 直接暴露到公网。录像目录改到挂载盘时，需要让 `bili-record-2k` 用户拥有目标目录写权限。
+如果需要在首次安装后改为监听所有网卡，请在 WebUI 的“软件维护”页修改监听地址为 `0.0.0.0`；不要继续编辑 bootstrap 环境变量。反向代理部署应在同页填写实际直连代理的 IP/CIDR（本机 Caddy/Nginx 通常填 `loopback`）作为可信代理，仅可信直连代理的 `X-Forwarded-*` 才参与客户端地址和 HTTPS 判断；可信代理不会获得免认证权限。这时仍应只通过防火墙开放 HTTPS 反向代理端口，不应把明文 WebUI 直接暴露到公网。
+
+0.4.0 以后新录像根目录使用 setgid 与组可写权限，systemd 服务使用 `UMask=0007`。录像目录改到挂载盘时，需要让 `bili-record-2k` 用户或组拥有目标目录写权限；安装和升级不会递归 chmod/chown 历史录像。
 
 ### systemd 与自动更新
 
@@ -303,9 +303,9 @@ bili-record-2k-update.path     监听经过校验的更新请求
 bili-record-2k-update.service  使用 root 安装更新并重启主服务
 ```
 
-Linux 安装版默认每 6 小时检查一次更新。存在录制、合并、烧录或导出任务时会等待任务全部结束；空闲后下载与当前平台、架构和安装方式匹配的包，校验 SHA-256，再由独立的 systemd 更新单元复查包路径、包名、版本和摘要后安装。可以在“软件维护”页面关闭自动更新，也可以手动检查和安装。
+Linux 安装版默认每 6 小时检查一次更新。存在录制、合并、烧录、导出或预览任务时会等待任务结束；空闲后下载与当前平台、架构和安装方式匹配的包。独立 root updater 不信任普通服务进程提交的包和 SHA，而是使用安装包内公钥验证官方 Ed25519 签名，再复查签名绑定的包名、SemVer、架构、SHA-256 与包内元数据。更新队列父目录由 root 持有，root 写入状态和日志时拒绝符号链接并使用原子替换；pending/processing/error/success 状态可在重启后恢复。自定义或未签名更新源只能手动安装，默认不能交给 root 自动更新。
 
-卸载 Debian 包时使用 `sudo apt remove bili-record-2k`。通用包使用解压目录中的 `sudo ./uninstall.sh`。两种卸载方式都会保留 `/etc/bili-record-2k` 和 `/var/lib/bili-record-2k`，避免误删配置与录像。
+卸载 Debian 包时使用 `sudo apt remove bili-record-2k`。通用包使用解压目录中的 `sudo ./uninstall.sh`。两种卸载方式都会保留 `/etc/bili-record-2k`、`/var/lib/bili-record-2k` 和更新队列，避免误删配置、录像或待恢复状态。
 
 ## 常见问题
 
@@ -364,10 +364,14 @@ release/webui/BiliRecord2K.Service.exe
 release/bili-record-2k-setup.exe
 release/bili-record-2k-webui.zip
 release/bili-record-2k_版本_amd64.deb
+release/bili-record-2k_版本_arm64.deb
 release/bili-record-2k_版本_linux_x64.tar.gz
+release/bili-record-2k_版本_linux_arm64.tar.gz
 release/install-linux.sh
 release/update.json
 ```
+
+官方 Release 在发布前会依次通过单测、FFmpeg smoke、Windows x64 构建、Linux x64/ARM64 原生构建，并用仓库 Secret `UPDATE_SIGNING_PRIVATE_KEY_B64` 生成和复验签名清单；缺少任何架构产物或签名验证失败时不会发布。
 
 如果不想构建结束后自动打开资源管理器，可以设置：
 
