@@ -110,14 +110,32 @@ Function AppendUpdateLog
 done:
 FunctionEnd
 
+Function IsTrayRunning
+  StrCpy $0 "0"
+  System::Call 'kernel32::OpenMutexW(i 0x00100000, i 0, w "Local\BiliRecord2K.Tray") p.r1'
+  StrCmp $1 0 done
+  System::Call 'kernel32::CloseHandle(p r1)'
+  StrCpy $0 "1"
+done:
+  Push $0
+FunctionEnd
+
 Function StopRunningApp
-  DetailPrint "Requesting a graceful ${APP_NAME} shutdown..."
+  Call IsTrayRunning
+  Pop $0
+  StrCmp "$0" "1" 0 forceStop
   IfFileExists "$INSTDIR\BiliRecord2K.exe" 0 forceStop
-  nsExec::ExecToLog '"$INSTDIR\BiliRecord2K.exe" --request-shutdown'
+  DetailPrint "Requesting a graceful ${APP_NAME} shutdown (up to 125 seconds)..."
+  nsExec::ExecToLog /TIMEOUT=125000 '"$INSTDIR\BiliRecord2K.exe" --request-shutdown'
+  Pop $0
+  StrCmp "$0" "timeout" 0 forceStop
+  DetailPrint "Graceful shutdown timed out; continuing with the bounded fallback."
 forceStop:
   DetailPrint "Stopping any remaining ${APP_NAME} processes..."
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
+  nsExec::ExecToLog /TIMEOUT=10000 '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
+  Pop $0
+  nsExec::ExecToLog /TIMEOUT=10000 '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
+  Pop $0
   Sleep 1200
 FunctionEnd
 
@@ -162,13 +180,31 @@ Section "Uninstall"
   DeleteRegKey HKCU "${REG_KEY}"
 SectionEnd
 
+Function un.IsTrayRunning
+  StrCpy $0 "0"
+  System::Call 'kernel32::OpenMutexW(i 0x00100000, i 0, w "Local\BiliRecord2K.Tray") p.r1'
+  StrCmp $1 0 done
+  System::Call 'kernel32::CloseHandle(p r1)'
+  StrCpy $0 "1"
+done:
+  Push $0
+FunctionEnd
+
 Function un.StopRunningApp
-  DetailPrint "Requesting a graceful ${APP_NAME} shutdown..."
+  Call un.IsTrayRunning
+  Pop $0
+  StrCmp "$0" "1" 0 forceStop
   IfFileExists "$INSTDIR\BiliRecord2K.exe" 0 forceStop
-  nsExec::ExecToLog '"$INSTDIR\BiliRecord2K.exe" --request-shutdown'
+  DetailPrint "Requesting a graceful ${APP_NAME} shutdown (up to 125 seconds)..."
+  nsExec::ExecToLog /TIMEOUT=125000 '"$INSTDIR\BiliRecord2K.exe" --request-shutdown'
+  Pop $0
+  StrCmp "$0" "timeout" 0 forceStop
+  DetailPrint "Graceful shutdown timed out; continuing with the bounded fallback."
 forceStop:
   DetailPrint "Stopping any remaining ${APP_NAME} processes..."
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
+  nsExec::ExecToLog /TIMEOUT=10000 '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.exe /T /F'
+  Pop $0
+  nsExec::ExecToLog /TIMEOUT=10000 '"$SYSDIR\taskkill.exe" /IM BiliRecord2K.Service.exe /T /F'
+  Pop $0
   Sleep 1200
 FunctionEnd

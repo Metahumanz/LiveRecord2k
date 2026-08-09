@@ -841,3 +841,84 @@ test('tray polling stays off the window thread and uses callback coordinates', (
   assert.match(traySource, /GET_X_LPARAM\(wparam\)/);
   assert.match(traySource, /Shell_NotifyIconGetRect/);
 });
+
+test('Windows installer does not launch a legacy tray executable while the app is stopped', () => {
+  const installerSource = fs.readFileSync(path.join(projectRoot, 'scripts/installer.nsi'), 'utf8');
+  const installStop = installerSource.match(/Function StopRunningApp([\s\S]*?)FunctionEnd/)?.[1] || '';
+  const uninstallStop = installerSource.match(/Function un\.StopRunningApp([\s\S]*?)FunctionEnd/)?.[1] || '';
+
+  assert.match(installerSource, /OpenMutexW\(i 0x00100000, i 0, w "Local\\BiliRecord2K\.Tray"\)/);
+  for (const stopFunction of [installStop, uninstallStop]) {
+    assert.match(stopFunction, /IsTrayRunning/);
+    assert.ok(stopFunction.indexOf('IsTrayRunning') < stopFunction.indexOf('--request-shutdown'));
+    assert.match(stopFunction, /StrCmp "\$0" "1" 0 forceStop/);
+    assert.match(stopFunction, /ExecToLog \/TIMEOUT=125000 .*--request-shutdown/);
+    assert.match(stopFunction, /ExecToLog \/TIMEOUT=10000 .*taskkill\.exe/);
+  }
+});
+
+test(
+  'Linux normalizes only the configured recording root and leaves historical contents untouched',
+  { skip: process.platform !== 'linux' },
+  async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-output-root-mode-'));
+    const outputRoot = path.join(tempDir, 'custom-output');
+    const historicalDir = path.join(outputRoot, 'historical-recording');
+    const historicalFile = path.join(historicalDir, 'old.clean.mkv');
+    const service = new LiveRecordService();
+    try {
+      await fsp.mkdir(historicalDir, { recursive: true, mode: 0o700 });
+      await fsp.writeFile(historicalFile, 'history', { mode: 0o600 });
+      await fsp.chmod(outputRoot, 0o700);
+      await fsp.chmod(historicalDir, 0o700);
+      await fsp.chmod(historicalFile, 0o600);
+
+      const changed = await service.normalizeLinuxRecordingRootPermissions(outputRoot);
+
+      assert.equal(changed, true);
+      assert.equal((await fsp.stat(outputRoot)).mode & 0o7777, 0o2770);
+      assert.equal((await fsp.stat(historicalDir)).mode & 0o7777, 0o700);
+      assert.equal((await fsp.stat(historicalFile)).mode & 0o7777, 0o600);
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+test('Linux recording root permission normalization targets only the configured root node', async () => {
+  const service = new LiveRecordService();
+  const outputRoot = path.resolve('simulated-linux-output-root');
+  let mode = 0o700;
+  let gid = 2002;
+  const calls = [];
+  const fileSystem = {
+    async stat(target) {
+      calls.push(['stat', target]);
+      return { mode, uid: 1001, gid, isDirectory: () => true };
+    },
+    async chown(target, uid, nextGid) {
+      calls.push(['chown', target, uid, nextGid]);
+      gid = nextGid;
+    },
+    async chmod(target, nextMode) {
+      calls.push(['chmod', target, nextMode]);
+      mode = nextMode;
+    }
+  };
+
+  const changed = await service.normalizeLinuxRecordingRootPermissions(outputRoot, {
+    platform: 'linux',
+    currentUid: 1001,
+    currentGid: 2001,
+    fileSystem
+  });
+
+  assert.equal(changed, true);
+  assert.equal(mode, 0o2770);
+  assert.equal(gid, 2001);
+  assert.ok(calls.every(([, target]) => target === outputRoot));
+  assert.deepEqual(
+    calls.map(([operation]) => operation),
+    ['stat', 'chown', 'chmod', 'stat']
+  );
+});
