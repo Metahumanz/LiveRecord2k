@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   compareVersions: compareAppVersions,
+  getAppPackageType,
   normalizeUpdateManifest,
   updatePackageFileName
 } = require('../src/server/shared/helpers.cjs');
@@ -73,6 +74,42 @@ test('update manifest selects the package matching platform, architecture, and i
   const windows = normalizeUpdateManifest(payload, { platform: 'win32', arch: 'x64', packageType: 'installer' });
   assert.equal(windows.packageType, 'installer');
   assert.equal(windows.packageUrl, files[0].url);
+});
+
+test('legacy Windows setup installs select the EXE while portable folders keep the ZIP', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-windows-package-type-'));
+  const payload = { version: '1.2.3', files };
+  try {
+    await fsp.writeFile(path.join(tempDir, 'version.json'), JSON.stringify({ version: '1.2.2' }));
+    await fsp.writeFile(path.join(tempDir, 'install-type.json'), JSON.stringify({ packageType: 'installer' }));
+
+    assert.equal(getAppPackageType({ platform: 'win32', appRoot: tempDir, configuredType: '' }), 'installer');
+    await fsp.rm(path.join(tempDir, 'install-type.json'));
+    await fsp.writeFile(path.join(tempDir, 'Uninstall.exe'), 'nsis-uninstaller');
+
+    assert.equal(getAppPackageType({ platform: 'win32', appRoot: tempDir, configuredType: '' }), 'installer');
+    const installedManifest = normalizeUpdateManifest(payload, {
+      platform: 'win32',
+      arch: 'x64',
+      appRoot: tempDir,
+      configuredType: ''
+    });
+    assert.equal(installedManifest.packageType, 'installer');
+    assert.equal(installedManifest.packageUrl, files[0].url);
+
+    await fsp.rm(path.join(tempDir, 'Uninstall.exe'));
+    assert.equal(getAppPackageType({ platform: 'win32', appRoot: tempDir, configuredType: '' }), 'portable');
+    const portableManifest = normalizeUpdateManifest(payload, {
+      platform: 'win32',
+      arch: 'x64',
+      appRoot: tempDir,
+      configuredType: ''
+    });
+    assert.equal(portableManifest.packageType, 'portable');
+    assert.equal(portableManifest.packageUrl, files[1].url);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('GitHub API asset fallback does not mistake Windows zip for a Linux package', () => {

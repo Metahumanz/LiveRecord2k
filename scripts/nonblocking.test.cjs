@@ -848,6 +848,8 @@ test('Windows installer does not launch a legacy tray executable while the app i
   const uninstallStop = installerSource.match(/Function un\.StopRunningApp([\s\S]*?)FunctionEnd/)?.[1] || '';
 
   assert.match(installerSource, /OpenMutexW\(i 0x00100000, i 0, w "Local\\BiliRecord2K\.Tray"\)/);
+  assert.match(installerSource, /FileWrite \$0 .*packageType.*installer/);
+  assert.match(installerSource, /Delete "\$INSTDIR\\install-type\.json"/);
   for (const stopFunction of [installStop, uninstallStop]) {
     assert.match(stopFunction, /IsTrayRunning/);
     assert.ok(stopFunction.indexOf('IsTrayRunning') < stopFunction.indexOf('--request-shutdown'));
