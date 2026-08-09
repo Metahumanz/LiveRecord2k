@@ -224,7 +224,7 @@ function createConcatCopyArgs({ concatPath, outputPath, container }) {
   return args;
 }
 
-function createConcatTranscodeArgs({ segments, outputPath, container, targetVideoInfo, videoCodec }) {
+function createConcatTranscodeArgs({ segments, outputPath, container, targetVideoInfo, videoCodec, softwareThreads = 4 }) {
   const width = makeEvenDimension(targetVideoInfo?.width);
   const height = makeEvenDimension(targetVideoInfo?.height);
   if (!Array.isArray(segments) || segments.length < 2) {
@@ -250,10 +250,25 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     const audioDurationFilter = Number(segment.durationSec) > 0
       ? `apad,atrim=duration=${formatFfmpegSeconds(segment.durationSec)},`
       : '';
+    const sourcePixelFormat = String(targetVideoInfo?.pixelFormat || '').toLowerCase();
+    const hardwareCodec = /(?:nvenc|qsv|amf)/.test(String(videoCodec || ''));
+    const bitDepth = Number(targetVideoInfo?.bitDepth || 8);
+    const softwarePixelFormats = new Set([
+      'yuv420p', 'yuv422p', 'yuv444p',
+      'yuv420p10le', 'yuv422p10le', 'yuv444p10le',
+      'yuv420p12le', 'yuv422p12le', 'yuv444p12le'
+    ]);
+    const pixelFormat = hardwareCodec && bitDepth > 8
+      ? 'p010le'
+      : softwarePixelFormats.has(sourcePixelFormat)
+        ? sourcePixelFormat
+        : bitDepth > 8
+          ? 'yuv420p10le'
+          : 'yuv420p';
     filters.push(
       `[${index}:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
         `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
-        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=yuv420p[v${index}]`
+        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=${pixelFormat}[v${index}]`
     );
     if (segment.hasAudio) {
       filters.push(
@@ -281,8 +296,11 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     const qp = isHevcCodec(codec) ? '24' : '20';
     args.push('-quality', 'balanced', '-qp_i', qp, '-qp_p', qp);
   } else {
-    args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20');
+    args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20', '-threads', String(Math.max(1, Number(softwareThreads) || 4)));
   }
+  if (targetVideoInfo?.colorPrimaries) args.push('-color_primaries', String(targetVideoInfo.colorPrimaries));
+  if (targetVideoInfo?.colorTransfer) args.push('-color_trc', String(targetVideoInfo.colorTransfer));
+  if (targetVideoInfo?.colorSpace) args.push('-colorspace', String(targetVideoInfo.colorSpace));
   args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-dn', '-sn', '-avoid_negative_ts', 'make_zero');
   if (container === 'mp4') {
     if (isHevcCodec(codec)) {
@@ -290,6 +308,20 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     }
     args.push('-movflags', '+faststart');
   }
+  args.push(outputPath);
+  return args;
+}
+
+function createAudioAlignArgs({ inputPath, outputPath, container, videoDurationSec }) {
+  const duration = Number(videoDurationSec || 0);
+  if (!duration) throw new Error('音画对齐缺少有效的视频时长。');
+  const args = [
+    '-hide_banner', '-y', '-i', inputPath,
+    '-filter_complex', `[0:a:0]aresample=48000:async=1:first_pts=0,apad,atrim=duration=${formatFfmpegSeconds(duration)},asetpts=PTS-STARTPTS[aout]`,
+    '-map', '0:v:0', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-ac', '2',
+    '-dn', '-sn', '-avoid_negative_ts', 'make_zero'
+  ];
+  if (container === 'mp4') args.push('-movflags', '+faststart');
   args.push(outputPath);
   return args;
 }
@@ -312,12 +344,11 @@ function selectHighestResolutionVideoInfo(mediaInfos) {
     }
     return Number(candidate.height) > Number(best.height) ? candidate : best;
   });
-  const highestFps = candidates.reduce((maximum, videoInfo) => Math.max(maximum, Number(videoInfo.fps) || 0), 0);
   return {
     ...highestResolution,
     width: makeEvenDimension(highestResolution.width),
     height: makeEvenDimension(highestResolution.height),
-    fps: highestFps || highestResolution.fps
+    fps: highestResolution.fps
   };
 }
 
@@ -330,6 +361,43 @@ function shouldTranscodeConcat(mediaInfos) {
   return signatures.size > 1;
 }
 
+function assertSafeMergeTargetProfile(mediaInfos, targetVideoInfo, options = {}) {
+  const videoInfos = (mediaInfos || []).map((item) => item?.videoInfo || item).filter(Boolean);
+  if (!videoInfos.length || !targetVideoInfo) throw new Error('缺少可验证的合并视频 profile。');
+  const hdrModes = new Set(videoInfos.map((info) => Boolean(info.hdr)));
+  if (hdrModes.size > 1) {
+    throw new Error('分段同时包含 HDR 与 SDR；为避免错误色彩转换，已拒绝自动合并并保留所有源分段。');
+  }
+  const bitDepth = (info) => Math.max(8, Number(info?.bitDepth || 8));
+  const chromaRank = (info) => {
+    const pixelFormat = String(info?.pixelFormat || '').toLowerCase();
+    if (pixelFormat.includes('444')) return 3;
+    if (pixelFormat.includes('422')) return 2;
+    return 1;
+  };
+  const maxBitDepth = Math.max(...videoInfos.map(bitDepth));
+  const maxChromaRank = Math.max(...videoInfos.map(chromaRank));
+  if (bitDepth(targetVideoInfo) < maxBitDepth || chromaRank(targetVideoInfo) < maxChromaRank) {
+    throw new Error(
+      `真实目标 profile 无法同时覆盖源分段的 ${maxBitDepth}bit/色度规格；已拒绝静默降质并保留所有源分段。`
+    );
+  }
+  for (const field of ['colorPrimaries', 'colorTransfer', 'colorSpace']) {
+    const knownValues = new Set(
+      videoInfos
+        .map((info) => String(info?.[field] || '').trim().toLowerCase())
+        .filter((value) => value && value !== 'unknown' && value !== 'unspecified')
+    );
+    if (knownValues.size > 1) {
+      throw new Error(`分段 ${field} 不一致；已拒绝未经验证的色彩转换并保留所有源分段。`);
+    }
+  }
+  if (Boolean(targetVideoInfo.hdr) && options.requiresVideoTranscode) {
+    throw new Error('跨规格 HDR 合并需要重编码且可能丢失 mastering metadata；已拒绝静默降质并保留所有源分段。');
+  }
+  return true;
+}
+
 function createConcatStreamSignature(mediaInfo) {
   const videoInfo = mediaInfo?.videoInfo || {};
   const audioInfo = mediaInfo?.audioInfo || null;
@@ -339,6 +407,13 @@ function createConcatStreamSignature(mediaInfo) {
     videoCodec,
     `${Number(videoInfo.width) || 0}x${Number(videoInfo.height) || 0}`,
     normalizeMergeFps(videoInfo.fps) || 'unknown-fps',
+    String(videoInfo.profile || '').toLowerCase(),
+    String(videoInfo.pixelFormat || '').toLowerCase(),
+    Number(videoInfo.bitDepth || 0),
+    String(videoInfo.colorSpace || '').toLowerCase(),
+    String(videoInfo.colorPrimaries || '').toLowerCase(),
+    String(videoInfo.colorTransfer || '').toLowerCase(),
+    videoInfo.hdr ? 'hdr' : 'sdr',
     audioCodec,
     Number(audioInfo?.sampleRate) || 0,
     String(audioInfo?.channelLayout || '')
@@ -429,8 +504,10 @@ module.exports = {
   createClipCopyArgs,
   createConcatCopyArgs,
   createConcatTranscodeArgs,
+  createAudioAlignArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
+  assertSafeMergeTargetProfile,
   createConcatStreamSignature,
   writeConcatFile,
   escapeConcatPath,

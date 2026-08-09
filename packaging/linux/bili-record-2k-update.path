@@ -2,7 +2,8 @@
 Description=Watch for verified BiliRecord2K update requests
 
 [Path]
-PathExists=/var/lib/bili-record-2k/BiliRecord2K/updates/apply-request.json
+PathExists=/var/lib/bili-record-2k-updates/apply-request.json
+PathExists=/var/lib/bili-record-2k-updates/apply-request.processing.json
 Unit=bili-record-2k-update.service
 
 [Install]

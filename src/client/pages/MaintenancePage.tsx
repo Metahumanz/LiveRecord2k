@@ -231,7 +231,7 @@ export function MaintenancePage({
                 <option value="127.0.0.1">仅本机 127.0.0.1</option>
                 <option value="0.0.0.0">外部网络 0.0.0.0</option>
               </select>
-              <p className="field-help">选择 0.0.0.0 后，局域网或公网入口都会先要求登录；云服务器还应配合 HTTPS 反向代理。</p>
+              <p className="field-help">只有直接连接 127.0.0.1/localhost 的本机页面免登录；局域网、公网和反向代理入口始终要求鉴权。</p>
             </label>
             <label className="field">
               <span>服务端口（重启生效）</span>
@@ -267,6 +267,20 @@ export function MaintenancePage({
                 onChange={(event) => setSettingsDraft({ ...settingsDraft, accessPassword: event.target.value })}
               />
               <p className="field-help">密码只提交一次，服务端使用 scrypt 加盐哈希保存，不会回传明文。</p>
+            </label>
+            <label className="field">
+              <span>可信反向代理（逗号分隔）</span>
+              <input
+                value={(settingsDraft.trustedProxies || []).join(', ')}
+                placeholder="127.0.0.1, 10.0.0.10/32"
+                onChange={(event) =>
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean)
+                  })
+                }
+              />
+              <p className="field-help">仅这些直连地址的 Forwarded/X-Forwarded-* 会被信任；配置不会让代理请求免登录。</p>
             </label>
             <label className="field">
               <span>更新源</span>
@@ -329,7 +343,7 @@ export function MaintenancePage({
                 disabled={busy === 'shutdown'}
                 onClick={() => {
                   const message = hasActiveJobs
-                    ? '当前有录制或生成弹幕视频任务，确定退出后台服务？'
+                    ? '当前有录制、合并、烧录、导出或预览任务；退出会先进入收尾流程，确定继续？'
                     : '确定退出后台服务？';
                   if (window.confirm(message)) {
                     run('shutdown', recorder.shutdown);

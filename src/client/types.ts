@@ -8,6 +8,7 @@ export type RoomState = {
   keyframe?: string;
   liveStatus?: number;
   monitoring: boolean;
+  autoRecord: boolean;
   recording: boolean;
   burning: boolean;
   lastCheckedAt?: number;
@@ -113,6 +114,7 @@ export type AppSettings = {
   webhookBearerToken: string;
   webhookBearerTokenConfigured: boolean;
   webhookBearerTokenClear: boolean;
+  webhookAllowPrivateNetwork: boolean;
   openBrowserOnStart: boolean;
   hideOverviewNextStep: boolean;
   autoUpdateEnabled: boolean;
@@ -122,6 +124,7 @@ export type AppSettings = {
   accessUsername: string;
   accessPassword: string;
   accessAuthConfigured: boolean;
+  trustedProxies: string[];
 };
 
 export type UpdateState = {
@@ -370,6 +373,7 @@ export type RecorderApi = {
   removeRoom: (roomId: string) => Promise<AppState>;
   refreshRoom: (roomId: string, options?: { silent?: boolean }) => Promise<AppState>;
   setMonitoring: (roomId: string, enabled: boolean) => Promise<AppState>;
+  setAutoRecord: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;

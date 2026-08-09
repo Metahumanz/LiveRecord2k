@@ -52,13 +52,27 @@ async function start() {
     }
   });
 
-  const shutdown = () => {
-    service.shutdown();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1500).unref();
+  let shutdownPromise = null;
+  const shutdown = (reason = 'signal') => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      const serverClosed = new Promise((resolve) => server.close(resolve));
+      await service.beginShutdown(reason);
+      for (const response of service.clients.keys()) response.end();
+      await vite?.close?.();
+      await Promise.race([serverClosed, new Promise((resolve) => setTimeout(resolve, 5000))]);
+      process.exit(0);
+    })().catch((error) => {
+      console.error(`优雅退出失败：${error.stack || error.message || error}`);
+      process.exit(1);
+    });
+    const watchdog = setTimeout(() => process.exit(1), 125000);
+    watchdog.unref();
+    return shutdownPromise;
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  service.setShutdownHandler(shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 module.exports = { start };

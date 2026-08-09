@@ -12,15 +12,14 @@ Environment=NODE_ENV=production
 Environment=BILI_RECORD_NO_OPEN=1
 Environment=BILI_RECORD_APP_ROOT=/usr/lib/bili-record-2k
 Environment=BILI_RECORD_SERVER_ENTRY=/usr/lib/bili-record-2k/server.bundle.cjs
+Environment=BILI_RECORD_UPDATE_DIR=/var/lib/bili-record-2k-updates
 EnvironmentFile=-/etc/bili-record-2k/environment
 ExecStart=/usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/server.bundle.cjs --prod --no-open
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=20s
+TimeoutStopSec=120s
 KillSignal=SIGTERM
-StateDirectory=bili-record-2k
-StateDirectoryMode=0750
-UMask=0077
+UMask=0007
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

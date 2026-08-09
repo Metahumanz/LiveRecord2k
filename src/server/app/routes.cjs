@@ -2,6 +2,11 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { DIST_ROOT, writeJson, writeText, mimeType } = require('./service.cjs');
 const { parseCookieHeader, SESSION_TTL_MS } = require('./auth.cjs');
+const {
+  getRequestNetworkContext,
+  hasForwardingHeaders,
+  isLoopbackAddress
+} = require('../shared/security.cjs');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const DEFAULT_PORT = 3263;
@@ -72,7 +77,8 @@ async function handleApi(service, parsed, port, request, response, access) {
   const stateOptions = {
     redactCookie: !localConsole,
     localConsole,
-    accessAuthenticated: access.authenticated
+    accessAuthenticated: access.authenticated,
+    accessRequired: access.required
   };
   if (request.method === 'GET' && pathname === '/api/state') {
     writeJson(response, 200, service.getState(stateOptions));
@@ -137,8 +143,10 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/rooms/remove': () => service.removeRoom(body.roomId),
     '/api/rooms/refresh': () => service.refreshRoom(body.roomId, { silent: Boolean(body.silent) }),
     '/api/rooms/monitor': () => service.setMonitoring(body.roomId, body.enabled),
+    '/api/rooms/auto-record': () => service.setAutoRecord(body.roomId, body.enabled),
     '/api/rooms/record/start': () => service.startRecording(body.roomId, false),
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
+    '/api/rooms/merge/cancel': () => service.cancelMerge(body.roomId),
     '/api/rooms/preview/start': () => service.startPreview(body.roomId),
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
     '/api/rooms/burn/cancel': () => service.cancelBurnDanmaku(body.roomId),
@@ -195,8 +203,9 @@ async function handleAccessLogin(service, request, response) {
     body = Object.fromEntries(new URLSearchParams(raw));
   }
   try {
-    const session = await service.loginAccess(body.username, body.password, getRemoteKey(request));
-    const secure = request.socket?.encrypted || String(request.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+    const network = getRequestNetworkContext(request, service.settings?.trustedProxies);
+    const session = await service.loginAccess(body.username, body.password, network.clientAddress || 'unknown');
+    const secure = Boolean(request.socket?.encrypted) || network.forwardedProto === 'https';
     response.writeHead(303, {
       Location: '/',
       'Set-Cookie': `${ACCESS_COOKIE}=${encodeURIComponent(session.token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(
@@ -211,9 +220,9 @@ async function handleAccessLogin(service, request, response) {
 }
 
 function getAccessContext(service, request) {
-  const host = String(service.currentHost || service.settings?.serverHost || '').toLowerCase();
-  const exposed = host === '0.0.0.0' || host === '::';
-  const required = exposed && !isLocalConsoleRequest(request);
+  // Authentication is decided per request, never from the bind address. A
+  // loopback-bound service can still be exposed by a reverse proxy.
+  const required = !isLocalConsoleRequest(request, service.settings?.trustedProxies);
   const token = parseCookieHeader(request.headers.cookie)[ACCESS_COOKIE] || '';
   return {
     required,
@@ -229,7 +238,7 @@ function serveAccessLoginPage(service, response, errorMessage = '', statusCode =
     ? `<div class="notice error">${escapeHtml(errorMessage)}</div>`
     : configured
       ? '<div class="notice">此服务正在监听外部网络，登录后才能进入管理界面。</div>'
-      : '<div class="notice error">远程访问密码尚未配置。请在服务端本机设置，或通过 BILI_RECORD_AUTH_PASSWORD 环境变量启动。</div>';
+      : '<div class="notice error">远程访问密码尚未配置。请先通过本机 WebUI 设置；全新 Linux 安装可在首次 bootstrap 时提供密码。</div>';
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -264,10 +273,6 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
-}
-
-function getRemoteKey(request) {
-  return String(request.socket?.remoteAddress || request.connection?.remoteAddress || 'unknown').toLowerCase();
 }
 
 async function readRequestBody(request) {
@@ -360,12 +365,16 @@ function isLoopbackHost(hostname) {
 }
 
 function isLocalRequest(request) {
-  const remoteAddress = String(request.socket?.remoteAddress || request.connection?.remoteAddress || '').toLowerCase();
-  return remoteAddress === '127.0.0.1' || remoteAddress === '::1' || remoteAddress === '::ffff:127.0.0.1';
+  return isLoopbackAddress(request.socket?.remoteAddress || request.connection?.remoteAddress || '');
 }
 
 function isLocalConsoleRequest(request) {
   if (!isLocalRequest(request)) {
+    return false;
+  }
+  // A request relayed by a local reverse proxy is remote management traffic,
+  // even though the final TCP peer is loopback.
+  if (hasForwardingHeaders(request.headers || {})) {
     return false;
   }
   const host = normalizeHostHeader(request.headers.host);
@@ -463,6 +472,8 @@ module.exports = {
   createViteMiddleware,
   handleRequest,
   isLocalRequest,
+  isLocalConsoleRequest,
+  getAccessContext,
   redactRemoteState,
   LOCAL_ONLY_API_PATHS,
   LOCAL_ONLY_ERROR

@@ -1,8 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const {
+  compareVersions: compareAppVersions,
   normalizeUpdateManifest,
   updatePackageFileName
 } = require('../src/server/shared/helpers.cjs');
@@ -10,8 +13,11 @@ const {
   getPaths,
   validateRequestShape,
   assertUpgradeVersion,
-  compareVersions
+  compareVersions,
+  appendLog,
+  copyUntrustedPackage
 } = require('../packaging/linux/linux-update.cjs');
+const { migrateBootstrapStore } = require('../packaging/linux/bootstrap-config.cjs');
 
 const files = [
   {
@@ -83,25 +89,29 @@ test('GitHub API asset fallback does not mistake Windows zip for a Linux package
 });
 
 test('Linux update package filenames keep their complete package extension', () => {
+  const debArch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   assert.equal(
     updatePackageFileName({ version: '1.2.3', packageType: 'deb', packageUrl: files[2].url }),
-    'bili-record-2k_1.2.3_all.deb'
+    `bili-record-2k_1.2.3_${debArch}.deb`
   );
   assert.equal(
     updatePackageFileName({ version: '1.2.3', packageType: 'tarball', packageUrl: files[3].url }),
-    'bili-record-2k_1.2.3_linux_all.tar.gz'
+    `bili-record-2k_1.2.3_linux_${process.arch}.tar.gz`
   );
 });
 
 test('root updater only accepts direct files in its controlled update directory', () => {
-  const paths = getPaths({ BILI_RECORD_CONFIG_DIR: path.join(path.sep, 'var', 'lib', 'bili-record-2k-test') });
+  const paths = getPaths({ BILI_RECORD_UPDATE_DIR: path.join(path.sep, 'var', 'lib', 'bili-record-2k-test-updates') });
   const valid = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     app: 'bili-record-2k',
     version: '1.2.3',
     packageType: 'deb',
     packagePath: path.join(paths.updateDir, 'bili-record-2k_1.2.3_all.deb'),
-    sha256: 'a'.repeat(64)
+    sha256: 'a'.repeat(64),
+    signed: { schemaVersion: 1, app: 'bili-record-2k', version: '1.2.3', files: [] },
+    signatureAlgorithm: 'ed25519',
+    signature: Buffer.alloc(64).toString('base64')
   };
   assert.doesNotThrow(() => validateRequestShape(valid, paths));
   assert.throws(
@@ -119,6 +129,51 @@ test('root updater rejects downgrade and repeated installation requests', () => 
   assert.doesNotThrow(() => assertUpgradeVersion('1.2.4', '1.2.3'));
   assert.throws(() => assertUpgradeVersion('1.2.3', '1.2.3'), /拒绝降级/);
   assert.throws(() => assertUpgradeVersion('1.1.9', '1.2.3'), /拒绝降级/);
+  assert.equal(compareVersions('1.2.3-rc.1', '1.2.3'), -1);
+  assert.equal(compareAppVersions('1.2.3-rc.1', '1.2.3'), -1);
+  assert.equal(compareAppVersions('1.2.3+build.2', '1.2.3+build.1'), 0);
+});
+
+test('Linux bootstrap hashes legacy plaintext and ignores credentials after the first migration', async () => {
+  const legacy = await migrateBootstrapStore(
+    { settings: { configBootstrapVersion: 1, accessPassword: 'legacy-password' } },
+    { BILI_RECORD_AUTH_PASSWORD: 'environment-password' }
+  );
+  assert.match(legacy.settings.accessPasswordHash, /^scrypt\$/);
+  assert.equal('accessPassword' in legacy.settings, false);
+
+  const alreadyBootstrapped = await migrateBootstrapStore(
+    { settings: { configBootstrapVersion: 1 } },
+    { BILI_RECORD_AUTH_PASSWORD: 'must-not-return' }
+  );
+  assert.equal(alreadyBootstrapped.settings.accessPasswordHash, undefined);
+});
+
+test('root updater refuses to append through a symbolic-link log target', { skip: process.platform !== 'linux' }, async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-updater-log-'));
+  const victimPath = path.join(tempDir, 'victim');
+  const logPath = path.join(tempDir, 'apply-update.log');
+  try {
+    await fsp.writeFile(victimPath, 'protected', 'utf8');
+    await fsp.symlink(victimPath, logPath);
+    await assert.rejects(appendLog({ logPath }, 'must not append'), /ELOOP|symbolic link/i);
+    assert.equal(await fsp.readFile(victimPath, 'utf8'), 'protected');
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('root updater copies an already-open ordinary package into its private staging file', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-updater-copy-'));
+  const sourcePath = path.join(tempDir, 'source.deb');
+  const targetPath = path.join(tempDir, 'target.deb');
+  try {
+    await fsp.writeFile(sourcePath, Buffer.alloc(256 * 1024, 0x5a));
+    await copyUntrustedPackage(sourcePath, targetPath);
+    assert.deepEqual(await fsp.readFile(targetPath), await fsp.readFile(sourcePath));
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('one-click Linux installer prompts through the terminal and verifies release packages before root installation', () => {
@@ -132,7 +187,17 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(source, /https:\/\/gh-proxy\.com\//);
   assert.match(source, /MIRROR_PACKAGE_URL=.*\$PACKAGE_URL/);
   assert.match(source, /download_and_verify "GitHub 官方源"/);
+  assert.match(source, /--proto '=https' --proto-redir '=https'/);
   assert.match(source, /systemctl restart bili-record-2k\.service/);
   assert.match(source, /api\/state/);
   assert.doesNotMatch(source, /\beval\b/);
+  const provision = fs.readFileSync(path.join(__dirname, '..', 'packaging', 'linux', 'provision.sh'), 'utf8');
+  assert.match(provision, /install -d -m 0770 -o root -g "\$SERVICE_GROUP" "\$UPDATE_ROOT"/);
+  assert.match(provision, /install -d -m 2770 -o root -g "\$SERVICE_GROUP" "\$STATE_ROOT\/recordings"/);
+  assert.match(provision, /runuser -u "\$SERVICE_USER"/);
+  const updatePathUnit = fs.readFileSync(
+    path.join(__dirname, '..', 'packaging', 'linux', 'bili-record-2k-update.path'),
+    'utf8'
+  );
+  assert.match(updatePathUnit, /apply-request\.processing\.json/);
 });

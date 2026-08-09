@@ -7,6 +7,7 @@ const os = require('node:os');
 const tls = require('node:tls');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { validateRemoteUrl } = require('./security.cjs');
 
 let ffmpegStatic = null;
 try {
@@ -136,6 +137,46 @@ function mergeCookieString(existingCookie, setCookieHeaders) {
     .join('; ');
 }
 
+function cookieHeadersFromLoginUrl(value) {
+  let target;
+  try {
+    target = new URL(String(value || ''));
+  } catch {
+    return [];
+  }
+  const hostname = target.hostname.toLowerCase();
+  if (
+    hostname !== 'bilibili.com' &&
+    !hostname.endsWith('.bilibili.com') &&
+    hostname !== 'biligame.com' &&
+    !hostname.endsWith('.biligame.com')
+  ) {
+    return [];
+  }
+  const allowedNames = new Map(
+    ['SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5', 'sid', 'buvid3', 'buvid4'].map((name) => [
+      name.toLowerCase(),
+      name
+    ])
+  );
+  const result = [];
+  for (const part of target.search.slice(1).split('&')) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) continue;
+    let name;
+    try {
+      name = decodeURIComponent(part.slice(0, separator).replace(/\+/g, ' '));
+    } catch {
+      continue;
+    }
+    const canonicalName = allowedNames.get(name.toLowerCase());
+    const rawValue = part.slice(separator + 1);
+    if (!canonicalName || !rawValue || /[\r\n;]/.test(rawValue)) continue;
+    result.push(`${canonicalName}=${rawValue}`);
+  }
+  return result;
+}
+
 function sanitizeFilename(name) {
   return String(name || 'recording')
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
@@ -263,6 +304,8 @@ function isBilibiliHost(hostname) {
     host.endsWith('.bilibili.com') ||
     host === 'bilivideo.com' ||
     host.endsWith('.bilivideo.com') ||
+    host === 'bilivideo.cn' ||
+    host.endsWith('.bilivideo.cn') ||
     host === 'hdslb.com' ||
     host.endsWith('.hdslb.com') ||
     host === 'biliimg.com' ||
@@ -271,10 +314,11 @@ function isBilibiliHost(hostname) {
 }
 
 function getCookieValue(cookie, key) {
+  const expectedKey = String(key || '').toLowerCase();
   for (const part of String(cookie || '').split(';')) {
     const trimmed = part.trim();
     const index = trimmed.indexOf('=');
-    if (index > 0 && trimmed.slice(0, index) === key) {
+    if (index > 0 && trimmed.slice(0, index).toLowerCase() === expectedKey) {
       return trimmed.slice(index + 1);
     }
   }
@@ -342,7 +386,7 @@ async function detectFfmpegCapabilities(ffmpegPath) {
       continue;
     }
     if (candidate.kind === 'hardware') {
-      if (!hasVideoAdapterVendor(videoAdapters, candidate.vendor)) {
+      if (!shouldTestHardwareEncoder(candidate, videoAdapters)) {
         unavailableBurnCodecs.push({ ...candidate, reason: '未检测到对应显卡' });
         continue;
       }
@@ -466,6 +510,34 @@ function parseFfmpegHwaccels(output) {
 }
 
 async function detectVideoAdapters() {
+  if (process.platform === 'linux') {
+    const adapters = [];
+    const entries = await fsp.readdir('/sys/class/drm', { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!/^card\d+$/.test(entry.name)) continue;
+      const deviceRoot = path.join('/sys/class/drm', entry.name, 'device');
+      const [vendorId, uevent] = await Promise.all([
+        fsp.readFile(path.join(deviceRoot, 'vendor'), 'utf8').catch(() => ''),
+        fsp.readFile(path.join(deviceRoot, 'uevent'), 'utf8').catch(() => '')
+      ]);
+      const label = `${entry.name} ${vendorId.trim()} ${uevent}`.trim();
+      const vendor = detectVideoAdapterVendor(label);
+      if (vendor !== 'unknown') adapters.push({ name: label.split(/\r?\n/)[0], vendor });
+    }
+    if (!adapters.some((adapter) => adapter.vendor === 'nvidia')) {
+      const result = await runCapturedProcess(
+        'nvidia-smi',
+        ['--query-gpu=name', '--format=csv,noheader'],
+        { timeoutMs: 3000, maxOutputBytes: 32 * 1024 }
+      );
+      if (result.status === 0) {
+        for (const name of String(result.stdout || '').split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+          adapters.push({ name, vendor: 'nvidia' });
+        }
+      }
+    }
+    return Array.from(new Map(adapters.map((adapter) => [`${adapter.vendor}:${adapter.name}`, adapter])).values());
+  }
   if (process.platform !== 'win32') {
     return [];
   }
@@ -502,13 +574,13 @@ async function detectVideoAdapters() {
 
 function detectVideoAdapterVendor(value) {
   const text = String(value || '').toLowerCase();
-  if (text.includes('nvidia') || text.includes('ven_10de')) {
+  if (text.includes('nvidia') || text.includes('ven_10de') || text.includes('0x10de')) {
     return 'nvidia';
   }
-  if (text.includes('intel') || text.includes('ven_8086')) {
+  if (text.includes('intel') || text.includes('ven_8086') || text.includes('0x8086')) {
     return 'intel';
   }
-  if (text.includes('amd') || text.includes('radeon') || text.includes('advanced micro devices') || text.includes('ven_1002')) {
+  if (text.includes('amd') || text.includes('radeon') || text.includes('advanced micro devices') || text.includes('ven_1002') || text.includes('0x1002')) {
     return 'amd';
   }
   return 'unknown';
@@ -516,6 +588,10 @@ function detectVideoAdapterVendor(value) {
 
 function hasVideoAdapterVendor(adapters, vendor) {
   return adapters.some((adapter) => adapter.vendor === vendor);
+}
+
+function shouldTestHardwareEncoder(candidate, adapters, platform = process.platform) {
+  return String(platform) !== 'win32' || hasVideoAdapterVendor(adapters, candidate.vendor);
 }
 
 async function testFfmpegEncoder(ffmpegPath, codec) {
@@ -1060,10 +1136,24 @@ function parseFfmpegVideoInfo(text) {
     return null;
   }
   const codecMatch = line.match(/Video:\s*([^,\r\n]+)/i);
+  const profileMatch = line.match(/Video:\s*[^,(]+\s*\(([^)]+)\)/i);
+  const pixelFormatMatch = line.match(/Video:\s*[^,]+,\s*([a-z0-9_]+)(?:\(([^)]*)\))?/i);
   const fpsMatch = line.match(/,\s*([0-9]+(?:\.[0-9]+)?)\s*fps/i);
   const fps = fpsMatch ? Number(fpsMatch[1]) : 0;
+  const pixelFormat = pixelFormatMatch?.[1] || '';
+  const colorParts = String(pixelFormatMatch?.[2] || '').split('/').map((part) => part.trim());
+  const bitDepthMatch = pixelFormat.match(/p0?(\d{2})(?:le|be)?$/i);
+  const profile = profileMatch?.[1]?.trim() || '';
+  const bitDepth = bitDepthMatch ? Number(bitDepthMatch[1]) : /(?:main\s*10|10-bit)/i.test(profile) ? 10 : 8;
   return {
     codec: codecMatch ? codecMatch[1].trim() : '',
+    profile,
+    pixelFormat,
+    bitDepth,
+    colorSpace: colorParts.length >= 3 ? colorParts[0].replace(/^tv,\s*/, '') : '',
+    colorPrimaries: colorParts.length >= 3 ? colorParts[1] : '',
+    colorTransfer: colorParts.length >= 3 ? colorParts[2] : '',
+    hdr: /(?:smpte2084|arib-std-b67|bt2020)/i.test(String(pixelFormatMatch?.[2] || '')),
     width: Number(sizeMatch[1]),
     height: Number(sizeMatch[2]),
     fps: Number.isFinite(fps) && fps > 0 ? fps : undefined
@@ -1134,9 +1224,6 @@ function getRuntimePort(settingsPort) {
   if (portIndex >= 0 && argv[portIndex + 1]) {
     return clamp(Number(argv[portIndex + 1]), 1, 65535);
   }
-  if (process.env.BILI_RECORD_PORT || process.env.PORT) {
-    return clamp(Number(process.env.BILI_RECORD_PORT || process.env.PORT), 1, 65535);
-  }
   return clamp(Number(settingsPort || DEFAULT_PORT), 1, 65535);
 }
 
@@ -1157,9 +1244,6 @@ function getRuntimeHost(settingsHost) {
   const hostIndex = argv.indexOf('--host');
   if (hostIndex >= 0 && argv[hostIndex + 1]) {
     return normalizeServerHost(argv[hostIndex + 1]);
-  }
-  if (process.env.BILI_RECORD_HOST || process.env.HOST) {
-    return normalizeServerHost(process.env.BILI_RECORD_HOST || process.env.HOST);
   }
   return normalizeServerHost(settingsHost || '127.0.0.1');
 }
@@ -1225,7 +1309,7 @@ function getAppVersion() {
 }
 
 async function requestUrlBuffer(rawUrl, options = {}, redirectCount = 0) {
-  if (redirectCount > 8) {
+  if (redirectCount > Number(options.maxRedirects ?? 8)) {
     throw new Error('请求重定向次数过多。');
   }
   const maxAttempts = redirectCount === 0 ? clamp(Number(options.retries ?? 4), 1, 8) : 1;
@@ -1250,10 +1334,26 @@ async function requestUrlBuffer(rawUrl, options = {}, redirectCount = 0) {
 
 async function requestUrlBufferOnce(rawUrl, options = {}, redirectCount = 0) {
   const target = new URL(rawUrl);
-  const proxy = await getProxyForUrl(target);
+  const validation = options.validateUrl ? await options.validateUrl(target, redirectCount) : null;
+  const initialOrigin = options._initialOrigin || target.origin;
+  let headers = typeof options.headersForUrl === 'function'
+    ? options.headersForUrl(target, redirectCount)
+    : { ...(options.headers || {}) };
+  if (redirectCount > 0 && target.origin !== initialOrigin && typeof options.headersForUrl !== 'function') {
+    for (const name of Object.keys(headers)) {
+      if (/^(?:authorization|proxy-authorization|cookie|host)$/i.test(name)) delete headers[name];
+    }
+  }
+  const requestOptions = {
+    ...options,
+    headers,
+    lookup: validation?.lookup || options.lookup,
+    _initialOrigin: initialOrigin
+  };
+  const proxy = options.allowProxy === false ? null : await getProxyForUrl(target);
   return proxy
-    ? requestUrlViaHttpProxy(target, proxy, options, redirectCount)
-    : requestUrlDirect(target, options, redirectCount);
+    ? requestUrlViaHttpProxy(target, proxy, requestOptions, redirectCount)
+    : requestUrlDirect(target, requestOptions, redirectCount);
 }
 
 function requestUrlDirect(target, options, redirectCount) {
@@ -1266,7 +1366,8 @@ function requestUrlDirect(target, options, redirectCount) {
         port: target.port || (target.protocol === 'https:' ? 443 : 80),
         path: `${target.pathname}${target.search}`,
         method: options.method || 'GET',
-        headers: options.headers || {}
+        headers: options.headers || {},
+        lookup: options.lookup
       },
       (response) => collectUrlResponse(response, target, options, redirectCount, resolve, reject)
     );
@@ -1431,52 +1532,82 @@ function formatBytes(bytes) {
 }
 
 async function discoverRecordingFiles(outputDir, options = {}) {
-  const recordings = [];
+  const candidates = [];
   const maxDepth = Number.isFinite(Number(options.maxDepth)) ? Number(options.maxDepth) : 4;
+  const limit = Math.max(1, Number(options.limit || 160));
+  const concurrency = Math.max(1, Math.min(8, Number(options.concurrency || 4)));
 
-  async function visit(directory, depth) {
-    let entries;
-    try {
-      entries = await fsp.readdir(directory, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const filePath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        if (depth < maxDepth) {
-          await visit(filePath, depth + 1);
+  let directories = [outputDir];
+  for (let depth = 0; depth <= maxDepth && directories.length; depth += 1) {
+    const currentDirectories = directories;
+    const nextDirectories = [];
+    let directoryCursor = 0;
+    const scanDirectory = async () => {
+      while (directoryCursor < currentDirectories.length) {
+        const directory = currentDirectories[directoryCursor++];
+        const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          const filePath = path.join(directory, entry.name);
+          if (entry.isDirectory()) {
+            if (depth < maxDepth) nextDirectories.push(filePath);
+            continue;
+          }
+          if (
+            entry.isFile() &&
+            /\.(?:clean|merged)\.(?:mp4|mkv)$/i.test(entry.name) &&
+            !/\.tmp\.|\.finalizing\.|\.clip_/i.test(entry.name)
+          ) {
+            candidates.push(filePath);
+          }
         }
-        continue;
       }
-      if (!entry.isFile()) {
-        continue;
-      }
-      const name = entry.name;
-      if (!/\.(?:clean|merged)\.(?:mp4|mkv)$/i.test(name)) {
-        continue;
-      }
-      if (/\.tmp\.|\.finalizing\.|\.clip_/i.test(name)) {
-        continue;
-      }
-      const cleanPath = filePath;
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, currentDirectories.length) }, () => scanDirectory())
+    );
+    directories = nextDirectories;
+  }
+
+  const statCandidates = [];
+  let statCursor = 0;
+  const statWorker = async () => {
+    while (statCursor < candidates.length) {
+      const cleanPath = candidates[statCursor++];
       const stat = await fsp.stat(cleanPath).catch(() => null);
-      if (!stat?.isFile()) {
-        continue;
-      }
+      if (stat?.isFile()) statCandidates.push({ cleanPath, stat });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, candidates.length) }, () => statWorker()));
+  const selected = statCandidates.sort((a, b) => Number(b.stat.mtimeMs) - Number(a.stat.mtimeMs)).slice(0, limit);
+  const recordings = new Array(selected.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < selected.length) {
+      const index = cursor++;
+      const { cleanPath, stat } = selected[index];
       const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
-      const danmakuInfo = await danmakuAss.inspectDanmakuFile(danmakuPath);
+      const metadataPath = `${cleanPath}.metadata.json`;
+      const metadata = await fsp.readFile(metadataPath, 'utf8').then(JSON.parse).catch(() => null);
+      const metadataUsable =
+        metadata?.schemaVersion === 1 &&
+        Number(metadata.fileSize) === Number(stat.size) &&
+        Math.abs(Number(metadata.fileMtimeMs) - Number(stat.mtimeMs)) < 2;
+      const danmakuInfo = metadataUsable
+        ? { eventCount: Number(metadata.eventCount || 0), durationSec: Number(metadata.danmakuDurationSec || 0) }
+        : await danmakuAss.inspectDanmakuFile(danmakuPath);
       const eventCount = danmakuInfo.eventCount;
       const elapsedSec = estimateRecordingDurationFromStats(cleanPath, stat);
       const danmakuDurationSec = danmakuInfo.durationSec;
       const valid = stat.size >= 32 * 1024;
-      let mediaInfo = { durationSec: 0, videoInfo: null };
-      if (valid) {
+      let mediaInfo = metadataUsable
+        ? { durationSec: Number(metadata.durationSec || 0), videoInfo: metadata.videoInfo || null }
+        : { durationSec: 0, videoInfo: null };
+      if (valid && !metadataUsable) {
         mediaInfo = await probeMediaFileInfo(options.ffmpegPath, cleanPath, { timeoutMs: options.probeTimeoutMs }).catch(
           () => mediaInfo
         );
       }
-      recordings.push({
+      recordings[index] = {
         id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
         startedAt: stat.mtimeMs,
         cleanPath,
@@ -1500,13 +1631,13 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         rawDanmakuCount: eventCount,
         ignoredDanmakuCount: 0,
         danmakuCommandCounts: {},
-        videoInfo: mediaInfo.videoInfo
-      });
+        videoInfo: mediaInfo.videoInfo,
+        metadataPath
+      };
     }
   }
-
-  await visit(outputDir, 0);
-  return recordings;
+  await Promise.all(Array.from({ length: Math.min(concurrency, selected.length) }, () => worker()));
+  return recordings.filter(Boolean);
 }
 
 async function countDanmakuLines(filePath) {
@@ -1585,13 +1716,27 @@ function collectUrlResponse(response, target, options, redirectCount, resolve, r
   const location = response.headers.location;
   if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
     response.resume();
+    if (redirectCount >= Number(options.maxRedirects ?? 8)) {
+      reject(new Error('请求重定向次数过多。'));
+      return;
+    }
     resolve(requestUrlBuffer(new URL(location, target).toString(), options, redirectCount + 1));
     return;
   }
   const chunks = [];
   const totalBytes = Number(response.headers['content-length'] || 0);
+  const maxBytes = Math.max(0, Number(options.maxBytes || 0));
+  if (maxBytes && totalBytes > maxBytes) {
+    response.destroy();
+    reject(new Error(`远端响应超过大小限制 ${maxBytes} 字节。`));
+    return;
+  }
   let receivedBytes = 0;
   response.on('data', (chunk) => {
+    if (maxBytes && receivedBytes + chunk.length > maxBytes) {
+      response.destroy(new Error(`远端响应超过大小限制 ${maxBytes} 字节。`));
+      return;
+    }
     chunks.push(chunk);
     receivedBytes += chunk.length;
     options.onProgress?.({ receivedBytes, totalBytes, done: false });
@@ -1603,7 +1748,7 @@ function collectUrlResponse(response, target, options, redirectCount, resolve, r
       return;
     }
     options.onProgress?.({ receivedBytes: body.length, totalBytes, done: true });
-    resolve(body);
+    resolve(options.includeResponseMetadata ? { body, statusCode, headers: response.headers, url: target.toString() } : body);
   });
   response.on('error', reject);
 }
@@ -1743,7 +1888,11 @@ async function readTextSource(source, options = {}) {
       },
       retries: options.retries,
       timeoutMs: options.timeoutMs,
-      onRetry: options.onRetry
+      onRetry: options.onRetry,
+      maxRedirects: 4,
+      maxBytes: 2 * 1024 * 1024,
+      allowProxy: false,
+      validateUrl: (target) => validateRemoteUrl(target, { protocols: ['https:'] })
     });
     return body.toString('utf8');
   }
@@ -1778,7 +1927,8 @@ function normalizeUpdateManifest(payload, options = {}) {
       packageUrl: packageAsset?.url || '',
       sha256: packageAsset?.sha256 || payload.sha256 || '',
       releaseUrl: payload.html_url || '',
-      notes: payload.body || ''
+      notes: payload.body || '',
+      packageName: packageAsset?.name || packageFileNameFromUrl(packageAsset?.url || '')
     };
   }
   const files = Array.isArray(payload.files) ? payload.files : [];
@@ -1801,7 +1951,12 @@ function normalizeUpdateManifest(payload, options = {}) {
       '',
     installerArgs: payload.installerArgs,
     releaseUrl: payload.releaseUrl || payload.htmlUrl || '',
-    notes: payload.notes || payload.body || ''
+    notes: payload.notes || payload.body || '',
+    packageName: packageFile?.name || packageFileNameFromUrl(packageUrl),
+    packageArch: packageFile?.arch || '',
+    signed: payload.signed || null,
+    signatureAlgorithm: String(payload.signatureAlgorithm || ''),
+    signature: String(payload.signature || '')
   };
 }
 
@@ -1975,11 +2130,16 @@ function updatePackageLabel(manifest) {
 function updatePackageFileName(manifest) {
   const version = sanitizeFilename(manifest?.version || 'latest');
   const packageType = normalizeUpdatePackageType(manifest?.packageType || manifest?.packageUrl, process.platform);
+  const signedName = String(manifest?.packageName || '');
+  if (signedName && path.basename(signedName) === signedName && !/[\\/]/.test(signedName)) {
+    return signedName;
+  }
   if (packageType === 'deb') {
-    return `bili-record-2k_${version}_all.deb`;
+    const arch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+    return `bili-record-2k_${version}_${arch}.deb`;
   }
   if (packageType === 'tarball') {
-    return `bili-record-2k_${version}_linux_all.tar.gz`;
+    return `bili-record-2k_${version}_linux_${process.arch}.tar.gz`;
   }
   const urlName = packageFileNameFromUrl(manifest?.packageUrl || '');
   const extension = path.extname(urlName).toLowerCase();
@@ -1997,17 +2157,38 @@ function packageFileNameFromUrl(value) {
   }
 }
 
-function compareVersions(a, b) {
-  const left = normalizeVersion(a).split(/[.-]/).map((part) => Number(part) || 0);
-  const right = normalizeVersion(b).split(/[.-]/).map((part) => Number(part) || 0);
-  const length = Math.max(left.length, right.length, 3);
-  for (let index = 0; index < length; index += 1) {
-    const diff = (left[index] || 0) - (right[index] || 0);
-    if (diff !== 0) {
-      return diff;
-    }
+function compareVersions(left, right) {
+  const a = parseSemver(left);
+  const b = parseSemver(right);
+  for (const key of ['major', 'minor', 'patch']) {
+    if (a[key] !== b[key]) return a[key] - b[key];
+  }
+  if (!a.prerelease.length && b.prerelease.length) return 1;
+  if (a.prerelease.length && !b.prerelease.length) return -1;
+  for (let index = 0; index < Math.max(a.prerelease.length, b.prerelease.length); index += 1) {
+    if (a.prerelease[index] === undefined) return -1;
+    if (b.prerelease[index] === undefined) return 1;
+    const leftPart = a.prerelease[index];
+    const rightPart = b.prerelease[index];
+    if (leftPart === rightPart) continue;
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) return Number(leftPart) - Number(rightPart);
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftPart.localeCompare(rightPart);
   }
   return 0;
+}
+
+function parseSemver(value) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(normalizeVersion(value));
+  if (!match) throw new Error(`无效的 SemVer：${value}`);
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ? match[4].split('.') : []
+  };
 }
 
 async function downloadFile(url, targetPath, onProgress) {
@@ -2015,33 +2196,118 @@ async function downloadFile(url, targetPath, onProgress) {
     throw new Error('更新包下载地址无效。');
   }
   const tmpPath = `${targetPath}.tmp`;
-  await fsp.rm(tmpPath, { force: true });
-  const body = await requestUrlBuffer(url, {
+  const options = {
     headers: {
       Accept: 'application/x-msdownload, application/vnd.microsoft.portable-executable, application/vnd.debian.binary-package, application/gzip, application/zip, application/octet-stream, */*',
       'User-Agent': `${APP_NAME}/${APP_VERSION}`
     },
     onProgress,
-    onRetry: ({ attempt, maxAttempts, error }) => {
+    maxRedirects: 4,
+    maxBytes: 8 * 1024 * 1024 * 1024,
+    validateUrl: (target) => validateRemoteUrl(target, { protocols: ['https:'] })
+  };
+  let lastError;
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    await fsp.rm(tmpPath, { force: true });
+    try {
+      await downloadUrlToFile(url, tmpPath, options);
+      await fsp.rm(targetPath, { force: true });
+      await fsp.rename(tmpPath, targetPath);
+      return;
+    } catch (error) {
+      lastError = error;
+      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      if (attempt >= maxAttempts || !isTransientNetworkError(error)) break;
       onProgress?.({
         retrying: true,
         attempt,
-        maxAttempts,
+        maxAttempts: maxAttempts,
         error,
         receivedBytes: 0,
         totalBytes: 0,
         done: false
       });
+      await delay(Math.min(attempt * 800, 3000));
     }
+  }
+  throw lastError || new Error('更新包下载失败。');
+}
+
+async function downloadUrlToFile(rawUrl, temporaryPath, options, redirectCount = 0) {
+  if (redirectCount > Number(options.maxRedirects || 0)) throw new Error('更新包重定向次数过多。');
+  const target = new URL(rawUrl);
+  const validation = await options.validateUrl(target);
+  await new Promise((resolve, reject) => {
+    const transport = target.protocol === 'https:' ? https : http;
+    const request = transport.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method: 'GET',
+        headers: options.headers,
+        lookup: validation.lookup
+      },
+      (response) => {
+        const statusCode = Number(response.statusCode || 0);
+        const location = response.headers.location;
+        if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
+          response.resume();
+          resolve(downloadUrlToFile(new URL(location, target).toString(), temporaryPath, options, redirectCount + 1));
+          return;
+        }
+        if (statusCode < 200 || statusCode >= 300) {
+          response.resume();
+          reject(new Error(`更新包下载失败：HTTP ${statusCode}`));
+          return;
+        }
+        const maxBytes = Number(options.maxBytes || 0);
+        const totalBytes = Number(response.headers['content-length'] || 0);
+        if (maxBytes && totalBytes > maxBytes) {
+          response.destroy();
+          reject(new Error(`更新包超过大小限制 ${maxBytes} 字节。`));
+          return;
+        }
+        const output = fs.createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 });
+        let receivedBytes = 0;
+        let settled = false;
+        const fail = (error) => {
+          if (settled) return;
+          settled = true;
+          response.destroy();
+          output.destroy();
+          reject(error);
+        };
+        response.on('data', (chunk) => {
+          receivedBytes += chunk.length;
+          if (maxBytes && receivedBytes > maxBytes) {
+            fail(new Error(`更新包超过大小限制 ${maxBytes} 字节。`));
+            return;
+          }
+          options.onProgress?.({ receivedBytes, totalBytes, done: false });
+        });
+        response.on('error', fail);
+        output.on('error', fail);
+        output.on('finish', () => {
+          if (settled) return;
+          settled = true;
+          options.onProgress?.({ receivedBytes, totalBytes, done: true });
+          resolve();
+        });
+        response.pipe(output);
+      }
+    );
+    request.setTimeout(45_000, () => request.destroy(new Error('更新包下载超时。')));
+    request.on('error', reject);
+    request.end();
   });
-  await fsp.writeFile(tmpPath, body);
-  await fsp.rm(targetPath, { force: true });
-  await fsp.rename(tmpPath, targetPath);
 }
 
 async function fileSha256(filePath) {
   const hash = crypto.createHash('sha256');
-  hash.update(await fsp.readFile(filePath));
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
   return hash.digest('hex');
 }
 
@@ -2174,6 +2440,7 @@ module.exports = {
   getSetCookieHeaders,
   splitSetCookieHeader,
   mergeCookieString,
+  cookieHeadersFromLoginUrl,
   sanitizeFilename,
   sanitizeHeaderValue,
   createImageProxyHeaders,
@@ -2201,6 +2468,7 @@ module.exports = {
   detectVideoAdapters,
   detectVideoAdapterVendor,
   hasVideoAdapterVendor,
+  shouldTestHardwareEncoder,
   testFfmpegEncoder,
   normalizeBurnCodec,
   normalizeRoomImageMode,

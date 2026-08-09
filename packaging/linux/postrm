@@ -4,6 +4,6 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
 fi
 if [ "${1:-}" = purge ]; then
-  echo 'BiliRecord2K recordings and /etc/bili-record-2k were preserved intentionally.'
+  echo 'BiliRecord2K recordings, /etc/bili-record-2k, and /var/lib/bili-record-2k-updates were preserved intentionally.'
 fi
 exit 0

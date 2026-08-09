@@ -18,4 +18,4 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
 fi
 echo 'BiliRecord2K program files were removed.'
-echo 'Recordings and configuration under /var/lib/bili-record-2k and /etc/bili-record-2k were preserved.'
+echo 'Recordings, configuration, and /var/lib/bili-record-2k-updates were preserved.'

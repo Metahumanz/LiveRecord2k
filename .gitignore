@@ -4,5 +4,6 @@ dist/
 release/
 smoke-output/
 *.log
+*.tsbuildinfo
 .DS_Store
 Thumbs.db

@@ -49,15 +49,43 @@ async function main() {
       sha256: await fileSha256(path.join(releaseDir, entry.name))
     });
   }
-  for (const required of ['installer', 'portable', 'deb', 'tarball']) {
-    if (!files.some((file) => file.kind === required)) throw new Error(`Missing ${required} release package.`);
+  for (const required of [
+    ['installer', 'win32', 'x64'],
+    ['portable', 'win32', 'x64'],
+    ['deb', 'linux', 'x64'],
+    ['deb', 'linux', 'arm64'],
+    ['tarball', 'linux', 'x64'],
+    ['tarball', 'linux', 'arm64']
+  ]) {
+    const [kind, platform, arch] = required;
+    if (!files.some((file) => file.kind === kind && file.platform === platform && file.arch === arch)) {
+      throw new Error(`Missing ${platform}/${arch} ${kind} release package.`);
+    }
   }
   files.sort((left, right) => left.name.localeCompare(right.name));
   const installer = files.find((file) => file.kind === 'installer');
   const portable = files.find((file) => file.kind === 'portable');
-  const manifest = {
-    schemaVersion: 2,
+  const signed = {
+    schemaVersion: 1,
+    app: 'bili-record-2k',
     name: 'BiliRecord2K',
+    version,
+    tagName,
+    releasedAt: new Date().toISOString(),
+    files
+  };
+  const privateKeySource = String(process.env.UPDATE_SIGNING_PRIVATE_KEY_B64 || '').trim();
+  if (!privateKeySource) {
+    throw new Error('UPDATE_SIGNING_PRIVATE_KEY_B64 is required to sign an official release manifest.');
+  }
+  const privateKey = Buffer.from(privateKeySource, 'base64').toString('utf8');
+  const signature = crypto.sign(null, Buffer.from(stableStringify(signed)), privateKey).toString('base64');
+  const manifest = {
+    schemaVersion: 3,
+    signed,
+    signatureAlgorithm: 'ed25519',
+    signature,
+    name: signed.name,
     version,
     tagName,
     packageType: 'installer',
@@ -68,13 +96,21 @@ async function main() {
     portableUrl: portable.url,
     portableSha256: portable.sha256,
     releaseUrl: `https://github.com/${repository}/releases/tag/${tagName}`,
-    releasedAt: new Date().toISOString(),
+    releasedAt: signed.releasedAt,
     files
   };
   const outputPath = path.join(releaseDir, 'update.json');
   await fsp.writeFile(outputPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   console.log(`Generated ${outputPath}`);
   console.log(JSON.stringify(manifest, null, 2));
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function normalizeArch(value) {
