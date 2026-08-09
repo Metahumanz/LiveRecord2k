@@ -88,10 +88,11 @@ function normalizeDanmakuEvent(command, startedAt) {
   return null;
 }
 
+const DEFAULT_CJK_FONT = process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei';
 const DEFAULT_DANMAKU_STYLE = {
   playWidth: 1920,
   playHeight: 1080,
-  fontFamily: 'Microsoft YaHei',
+  fontFamily: DEFAULT_CJK_FONT,
   danmakuFontSize: 38,
   danmakuOutline: 2,
   danmakuLanes: 8,
@@ -202,7 +203,15 @@ async function ensureDanmakuCss(cssPath) {
   try {
     await fsp.access(cssPath);
   } catch {
-    await fsp.writeFile(cssPath, createDefaultDanmakuCss(), 'utf8');
+    const temporary = `${cssPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(temporary, createDefaultDanmakuCss(), { encoding: 'utf8', mode: 0o660 });
+    try {
+      await fsp.link(temporary, cssPath);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    } finally {
+      await fsp.rm(temporary, { force: true }).catch(() => {});
+    }
   }
   return cssPath;
 }
@@ -217,7 +226,7 @@ function createDefaultDanmakuCss() {
 :root {
   --play-width: 1920;
   --play-height: 1080;
-  --font-family: Microsoft YaHei;
+  --font-family: ${DEFAULT_CJK_FONT};
   --danmaku-font-size: 38;
   --danmaku-outline: 2;
   --danmaku-lanes: 8;

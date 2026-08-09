@@ -71,16 +71,14 @@ class AccessAuthManager {
     this.sessionTtlMs = Number(options.sessionTtlMs || SESSION_TTL_MS);
     this.sessions = new Map();
     this.failures = new Map();
-    this.environmentPasswordHash = '';
   }
 
   async initFromEnvironment() {
-    const password = String(process.env.BILI_RECORD_AUTH_PASSWORD || '');
-    this.environmentPasswordHash = password ? await hashAccessPassword(password) : '';
+    // Compatibility no-op: service bootstrap persists environment credentials.
   }
 
   getPasswordHash(settings) {
-    return this.environmentPasswordHash || String(settings?.accessPasswordHash || '');
+    return String(settings?.accessPasswordHash || '');
   }
 
   isConfigured(settings) {
@@ -99,12 +97,12 @@ class AccessAuthManager {
 
     const passwordHash = this.getPasswordHash(settings);
     if (!passwordHash) {
-      const error = new Error('远程访问密码尚未配置，请先在服务端本机设置，或设置 BILI_RECORD_AUTH_PASSWORD。');
+      const error = new Error('远程访问密码尚未配置，请先通过本机 WebUI 设置；全新 Linux 安装也可在首次 bootstrap 时提供密码。');
       error.statusCode = 503;
       throw error;
     }
 
-    const expectedUsername = String(process.env.BILI_RECORD_AUTH_USERNAME || settings?.accessUsername || 'admin').trim() || 'admin';
+    const expectedUsername = String(settings?.accessUsername || 'admin').trim() || 'admin';
     const passwordMatches = await verifyAccessPassword(password, passwordHash);
     const usernameMatches = safeTextEqual(String(username || ''), expectedUsername);
     if (!usernameMatches || !passwordMatches) {

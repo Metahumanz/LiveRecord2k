@@ -12,6 +12,7 @@ const {
   getSetCookieHeaders,
   splitSetCookieHeader,
   mergeCookieString,
+  cookieHeadersFromLoginUrl,
   danmakuCommandType,
   normalizeDanmakuEvent,
   normalizeDanmakuDisplayArea,
@@ -29,8 +30,10 @@ const {
   createClipCopyArgs,
   createConcatCopyArgs,
   createConcatTranscodeArgs,
+  createAudioAlignArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
+  assertSafeMergeTargetProfile,
   writeConcatFile,
   escapeConcatPath,
   mergeDanmakuFiles,
@@ -169,6 +172,11 @@ const {
   mimeType
 } = require('../shared/helpers.cjs');
 const { AccessAuthManager, hashAccessPassword } = require('./auth.cjs');
+const { AtomicJsonStore } = require('./atomic-store.cjs');
+const { MediaJobManager } = require('./media-job-manager.cjs');
+const { normalizeTrustedProxyList, validateRemoteUrl, redactSensitive } = require('../shared/security.cjs');
+const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safety.cjs');
+const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 
 
 
@@ -185,6 +193,7 @@ const USER_AGENT =
 
 const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
+const RECORDING_LIBRARY_LIMIT = 160;
 const DEFAULT_PORT = 3263;
 const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
 const MIN_PLAYABLE_BYTES = 128 * 1024;
@@ -350,6 +359,8 @@ class LiveRecordService {
         ? process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
         : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
     this.storePath = path.join(appData, 'BiliRecord2K', STORE_FILE);
+    this.stateStore = new AtomicJsonStore(this.storePath);
+    this.storeExists = false;
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
     this.legacyRepairCacheDir = path.join(appData, 'BiliRecord2K', 'repair-cache');
     this.settings = this.createDefaultSettings();
@@ -367,6 +378,13 @@ class LiveRecordService {
     this.activeBurnQueueItem = null;
     this.burnCancelRequests = new Set();
     this.pendingSegmentCleanups = new Map();
+    this.mergeProcesses = new Map();
+    this.mergeCancelRequests = new Set();
+    this.mediaJobs = new MediaJobManager();
+    this.draining = false;
+    this.shutdownPromise = null;
+    this.shutdownHandler = null;
+    this.linuxCjkFontVerified = process.platform !== 'linux';
     this.previewSessions = new Map();
     this.exportPreviewProcess = null;
     this.exportPreviewProgress = null;
@@ -381,6 +399,7 @@ class LiveRecordService {
     this.recordings = [];
     this.recordingScanPromise = null;
     this.clients = new Map();
+    this.stateEmitTimer = null;
     this.notifications = [];
     this.notificationSeq = 0;
     this.webhookQueue = [];
@@ -424,7 +443,7 @@ class LiveRecordService {
 
   createDefaultSettings() {
     return {
-      outputDir: process.env.BILI_RECORD_OUTPUT_DIR || path.join(os.homedir(), 'Videos', '哔哩录播2K'),
+      outputDir: path.join(os.homedir(), 'Videos', '哔哩录播2K'),
       cookie: '',
       pollIntervalSec: 15,
       targetQn: 15000,
@@ -446,20 +465,23 @@ class LiveRecordService {
       webhookEnabled: false,
       webhookUrl: '',
       webhookBearerToken: '',
+      webhookAllowPrivateNetwork: false,
       openBrowserOnStart: true,
       hideOverviewNextStep: false,
-      autoUpdateEnabled: process.platform === 'linux' && process.env.BILI_RECORD_AUTO_UPDATE === '1',
+      autoUpdateEnabled: false,
       updateManifestUrl: DEFAULT_UPDATE_MANIFEST_URL,
       serverHost: DEFAULT_HOST,
       serverPort: DEFAULT_PORT,
       accessUsername: 'admin',
-      accessPasswordHash: ''
+      accessPasswordHash: '',
+      trustedProxies: [],
+      configBootstrapVersion: 0
     };
   }
 
   async init() {
     await this.loadStore();
-    await this.accessAuth.initFromEnvironment();
+    await this.bootstrapPersistentConfiguration();
     await this.loadLastUpdateStatus();
     try {
       await this.prepareVersionedCaches();
@@ -493,6 +515,11 @@ class LiveRecordService {
       this.initializeRecordingLibrary().catch((error) => {
         this.log('warn', `后台扫描录像库失败：${error.message}`);
         this.emitState();
+      });
+    });
+    setImmediate(() => {
+      this.recoverPersistedSegmentCleanups().catch((error) => {
+        this.log('warn', `恢复 0.4.0 分段清理任务失败：${error.message}`);
       });
     });
     this.scheduleAutomaticUpdateCheck(AUTO_UPDATE_INITIAL_DELAY_MS);
@@ -612,14 +639,22 @@ class LiveRecordService {
 
   async loadStore() {
     try {
-      const raw = await fsp.readFile(this.storePath, 'utf8');
-      const store = JSON.parse(raw);
+      const result = await this.stateStore.load();
+      const store = result.store;
+      this.storeExists = await fsp.stat(this.storePath).then((stat) => stat.isFile()).catch(() => false);
       this.settings = this.normalizeSettings({ ...this.settings, ...(store.settings || {}) });
       for (const savedRoom of store.rooms || []) {
         const room = this.normalizeRoom(savedRoom);
         this.rooms.set(room.id, room);
       }
       this.recordings = (store.recordings || []).map((recording) => this.normalizeRecording(recording)).filter(Boolean);
+      this.pendingSegmentCleanups = new Map(
+        (store.segmentCleanups || []).filter((item) => item?.cleanupId).map((item) => [item.cleanupId, item])
+      );
+      if (result.recoveredFromBackup) {
+        this.log('warn', '主配置文件损坏，已从 settings.json.backup 恢复。');
+        await this.saveStore();
+      }
     } catch (error) {
       if (error.code !== 'ENOENT') {
         this.log('warn', `读取配置失败，将使用默认配置：${error.message}`);
@@ -628,7 +663,6 @@ class LiveRecordService {
   }
 
   async saveStore() {
-    await fsp.mkdir(path.dirname(this.storePath), { recursive: true });
     const rooms = Array.from(this.rooms.values()).map((room) => ({
       id: room.id,
       realRoomId: room.realRoomId,
@@ -638,9 +672,72 @@ class LiveRecordService {
       cover: room.cover,
       keyframe: room.keyframe,
       liveStatus: room.liveStatus,
-      monitoring: room.monitoring
+      monitoring: room.monitoring,
+      autoRecord: room.autoRecord !== false
     }));
-    await fsp.writeFile(this.storePath, JSON.stringify({ settings: this.settings, rooms, recordings: this.recordings }, null, 2), 'utf8');
+    await this.stateStore.save({
+      settings: this.settings,
+      rooms,
+      recordings: this.recordings,
+      mediaJobs: [],
+      segmentCleanups: Array.from(this.pendingSegmentCleanups.values())
+    });
+  }
+
+  async recoverPersistedSegmentCleanups() {
+    for (const cleanup of Array.from(this.pendingSegmentCleanups.values())) {
+      if (!cleanup?.cleanupId || !cleanup?.mergedRecording?.cleanPath || !Array.isArray(cleanup.segments)) continue;
+      const mergedExists = await isExistingFile(cleanup.mergedRecording.cleanPath);
+      if (!mergedExists) {
+        cleanup.status = 'error';
+        cleanup.lastError = '合并产物不存在，源分段受保护且不会清理。';
+        continue;
+      }
+      const room = this.rooms.get(String(cleanup.roomId)) || {
+        id: String(cleanup.roomId || 'cleanup'),
+        title: '分段清理',
+        anchor: '恢复任务'
+      };
+      await this.cleanupMergedSegmentFiles(room, cleanup.segments, cleanup.mergedRecording, {
+        cleanupId: cleanup.cleanupId
+      });
+    }
+    await this.saveStore();
+  }
+
+  async bootstrapPersistentConfiguration() {
+    const currentVersion = Number(this.settings.configBootstrapVersion || 0);
+    const legacyPassword = String(this.settings.legacyAccessPassword || '');
+    const environmentPassword = currentVersion < 1 ? String(process.env.BILI_RECORD_AUTH_PASSWORD || '') : '';
+    let changed = false;
+    if (!this.settings.accessPasswordHash && (legacyPassword || environmentPassword)) {
+      const password = legacyPassword || environmentPassword;
+      if (password.length < 8) {
+        throw new Error('首次配置的远程访问密码至少需要 8 位。');
+      }
+      this.settings.accessPasswordHash = await hashAccessPassword(password);
+      changed = true;
+    }
+    delete this.settings.legacyAccessPassword;
+    if (currentVersion < 1) {
+      const bootstrapHost = String(process.env.BILI_RECORD_HOST || '').trim();
+      const bootstrapPort = Number(process.env.BILI_RECORD_PORT || 0);
+      const bootstrapUsername = String(process.env.BILI_RECORD_AUTH_USERNAME || '').trim();
+      const bootstrapOutputDir = String(process.env.BILI_RECORD_OUTPUT_DIR || '').trim();
+      const bootstrapAutoUpdate = String(process.env.BILI_RECORD_AUTO_UPDATE || '').trim();
+      if (bootstrapHost) this.settings.serverHost = normalizeServerHost(bootstrapHost);
+      if (bootstrapPort >= 1 && bootstrapPort <= 65535) this.settings.serverPort = bootstrapPort;
+      if (bootstrapUsername) this.settings.accessUsername = bootstrapUsername.slice(0, 64);
+      if (bootstrapOutputDir) this.settings.outputDir = bootstrapOutputDir;
+      if (bootstrapAutoUpdate) this.settings.autoUpdateEnabled = process.platform === 'linux' && bootstrapAutoUpdate === '1';
+      this.settings.configBootstrapVersion = 1;
+      changed = true;
+    }
+    this.settings = this.normalizeSettings(this.settings);
+    if (changed) {
+      await this.saveStore();
+      this.log('info', '首次启动环境配置已迁移到持久化设置；后续运行不再读取 Host、Port、用户名和密码环境变量。');
+    }
   }
 
   normalizeSettings(settings) {
@@ -670,6 +767,7 @@ class LiveRecordService {
       webhookEnabled: Boolean(settings.webhookEnabled),
       webhookUrl: String(settings.webhookUrl || '').trim().slice(0, 2048),
       webhookBearerToken: String(settings.webhookBearerToken || '').trim().slice(0, 4096),
+      webhookAllowPrivateNetwork: Boolean(settings.webhookAllowPrivateNetwork),
       openBrowserOnStart: settings.openBrowserOnStart !== false,
       hideOverviewNextStep: Boolean(settings.hideOverviewNextStep),
       autoUpdateEnabled: Boolean(settings.autoUpdateEnabled),
@@ -677,7 +775,9 @@ class LiveRecordService {
       serverHost: normalizeServerHost(settings.serverHost || DEFAULT_HOST),
       serverPort: clamp(Number(settings.serverPort || DEFAULT_PORT), 1, 65535),
       accessUsername: String(settings.accessUsername || 'admin').trim().slice(0, 64) || 'admin',
-      accessPasswordHash: String(settings.accessPasswordHash || '')
+      accessPasswordHash: String(settings.accessPasswordHash || ''),
+      trustedProxies: normalizeTrustedProxyList(settings.trustedProxies),
+      configBootstrapVersion: Math.max(0, Number(settings.configBootstrapVersion || 0))
     };
   }
 
@@ -730,6 +830,7 @@ class LiveRecordService {
       keyframe: room.keyframe,
       liveStatus: room.liveStatus,
       monitoring: Boolean(room.monitoring),
+      autoRecord: room.autoRecord !== false,
       recording: false,
       burning: false,
       lastCheckedAt: room.lastCheckedAt,
@@ -763,6 +864,7 @@ class LiveRecordService {
       mergeSequence: Number(recording.mergeSequence || 0),
       mergeOutputPath: String(recording.mergeOutputPath || ''),
       mergedFrom: Array.isArray(recording.mergedFrom) ? recording.mergedFrom.map(String) : undefined,
+      cleanupId: String(recording.cleanupId || ''),
       durationSec: Number(recording.durationSec || 0),
       fileSize: Number(recording.fileSize || 0),
       valid: recording.valid !== false,
@@ -825,10 +927,11 @@ class LiveRecordService {
       burnQueue: this.burnQueue.map((item) => this.getPublicBurnQueueItem(item)),
       previewProgress: this.exportPreviewProgress ? { ...this.exportPreviewProgress } : null,
       previewProxy: this.exportPreview ? { ...this.exportPreview } : null,
+      mediaJobs: this.mediaJobs.snapshot(),
       startupEnabled: this.startupEnabled,
       outputDiskSpace: this.outputDiskSpace ? { ...this.outputDiskSpace } : null,
       access: {
-        required: isPublicServerHost(this.currentHost || this.settings.serverHost),
+        required: options.accessRequired ?? isPublicServerHost(this.currentHost || this.settings.serverHost),
         configured: this.accessAuth.isConfigured(this.settings),
         authenticated: Boolean(options.accessAuthenticated),
         username: this.settings.accessUsername
@@ -975,12 +1078,26 @@ class LiveRecordService {
   }
 
   addClient(response, options = {}) {
-    this.clients.set(response, { redactCookie: Boolean(options.redactCookie) });
+    this.clients.set(response, {
+      redactCookie: Boolean(options.redactCookie),
+      localConsole: Boolean(options.localConsole),
+      accessAuthenticated: Boolean(options.accessAuthenticated),
+      accessRequired: Boolean(options.accessRequired)
+    });
     this.writeSseState(response, options);
     response.on('close', () => this.clients.delete(response));
   }
 
   emitState() {
+    if (this.stateEmitTimer) return;
+    this.stateEmitTimer = setTimeout(() => {
+      this.stateEmitTimer = null;
+      this.flushState();
+    }, 80);
+    this.stateEmitTimer.unref?.();
+  }
+
+  flushState() {
     for (const [response, options] of this.clients) {
       this.writeSseState(response, options);
     }
@@ -999,7 +1116,7 @@ class LiveRecordService {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       time: Date.now(),
       level,
-      message
+      message: redactSensitive(message)
     });
     if (this.logs.length > 400) {
       this.logs.splice(0, this.logs.length - 400);
@@ -1041,7 +1158,8 @@ class LiveRecordService {
       notification,
       config: {
         url: this.settings.webhookUrl,
-        bearerToken: this.settings.webhookBearerToken
+        bearerToken: this.settings.webhookBearerToken,
+        allowPrivateNetwork: this.settings.webhookAllowPrivateNetwork
       }
     });
     if (!this.webhookQueueRunning) {
@@ -1078,7 +1196,8 @@ class LiveRecordService {
   async sendWebhookNotification(notification, options = {}) {
     const config = options.config || {
       url: this.settings.webhookUrl,
-      bearerToken: this.settings.webhookBearerToken
+      bearerToken: this.settings.webhookBearerToken,
+      allowPrivateNetwork: this.settings.webhookAllowPrivateNetwork
     };
     const url = normalizeWebhookUrl(config.url, { required: true });
     const bearerToken = String(config.bearerToken || '').trim();
@@ -1102,24 +1221,17 @@ class LiveRecordService {
         await delay(retryDelay);
       }
       try {
-        const response = await fetchWithTimeout(
-          url,
-          {
-            method: 'POST',
-            headers,
-            body,
-            redirect: 'error'
-          },
-          WEBHOOK_TIMEOUT_MS,
-          'Webhook 请求',
-          async (response) => {
-            await response.body?.cancel();
-            return response;
-          }
-        );
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
+        await requestUrlBuffer(url, {
+          method: 'POST',
+          headers,
+          body,
+          retries: 1,
+          timeoutMs: WEBHOOK_TIMEOUT_MS,
+          maxRedirects: 0,
+          maxBytes: 64 * 1024,
+          allowProxy: false,
+          validateUrl: (target) => validateRemoteUrl(target, { allowPrivate: Boolean(config.allowPrivateNetwork) })
+        });
         return payload;
       } catch (error) {
         lastError = error;
@@ -1834,8 +1946,11 @@ try {
       }
 
       if (code === 0) {
-        const mergedCookie = mergeCookieString(this.settings.cookie, cookies);
-        if (!mergedCookie) {
+        const mergedCookie = mergeCookieString(this.settings.cookie, [
+          ...cookies,
+          ...cookieHeadersFromLoginUrl(data.url)
+        ]);
+        if (!getCookieValue(mergedCookie, 'SESSDATA')) {
           throw new Error('登录成功但没有收到登录凭证');
         }
         this.settings.cookie = mergedCookie;
@@ -1936,7 +2051,7 @@ try {
       required: normalizedSettings.webhookEnabled
     });
     if (isPublicServerHost(normalizedSettings.serverHost) && !this.accessAuth.isConfigured(normalizedSettings)) {
-      throw new Error('监听 0.0.0.0/:: 前必须先设置至少 8 位远程访问密码，或设置 BILI_RECORD_AUTH_PASSWORD。');
+      throw new Error('监听 0.0.0.0/:: 前必须先在持久化配置中设置至少 8 位远程访问密码。');
     }
     const outputDirChanged = oldOutputDir !== normalizedSettings.outputDir;
     const outputReady = await this.ensureDirectoryReady(normalizedSettings.outputDir, {
@@ -2111,7 +2226,7 @@ try {
       const status = await this.fetchRoomLiveStatus(room.id);
       room.realRoomId = status.realRoomId || room.realRoomId;
       await this.applyDetectedLiveStatus(room, status.liveStatus, '轮询');
-      if (room.liveStatus === 1 && !this.isRoomRecording(room)) {
+      if (room.liveStatus === 1 && room.autoRecord && !this.isRoomRecording(room)) {
         await this.startRecording(room.id, true);
       }
     } catch (error) {
@@ -2158,7 +2273,7 @@ try {
           anchor: room.anchor || ''
         });
       }
-      await this.saveStore().catch((error) => {
+      this.saveStore().catch((error) => {
         this.log('warn', `${roomLabel(room)} 保存开播状态失败：${error.message}`);
       });
     }
@@ -2246,7 +2361,7 @@ try {
     const commandType = String(command?.cmd || '').split(':')[0].toUpperCase();
     if (commandType === 'LIVE') {
       await this.applyDetectedLiveStatus(room, 1, '弹幕服务器推送');
-      if (!this.isRoomRecording(room)) {
+      if (room.autoRecord && !this.isRoomRecording(room)) {
         await this.startRecording(room.id, true);
       }
       setImmediate(() => {
@@ -2373,37 +2488,23 @@ try {
       return;
     }
 
-    const asset = await fetchWithTimeout(
-      target.toString(),
-      { headers: createImageProxyHeaders(target, this.settings.cookie) },
-      15000,
-      '图片请求',
-      async (assetResponse) => {
-        const contentType = assetResponse.headers.get('content-type') || 'image/jpeg';
-        const contentLength = Number(assetResponse.headers.get('content-length') || 0);
-        const canReadBody =
-          assetResponse.ok &&
-          contentType.toLowerCase().startsWith('image/') &&
-          contentLength <= MAX_PROXY_IMAGE_BYTES;
-        return {
-          ok: assetResponse.ok,
-          status: assetResponse.status,
-          contentType,
-          contentLength,
-          body: canReadBody ? Buffer.from(await assetResponse.arrayBuffer()) : null
-        };
-      }
-    );
-    if (!asset.ok) {
-      writeJson(response, 502, { error: `图片获取失败：HTTP ${asset.status}` });
+    if (!isBilibiliHost(target.hostname)) {
+      writeJson(response, 403, { error: '图片代理只允许访问 B 站图片域名' });
       return;
     }
-    if (!asset.contentType.toLowerCase().startsWith('image/')) {
+    const asset = await requestUrlBuffer(target.toString(), {
+      headersForUrl: (nextTarget) => createImageProxyHeaders(nextTarget, this.settings.cookie),
+      validateUrl: (nextTarget) => validateRemoteUrl(nextTarget, { allowHost: isBilibiliHost }),
+      allowProxy: false,
+      retries: 2,
+      timeoutMs: 15000,
+      maxRedirects: 3,
+      maxBytes: MAX_PROXY_IMAGE_BYTES,
+      includeResponseMetadata: true
+    });
+    const contentType = String(asset.headers['content-type'] || 'image/jpeg');
+    if (!contentType.toLowerCase().startsWith('image/')) {
       writeJson(response, 502, { error: '远端返回的不是图片' });
-      return;
-    }
-    if (asset.contentLength > MAX_PROXY_IMAGE_BYTES || !asset.body) {
-      writeJson(response, 502, { error: '远端图片过大' });
       return;
     }
     if (asset.body.length > MAX_PROXY_IMAGE_BYTES) {
@@ -2411,7 +2512,7 @@ try {
       return;
     }
     response.writeHead(200, {
-      'Content-Type': asset.contentType,
+      'Content-Type': contentType,
       'Content-Length': String(asset.body.length),
       'Cache-Control': 'no-store'
     });
@@ -2477,8 +2578,9 @@ try {
       return { ok: true, id, previewUrl, ready: false, cached: false, progress: { ...this.exportPreviewProgress } };
     }
     await this.cancelExportPreview({ silent: true });
-    await fsp.rm(previewDir, { recursive: true, force: true }).catch(() => {});
-    await fsp.mkdir(previewDir, { recursive: true });
+    const workingPreviewDir = `${previewDir}.work-${crypto.randomBytes(6).toString('hex')}`;
+    const workingPlaylistPath = path.join(workingPreviewDir, 'index.m3u8');
+    await fsp.mkdir(workingPreviewDir, { recursive: true });
 
     const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, sourcePath);
     const durationSec = await this.resolveRecordingDuration({ cleanPath: sourcePath }, mediaInfo).catch(() => mediaInfo.durationSec || 0);
@@ -2501,13 +2603,19 @@ try {
     };
     this.emitState();
     this.log('info', `正在生成 H.264 兼容预览：${path.basename(sourcePath)}`);
+    const previewLease = await this.mediaJobs.acquire({
+      id: progress.id,
+      type: 'preview',
+      resource: 'cpu',
+      cancel: () => this.cancelExportPreview({ silent: true }).catch(() => {})
+    });
 
     runFfmpegJob(
       this.ffmpegPath,
       createPreviewHlsArgs({
         inputPath: sourcePath,
-        playlistPath,
-        segmentPattern: path.join(previewDir, 'segment_%05d.ts')
+        playlistPath: workingPlaylistPath,
+        segmentPattern: path.join(workingPreviewDir, 'segment_%05d.ts')
       }),
       (line) => {
         if (this.exportPreviewProgress?.id === progress.id && updateFfmpegJobProgress(this.exportPreviewProgress, line)) {
@@ -2523,10 +2631,16 @@ try {
         }
       }
     )
-      .then(() => {
+      .then(async () => {
         if (this.exportPreviewProgress?.id !== progress.id) {
           return;
         }
+        const generatedEntries = await fsp.readdir(workingPreviewDir);
+        if (!generatedEntries.includes('index.m3u8') || !generatedEntries.some((name) => name.endsWith('.ts'))) {
+          throw new Error('兼容预览没有生成可播放的 HLS 分片。');
+        }
+        await fsp.rm(previewDir, { recursive: true, force: true }).catch(() => {});
+        await fsp.rename(workingPreviewDir, previewDir);
         if (this.exportPreviewProgress?.id === progress.id) {
           finishFfmpegJobProgress(this.exportPreviewProgress, 'completed', '兼容预览已生成');
         }
@@ -2561,6 +2675,8 @@ try {
         this.log('error', `生成兼容预览失败：${error.message}`);
       })
       .finally(() => {
+        previewLease.release();
+        fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
         if (this.exportPreviewProgress?.id === progress.id) {
           this.exportPreviewProcess = null;
           this.exportPreviewClearTimer = setTimeout(() => {
@@ -2662,9 +2778,13 @@ try {
     session.expiresAt = Date.now() + PREVIEW_SESSION_TTL_MS;
     try {
       const body = await requestUrlBuffer(target.toString(), {
-        headers: createPreviewProxyHeaders(target, this.settings.cookie, request.headers.range),
+        headersForUrl: (nextTarget) => createPreviewProxyHeaders(nextTarget, this.settings.cookie, request.headers.range),
+        validateUrl: (nextTarget) => validateRemoteUrl(nextTarget),
+        allowProxy: false,
         retries: 2,
-        timeoutMs: 20000
+        timeoutMs: 20000,
+        maxRedirects: 4,
+        maxBytes: 256 * 1024 * 1024
       });
       if (isPreviewPlaylist(target, body)) {
         if (body.length > MAX_PREVIEW_PLAYLIST_BYTES) {
@@ -2976,6 +3096,9 @@ try {
   }
 
   async startRecording(roomId, autoStart = false, options = {}) {
+    if (this.draining) {
+      throw new Error('服务正在退出，不能开始新的录制。');
+    }
     const room = this.getRoom(roomId);
     if (this.hasActiveRecordingSession(room) || (this.reconnectPendingRooms.has(room.id) && !options.streamReconnect)) {
       return this.getState();
@@ -3026,6 +3149,7 @@ try {
       const liveFolder = sanitizeFilename(`${timestamp}-${room.title || 'live'}`).slice(0, 72) || timestamp;
       const outputDir = String(options.outputDir || path.join(outputRoot, roomFolder, liveFolder)).trim() || outputRoot;
       await this.ensureDirectoryReady(outputDir, { label: '本场录像保存目录' });
+      await assertDiskSpace(outputDir);
 
       const baseName = sanitizeFilename(
         `${room.realRoomId || room.id}_${room.anchor || 'anchor'}_${timestamp}`
@@ -3062,8 +3186,16 @@ try {
         stdio: ['pipe', 'ignore', 'pipe']
       });
 
-      const eventStream = fs.createWriteStream(danmakuPath, { flags: 'a' });
-      const session = {
+      let session = null;
+      const eventStream = new BufferedJsonlWriter(danmakuPath, {
+        onError: (error) => {
+          if (!session) return;
+          session.danmakuWriteFailed = true;
+          this.updateDanmakuStatus(room, session, 'write-error', `弹幕写盘失败，视频录制仍会继续：${error.message}`, 'error');
+        },
+        onDrop: () => {}
+      });
+      session = {
         roomId: room.id,
         ffmpeg,
         stream,
@@ -3091,6 +3223,8 @@ try {
         danmakuStatus: 'connecting',
         danmakuMessage: '弹幕通道连接中',
         danmakuPopularity: 0,
+        danmakuReconnectAttempt: 0,
+        danmakuReconnectTimer: null,
         ignoredCommandCount: 0,
         lastIgnoredEmitAt: 0,
         ffmpegProbeBuffer: '',
@@ -3108,8 +3242,12 @@ try {
         segmentMinutes,
         segmentDurationSec,
         finished: false,
-        stopping: false
+        stopping: false,
+        streamReconnectAttempt: Number(options.streamReconnectAttempt || 0)
       };
+      session.completionPromise = new Promise((resolve) => {
+        session.resolveCompletion = resolve;
+      });
 
       room.recording = true;
       room.currentRecording = {
@@ -3136,6 +3274,12 @@ try {
         videoInfo: null
       };
       this.recordingSessions.set(room.id, session);
+      session.releaseMediaJob = this.mediaJobs.registerExternal({
+        id: `recording:${room.id}:${session.startedAt}`,
+        type: 'recording',
+        resource: 'recording',
+        cancel: () => this.stopRecording(room.id).catch(() => {})
+      });
       this.reconnectPendingRooms.delete(room.id);
       this.armRecordingRotation(room, session);
       this.armNoMediaWatch(room, session);
@@ -3171,6 +3315,11 @@ try {
           const videoInfo = parseFfmpegVideoInfo(session.ffmpegProbeBuffer);
           if (videoInfo) {
             session.videoInfo = videoInfo;
+            clearTimeout(session.streamStableTimer);
+            session.streamStableTimer = setTimeout(() => {
+              session.streamReconnectAttempt = 0;
+            }, 60000);
+            session.streamStableTimer.unref?.();
             if (this.shouldUpdateCurrentRecording(room, session)) {
               room.currentRecording.videoInfo = videoInfo;
             }
@@ -3207,7 +3356,14 @@ try {
             `${roomLabel(room)} 录制进程没有生成临时视频文件，退出码 ${code}，信号 ${signal || '-'}。ffmpeg：${detail}`
           );
         }
-        await this.finishRecording(room.id, session, code, signal);
+        session.finishPromise = this.finishRecording(room.id, session, code, signal);
+        try {
+          await session.finishPromise;
+        } catch (error) {
+          this.log('error', `${roomLabel(room)} 录像收尾失败：${error.message}`);
+        } finally {
+          session.resolveCompletion?.();
+        }
       });
 
       this.startDanmakuCapture(room, session).catch((error) => {
@@ -3221,6 +3377,7 @@ try {
           room.currentRecording.danmakuMessage = session.danmakuMessage;
         }
         this.log('warn', `${roomLabel(room)} 弹幕连接失败：${error.message}`);
+        this.scheduleDanmakuReconnect(room, session, error.message);
         this.emitState();
       });
 
@@ -3242,6 +3399,8 @@ try {
   }
 
   async startDanmakuCapture(room, session) {
+    clearTimeout(session.danmakuReconnectTimer);
+    session.danmakuReconnectTimer = null;
     const info = await this.fetchDanmuInfo(room.realRoomId);
     if (info.code !== 0) {
       throw createBiliError('弹幕服务器', info);
@@ -3265,6 +3424,7 @@ try {
           return;
         }
         if (Number(reply?.code || 0) === 0) {
+          session.danmakuReconnectAttempt = 0;
           this.updateDanmakuStatus(room, session, 'connected', '弹幕通道已认证，等待事件');
           return;
         }
@@ -3281,8 +3441,9 @@ try {
         this.emitState();
       },
       onClose: (reason) => {
-        if (!session.finished) {
+        if (!session.finished && !session.stopping && session.danmakuClient === client) {
           this.updateDanmakuStatus(room, session, 'disconnected', `弹幕通道已断开：${reason}`, 'warn');
+          this.scheduleDanmakuReconnect(room, session, reason);
         }
       },
       onError: (error) => {
@@ -3323,6 +3484,22 @@ try {
           }
           return;
         }
+        const written = session.eventStream.write(`${JSON.stringify(event)}\n`);
+        if (!written) {
+          session.danmakuWriteDropped = Number(session.danmakuWriteDropped || 0) + 1;
+          const now = Date.now();
+          if (now - Number(session.lastDanmakuWriteWarningAt || 0) > 5000) {
+            session.lastDanmakuWriteWarningAt = now;
+            this.updateDanmakuStatus(
+              room,
+              session,
+              session.danmakuWriteFailed ? 'write-error' : 'backpressure',
+              `弹幕写盘缓冲已达上限，已丢弃 ${session.danmakuWriteDropped} 条；视频录制不受影响`,
+              'warn'
+            );
+          }
+          return;
+        }
         session.eventCount += 1;
         session.capturedDanmakuCount = session.eventCount;
         if (this.shouldUpdateCurrentRecording(room, session)) {
@@ -3331,7 +3508,6 @@ try {
           room.currentRecording.danmakuStatus = 'connected';
           room.currentRecording.danmakuMessage = `已捕获 ${session.eventCount} 条可烧录事件`;
         }
-        session.eventStream.write(`${JSON.stringify(event)}\n`);
         const now = Date.now();
         if (session.eventCount === 1 || now - session.lastEventEmitAt > 2000) {
           session.lastEventEmitAt = now;
@@ -3341,6 +3517,37 @@ try {
     });
     session.danmakuClient = client;
     client.connect();
+  }
+
+  scheduleDanmakuReconnect(room, session, reason = '') {
+    if (
+      this.draining ||
+      session.finished ||
+      session.stopping ||
+      this.recordingSessions.get(room.id) !== session ||
+      session.danmakuReconnectTimer
+    ) {
+      return;
+    }
+    const attempt = Math.min(12, Number(session.danmakuReconnectAttempt || 0) + 1);
+    session.danmakuReconnectAttempt = attempt;
+    const baseDelay = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5));
+    const delayMs = baseDelay + Math.floor(Math.random() * Math.min(1000, baseDelay * 0.2));
+    this.updateDanmakuStatus(
+      room,
+      session,
+      'reconnecting',
+      `弹幕通道将在 ${(delayMs / 1000).toFixed(1)} 秒后进行第 ${attempt} 次重连${reason ? `：${reason}` : ''}`,
+      'warn'
+    );
+    session.danmakuReconnectTimer = setTimeout(() => {
+      session.danmakuReconnectTimer = null;
+      this.startDanmakuCapture(room, session).catch((error) => {
+        this.updateDanmakuStatus(room, session, 'error', `弹幕重连失败：${error.message}`, 'warn');
+        this.scheduleDanmakuReconnect(room, session, error.message);
+      });
+    }, delayMs);
+    session.danmakuReconnectTimer.unref?.();
   }
 
   updateDanmakuStatus(room, session, status, message, level = 'info') {
@@ -3374,6 +3581,17 @@ try {
       }
       const fileSize = await getFileSize(session.capturePath || session.cleanPath);
       const now = Date.now();
+      if (now - Number(session.lastDiskSafetyCheckAt || 0) >= 30000) {
+        session.lastDiskSafetyCheckAt = now;
+        try {
+          await assertDiskSpace(session.capturePath || session.cleanPath);
+        } catch (error) {
+          session.stopping = true;
+          this.log('error', `${roomLabel(room)} ${error.message} 正在优雅停止当前录像。`);
+          requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 15000 });
+          return;
+        }
+      }
       if (fileSize > Number(session.lastMediaSize || 0) + MIN_MEDIA_GROWTH_BYTES) {
         session.lastMediaSize = fileSize;
         session.lastMediaGrowthAt = now;
@@ -3489,6 +3707,8 @@ try {
       return this.getState();
     }
     session.stopping = true;
+    clearTimeout(session.danmakuReconnectTimer);
+    clearTimeout(session.streamStableTimer);
     clearTimeout(session.rotateTimer);
     clearTimeout(session.mediaWatchTimer);
     clearTimeout(session.qualityWatchTimer);
@@ -3509,6 +3729,8 @@ try {
     clearTimeout(session.rotateTimer);
     clearTimeout(session.mediaWatchTimer);
     clearTimeout(session.qualityWatchTimer);
+    clearTimeout(session.danmakuReconnectTimer);
+    clearTimeout(session.streamStableTimer);
     session.finished = true;
     session.danmakuClient?.close('录制结束');
     await new Promise((resolve) => session.eventStream.end(resolve));
@@ -3521,6 +3743,7 @@ try {
       (session.rotating || session.qualitySwitching || hasReachedSegmentLimit(session, elapsedSec)) &&
       !session.stopping;
     if (shouldContinueSegment) {
+      session.releaseMediaJob?.();
       this.recordingSessions.delete(roomId);
       await this.startNextSegmentNow(room, session);
     }
@@ -3604,6 +3827,9 @@ try {
     }
     if (valid) {
       this.rememberRecording(room, finishedRecording);
+      await this.writeRecordingMetadata(finishedRecording).catch((error) => {
+        this.log('warn', `${roomLabel(room)} 写入轻量录像元数据失败，不影响录像文件：${error.message}`);
+      });
       await this.saveStore();
     } else {
       this.log(
@@ -3621,6 +3847,7 @@ try {
       this.reconnectPendingRooms.add(roomId);
     }
     if (this.recordingSessions.get(roomId) === session) {
+      session.releaseMediaJob?.();
       this.recordingSessions.delete(roomId);
     }
     const elapsedText = formatDurationSeconds(elapsedSec);
@@ -3669,6 +3896,9 @@ try {
     if (shouldContinueSegment) {
       this.scheduleQueuedUpdateCheck();
     } else if (shouldReconnectLiveStream) {
+      const reconnectAttempt = Math.min(10, Number(session.streamReconnectAttempt || 0) + 1);
+      const reconnectDelayMs = Math.min(30000, 1200 * 2 ** Math.min(reconnectAttempt - 1, 5)) + Math.floor(Math.random() * 500);
+      this.log('warn', `${roomLabel(room)} 将在 ${(reconnectDelayMs / 1000).toFixed(1)} 秒后进行第 ${reconnectAttempt} 次视频断流续录。`);
       setTimeout(() => {
         const currentRoom = this.rooms.get(roomId);
         if (!currentRoom || !currentRoom.monitoring) {
@@ -3688,6 +3918,7 @@ try {
         }
         this.startRecording(roomId, true, {
           streamReconnect: true,
+          streamReconnectAttempt: reconnectAttempt,
           silentNotify: true,
           outputDir: session.outputDir,
           outputContainer: session.outputContainer,
@@ -3713,7 +3944,7 @@ try {
           .finally(() => {
             this.emitState();
           });
-      }, 1200);
+      }, reconnectDelayMs);
     } else {
       await this.finalizeReconnectGroup(room, session.mergeGroup, valid ? finishedRecording : null);
     }
@@ -3830,7 +4061,10 @@ try {
     if (!item) {
       return;
     }
-    this.recordings = [item, ...this.recordings.filter((saved) => saved.cleanPath !== item.cleanPath)].slice(0, 80);
+    this.recordings = [item, ...this.recordings.filter((saved) => saved.cleanPath !== item.cleanPath)].slice(
+      0,
+      RECORDING_LIBRARY_LIMIT
+    );
   }
 
   async refreshRecordingLibrary(options = {}) {
@@ -3861,7 +4095,9 @@ try {
     }
     const discovered = await discoverRecordingFiles(this.settings.outputDir, {
       ffmpegPath: this.ffmpegPath,
-      segmentDurationSec: this.getSegmentDurationSec()
+      segmentDurationSec: this.getSegmentDurationSec(),
+      limit: RECORDING_LIBRARY_LIMIT,
+      concurrency: 4
     });
     const existing = new Map(this.recordings.map((recording) => [path.resolve(recording.cleanPath).toLowerCase(), recording]));
     const nextRecordings = [];
@@ -3888,7 +4124,7 @@ try {
     this.recordings = nextRecordings
       .filter(Boolean)
       .sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0))
-      .slice(0, 160);
+      .slice(0, RECORDING_LIBRARY_LIMIT);
     await this.saveStore();
     if (!options.silent) {
       const validCount = this.recordings.filter((recording) => recording.valid !== false).length;
@@ -3938,9 +4174,12 @@ try {
     const outputPath = segments[0].mergeOutputPath || deriveSiblingPath(segments[0].cleanPath, 'merged');
     const container = getContainerFromPath(outputPath);
     const tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
+    const syncTmpPath = replaceExtension(outputPath, `.sync.tmp.${container}`);
     const concatPath = replaceExtension(outputPath, '.concat.txt');
     const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
     const cssPath = deriveSiblingPath(outputPath, 'danmaku', 'css');
+    const danmakuTmpPath = `${danmakuPath}.${process.pid}.tmp`;
+    const cssTmpPath = `${cssPath}.${process.pid}.tmp`;
     const assPath = deriveSiblingPath(outputPath, 'danmaku', 'ass');
     const burnedPath = deriveBurnedPath(outputPath, this.settings.burnOverlayMode);
     const mergeDurationSec = segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0);
@@ -3957,46 +4196,28 @@ try {
         durationSec:
           Number(mediaInfo.durationSec) || Number(segment.durationSec) || getSegmentDurationForMerge(segment, segments[index + 1])
       });
-      try {
-        const timingInfo = await probeMediaTimelineInfo(this.ffmpegPath, segment.cleanPath, mediaInfo, {
-          timeoutMs: 120000
-        });
-        segmentTimelineInfos.push(timingInfo);
-        segment.timingInfo = timingInfo;
-        this.log(
-          Math.abs(timingInfo.avDeltaSec) > 0.08 ? 'warn' : 'info',
-          `${roomLabel(room)} 合并前时轴检查 #${index + 1}：视频 ${timingInfo.videoDurationSec.toFixed(
-            3
-          )}s，音频 ${timingInfo.audioDurationSec.toFixed(3)}s，音频${timingInfo.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
-            timingInfo.avDeltaSec
-          ).toFixed(3)}s。`
-        );
-      } catch (error) {
-        segmentTimelineInfos.push({
-          videoDurationSec: Number(mediaInfo.durationSec || segment.durationSec || 0),
-          audioDurationSec: 0,
-          avDeltaSec: 0,
-          containerDeltaSec: 0,
-          timingSafeForCopy: false,
-          error: error.message
-        });
-        this.log('warn', `${roomLabel(room)} 合并前时轴检查 #${index + 1} 失败，将使用安全转码合并：${error.message}`);
-      }
+      const quickDurationSec = Number(mediaInfo.durationSec || segment.durationSec || 0);
+      segmentTimelineInfos.push({
+        containerDurationSec: quickDurationSec,
+        videoDurationSec: quickDurationSec,
+        audioDurationSec: mediaInfo.audioInfo ? quickDurationSec : 0,
+        avDeltaSec: 0,
+        containerDeltaSec: 0,
+        timingSafeForCopy: true,
+        auditMode: 'metadata'
+      });
     }
     const targetVideoInfo = selectHighestResolutionVideoInfo(segmentMediaInfos);
     if (!targetVideoInfo) {
       throw new Error('没有找到可用于合并的目标分辨率。');
     }
     const streamSpecsChanged = shouldTranscodeConcat(segmentMediaInfos);
-    const cumulativeAvDeltaSec = segmentTimelineInfos.reduce(
-      (sum, timingInfo) => sum + Number(timingInfo.avDeltaSec || 0),
-      0
-    );
-    const timingNeedsRepair =
-      segmentTimelineInfos.some((timingInfo) => !timingInfo.timingSafeForCopy) ||
-      Math.abs(cumulativeAvDeltaSec) > 0.1;
-    const requiresTranscode = streamSpecsChanged || timingNeedsRepair;
-    const mergeVideoCodec = isHevcCodec(targetVideoInfo.codec) ? 'libx265' : 'libx264';
+    // Avoid two complete FFmpeg scans for every source segment on the healthy
+    // path. The merged candidate is audited once; only a detected drift causes
+    // a source-by-source deep audit for diagnosis and persisted metadata.
+    const requiresTranscode = streamSpecsChanged;
+    assertSafeMergeTargetProfile(segmentMediaInfos, targetVideoInfo, { requiresVideoTranscode: requiresTranscode });
+    const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
     const progress = createFfmpegJobProgress({
       kind: 'merge',
       label: `合并续录分段：${path.basename(outputPath)}`,
@@ -4005,21 +4226,33 @@ try {
       roomId: room.id
     });
     room.mergeProgress = progress;
+    await assertDiskSpace(outputPath, {
+      estimatedBytes: segments.reduce((sum, segment) => sum + Number(segment.fileSize || 0), 0)
+    });
+    const mergeLease = await this.mediaJobs.acquire({
+      id: progress.id,
+      type: 'merge',
+      resource: mergeEncoderPlan.preferred.includes('libx') ? 'cpu' : 'gpu',
+      cancel: () => this.cancelMerge(room.id).catch(() => {})
+    });
+    this.mergeCancelRequests.delete(room.id);
 
     this.log(
       'info',
       `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}。${
         requiresTranscode
-          ? `${streamSpecsChanged ? '检测到分辨率、帧率或编码规格变化' : '检测到分段音视频时长差'}，将重建各段时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height} 后合并`
+          ? `检测到分辨率、帧率或编码规格变化，将重建各段时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height} 后合并`
           : '各分段规格一致，使用快速无损合并'
       }`
     );
     this.emitState();
     try {
       await fsp.rm(tmpPath, { force: true });
-      let mergeArgs;
-      if (requiresTranscode) {
-        mergeArgs = createConcatTranscodeArgs({
+      await fsp.rm(syncTmpPath, { force: true });
+      await fsp.rm(danmakuTmpPath, { force: true });
+      await fsp.rm(cssTmpPath, { force: true });
+      const transcodeArgs = (videoCodec) =>
+        createConcatTranscodeArgs({
           segments: segments.map((segment, index) => ({
             filePath: segment.cleanPath,
             durationSec:
@@ -4029,31 +4262,61 @@ try {
           outputPath: tmpPath,
           container,
           targetVideoInfo,
-          videoCodec: mergeVideoCodec
+          videoCodec,
+          softwareThreads: Math.max(1, Math.min(4, Math.floor((os.cpus()?.length || 4) / 2)))
         });
-      } else {
-        await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
-        mergeArgs = createConcatCopyArgs({ concatPath, outputPath: tmpPath, container });
-      }
-      await runFfmpegJob(
-        this.ffmpegPath,
-        mergeArgs,
-        (line) => {
+      const runMergeFfmpeg = async (args) => {
+        if (this.mergeCancelRequests.has(room.id)) throw new Error('合并已取消');
+        await runFfmpegJob(this.ffmpegPath, args, (line) => {
           if (room.mergeProgress?.id === progress.id && updateFfmpegJobProgress(room.mergeProgress, line)) {
             this.emitState();
           }
           if (/error|failed|invalid/i.test(line)) {
             this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
           }
+        }, {
+          onChild: (child) => this.mergeProcesses.set(room.id, child)
+        });
+        this.mergeProcesses.delete(room.id);
+      };
+      const runSafeTranscode = async () => {
+        try {
+          await runMergeFfmpeg(transcodeArgs(mergeEncoderPlan.preferred));
+        } catch (error) {
+          this.mergeProcesses.delete(room.id);
+          if (!mergeEncoderPlan.fallback || this.mergeCancelRequests.has(room.id)) throw error;
+          this.log(
+            'warn',
+            `${roomLabel(room)} ${mergeEncoderPlan.preferred} 合并失败，将仅回退一次 ${mergeEncoderPlan.fallback} 软件编码：${error.message}`
+          );
+          await fsp.rm(tmpPath, { force: true });
+          await runMergeFfmpeg(transcodeArgs(mergeEncoderPlan.fallback));
         }
-      );
+      };
+      if (requiresTranscode) {
+        await runSafeTranscode();
+      } else {
+        await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
+        try {
+          await runMergeFfmpeg(createConcatCopyArgs({ concatPath, outputPath: tmpPath, container }));
+        } catch (error) {
+          this.mergeProcesses.delete(room.id);
+          if (this.mergeCancelRequests.has(room.id)) throw error;
+          if (targetVideoInfo.hdr) {
+            throw new Error(`HDR 无损 copy 合并失败；为避免丢失 HDR metadata，不会自动转码：${error.message}`);
+          }
+          this.log('warn', `${roomLabel(room)} 无损 copy 合并失败，自动切换安全统一转码：${error.message}`);
+          await fsp.rm(tmpPath, { force: true });
+          await runSafeTranscode();
+        }
+      }
       if (room.mergeProgress?.id === progress.id) {
         room.mergeProgress.message = '正在合并弹幕记录';
         room.mergeProgress.percent = 99.5;
         room.mergeProgress.updatedAt = Date.now();
         this.emitState();
       }
-      const mergedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 15000 });
+      let mergedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 15000 });
       if (!mergedMediaInfo.videoInfo) {
         throw new Error('合并文件生成后没有检测到视频流。');
       }
@@ -4076,19 +4339,76 @@ try {
             mergedTimingInfo.avDeltaSec
           ).toFixed(3)}s。`
         );
-        if (!mergedTimingInfo.timingSafeForCopy) {
-          throw new Error(`合并后的音视频时长仍相差 ${Math.round(Math.abs(mergedTimingInfo.avDeltaSec) * 1000)}ms`);
+        if (!mergedTimingInfo.timingSafeForCopy && mergedMediaInfo.audioInfo) {
+          const driftMs = Math.round(Math.abs(mergedTimingInfo.avDeltaSec) * 1000);
+          this.log('warn', `${roomLabel(room)} 合并候选音画相差 ${driftMs}ms，正在自动重采样、补齐或裁剪音频进行对齐。`);
+          for (let index = 0; index < segments.length; index += 1) {
+            try {
+              const sourceTiming = await probeMediaTimelineInfo(
+                this.ffmpegPath,
+                segments[index].cleanPath,
+                segmentMediaInfos[index],
+                { timeoutMs: 120000 }
+              );
+              sourceTiming.auditMode = 'deep';
+              segmentTimelineInfos[index] = sourceTiming;
+              segments[index].timingInfo = sourceTiming;
+              this.log(
+                Math.abs(sourceTiming.avDeltaSec) > 0.08 ? 'warn' : 'info',
+                `${roomLabel(room)} 漂移来源检查 #${index + 1}：音频${sourceTiming.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
+                  sourceTiming.avDeltaSec
+                ).toFixed(3)}s。`
+              );
+            } catch (error) {
+              segmentTimelineInfos[index] = { ...segmentTimelineInfos[index], auditMode: 'failed', error: error.message };
+              this.log('warn', `${roomLabel(room)} 漂移来源检查 #${index + 1} 失败：${error.message}`);
+            }
+          }
+          if (room.mergeProgress?.id === progress.id) {
+            room.mergeProgress.message = `正在修复 ${driftMs}ms 音画偏差`;
+            room.mergeProgress.percent = 99.8;
+            room.mergeProgress.updatedAt = Date.now();
+            this.emitState();
+          }
+          await runMergeFfmpeg(
+            createAudioAlignArgs({
+              inputPath: tmpPath,
+              outputPath: syncTmpPath,
+              container,
+              videoDurationSec: mergedTimingInfo.videoDurationSec
+            })
+          );
+          const repairedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, syncTmpPath, { timeoutMs: 15000 });
+          const repairedTimingInfo = await probeMediaTimelineInfo(this.ffmpegPath, syncTmpPath, repairedMediaInfo, {
+            timeoutMs: 120000
+          });
+          if (!repairedMediaInfo.videoInfo || !repairedTimingInfo.timingSafeForCopy) {
+            throw new Error(
+              `自动音画对齐后仍相差 ${Math.round(Math.abs(repairedTimingInfo.avDeltaSec || 0) * 1000)}ms；所有源分段已保留`
+            );
+          }
+          await atomicReplaceFile(syncTmpPath, tmpPath);
+          mergedMediaInfo = repairedMediaInfo;
+          mergedTimingInfo = repairedTimingInfo;
+          this.log('success', `${roomLabel(room)} 音画偏差已修复到 ${Math.round(Math.abs(repairedTimingInfo.avDeltaSec) * 1000)}ms。`);
         }
       } catch (error) {
         this.log('warn', `${roomLabel(room)} 合并后时轴检查失败：${error.message}`);
         throw error;
       }
-      await fsp.rm(outputPath, { force: true });
-      await fsp.rename(tmpPath, outputPath);
+      await mergeDanmakuFiles(segments, danmakuTmpPath);
+      await copyFirstExistingFile(
+        segments.map((segment) => segment.cssPath).filter(Boolean),
+        cssTmpPath,
+        createDefaultDanmakuCss()
+      );
+      await Promise.all([fsp.stat(danmakuTmpPath), fsp.stat(cssTmpPath)]);
+      await atomicReplaceFile(tmpPath, outputPath);
+      await atomicReplaceFile(danmakuTmpPath, danmakuPath);
+      await atomicReplaceFile(cssTmpPath, cssPath);
       await fsp.rm(concatPath, { force: true });
-      await mergeDanmakuFiles(segments, danmakuPath);
-      await copyFirstExistingFile(segments.map((segment) => segment.cssPath).filter(Boolean), cssPath, createDefaultDanmakuCss());
 
+      const cleanupId = crypto.randomUUID();
       const mergedRecording = this.normalizeRecording({
         id: `${outputPath}:${Date.now()}`,
         roomId: room.id,
@@ -4104,6 +4424,7 @@ try {
         mergeSequence: 0,
         mergeOutputPath: outputPath,
         mergedFrom: segments.map((segment) => segment.cleanPath),
+        cleanupId,
         durationSec: Number(mergedMediaInfo.durationSec) || mergeDurationSec,
         fileSize: await getFileSize(outputPath),
         valid: true,
@@ -4138,12 +4459,24 @@ try {
           const recordingKey = path.resolve(recording.cleanPath).toLowerCase();
           return recordingKey !== outputPathKey && !segmentPathKeys.has(recordingKey);
         })
-      ].slice(0, 80);
+      ].slice(0, RECORDING_LIBRARY_LIMIT);
+      await this.writeRecordingMetadata(mergedRecording).catch((error) => {
+        this.log('warn', `${roomLabel(room)} 写入合并录像元数据失败：${error.message}`);
+      });
       if (!this.isRoomRecording(room)) {
         room.currentRecording = mergedRecording;
       }
+      this.pendingSegmentCleanups.set(cleanupId, {
+        cleanupId,
+        roomId: room.id,
+        status: 'pending',
+        attempts: 0,
+        createdAt: new Date().toISOString(),
+        segments: segments.map((segment) => cloneRecordingState(segment)),
+        mergedRecording: cloneRecordingState(mergedRecording)
+      });
       await this.saveStore();
-      await this.cleanupMergedSegmentFiles(room, segments, mergedRecording);
+      await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId });
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(room.mergeProgress, 'completed', '续录分段已合并');
       }
@@ -4162,23 +4495,96 @@ try {
       }, 5000).unref?.();
       return mergedRecording;
     } catch (error) {
+      const cancelled = this.mergeCancelRequests.has(room.id);
       if (room.mergeProgress?.id === progress.id) {
-        finishFfmpegJobProgress(room.mergeProgress, 'error', `合并失败：${error.message}`);
+        finishFfmpegJobProgress(
+          room.mergeProgress,
+          cancelled ? 'cancelled' : 'error',
+          cancelled ? '合并已取消，所有源分段均已保留' : `合并失败：${error.message}；所有源分段均已保留`
+        );
       }
+      this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : `合并失败：${error.message}`}；源分段未删除。`);
       this.emitState();
+      if (cancelled) return fallbackRecording;
       throw error;
     } finally {
+      mergeLease.release();
+      this.mergeProcesses.delete(room.id);
+      this.mergeCancelRequests.delete(room.id);
       await fsp.rm(concatPath, { force: true }).catch(() => {});
       await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      await fsp.rm(syncTmpPath, { force: true }).catch(() => {});
+      await fsp.rm(danmakuTmpPath, { force: true }).catch(() => {});
+      await fsp.rm(cssTmpPath, { force: true }).catch(() => {});
     }
   }
 
-  async cleanupMergedSegmentFiles(room, segments, mergedRecording) {
+  async writeRecordingMetadata(recording) {
+    const cleanPath = String(recording?.cleanPath || '');
+    if (!cleanPath) return '';
+    const stat = await fsp.stat(cleanPath);
+    const metadataPath = `${cleanPath}.metadata.json`;
+    const temporaryPath = `${metadataPath}.${process.pid}.tmp`;
+    const payload = {
+      schemaVersion: 1,
+      createdByVersion: APP_VERSION,
+      cleanPath: path.basename(cleanPath),
+      fileSize: stat.size,
+      fileMtimeMs: stat.mtimeMs,
+      durationSec: Number(recording.durationSec || 0),
+      danmakuDurationSec: Number(recording.durationSec || 0),
+      eventCount: Number(recording.eventCount || 0),
+      videoInfo: recording.videoInfo || null,
+      updatedAt: new Date().toISOString()
+    };
+    await fsp.writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o660 });
+    await atomicReplaceFile(temporaryPath, metadataPath);
+    return metadataPath;
+  }
+
+  async cancelMerge(roomId) {
+    const room = this.getRoom(roomId);
+    const child = this.mergeProcesses.get(room.id);
+    if (!child && room.mergeProgress?.status !== 'running') return this.getState();
+    this.mergeCancelRequests.add(room.id);
+    if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+    if (room.mergeProgress?.status === 'running') room.mergeProgress.message = '正在取消合并，源分段会全部保留';
+    this.emitState();
+    return this.getState();
+  }
+
+  async setAutoRecord(roomId, enabled) {
+    const room = this.getRoom(roomId);
+    room.autoRecord = Boolean(enabled);
+    if (room.autoRecord && !room.monitoring) {
+      await this.setMonitoring(room.id, true);
+    } else {
+      await this.saveStore();
+    }
+    this.log('info', `${roomLabel(room)} 自动录制已${room.autoRecord ? '开启' : '关闭'}；监听仍只负责状态和通知。`);
+    this.emitState();
+    return this.getState();
+  }
+
+  async cleanupMergedSegmentFiles(room, segments, mergedRecording, options = {}) {
+    const cleanupId = String(options.cleanupId || mergedRecording?.cleanupId || '');
+    const cleanupRoot = path.dirname(String(mergedRecording?.cleanPath || ''));
+    if (!mergedRecording?.cleanPath || !isPathInsideDirectory(mergedRecording.cleanPath, this.settings.outputDir)) {
+      throw new Error('合并产物不在当前录像库内，拒绝清理任何源分段。');
+    }
     if (this.isRoomBurning(room)) {
-      this.pendingSegmentCleanups.set(room.id, {
-        segments: segments.map((segment) => cloneRecordingState(segment)),
-        mergedRecording: cloneRecordingState(mergedRecording)
-      });
+      if (cleanupId) {
+        const existing = this.pendingSegmentCleanups.get(cleanupId) || {};
+        this.pendingSegmentCleanups.set(cleanupId, {
+          ...existing,
+          cleanupId,
+          roomId: room.id,
+          status: 'pending',
+          segments: segments.map((segment) => cloneRecordingState(segment)),
+          mergedRecording: cloneRecordingState(mergedRecording)
+        });
+        await this.saveStore();
+      }
       this.log('info', `${roomLabel(room)} 当前仍有烧录任务，小分段文件会在烧录结束后清理。`);
       return;
     }
@@ -4229,6 +4635,7 @@ try {
         }
       };
       add(recording.cleanPath);
+      add(`${recording.cleanPath}.metadata.json`);
       add(recording.capturePath);
       add(recording.danmakuPath);
       add(recording.cssPath);
@@ -4259,6 +4666,11 @@ try {
       if (protectedPaths.has(key)) {
         continue;
       }
+      if (!isPathInsideDirectory(filePath, cleanupRoot)) {
+        failedCount += 1;
+        this.log('warn', `${roomLabel(room)} 源分段不在本次合并目录内，已拒绝清理：${filePath}`);
+        continue;
+      }
       const stat = await fsp.stat(filePath).catch(() => null);
       if (!stat?.isFile()) {
         continue;
@@ -4272,11 +4684,62 @@ try {
       }
     }
 
+    let emptyDirectoryCount = 0;
+    const mergedDirectoryKey = pathKey(path.dirname(mergedRecording.cleanPath));
+    const activeDirectoryKeys = new Set(
+      Array.from(this.recordingSessions.values()).map((session) =>
+        pathKey(session.outputDir || path.dirname(session.cleanPath))
+      )
+    );
+    const sourceDirectories = new Set(
+      segments.map((segment) => path.dirname(String(segment.cleanPath || ''))).filter(Boolean)
+    );
+    for (const directory of sourceDirectories) {
+      const directoryKey = pathKey(directory);
+      if (
+        !directoryKey ||
+        directoryKey === mergedDirectoryKey ||
+        activeDirectoryKeys.has(directoryKey) ||
+        !isPathInsideDirectory(directory, this.settings.outputDir)
+      ) {
+        continue;
+      }
+      try {
+        await fsp.rmdir(directory);
+        emptyDirectoryCount += 1;
+      } catch (error) {
+        if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) {
+          this.log('warn', `${roomLabel(room)} 清理安全空目录失败：${directory}，${error.message}`);
+        }
+      }
+    }
+
     if (deletedCount > 0) {
-      this.log('success', `${roomLabel(room)} 已清理合并前的小分段文件 ${deletedCount} 个。`);
+      this.log(
+        'success',
+        `${roomLabel(room)} 已清理合并前的小分段文件 ${deletedCount} 个${emptyDirectoryCount ? `、安全空目录 ${emptyDirectoryCount} 个` : ''}。`
+      );
     }
     if (failedCount > 0) {
       this.log('warn', `${roomLabel(room)} 有 ${failedCount} 个小分段文件未能删除，可稍后手动清理。`);
+    }
+    if (cleanupId) {
+      const existing = this.pendingSegmentCleanups.get(cleanupId) || {};
+      if (failedCount > 0) {
+        this.pendingSegmentCleanups.set(cleanupId, {
+          ...existing,
+          cleanupId,
+          roomId: room.id,
+          status: 'error',
+          attempts: Number(existing.attempts || 0) + 1,
+          lastErrorAt: new Date().toISOString(),
+          segments: segments.map((segment) => cloneRecordingState(segment)),
+          mergedRecording: cloneRecordingState(mergedRecording)
+        });
+      } else {
+        this.pendingSegmentCleanups.delete(cleanupId);
+      }
+      await this.saveStore();
     }
     return { deletedCount, failedCount };
   }
@@ -4379,7 +4842,15 @@ try {
     this.activeBurnQueueItem = item;
     this.emitState();
     setImmediate(async () => {
+      let lease = null;
       try {
+        const codec = this.chooseBurnCodec(item.options.codec || this.settings.burnCodec);
+        lease = await this.mediaJobs.acquire({
+          id: item.id,
+          type: 'burn',
+          resource: codec.includes('libx') ? 'cpu' : 'gpu',
+          cancel: () => this.cancelBurnDanmaku(item.roomId).catch(() => {})
+        });
         const started = await this.startBurnRecording(item.room, item.recording, item.options);
         if (started) {
           await this.waitForBurnIdle(item.roomId);
@@ -4387,6 +4858,7 @@ try {
       } catch (error) {
         this.log('error', `烧录队列任务失败：${item.label}，${error.message || String(error)}`);
       } finally {
+        lease?.release();
         this.activeBurnQueueItem = null;
         this.burnQueueRunning = false;
         this.emitState();
@@ -4454,14 +4926,17 @@ try {
         return true;
       }
       const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
+      const burnedTmpPath = replaceExtension(burnedPath, `.tmp.${getContainerFromPath(burnedPath)}`);
       recording.burnedPath = burnedPath;
       const codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
       const burnSourcePath = recording.cleanPath;
 
+      await assertDiskSpace(burnedPath, { estimatedBytes: Number(recording.fileSize || 0) });
+      await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
       const args = createBurnArgs({
         cleanPath: burnSourcePath,
         assPath: assets.assPath,
-        burnedPath,
+        burnedPath: burnedTmpPath,
         codec: this.settings.burnCodec,
         crf: this.settings.burnCrf,
         container: getContainerFromPath(burnedPath),
@@ -4515,19 +4990,33 @@ try {
           room.burning = false;
         }
         finishFfmpegJobProgress(room.burnProgress, 'error', `启动失败：${error.message}`);
+        fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
         this.log('error', `${roomLabel(room)} 烧录进程启动失败：${error.message}`);
         this.emitState();
       });
-      ffmpeg.on('close', (code, signal) => {
+      ffmpeg.on('close', async (code, signal) => {
         const progressId = room.burnProgress?.id;
         const cancelled = this.burnCancelRequests.delete(room.id);
+        let validationError = null;
+        if (!cancelled && code === 0) {
+          try {
+            const result = await probeMediaFileInfo(this.ffmpegPath, burnedTmpPath, { timeoutMs: 15000 });
+            if (!result.videoInfo || (await getFileSize(burnedTmpPath)) < 32 * 1024) {
+              throw new Error('烧录临时输出未通过视频流与文件大小验证。');
+            }
+            await atomicReplaceFile(burnedTmpPath, burnedPath);
+          } catch (error) {
+            validationError = error;
+            code = -1;
+          }
+        }
         if (this.burnSessions.get(room.id) === ffmpeg) {
           room.burning = false;
           this.burnSessions.delete(room.id);
         }
         if (cancelled) {
           finishFfmpegJobProgress(room.burnProgress, 'cancelled', '弹幕视频生成已取消');
-          fsp.rm(burnedPath, { force: true }).catch(() => {});
+          fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
           this.log('info', `${roomLabel(room)} 已取消生成弹幕视频：${path.basename(burnedPath)}`);
         } else if (code === 0) {
           finishFfmpegJobProgress(room.burnProgress, 'completed', '弹幕版已生成');
@@ -4541,8 +5030,10 @@ try {
             });
           }
         } else {
-          finishFfmpegJobProgress(room.burnProgress, 'error', `烧录失败：退出码 ${code}`);
-          this.log('error', `${roomLabel(room)} 烧录失败：退出码 ${code}，信号 ${signal || '-'}`);
+          await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+          const failureDetail = validationError?.message || `退出码 ${code}`;
+          finishFfmpegJobProgress(room.burnProgress, 'error', `烧录失败：${failureDetail}`);
+          this.log('error', `${roomLabel(room)} 烧录失败：${failureDetail}，信号 ${signal || '-'}`);
           if (this.settings.notifyBurnEnded) {
             this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${code}`, 'burn.failed', {
               roomId: room.id,
@@ -4560,10 +5051,13 @@ try {
             this.emitState();
           }
         }, 5000).unref?.();
-        const pendingCleanup = this.pendingSegmentCleanups.get(room.id);
+        const pendingCleanup = Array.from(this.pendingSegmentCleanups.values()).find(
+          (cleanup) => String(cleanup.roomId) === room.id
+        );
         if (pendingCleanup && !this.isRoomBurning(room)) {
-          this.pendingSegmentCleanups.delete(room.id);
-          this.cleanupMergedSegmentFiles(room, pendingCleanup.segments, pendingCleanup.mergedRecording).catch((error) => {
+          this.cleanupMergedSegmentFiles(room, pendingCleanup.segments, pendingCleanup.mergedRecording, {
+            cleanupId: pendingCleanup.cleanupId
+          }).catch((error) => {
             this.log('warn', `${roomLabel(room)} 清理合并前小分段失败：${error.message}`);
           });
         }
@@ -4604,6 +5098,7 @@ try {
   }
 
   async generateSubtitleAssets(recording, options = {}) {
+    await this.ensurePlatformCjkFont();
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const cssPath = options.cssPath || recording.cssPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'css');
@@ -4611,16 +5106,23 @@ try {
     const assPath =
       options.assPath ||
       deriveSiblingPath(recording.cleanPath, createDanmakuAssSuffix(overlayMode, danmakuArea), 'ass');
+    const temporaryAssPath = `${assPath}.${process.pid}.${Date.now()}.tmp`;
     const result = await runAssWorkerJob({
       danmakuPath: recording.danmakuPath,
       cssPath,
-      assPath,
+      assPath: temporaryAssPath,
       overlayMode,
       danmakuArea,
       startTime: options.startTime,
       endTime: options.endTime,
       shiftTime: options.shiftTime
     });
+    const generatedAss = await fsp.readFile(temporaryAssPath, 'utf8').catch(() => '');
+    if (!generatedAss.includes('[Script Info]') || !generatedAss.includes('[Events]')) {
+      await fsp.rm(temporaryAssPath, { force: true }).catch(() => {});
+      throw new Error('生成的 ASS 字幕未通过结构验证。');
+    }
+    await atomicReplaceFile(temporaryAssPath, assPath);
     recording.cssPath = cssPath;
     recording.assPath = assPath;
     return { cssPath, assPath, eventCount: result.eventCount };
@@ -4773,11 +5275,20 @@ try {
     this.exportQueueRunning = true;
     this.emitState();
     setImmediate(async () => {
+      let lease = null;
       try {
+        const codec = this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
+        lease = await this.mediaJobs.acquire({
+          id: item.id,
+          type: 'export',
+          resource: item.mode === 'clean' ? 'io' : codec.includes('libx') ? 'cpu' : 'gpu',
+          cancel: () => this.cancelExportClip().catch(() => {})
+        });
         await this.runExportClipNow(item.request);
       } catch (error) {
         this.log('error', `导出队列任务失败：${item.label}，${error.message || String(error)}`);
       } finally {
+        lease?.release();
         this.exportQueueRunning = false;
         this.emitState();
         if (this.exportQueue.length > 0) {
@@ -4827,6 +5338,10 @@ try {
     const outputPath =
       options.outputPath ||
       deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime);
+    const outputContainer = getContainerFromPath(outputPath);
+    const temporaryOutputPath = replaceExtension(outputPath, `.tmp.${outputContainer}`);
+    await assertDiskSpace(outputPath, { estimatedBytes: Math.ceil(Number(recording.fileSize || 0) * Math.min(1, duration / Math.max(1, durationSec || duration))) });
+    await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
     this.exportCancelRequested = false;
 
     let cssPath = recording.cssPath;
@@ -4837,10 +5352,10 @@ try {
     if (mode === 'clean') {
       args = createClipCopyArgs({
         cleanPath: recording.cleanPath,
-        outputPath,
+        outputPath: temporaryOutputPath,
         startTime,
         duration,
-        container: getContainerFromPath(outputPath)
+        container: outputContainer
       });
     } else {
       temporaryAssDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-ass-'));
@@ -4860,10 +5375,10 @@ try {
       args = createBurnArgs({
         cleanPath: recording.cleanPath,
         assPath,
-        burnedPath: outputPath,
+        burnedPath: temporaryOutputPath,
         codec: this.settings.burnCodec,
         crf: this.settings.burnCrf,
-        container: getContainerFromPath(outputPath),
+        container: outputContainer,
         startTime,
         duration,
         fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps
@@ -4904,6 +5419,11 @@ try {
           this.exportProcess = child;
         }
       });
+      const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
+      if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
+        throw new Error('导出临时输出未通过视频流与文件大小验证。');
+      }
+      await atomicReplaceFile(temporaryOutputPath, outputPath);
       if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'completed', '片段已导出');
         this.emitState();
@@ -4917,7 +5437,7 @@ try {
           finishFfmpegJobProgress(this.exportProgress, 'cancelled', '导出已取消');
           this.emitState();
         }
-        await fsp.rm(outputPath, { force: true }).catch(() => {});
+        await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
         this.log('info', `已取消导出片段：${path.basename(outputPath)}`);
       } else if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'error', `导出失败：${message}`);
@@ -4927,6 +5447,7 @@ try {
         throw error;
       }
     } finally {
+      await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
       if (this.exportProgress?.id === progress.id) {
         this.exportProcess = null;
         this.exportCancelRequested = false;
@@ -5083,8 +5604,8 @@ try {
       status: 'queued',
       queued: true,
       message: this.supportsManagedLinuxUpdate()
-        ? `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后将自动校验、安装并重启服务。`
-        : `已排队更新到 ${this.updateState.latestVersion}，录制/烧录结束后自动下载更新包。`
+        ? `已排队更新到 ${this.updateState.latestVersion}，全部媒体任务结束后将自动校验、安装并重启服务。`
+        : `已排队更新到 ${this.updateState.latestVersion}，全部媒体任务结束后自动下载更新包。`
     };
     this.log('info', this.updateState.message);
     this.emitState();
@@ -5154,7 +5675,7 @@ try {
         ...this.updateState,
         status: 'blocked',
         queued: false,
-        message: '当前仍有录制或烧录任务，暂不安装更新；可以排队等待任务结束。'
+        message: '当前仍有录制或媒体处理任务，暂不安装更新；可以排队等待任务结束。'
       };
       this.emitState();
       return this.getState();
@@ -5288,6 +5809,7 @@ try {
     }
     const payload = JSON.parse(raw);
     const manifest = normalizeUpdateManifest(payload);
+    manifest.officialSource = isDefaultUpdateSource(source, DEFAULT_UPDATE_MANIFEST_URL);
     if (!manifest.version || !manifest.packageUrl) {
       throw new Error('更新源缺少 version 或 packageUrl。');
     }
@@ -5373,6 +5895,21 @@ try {
           updateLogPath: status.logPath || this.getUpdateLogPath()
         };
         this.log('error', this.updateState.message);
+      } else if (updateStatus === 'pending' || updateStatus === 'processing') {
+        this.updateState = {
+          ...this.updateState,
+          status: updateStatus === 'pending' ? 'queued' : 'applying',
+          queued: updateStatus === 'pending',
+          latestVersion: version,
+          message:
+            updateStatus === 'pending'
+              ? `官方签名更新 ${version || ''} 已交给 root 更新服务，等待处理。`
+              : `root 更新服务正在处理 ${version || '目标版本'}；若上次中断，将从 processing 状态恢复。`,
+          checkedAt: Date.now(),
+          statusPath,
+          updateLogPath: status.logPath || this.getUpdateLogPath()
+        };
+        this.log('info', this.updateState.message);
       } else if (updateStatus === 'success') {
         if (version && compareVersions(version, APP_VERSION) > 0) {
           this.updateState = {
@@ -5409,6 +5946,9 @@ try {
   }
 
   getUpdateDir() {
+    if (process.platform === 'linux' && process.env.BILI_RECORD_MANAGED_UPDATE === '1') {
+      return path.resolve(process.env.BILI_RECORD_UPDATE_DIR || '/var/lib/bili-record-2k-updates');
+    }
     return path.join(path.dirname(this.storePath), 'updates');
   }
 
@@ -5479,14 +6019,49 @@ try {
     this.queuedUpdateTimer.unref?.();
   }
 
-  supportsManagedLinuxUpdate() {
-    return process.platform === 'linux' && process.env.BILI_RECORD_MANAGED_UPDATE === '1';
+  supportsManagedLinuxUpdate(manifest = this.updateState.manifest) {
+    return (
+      process.platform === 'linux' &&
+      process.env.BILI_RECORD_MANAGED_UPDATE === '1' &&
+      Boolean(manifest?.officialSource) &&
+      manifest?.signatureAlgorithm === 'ed25519' &&
+      Boolean(manifest?.signed && manifest?.signature)
+    );
+  }
+
+  async ensurePlatformCjkFont() {
+    if (this.linuxCjkFontVerified || process.platform !== 'linux') return;
+    const result = await runCapturedProcess('fc-match', ['-f', '%{family}', 'Noto Sans CJK SC'], {
+      timeoutMs: 5000,
+      maxOutputBytes: 16 * 1024
+    });
+    if (result.status !== 0 || !/Noto Sans CJK SC/i.test(result.stdout)) {
+      throw new Error('Linux 缺少已验证的 Noto Sans CJK SC 字体；请安装 fonts-noto-cjk 后再生成新字幕或烧录。');
+    }
+    this.linuxCjkFontVerified = true;
+  }
+
+  getMergeEncoderPlan(targetVideoInfo) {
+    const hevc = isHevcCodec(targetVideoInfo?.codec);
+    const bitDepth = Number(targetVideoInfo?.bitDepth || 8);
+    const tenBit = bitDepth > 8 || Boolean(targetVideoInfo?.hdr);
+    const highChroma = /(?:422|444)/.test(String(targetVideoInfo?.pixelFormat || ''));
+    const available = new Set(this.getAvailableBurnCodecs());
+    const hardwareCandidates = highChroma || bitDepth > 10
+      ? []
+      : hevc
+      ? ['hevc_nvenc', 'hevc_qsv', 'hevc_amf']
+      : tenBit
+        ? []
+        : ['h264_nvenc', 'h264_qsv', 'h264_amf'];
+    const hardware = hardwareCandidates.find((codec) => available.has(codec)) || '';
+    const software = hevc ? 'libx265' : 'libx264';
+    return { preferred: hardware || software, fallback: hardware ? software : '', software, tenBit };
   }
 
   async requestManagedLinuxUpdate(manifest, packagePath) {
-    const sha256 = String(manifest?.sha256 || '').trim().toLowerCase();
-    if (!/^[a-f0-9]{64}$/.test(sha256)) {
-      throw new Error('Linux 自动安装要求更新清单提供有效的 SHA-256；当前包只能手动安装。');
+    if (!this.supportsManagedLinuxUpdate(manifest)) {
+      throw new Error('Linux root 自动安装只接受官方 Ed25519 签名更新清单；自定义或未签名更新源只能手动安装。');
     }
     const resolvedPackagePath = path.resolve(packagePath);
     if (!isPathInsideDirectory(resolvedPackagePath, this.getUpdateDir())) {
@@ -5495,17 +6070,25 @@ try {
     const requestPath = path.join(this.getUpdateDir(), 'apply-request.json');
     const tmpPath = `${requestPath}.${process.pid}.tmp`;
     const request = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       app: 'bili-record-2k',
-      version: normalizeVersion(manifest.version),
-      packageType: String(manifest.packageType || ''),
       packagePath: resolvedPackagePath,
-      sha256,
+      signed: manifest.signed,
+      signatureAlgorithm: manifest.signatureAlgorithm,
+      signature: manifest.signature,
       requestedAt: new Date().toISOString()
     };
     await fsp.mkdir(this.getUpdateDir(), { recursive: true });
     await fsp.writeFile(tmpPath, `${JSON.stringify(request, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await fsp.rename(tmpPath, requestPath);
+    const statusPath = this.getUpdateStatusPath();
+    const statusTmpPath = `${statusPath}.${process.pid}.tmp`;
+    await fsp.writeFile(
+      statusTmpPath,
+      `${JSON.stringify({ status: 'pending', version: normalizeVersion(manifest.version), packagePath: resolvedPackagePath, message: '官方签名更新已排队。', updatedAt: new Date().toISOString() }, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o600 }
+    );
+    await fsp.rename(statusTmpPath, statusPath);
   }
 
   scheduleAutomaticUpdateCheck(delayMs = AUTO_UPDATE_INTERVAL_MS) {
@@ -5531,6 +6114,7 @@ try {
 
   hasActiveJobs() {
     return (
+      this.mediaJobs.hasActive() ||
       this.recordingSessions.size > 0 ||
       this.recordingStartLocks.size > 0 ||
       this.reconnectPendingRooms.size > 0 ||
@@ -5589,13 +6173,18 @@ try {
   }
 
   async requestShutdown() {
-    this.log('info', '正在退出后台服务。');
+    if (this.draining) return { ok: true, draining: true };
+    this.log('info', '后台服务即将进入 draining：停止接收新任务，完成录像收尾与状态保存后退出。');
     this.emitState();
     setTimeout(() => {
-      this.shutdown();
-      setTimeout(() => process.exit(0), 1500).unref();
+      if (this.shutdownHandler) this.shutdownHandler('webui');
+      else this.beginShutdown('webui').catch(() => {});
     }, 250).unref();
     return { ok: true };
+  }
+
+  setShutdownHandler(handler) {
+    this.shutdownHandler = typeof handler === 'function' ? handler : null;
   }
 
   getRoom(roomId) {
@@ -5606,7 +6195,15 @@ try {
     return room;
   }
 
-  shutdown() {
+  async beginShutdown(reason = 'signal') {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shutdownPromise = this.performShutdown(reason);
+    return this.shutdownPromise;
+  }
+
+  async performShutdown(reason) {
+    this.draining = true;
+    this.log('info', `正在优雅退出（${reason}）：停止监听并收尾活动媒体任务。`);
     this.clearLoginTimer();
     clearTimeout(this.queuedUpdateTimer);
     clearTimeout(this.autoUpdateTimer);
@@ -5623,22 +6220,54 @@ try {
     for (const roomId of Array.from(this.livePushMonitors.keys())) {
       this.stopLivePushMonitor(roomId);
     }
-    for (const room of this.rooms.values()) {
-      const session = this.recordingSessions.get(room.id);
+    const activeSessions = Array.from(this.recordingSessions.values());
+    for (const session of activeSessions) {
       clearTimeout(session?.rotateTimer);
       clearTimeout(session?.mediaWatchTimer);
       clearTimeout(session?.qualityWatchTimer);
+      session.stopping = true;
       session?.danmakuClient?.close('服务退出');
       if (session?.ffmpeg) {
-        requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 1500 });
+        requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 15000 });
       }
     }
+    const cancelledBurnQueueCount = this.burnQueue.splice(0).length;
+    const cancelledExportQueueCount = this.exportQueue.splice(0).length;
+    if (cancelledBurnQueueCount || cancelledExportQueueCount) {
+      this.log(
+        'info',
+        `退出前已取消尚未开始的媒体任务：烧录 ${cancelledBurnQueueCount} 个，导出 ${cancelledExportQueueCount} 个。`
+      );
+    }
+    await this.mediaJobs.shutdown();
     for (const ffmpeg of this.burnSessions.values()) {
-      requestFfmpegStop(ffmpeg, { graceful: false, timeoutMs: 1500 });
+      requestFfmpegStop(ffmpeg, { graceful: false, timeoutMs: 5000 });
     }
     if (this.exportProcess) {
       requestFfmpegStop(this.exportProcess, { graceful: false, timeoutMs: 1500 });
     }
+    const completion = Promise.all([
+      Promise.allSettled(activeSessions.map((session) => session.completionPromise)),
+      this.mediaJobs.waitForIdle(90_000)
+    ]);
+    await Promise.race([
+      completion,
+      new Promise((resolve) => setTimeout(resolve, 90000))
+    ]);
+    const webhookFlush = this.webhookQueueRunning
+      ? new Promise((resolve) => {
+          const check = () => (this.webhookQueueRunning ? setTimeout(check, 100) : resolve());
+          check();
+        })
+      : Promise.resolve();
+    await Promise.race([webhookFlush, new Promise((resolve) => setTimeout(resolve, 5000))]);
+    await this.saveStore().catch((error) => this.log('error', `退出前保存状态失败：${error.message}`));
+    await this.stateStore.flush();
+    this.log('success', '录像、弹幕和配置状态已完成收尾，可以安全退出。');
+  }
+
+  shutdown() {
+    return this.beginShutdown('legacy');
   }
 }
 
