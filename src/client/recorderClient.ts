@@ -3,6 +3,7 @@ import type { AppSettings, AppState, RecorderApi } from './types';
 const listeners = new Set<(state: AppState) => void>();
 let eventSource: EventSource | null = null;
 let latestState: AppState | null = null;
+let eventSourceRetryCount = 0;
 
 export const recorder: RecorderApi = {
   async getInitialState() {
@@ -31,6 +32,7 @@ export const recorder: RecorderApi = {
   removeRoom: (roomId) => api<AppState>('/api/rooms/remove', { roomId }),
   refreshRoom: (roomId, options) => api<AppState>('/api/rooms/refresh', { roomId, ...options }, { timeoutMs: 75000 }),
   setMonitoring: (roomId, enabled) => api<AppState>('/api/rooms/monitor', { roomId, enabled }),
+  setAutoRecord: (roomId, enabled) => api<AppState>('/api/rooms/auto-record', { roomId, enabled }),
   startRecording: (roomId) => api<AppState>('/api/rooms/record/start', { roomId }, { timeoutMs: 120000 }),
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
   startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }, { timeoutMs: 120000 }),
@@ -109,20 +111,25 @@ function ensureEventSource() {
   }
   eventSource = new EventSource('/api/events');
   eventSource.onmessage = (event) => {
-    const state = JSON.parse(event.data) as AppState;
-    latestState = state;
-    for (const listener of listeners) {
-      listener(state);
+    try {
+      const state = JSON.parse(event.data) as AppState;
+      if (!isAppState(state)) return;
+      eventSourceRetryCount = 0;
+      latestState = state;
+      for (const listener of listeners) listener(state);
+    } catch {
+      // Ignore one malformed event; EventSource remains connected for recovery.
     }
   };
   eventSource.onerror = () => {
     eventSource?.close();
     eventSource = null;
+    eventSourceRetryCount += 1;
     window.setTimeout(() => {
       if (listeners.size > 0) {
         ensureEventSource();
       }
-    }, 1500);
+    }, Math.min(15000, 1000 * 2 ** Math.min(eventSourceRetryCount - 1, 4)));
   };
 }
 

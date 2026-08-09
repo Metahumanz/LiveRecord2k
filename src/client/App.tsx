@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type React from 'react';
 import {
   Activity,
+  CircleAlert,
   Gauge,
   Home,
   ListVideo,
@@ -58,14 +59,22 @@ export default function App() {
   });
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [previewRoomId, setPreviewRoomId] = useState<string | null>(null);
+  const [initialLoadError, setInitialLoadError] = useState('');
 
   useEffect(() => {
-    recorder.getInitialState().then((nextState) => {
+    let cancelled = false;
+    const load = () => recorder.getInitialState().then((nextState) => {
+      if (cancelled) return;
+      setInitialLoadError('');
       setState(nextState);
       setSettingsDraft(nextState.settings);
       setExportDraft((current) => hydrateExportDraft(current, nextState));
+    }).catch((error) => {
+      if (!cancelled) setInitialLoadError(error instanceof Error ? error.message : '初始状态加载失败');
     });
-    return recorder.onStateChanged((nextState) => {
+    void load();
+    const unsubscribe = recorder.onStateChanged((nextState) => {
+      setInitialLoadError('');
       setState(nextState);
       setSettingsDraft((current) => {
         if (!current) {
@@ -78,6 +87,10 @@ export default function App() {
       });
       setExportDraft((current) => hydrateExportDraft(current, nextState));
     });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -232,8 +245,9 @@ export default function App() {
   if (!state || !settingsDraft) {
     return (
       <main className="loading-screen">
-        <Activity className="spin" size={30} />
-        <span>正在启动哔哩录播 2K</span>
+        {initialLoadError ? <CircleAlert size={30} /> : <Activity className="spin" size={30} />}
+        <span>{initialLoadError || '正在启动哔哩录播 2K'}</span>
+        {initialLoadError ? <button onClick={() => window.location.reload()}>重新连接</button> : null}
       </main>
     );
   }

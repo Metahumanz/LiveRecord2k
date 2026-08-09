@@ -413,9 +413,14 @@ export function SettingsPage({
                 onChange={(event) => setSettingsDraft({ ...settingsDraft, webhookUrl: event.target.value })}
               />
               <p className="field-help">
-                公网地址必须使用 HTTPS；本机和私有 IP 可使用 HTTP。接收端需以 2xx 状态码确认成功。
+                公网地址必须使用 HTTPS；DNS 和每一跳地址都会经过 SSRF 检查，重定向默认拒绝。
               </p>
             </label>
+            <Toggle
+              label="允许 Webhook 访问本机/私有网络"
+              checked={settingsDraft.webhookAllowPrivateNetwork}
+              onChange={(checked) => setSettingsDraft({ ...settingsDraft, webhookAllowPrivateNetwork: checked })}
+            />
             <label className="field">
               <span>Bearer Token（可选）</span>
               <input

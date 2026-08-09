@@ -24,7 +24,7 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress } from './common';
 import type { AppSettings, AppState, RoomState } from '../types';
-import { KEYFRAME_IMAGE_REFRESH_MS, KEYFRAME_INFO_REFRESH_MS } from '../ui/options';
+import { KEYFRAME_IMAGE_REFRESH_MS } from '../ui/options';
 import {
   commandCountsSummary,
   containerStageLabel,
@@ -35,7 +35,6 @@ import {
   getRoomStatus,
   imageProxyUrl,
   loginStatusLabel,
-  mediaUrl,
   qnLabel
 } from '../utils';
 
@@ -85,7 +84,6 @@ export function RoomPreview({
 }) {
   const rawImageUrl = roomImageMode === 'cover' ? room.cover : room.keyframe;
   const [previewVersion, setPreviewVersion] = useState(Date.now());
-  const shouldRefreshRoomInfo = roomImageMode === 'keyframe' && (room.liveStatus === 1 || room.recording);
   useEffect(() => {
     if (roomImageMode !== 'keyframe') {
       return;
@@ -94,23 +92,6 @@ export function RoomPreview({
     const timer = window.setInterval(() => setPreviewVersion(Date.now()), KEYFRAME_IMAGE_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [rawImageUrl, roomImageMode]);
-  useEffect(() => {
-    if (!shouldRefreshRoomInfo) {
-      return;
-    }
-    let cancelled = false;
-    const refresh = () => {
-      if (!cancelled) {
-        recorder.refreshRoom(room.id, { silent: true }).catch(() => {});
-      }
-    };
-    refresh();
-    const timer = window.setInterval(refresh, KEYFRAME_INFO_REFRESH_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [room.id, shouldRefreshRoomInfo]);
   const imageVersion = roomImageMode === 'keyframe' ? previewVersion : room.lastCheckedAt;
   const imageUrl = rawImageUrl ? imageProxyUrl(rawImageUrl, imageVersion) : '';
   const imageKey = rawImageUrl ? `${rawImageUrl}:${imageVersion || 0}` : '';
@@ -338,6 +319,17 @@ export function RoomCard({
             <MonitorDot size={18} />
             {room.monitoring ? '监听中' : '监听'}
           </button>
+          <button
+            className={room.autoRecord ? 'wide-button active' : 'wide-button'}
+            disabled={busy === `auto-record-${roomKey}`}
+            title="监听只负责状态和通知；自动录制决定开播后是否自动开始录像"
+            onClick={() =>
+              run(`auto-record-${roomKey}`, () => recorder.setAutoRecord(room.id, !room.autoRecord))
+            }
+          >
+            <Radio size={18} />
+            {room.autoRecord ? '自动录制开' : '自动录制关'}
+          </button>
           {room.recording ? (
             <button
               className="wide-button danger"
@@ -366,7 +358,6 @@ export function RoomCard({
 export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: () => void }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const temporaryRetryCountRef = useRef(0);
   const temporaryPath = room.currentRecording?.capturePath || '';
   const canPreviewTemporary = Boolean(temporaryPath);
   const [previewMode, setPreviewMode] = useState<'recording' | 'live'>('live');
@@ -380,10 +371,6 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
       setPreviewMode('live');
     }
   }, [canPreviewTemporary, previewMode]);
-
-  useEffect(() => {
-    temporaryRetryCountRef.current = 0;
-  }, [previewMode, temporaryPath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -436,26 +423,18 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
       try {
         resetPlayer();
 
-        if (previewMode === 'recording') {
-          if (!temporaryPath) {
-            setError('当前还没有可预览的临时 MKV。');
-            return;
-          }
-          player.muted = false;
-          player.autoplay = false;
-          player.playsInline = true;
-          player.src = mediaUrl(temporaryPath, temporaryPreviewVersion);
-          player.load();
-          setLoading(false);
+        if (previewMode === 'recording' && !temporaryPath) {
+          setError('当前还没有可预览的临时录像。');
           return;
         }
-
-        const nextPreview = await recorder.startPreview(room.id);
+        const nextPreview = previewMode === 'recording'
+          ? await recorder.startExportPreview({ cleanPath: temporaryPath })
+          : await recorder.startPreview(room.id);
         if (cancelled) {
           return;
         }
-        player.muted = true;
-        player.autoplay = true;
+        player.muted = previewMode === 'live';
+        player.autoplay = previewMode === 'live';
         player.playsInline = true;
         nativeErrorHandler = () => scheduleLiveRetry('播放器无法读取实时流');
 
@@ -482,6 +461,11 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
               return;
             }
             const detail = data.details || data.type;
+            if (previewMode === 'recording') {
+              setLoading(false);
+              setError(`临时录像 HLS 预览失败：${detail}`);
+              return;
+            }
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !triedNetworkRecovery) {
               triedNetworkRecovery = true;
               setLoading(true);
@@ -530,6 +514,9 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
         window.clearTimeout(retryTimer);
       }
       resetPlayer();
+      if (previewMode === 'recording') {
+        void recorder.cancelExportPreview().catch(() => {});
+      }
     };
   }, [room.id, previewMode, temporaryPath, temporaryPreviewVersion]);
 
@@ -555,14 +542,14 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
           <button
             className={previewMode === 'recording' ? 'active' : ''}
             disabled={!canPreviewTemporary}
-            title={canPreviewTemporary ? '打开或刷新正在写入的临时 MKV' : '当前没有临时 MKV'}
+            title={canPreviewTemporary ? '生成浏览器兼容的临时录像 HLS 预览' : '当前没有临时录像'}
             onClick={() => {
               setTemporaryPreviewVersion(Date.now());
               setPreviewMode('recording');
             }}
           >
             <RefreshCw size={14} />
-            临时 MKV
+            临时录像
           </button>
           <button
             className={previewMode === 'live' ? 'active' : ''}
@@ -580,17 +567,10 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
             playsInline
             preload="metadata"
             onError={() => {
-              if (previewMode === 'recording' && temporaryRetryCountRef.current < 2) {
-                temporaryRetryCountRef.current += 1;
-                setError('');
-                setLoading(true);
-                window.setTimeout(() => setTemporaryPreviewVersion(Date.now()), 700);
-                return;
-              }
               setError((current) =>
                 current ||
                 (previewMode === 'recording'
-                  ? '浏览器通常无法直接播放正在写入的临时 MKV，请用直播流预览确认画面，或稍后查看最终 MP4。'
+                  ? '临时录像兼容预览失败，可刷新后重试；所有录制数据仍写入原临时文件。'
                   : '实时预览播放失败。')
               );
               setLoading(false);
@@ -599,7 +579,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
           {loading && !error ? (
             <div className="live-preview-status">
               <Activity className="spin" size={24} />
-              <span>{previewMode === 'recording' ? '正在打开临时 MKV' : '正在连接实时画面'}</span>
+              <span>{previewMode === 'recording' ? '正在生成临时录像 HLS 预览' : '正在连接实时画面'}</span>
             </div>
           ) : null}
           {error ? (
