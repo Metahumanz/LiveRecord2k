@@ -1,5 +1,19 @@
 # 更新日志
 
+## 0.4.0 - 2026-08-09
+
+- 修复分段合并候选因约 900ms 音画时差被直接判失败且不保留成品的问题：现在会自动重采样、补齐或裁剪音频，复验通过后原子保存；无损 copy 失败会安全转码，合并可取消且取消/失败不删除源分段。
+- 跨规格合并改用真实完整视频 profile，并复用实际探测成功的 NVENC/QSV/AMF 编码器；硬编失败只回退一次受限线程的软件编码，新增 10bit/HDR 保护，健康路径不再逐段重复完整扫描。
+- 修复反向代理可能继承本机免认证的问题，引入显式可信代理链；图片、HLS、Webhook 和更新下载增加 DNS 固定、私网/保留地址、重定向、敏感 Header、响应大小与日志脱敏保护。
+- Linux root updater 改为只接受 Ed25519 官方签名清单，并校验签名绑定的包名、版本、架构与 SHA-256；受控队列改用 root 所有父目录和 no-follow 原子写，修复 Deb 字段解析和 SemVer，支持 pending/processing/error/success 中断恢复，自定义更新源不再自动以 root 安装。
+- Linux 首次环境变量配置会迁移到原子持久化设置，旧明文密码先迁移为 scrypt hash 再移除；bootstrap 降权为服务用户执行。新录像目录使用 setgid、UMask 0007 和组权限，不递归修改历史录像。
+- `settings.json` 增加 schema 迁移、串行写入、fsync、临时文件原子替换和 backup 恢复；Windows 退出、SIGTERM、systemd stop 与更新重启统一进入 draining，优雅结束录像、弹幕写盘、媒体任务和状态保存。
+- 新增统一 MediaJobManager，对 merge、burn、export、preview 做优先级、CPU/GPU/IO 并发和取消管理；录制期间新的 CPU/GPU 重任务等待，更新也会等待媒体任务清空。
+- 弹幕 WebSocket 和视频续录新增指数退避、去抖和时间轴保持；JSONL 写入支持 backpressure、有限缓冲与独立错误状态，弹幕盘写失败不再拖垮视频录制；活动 `.recording.mkv` 改走兼容 HLS 预览。
+- merge、burn、export、字幕和预览改为临时输出、验证、原子替换，并增加录像及后处理磁盘安全阈值；新 merge 使用持久化 cleanupId 恢复清理，历史 merged 残留只允许用户手动触发。
+- Linux 新字幕/烧录验证 Noto Sans CJK SC，Windows 字体保持原选择；新录像写轻量 metadata，录像库限制和有限并发扫描统一，SSE 合并限频、断线恢复，监听和自动录制语义拆分。
+- Release 增加测试、FFmpeg smoke、Windows 构建、Linux x64/ARM64 原生构建与签名清单验签门禁，发布口径与实际产物保持一致。
+
 ## 0.3.3 - 2026-08-03
 
 - 启动时新增缓存版本检查：升级、降级、缓存格式变化或发现旧版未标记缓存时，自动清理兼容预览缓存；同时自动删除 0.3.0 以前“导出前修复源流”功能遗留且可能很大的 `repair-cache`，并严格隔离录像、弹幕、字幕、设置和更新日志。
