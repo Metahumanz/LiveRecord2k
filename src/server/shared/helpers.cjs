@@ -44,6 +44,7 @@ const UPDATE_DOWNLOAD_LOW_SPEED_WINDOW_MS = 20 * 1000;
 
 const danmakuClient = require('../danmaku/client.cjs');
 const danmakuAss = require('../danmaku/ass.cjs');
+const danmakuDedupe = require('../danmaku/dedupe.cjs');
 const ffmpegHelpers = require('../recording/ffmpeg.cjs');
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000, label = '网络请求', consumeResponse = null) {
@@ -1072,6 +1073,250 @@ async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, opti
   };
 }
 
+function parseDebugTimestamp(line, field) {
+  const match = new RegExp(`${field}_time:([-+]?\\d+(?:\\.\\d+)?)`, 'i').exec(String(line || ''));
+  const value = Number(match?.[1]);
+  return Number.isFinite(value) ? value : Number.NaN;
+}
+
+async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options = {}) {
+  const timeoutMs = Math.max(5_000, Number(options.timeoutMs || 120_000));
+  const sampleDurationSec = Math.max(0, Number(options.packetSampleDurationSec || 0));
+  return new Promise((resolve, reject) => {
+    let child;
+    let timer;
+    let stderrTail = '';
+    let residual = '';
+    let settled = false;
+    const result = {
+      firstPts: null,
+      firstDts: null,
+      lastPts: null,
+      lastDts: null,
+      ptsMonotonic: true,
+      dtsMonotonic: true,
+      ptsBackwardCount: 0,
+      dtsBackwardCount: 0,
+      ptsMaxBackwardSec: 0,
+      dtsMaxBackwardSec: 0,
+      packetCount: 0,
+      decodeErrorCount: 0
+    };
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        error.stderr = compactLogLine(stderrTail);
+        reject(error);
+      } else {
+        resolve(result);
+      }
+    };
+    const consumeLine = (line) => {
+      const text = String(line || '');
+      if (/(?:corrupt|invalid (?:data|nal)|non[- ]monoton|timestamp.*discontinuity|error while decoding)/i.test(text)) {
+        result.decodeErrorCount += 1;
+      }
+      // -debug_ts prints each packet at several pipeline stages. Only the
+      // original demuxer line is the source-order packet timeline; mixing it
+      // with muxer output falsely reports ordinary B-frame reordering as DTS
+      // rollback.
+      if (!/\bdemuxer\s+->\s+ist_index:/i.test(text)) return;
+      const pts = parseDebugTimestamp(text, 'pkt_pts');
+      const dts = parseDebugTimestamp(text, 'pkt_dts');
+      if (!Number.isFinite(pts) && !Number.isFinite(dts)) return;
+      result.packetCount += 1;
+      if (Number.isFinite(pts)) {
+        if (result.firstPts === null) result.firstPts = pts;
+        if (result.lastPts !== null && pts + 0.0005 < result.lastPts) {
+          result.ptsMonotonic = false;
+          result.ptsBackwardCount += 1;
+          result.ptsMaxBackwardSec = Math.max(result.ptsMaxBackwardSec, result.lastPts - pts);
+        }
+        result.lastPts = pts;
+      }
+      if (Number.isFinite(dts)) {
+        if (result.firstDts === null) result.firstDts = dts;
+        if (result.lastDts !== null && dts + 0.0005 < result.lastDts) {
+          result.dtsMonotonic = false;
+          result.dtsBackwardCount += 1;
+          result.dtsMaxBackwardSec = Math.max(result.dtsMaxBackwardSec, result.lastDts - dts);
+        }
+        result.lastDts = dts;
+      }
+    };
+    try {
+      child = spawn(
+        ffmpegPath,
+        [
+          '-hide_banner',
+          '-nostdin',
+          '-loglevel',
+          'verbose',
+          '-debug_ts',
+          ...(options.packetSampleFromEnd
+            ? ['-sseof', `-${Math.max(1, sampleDurationSec || 3)}`, '-i', filePath]
+            : ['-i', filePath]),
+          ...(sampleDurationSec && !options.packetSampleFromEnd ? ['-t', String(sampleDurationSec)] : []),
+          '-map',
+          selector,
+          '-c',
+          'copy',
+          '-f',
+          'null',
+          '-'
+        ],
+        { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] }
+      );
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    child.stderr.on('data', (chunk) => {
+      const text = `${residual}${chunk.toString('utf8')}`;
+      stderrTail = `${stderrTail}${text}`.slice(-16 * 1024);
+      const lines = text.split(/\r?\n/);
+      residual = lines.pop() || '';
+      for (const line of lines) consumeLine(line);
+    });
+    child.on('error', finish);
+    child.on('close', (code, signal) => {
+      if (residual) consumeLine(residual);
+      if (code === 0) {
+        finish();
+      } else {
+        finish(new Error(`媒体包时间轴扫描失败：${path.basename(filePath)}（退出码 ${code}，信号 ${signal || '-'}）`));
+      }
+    });
+    timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {}
+      finish(new Error(`媒体包时间轴扫描超时：${path.basename(filePath)}`));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
+async function scanMediaCopyWarnings(ffmpegPath, filePath, options = {}) {
+  const result = await runCapturedProcess(
+    ffmpegPath,
+    [
+      '-hide_banner',
+      '-nostdin',
+      '-loglevel',
+      'warning',
+      '-i',
+      filePath,
+      '-map',
+      '0:v?',
+      '-map',
+      '0:a?',
+      '-c',
+      'copy',
+      '-f',
+      'null',
+      '-'
+    ],
+    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 120_000)), maxOutputBytes: 128 * 1024 }
+  );
+  if (result.timedOut) throw new Error(`媒体完整性扫描超时：${path.basename(filePath)}`);
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  return {
+    exitCode: result.status,
+    corruptPacketCount: (output.match(/(?:corrupt|invalid (?:data|nal)|error while decoding)/gi) || []).length,
+    nonMonotonicCount: (output.match(/(?:non[- ]monoton(?:ous|ically)|timestamp.*discontinuity)/gi) || []).length,
+    output: compactLogLine(output)
+  };
+}
+
+async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
+  const timingInfo = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo, options);
+  const packetSampleDurationSec = Math.max(1, Number(options.packetSampleDurationSec || 3));
+  const [videoStart, videoEnd, audioStart, audioEnd, copyWarnings] = await Promise.all([
+    scanMediaPacketTimeline(ffmpegPath, filePath, '0:v:0', { ...options, packetSampleDurationSec }),
+    scanMediaPacketTimeline(ffmpegPath, filePath, '0:v:0', {
+      ...options,
+      packetSampleDurationSec,
+      packetSampleFromEnd: true
+    }),
+    mediaInfo.audioInfo
+      ? scanMediaPacketTimeline(ffmpegPath, filePath, '0:a:0', { ...options, packetSampleDurationSec })
+      : Promise.resolve(null),
+    mediaInfo.audioInfo
+      ? scanMediaPacketTimeline(ffmpegPath, filePath, '0:a:0', {
+          ...options,
+          packetSampleDurationSec,
+          packetSampleFromEnd: true
+        })
+      : Promise.resolve(null),
+    scanMediaCopyWarnings(ffmpegPath, filePath, options)
+  ]);
+  const video = {
+    ...videoStart,
+    lastPts: videoEnd.lastPts ?? videoStart.lastPts,
+    lastDts: videoEnd.lastDts ?? videoStart.lastDts,
+    ptsMonotonic: videoStart.ptsMonotonic && videoEnd.ptsMonotonic,
+    dtsMonotonic: videoStart.dtsMonotonic && videoEnd.dtsMonotonic,
+    ptsBackwardCount: Number(videoStart.ptsBackwardCount || 0) + Number(videoEnd.ptsBackwardCount || 0),
+    dtsBackwardCount: Number(videoStart.dtsBackwardCount || 0) + Number(videoEnd.dtsBackwardCount || 0),
+    ptsMaxBackwardSec: Math.max(Number(videoStart.ptsMaxBackwardSec || 0), Number(videoEnd.ptsMaxBackwardSec || 0)),
+    dtsMaxBackwardSec: Math.max(Number(videoStart.dtsMaxBackwardSec || 0), Number(videoEnd.dtsMaxBackwardSec || 0)),
+    decodeErrorCount: Number(videoStart.decodeErrorCount || 0) + Number(videoEnd.decodeErrorCount || 0)
+  };
+  const audio = audioStart
+    ? {
+        ...audioStart,
+        lastPts: audioEnd?.lastPts ?? audioStart.lastPts,
+        lastDts: audioEnd?.lastDts ?? audioStart.lastDts,
+        ptsMonotonic: audioStart.ptsMonotonic && (audioEnd?.ptsMonotonic ?? true),
+        dtsMonotonic: audioStart.dtsMonotonic && (audioEnd?.dtsMonotonic ?? true),
+        ptsBackwardCount: Number(audioStart.ptsBackwardCount || 0) + Number(audioEnd?.ptsBackwardCount || 0),
+        dtsBackwardCount: Number(audioStart.dtsBackwardCount || 0) + Number(audioEnd?.dtsBackwardCount || 0),
+        ptsMaxBackwardSec: Math.max(Number(audioStart.ptsMaxBackwardSec || 0), Number(audioEnd?.ptsMaxBackwardSec || 0)),
+        dtsMaxBackwardSec: Math.max(Number(audioStart.dtsMaxBackwardSec || 0), Number(audioEnd?.dtsMaxBackwardSec || 0)),
+        decodeErrorCount: Number(audioStart.decodeErrorCount || 0) + Number(audioEnd?.decodeErrorCount || 0)
+      }
+    : null;
+  const warnings = [];
+  if (!video.packetCount) warnings.push('没有检测到视频包');
+  if (video.ptsMaxBackwardSec > 0.75) warnings.push(`视频 PTS 大幅回退 ${video.ptsBackwardCount} 次`);
+  if (video.dtsBackwardCount) warnings.push(`视频 DTS 回退 ${video.dtsBackwardCount} 次`);
+  if (video.decodeErrorCount) warnings.push(`视频损坏/解析警告 ${video.decodeErrorCount} 次`);
+  if (audio?.ptsMaxBackwardSec > 0.75) warnings.push(`音频 PTS 大幅回退 ${audio.ptsBackwardCount} 次`);
+  if (audio?.dtsBackwardCount) warnings.push(`音频 DTS 回退 ${audio.dtsBackwardCount} 次`);
+  if (audio?.decodeErrorCount) warnings.push(`音频损坏/解析警告 ${audio.decodeErrorCount} 次`);
+  if (copyWarnings.nonMonotonicCount) warnings.push(`完整流扫描发现时间戳异常 ${copyWarnings.nonMonotonicCount} 次`);
+  if (copyWarnings.corruptPacketCount) warnings.push(`完整流扫描发现损坏包警告 ${copyWarnings.corruptPacketCount} 次`);
+  if (Math.abs(Number(timingInfo.avDeltaSec || 0)) > 0.08) warnings.push(`A/V 时长差 ${timingInfo.avDeltaSec.toFixed(3)}s`);
+  const broken =
+    !video.packetCount ||
+    video.dtsBackwardCount > 0 ||
+    (audio && audio.dtsBackwardCount > 0) ||
+    copyWarnings.nonMonotonicCount > 0;
+  return {
+    ...timingInfo,
+    firstVideoPts: video.firstPts,
+    firstVideoDts: video.firstDts,
+    lastVideoPts: video.lastPts,
+    lastVideoDts: video.lastDts,
+    firstAudioPts: audio?.firstPts ?? null,
+    firstAudioDts: audio?.firstDts ?? null,
+    lastAudioPts: audio?.lastPts ?? null,
+    lastAudioDts: audio?.lastDts ?? null,
+    videoPtsMonotonic: video.ptsMonotonic,
+    videoDtsMonotonic: video.dtsMonotonic,
+    audioPtsMonotonic: audio?.ptsMonotonic ?? true,
+    audioDtsMonotonic: audio?.dtsMonotonic ?? true,
+    corruptPacketCount:
+      Number(video.decodeErrorCount || 0) + Number(audio?.decodeErrorCount || 0) + Number(copyWarnings.corruptPacketCount || 0),
+    packetAuditMode: 'leading-and-trailing-sample-plus-full-copy-scan',
+    timelineHealth: broken ? 'broken' : warnings.length ? 'warning' : 'healthy',
+    warnings
+  };
+}
+
 function isHevcCodec(codec) {
   const value = String(codec || '').toLowerCase();
   return value.includes('hevc') || value.includes('h265') || value.includes('x265');
@@ -1098,15 +1343,41 @@ function formatDurationSeconds(seconds) {
   return `${s}秒`;
 }
 
-function streamScore(stream, settings) {
+function streamScore(stream, settings, options = {}) {
   const codec = String(stream.codec || '').toLowerCase();
   const hevc = codec.includes('hevc') || codec.includes('h265');
   const avc = codec.includes('avc') || codec.includes('h264');
+  const protocol = String(stream.protocol || '').toLowerCase();
+  const format = String(stream.format || '').toLowerCase();
+  const purpose = options.purpose === 'recording' ? 'recording' : 'preview';
   const qualityScore = Number(stream.qn || 0) * 1_000_000;
   const codecScore = settings.preferHevc ? (hevc ? 10_000 : avc ? 1_000 : 0) : avc ? 10_000 : hevc ? 1_000 : 0;
-  const protocolScore = stream.protocol.includes('hls') ? 500 : 250;
-  const formatScore = stream.format.includes('fmp4') ? 200 : stream.format.includes('flv') ? 100 : 0;
-  return qualityScore + codecScore + protocolScore + formatScore;
+  const isFlv = format.includes('flv') || protocol.includes('http_stream') || protocol.includes('http-flv');
+  const isHls = format.includes('fmp4') || format.includes('ts') || protocol.includes('hls');
+  const protocolScore = purpose === 'recording'
+    ? isFlv
+      ? 2_000
+      : isHls
+        ? 250
+        : 500
+    : isHls
+      ? 500
+      : isFlv
+        ? 250
+        : 300;
+  const formatScore = purpose === 'recording'
+    ? format.includes('flv')
+      ? 400
+      : format.includes('fmp4')
+        ? 50
+        : 0
+    : format.includes('fmp4')
+      ? 200
+      : format.includes('flv')
+        ? 100
+        : 0;
+  const healthPenalty = Math.max(0, Number(options.healthPenalty || 0));
+  return qualityScore + codecScore + protocolScore + formatScore - healthPenalty;
 }
 
 function displayCodecName(codec) {
@@ -1509,7 +1780,10 @@ function cloneRecordingState(recording) {
   return {
     ...recording,
     danmakuCommandCounts: { ...(recording.danmakuCommandCounts || {}) },
-    videoInfo: recording.videoInfo ? { ...recording.videoInfo } : recording.videoInfo
+    danmakuDropCounts: { ...(recording.danmakuDropCounts || {}) },
+    videoInfo: recording.videoInfo ? { ...recording.videoInfo } : recording.videoInfo,
+    streamMetadata: recording.streamMetadata ? { ...recording.streamMetadata } : recording.streamMetadata,
+    timelineHealth: recording.timelineHealth ? { ...recording.timelineHealth } : recording.timelineHealth
   };
 }
 
@@ -1594,7 +1868,7 @@ async function discoverRecordingFiles(outputDir, options = {}) {
       const metadataPath = `${cleanPath}.metadata.json`;
       const metadata = await fsp.readFile(metadataPath, 'utf8').then(JSON.parse).catch(() => null);
       const metadataUsable =
-        metadata?.schemaVersion === 1 &&
+        Number(metadata?.schemaVersion || 0) >= 1 &&
         Number(metadata.fileSize) === Number(stat.size) &&
         Math.abs(Number(metadata.fileMtimeMs) - Number(stat.mtimeMs)) < 2;
       const danmakuInfo = metadataUsable
@@ -1629,6 +1903,7 @@ async function discoverRecordingFiles(outputDir, options = {}) {
           danmakuDurationSec,
           segmentDurationSec: options.segmentDurationSec
         }),
+        danmakuDurationSec,
         fileSize: stat.size,
         valid,
         eventCount,
@@ -1637,6 +1912,20 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         ignoredDanmakuCount: 0,
         danmakuCommandCounts: {},
         videoInfo: mediaInfo.videoInfo,
+        liveSessionId: String(metadata?.liveSessionId || ''),
+        mergeGroup: String(metadata?.mergeGroup || ''),
+        mergeSequence: Number(metadata?.mergeSequence || 0),
+        segmentReason: String(metadata?.segmentReason || 'initial'),
+        streamMetadata: metadata?.streamMetadata || null,
+        timelineHealth:
+          metadata?.timelineDetails ||
+          (typeof metadata?.timelineHealth === 'string' ? { timelineHealth: metadata.timelineHealth, warnings: [] } : metadata?.timelineHealth) ||
+          null,
+        timelineHealthStatus: String(metadata?.timelineHealth || ''),
+        timingInfo: metadata?.timingInfo || null,
+        danmakuDropCounts: metadata?.danmakuDropCounts || {},
+        diagnosticsPath: metadata?.diagnosticsPath ? path.join(path.dirname(cleanPath), metadata.diagnosticsPath) : '',
+        recovery: metadata?.recovery || null,
         metadataPath
       };
     }
@@ -2530,6 +2819,7 @@ function mimeType(filePath) {
 module.exports = {
   ...danmakuClient,
   ...danmakuAss,
+  ...danmakuDedupe,
   ...ffmpegHelpers,
   fetchWithTimeout,
   requestBiliJsonWithCookies,
@@ -2598,6 +2888,7 @@ module.exports = {
   readDanmakuDurationSec,
   probeMediaFileInfo,
   probeMediaTimelineInfo,
+  probeMediaTimelineHealth,
   isHevcCodec,
   formatTimestamp,
   formatDurationSeconds,

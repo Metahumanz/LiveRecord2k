@@ -15,6 +15,9 @@ const {
   cookieHeadersFromLoginUrl,
   danmakuCommandType,
   normalizeDanmakuEvent,
+  classifyDanmakuEventIgnore,
+  monotonicNowMs,
+  SessionEventDeduper,
   normalizeDanmakuDisplayArea,
   danmakuDisplayAreaLabel,
   ensureDanmakuCss,
@@ -105,6 +108,7 @@ const {
   parseFfmpegTime,
   probeMediaFileInfo,
   probeMediaTimelineInfo,
+  probeMediaTimelineHealth,
   resolveReliableDurationSec,
   readDanmakuDurationSec,
   isHevcCodec,
@@ -199,7 +203,6 @@ const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
 const MIN_PLAYABLE_BYTES = 128 * 1024;
 const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
 const MEDIA_STALL_CHECK_MS = 20 * 1000;
-const MEDIA_STALL_TIMEOUT_MS = 75 * 1000;
 const MIN_MEDIA_GROWTH_BYTES = 32 * 1024;
 const WBI_MIXIN_KEY_TABLE = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14,
@@ -237,6 +240,11 @@ const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PREVIEW_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const QUALITY_UPGRADE_CHECK_MS = 90 * 1000;
+const QUALITY_UPGRADE_CONFIRMATIONS = 2;
+const QUALITY_SWITCH_COOLDOWN_MS = 3 * 60 * 1000;
+const MEDIA_PROGRESS_STALL_TIMEOUT_MS = 75 * 1000;
+const MEDIA_PROGRESS_JUMP_TOLERANCE_SEC = 8;
+const MEDIA_PROGRESS_BACKWARD_TOLERANCE_SEC = 0.75;
 const RECORDING_MEDIA_FILE_PATTERN =
   /(?:\.(?:clean|merged|danmaku|danmaku-only)|\.clip_[^.]+\.(?:clean|danmaku|danmaku-only))\.(?:mp4|mkv)$/i;
 const EXPORT_PREVIEW_EXTENSIONS = new Set(['.m3u8', '.ts']);
@@ -372,6 +380,11 @@ class LiveRecordService {
     this.recordingSessions = new Map();
     this.recordingStartLocks = new Set();
     this.reconnectPendingRooms = new Set();
+    this.streamStartRetryRooms = new Set();
+    this.streamStartRetryTimers = new Map();
+    this.liveStreamHealth = new Map();
+    this.liveDiagnostics = new Map();
+    this.liveDanmakuDedupers = new Map();
     this.burnSessions = new Map();
     this.burnQueue = [];
     this.burnQueueRunning = false;
@@ -520,6 +533,11 @@ class LiveRecordService {
     setImmediate(() => {
       this.recoverPersistedSegmentCleanups().catch((error) => {
         this.log('warn', `恢复 0.4.0 分段清理任务失败：${error.message}`);
+      });
+    });
+    setImmediate(() => {
+      this.recoverInterruptedRecordings().catch((error) => {
+        this.log('warn', `恢复异常中断录像失败：${error.message}`);
       });
     });
     this.scheduleAutomaticUpdateCheck(AUTO_UPDATE_INITIAL_DELAY_MS);
@@ -838,6 +856,7 @@ class LiveRecordService {
       lastError: undefined,
       qualityWarning: undefined,
       stream: undefined,
+      recordingState: undefined,
       currentRecording: undefined
     };
   }
@@ -847,11 +866,16 @@ class LiveRecordService {
     if (!cleanPath) {
       return null;
     }
+    const timelineHealth =
+      typeof recording.timelineHealth === 'string'
+        ? { timelineHealth: recording.timelineHealth, warnings: [] }
+        : recording.timelineHealth || recording.timelineDetails || null;
     return {
       id: String(recording.id || cleanPath),
       roomId: recording.roomId ? String(recording.roomId) : '',
       roomTitle: String(recording.roomTitle || ''),
       anchor: String(recording.anchor || ''),
+      liveSessionId: String(recording.liveSessionId || ''),
       startedAt: Number(recording.startedAt || Date.now()),
       cleanPath,
       danmakuPath: String(recording.danmakuPath || deriveSiblingPath(cleanPath, 'danmaku', 'jsonl')),
@@ -864,6 +888,8 @@ class LiveRecordService {
       mergeGroup: String(recording.mergeGroup || ''),
       mergeSequence: Number(recording.mergeSequence || 0),
       mergeOutputPath: String(recording.mergeOutputPath || ''),
+      segmentReason: String(recording.segmentReason || 'initial'),
+      diagnosticsPath: String(recording.diagnosticsPath || ''),
       mergedFrom: Array.isArray(recording.mergedFrom) ? recording.mergedFrom.map(String) : undefined,
       cleanupId: String(recording.cleanupId || ''),
       durationSec: Number(recording.durationSec || 0),
@@ -874,11 +900,17 @@ class LiveRecordService {
       capturedDanmakuCount: Number(recording.capturedDanmakuCount ?? recording.eventCount ?? 0),
       ignoredDanmakuCount: Number(recording.ignoredDanmakuCount || 0),
       danmakuCommandCounts: normalizeCommandCounts(recording.danmakuCommandCounts),
+      danmakuDropCounts: normalizeCommandCounts(recording.danmakuDropCounts),
       danmakuStatus: recording.danmakuStatus,
       danmakuMessage: recording.danmakuMessage,
       danmakuPopularity: Number(recording.danmakuPopularity || 0),
       videoInfo: recording.videoInfo || null,
-      timingInfo: recording.timingInfo || null
+      timingInfo: recording.timingInfo || null,
+      timelineHealth,
+      timelineHealthStatus: String(timelineHealth?.timelineHealth || recording.timelineHealthStatus || ''),
+      streamMetadata: recording.streamMetadata || null,
+      recordingState: String(recording.recordingState || ''),
+      recovery: recording.recovery || null
     };
   }
 
@@ -1006,6 +1038,7 @@ class LiveRecordService {
   getCurrentRecordingStateFromSession(session) {
     return {
       startedAt: session.startedAt,
+      liveSessionId: session.liveSessionId,
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
       cssPath: session.cssPath,
@@ -1017,16 +1050,21 @@ class LiveRecordService {
       mergeGroup: session.mergeGroup,
       mergeSequence: session.mergeSequence,
       mergeOutputPath: session.mergeOutputPath,
-      durationSec: Math.max(0, (Date.now() - session.startedAt) / 1000),
+      segmentReason: session.segmentReason || 'initial',
+      diagnosticsPath: session.diagnosticsPath || '',
+      recordingState: session.state || 'connecting',
+      durationSec: this.getSessionMediaDurationSec(session),
       eventCount: Number(session.eventCount || 0),
       rawDanmakuCount: Number(session.rawDanmakuCount || 0),
       capturedDanmakuCount: Number(session.capturedDanmakuCount ?? session.eventCount ?? 0),
       ignoredDanmakuCount: Number(session.ignoredCommandCount || 0),
       danmakuCommandCounts: { ...(session.danmakuCommandCounts || {}) },
+      danmakuDropCounts: { ...(session.danmakuDropCounts || {}) },
       danmakuStatus: session.danmakuStatus,
       danmakuMessage: session.danmakuMessage,
       danmakuPopularity: Number(session.danmakuPopularity || 0),
-      videoInfo: session.videoInfo || null
+      videoInfo: session.videoInfo || null,
+      streamMetadata: session.streamMetadata ? { ...session.streamMetadata } : null
     };
   }
 
@@ -1050,7 +1088,12 @@ class LiveRecordService {
   }
 
   hasRecordingIntent(room) {
-    return Boolean(room?.id && (this.recordingStartLocks.has(room.id) || this.reconnectPendingRooms.has(room.id)));
+    return Boolean(
+      room?.id &&
+        (this.recordingStartLocks.has(room.id) ||
+          this.reconnectPendingRooms.has(room.id) ||
+          this.streamStartRetryRooms.has(room.id))
+    );
   }
 
   isRoomBurning(room) {
@@ -2438,7 +2481,7 @@ try {
     if (commandType === 'LIVE') {
       await this.applyDetectedLiveStatus(room, 1, '弹幕服务器推送');
       if (room.autoRecord && !this.isRoomRecording(room)) {
-        await this.startRecording(room.id, true);
+        await this.startRecording(room.id, true, { livePushReceivedAt: Date.now() });
       }
       setImmediate(() => {
         this.refreshRoom(room.id, { silent: true }).catch(() => {});
@@ -3064,6 +3107,212 @@ try {
     }
   }
 
+  getStreamHealthKey(stream) {
+    const host = String(stream?.host || '').trim().toLowerCase();
+    if (host) return host;
+    try {
+      return new URL(String(stream?.url || '')).host.toLowerCase();
+    } catch {
+      return String(stream?.url || '').slice(0, 160).toLowerCase();
+    }
+  }
+
+  getLiveDanmakuDeduper(liveSessionId) {
+    const sessionId = String(liveSessionId || '');
+    if (!sessionId) return new SessionEventDeduper();
+    let deduper = this.liveDanmakuDedupers.get(sessionId);
+    if (!deduper) {
+      deduper = new SessionEventDeduper();
+      this.liveDanmakuDedupers.set(sessionId, deduper);
+    }
+    return deduper;
+  }
+
+  getStreamHealthPenalty(liveSessionId, stream) {
+    const sessionId = String(liveSessionId || '');
+    if (!sessionId) return 0;
+    const health = this.liveStreamHealth.get(sessionId)?.get(this.getStreamHealthKey(stream));
+    return Math.max(0, Number(health?.penalty || 0));
+  }
+
+  recordStreamHealth(liveSessionId, stream, reason) {
+    const sessionId = String(liveSessionId || '');
+    const key = this.getStreamHealthKey(stream);
+    if (!sessionId || !key) return;
+    let bucket = this.liveStreamHealth.get(sessionId);
+    if (!bucket) {
+      bucket = new Map();
+      this.liveStreamHealth.set(sessionId, bucket);
+    }
+    const current = bucket.get(key) || { failureCount: 0, eofCount: 0, ptsDiscontinuityCount: 0, penalty: 0 };
+    current.failureCount += 1;
+    if (reason === 'stream-eof' || reason === 'network-error' || reason === 'no-media-progress') current.eofCount += 1;
+    if (reason === 'pts-discontinuity') current.ptsDiscontinuityCount += 1;
+    current.penalty = Math.min(900_000, Number(current.penalty || 0) + (reason === 'pts-discontinuity' ? 160_000 : 90_000));
+    current.lastFailureAt = Date.now();
+    current.lastReason = reason || 'unknown';
+    bucket.set(key, current);
+  }
+
+  createStreamMetadata(stream) {
+    const rawUrl = String(stream?.url || '');
+    let urlIdentifier = '';
+    try {
+      const parsed = new URL(rawUrl);
+      urlIdentifier = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    } catch {
+      urlIdentifier = rawUrl.replace(/[?&](?:token|sign|expires|wsTime)=[^&]+/gi, '');
+    }
+    return {
+      protocol: String(stream?.protocol || ''),
+      format: String(stream?.format || ''),
+      codec: String(stream?.codec || ''),
+      qn: Number(stream?.qn || 0),
+      host: this.getStreamHealthKey(stream),
+      streamUrlId: crypto.createHash('sha256').update(urlIdentifier).digest('hex').slice(0, 16)
+    };
+  }
+
+  getOrCreateLiveDiagnostics(room, session) {
+    const liveSessionId = String(session?.liveSessionId || '');
+    if (!liveSessionId) return null;
+    let diagnostics = this.liveDiagnostics.get(liveSessionId);
+    if (!diagnostics) {
+      diagnostics = {
+        schemaVersion: 1,
+        liveSessionId,
+        roomId: String(room?.id || ''),
+        roomTitle: String(room?.title || ''),
+        anchor: String(room?.anchor || ''),
+        startedAt: Number(session.startedAt || Date.now()),
+        diagnosticsPath: session.diagnosticsPath,
+        start: {
+          livePushReceivedAt: Number(session.livePushReceivedAt || 0) || undefined,
+          startRecordingCalledAt: Number(session.startRecordingCalledAt || session.startedAt || Date.now()),
+          ffmpegSpawnAt: Number(session.ffmpegSpawnAt || 0) || undefined,
+          firstMediaProgressAt: undefined,
+          firstVideoAt: undefined,
+          firstAudioAt: undefined,
+          danmakuWsConnectedAt: undefined,
+          firstDanmakuAt: undefined
+        },
+        video: {
+          segmentCount: 0,
+          segments: [],
+          disconnectCount: 0,
+          reconnectCount: 0,
+          qualitySwitchCount: 0,
+          ptsDiscontinuityCount: 0,
+          timelineHealth: 'healthy'
+        },
+        danmaku: {
+          websocketPackets: 0,
+          commandsReceived: 0,
+          eventsCaptured: 0,
+          duplicateDropped: 0,
+          unsupportedDropped: 0,
+          decodeErrors: 0,
+          writeDropped: 0,
+          reconnectCount: 0,
+          maxQueueLagMs: 0,
+          avgQueueLagMs: 0
+        },
+        final: { mergeResult: 'pending', warnings: [] },
+        updatedAt: new Date().toISOString()
+      };
+      this.liveDiagnostics.set(liveSessionId, diagnostics);
+    }
+    if (session?.diagnosticsPath && !diagnostics.diagnosticsPath) diagnostics.diagnosticsPath = session.diagnosticsPath;
+    return diagnostics;
+  }
+
+  updateLiveDiagnosticsFromSession(room, session) {
+    const diagnostics = this.getOrCreateLiveDiagnostics(room, session);
+    if (!diagnostics) return null;
+    const queue = session.danmakuQueueMetrics || {};
+    diagnostics.start.firstMediaProgressAt ||= session.firstMediaProgressAt || undefined;
+    diagnostics.start.firstVideoAt ||= session.firstVideoAt || undefined;
+    diagnostics.start.firstAudioAt ||= session.firstAudioAt || undefined;
+    diagnostics.start.danmakuWsConnectedAt ||= session.danmakuWsConnectedAt || undefined;
+    diagnostics.start.firstDanmakuAt ||= session.firstDanmakuAt || undefined;
+    diagnostics.danmaku.websocketPackets = Number(session.websocketPackets || 0);
+    diagnostics.danmaku.commandsReceived = Number(session.rawDanmakuCount || 0);
+    diagnostics.danmaku.eventsCaptured = Number(session.eventCount || 0);
+    diagnostics.danmaku.duplicateDropped = Number(session.danmakuDropCounts?.duplicateDropped || 0);
+    diagnostics.danmaku.unsupportedDropped = Number(session.danmakuDropCounts?.unsupportedCommand || 0);
+    diagnostics.danmaku.decodeErrors = Number(session.danmakuDropCounts?.decodeFailed || 0);
+    diagnostics.danmaku.writeDropped = Number(session.danmakuDropCounts?.writeDropped || 0);
+    diagnostics.danmaku.reconnectCount = Number(session.danmakuReconnectCount || 0);
+    diagnostics.danmaku.maxQueueLagMs = Number(queue.maxQueueLagMs || 0);
+    diagnostics.danmaku.avgQueueLagMs = Number(queue.averageQueueLagMs || 0);
+    diagnostics.updatedAt = new Date().toISOString();
+    return diagnostics;
+  }
+
+  queueDiagnosticsWrite(diagnostics) {
+    if (!diagnostics?.diagnosticsPath) return Promise.resolve();
+    diagnostics.writePromise = (diagnostics.writePromise || Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        const payload = { ...diagnostics, writePromise: undefined, diagnosticsPath: path.basename(diagnostics.diagnosticsPath) };
+        const temporaryPath = `${diagnostics.diagnosticsPath}.${process.pid}.${Date.now()}.tmp`;
+        await fsp.writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o660 });
+        await atomicReplaceFile(temporaryPath, diagnostics.diagnosticsPath);
+      });
+    return diagnostics.writePromise;
+  }
+
+  appendSegmentDiagnostics(room, session, recording) {
+    const diagnostics = this.updateLiveDiagnosticsFromSession(room, session);
+    if (!diagnostics) return Promise.resolve();
+    const health = recording.timelineHealth || {};
+    diagnostics.video.segments.push({
+      sequence: Number(recording.mergeSequence || 0),
+      fileName: path.basename(recording.cleanPath || ''),
+      reason: recording.segmentReason || 'initial',
+      durationSec: Number(recording.durationSec || 0),
+      danmakuDurationSec: Number(recording.danmakuDurationSec || 0),
+      protocol: recording.streamMetadata?.protocol || '',
+      format: recording.streamMetadata?.format || '',
+      codec: recording.videoInfo?.codec || recording.streamMetadata?.codec || '',
+      qn: Number(recording.streamMetadata?.qn || 0),
+      host: recording.streamMetadata?.host || '',
+      resolution: recording.videoInfo ? `${recording.videoInfo.width || 0}x${recording.videoInfo.height || 0}` : '',
+      timelineHealth: health.timelineHealth || 'warning',
+      firstVideoPts: health.firstVideoPts ?? null,
+      firstAudioPts: health.firstAudioPts ?? null
+    });
+    diagnostics.video.segmentCount = diagnostics.video.segments.length;
+    diagnostics.video.disconnectCount = diagnostics.video.segments.filter((item) => /stream-eof|network-error|no-media-progress/i.test(item.reason)).length;
+    diagnostics.video.reconnectCount = Math.max(0, diagnostics.video.segmentCount - 1);
+    diagnostics.video.qualitySwitchCount = diagnostics.video.segments.filter((item) => item.reason === 'quality-upgrade').length;
+    diagnostics.video.ptsDiscontinuityCount = diagnostics.video.segments.filter((item) => item.reason === 'pts-discontinuity').length;
+    diagnostics.video.timelineHealth = diagnostics.video.segments.some((item) => item.timelineHealth === 'broken')
+      ? 'broken'
+      : diagnostics.video.segments.some((item) => item.timelineHealth === 'warning')
+        ? 'warning'
+        : 'healthy';
+    diagnostics.updatedAt = new Date().toISOString();
+    return this.queueDiagnosticsWrite(diagnostics);
+  }
+
+  finalizeLiveDiagnostics(room, recording, mergeResult = 'completed') {
+    const sessionLike = { liveSessionId: recording?.liveSessionId, diagnosticsPath: recording?.diagnosticsPath, startedAt: recording?.startedAt };
+    const diagnostics = this.getOrCreateLiveDiagnostics(room, sessionLike);
+    if (!diagnostics) return Promise.resolve();
+    diagnostics.final = {
+      finalVideoDuration: Number(recording?.timelineHealth?.videoDurationSec || recording?.durationSec || 0),
+      finalAudioDuration: Number(recording?.timelineHealth?.audioDurationSec || 0),
+      finalDanmakuEndTime: Number(recording?.danmakuDurationSec || 0),
+      audioVideoDelta: Number(recording?.timelineHealth?.avDeltaSec || recording?.timingInfo?.avDeltaSec || 0),
+      danmakuVideoDelta: Number(recording?.danmakuDurationSec || 0) - Number(recording?.durationSec || 0),
+      mergeResult,
+      warnings: Array.from(new Set([...(recording?.timelineHealth?.warnings || []), ...(diagnostics.final?.warnings || [])]))
+    };
+    diagnostics.updatedAt = new Date().toISOString();
+    return this.queueDiagnosticsWrite(diagnostics);
+  }
+
   async resolvePlayStream(room, options = {}) {
     if (!room.realRoomId) {
       Object.assign(room, await this.fetchRoomInfo(room.id));
@@ -3148,7 +3397,18 @@ try {
       );
     }
 
-    selectableCandidates.sort((a, b) => streamScore(b, this.settings) - streamScore(a, this.settings));
+    const streamPurpose = options.requireHls ? 'preview' : 'recording';
+    selectableCandidates.sort(
+      (a, b) =>
+        streamScore(b, this.settings, {
+          purpose: streamPurpose,
+          healthPenalty: this.getStreamHealthPenalty(options.liveSessionId, b)
+        }) -
+        streamScore(a, this.settings, {
+          purpose: streamPurpose,
+          healthPenalty: this.getStreamHealthPenalty(options.liveSessionId, a)
+        })
+    );
     room.stream = selectableCandidates[0];
     const availableQn = Array.from(
       new Set(candidates.flatMap((candidate) => [candidate.qn, ...(candidate.acceptQn || [])]).filter(Boolean))
@@ -3176,11 +3436,16 @@ try {
       throw new Error('服务正在退出，不能开始新的录制。');
     }
     const room = this.getRoom(roomId);
+    const liveSessionId = String(options.liveSessionId || crypto.randomUUID());
+    const startRecordingCalledAt = Date.now();
+    const startRecordingMono = monotonicNowMs();
     if (this.hasActiveRecordingSession(room) || (this.reconnectPendingRooms.has(room.id) && !options.streamReconnect)) {
       return this.getState();
     }
     this.recordingStartLocks.add(room.id);
+    room.recordingState = 'waiting-stream';
     this.emitState();
+    let streamResolved = false;
 
     try {
       if (!room.realRoomId || room.liveStatus !== 1) {
@@ -3203,7 +3468,7 @@ try {
         );
       } else {
         try {
-          stream = await this.resolvePlayStream(room);
+          stream = await this.resolvePlayStream(room, { liveSessionId, purpose: '正式录像' });
         } catch (error) {
           if (!fallbackStream) {
             throw error;
@@ -3218,6 +3483,7 @@ try {
           );
         }
       }
+      streamResolved = Boolean(stream?.url);
       const timestamp = formatTimestamp(new Date());
       const outputRoot = String(this.settings.outputDir || '').trim() || this.settings.outputDir;
       await this.ensureRecordingOutputRootReady(outputRoot, { label: '录像保存根目录' });
@@ -3242,6 +3508,11 @@ try {
       const mergeSequence = Number(options.mergeSequence || 0);
       const mergeOutputPath =
         options.mergeOutputPath || path.join(outputDir, `${sanitizeFilename(mergeGroup)}.merged.${container}`);
+      const segmentReason = String(
+        options.segmentReason ||
+          (options.streamReconnect ? 'stream-eof' : options.segmentContinue ? 'duration-limit' : 'initial')
+      );
+      const diagnosticsPath = String(options.diagnosticsPath || path.join(outputDir, 'diagnostics.json'));
 
       const segmentMinutes = Number(options.segmentMinutes ?? this.settings.segmentMinutes ?? 0);
       const optionSegmentDurationSec = Number(options.segmentDurationSec);
@@ -3258,6 +3529,9 @@ try {
         maxDurationSec: segmentDurationSec
       });
 
+      const ffmpegSpawnAt = Date.now();
+      const ffmpegSpawnMono = monotonicNowMs();
+      room.recordingState = 'connecting';
       const ffmpeg = spawn(this.ffmpegPath, args, {
         windowsHide: true,
         stdio: ['pipe', 'ignore', 'pipe']
@@ -3270,15 +3544,26 @@ try {
           session.danmakuWriteFailed = true;
           this.updateDanmakuStatus(room, session, 'write-error', `弹幕写盘失败，视频录制仍会继续：${error.message}`, 'error');
         },
-        onDrop: () => {}
+        onDrop: () => {
+          if (!session) return;
+          this.incrementDanmakuDrop(session, 'writeDropped');
+        }
       });
       session = {
         roomId: room.id,
+        liveSessionId,
         ffmpeg,
         stream,
+        streamMetadata: this.createStreamMetadata(stream),
         eventStream,
         danmakuClient: null,
-        startedAt: Date.now(),
+        startedAt: startRecordingCalledAt,
+        startedMono: startRecordingMono,
+        startRecordingCalledAt,
+        livePushReceivedAt: Number(options.livePushReceivedAt || 0),
+        ffmpegSpawnAt,
+        ffmpegSpawnMono,
+        state: 'waiting-first-frame',
         outputDir,
         outputContainer: container,
         cleanPath,
@@ -3292,6 +3577,8 @@ try {
         mergeGroup,
         mergeSequence,
         mergeOutputPath,
+        segmentReason,
+        diagnosticsPath,
         eventCount: 0,
         rawDanmakuCount: 0,
         capturedDanmakuCount: 0,
@@ -3302,7 +3589,25 @@ try {
         danmakuPopularity: 0,
         danmakuReconnectAttempt: 0,
         danmakuReconnectTimer: null,
+        danmakuReconnectCount: 0,
         ignoredCommandCount: 0,
+        danmakuDropCounts: {
+          unsupportedCommand: 0,
+          deliberatelyIgnored: 0,
+          duplicateDropped: 0,
+          decodeFailed: 0,
+          malformedEvent: 0,
+          writeDropped: 0,
+          filteredEvent: 0
+        },
+        deduper: this.getLiveDanmakuDeduper(liveSessionId),
+        danmakuQueueMetrics: {
+          queueLength: 0,
+          oldestPacketWaitMs: 0,
+          maxQueueLagMs: 0,
+          averageQueueLagMs: 0
+        },
+        websocketPackets: 0,
         lastIgnoredEmitAt: 0,
         ffmpegProbeBuffer: '',
         ffmpegLogBuffer: '',
@@ -3312,10 +3617,25 @@ try {
         qualityWatchTimer: null,
         lastMediaSize: 0,
         lastMediaGrowthAt: Date.now(),
+        lastMediaProgressAt: 0,
+        lastMediaProgressMono: 0,
+        lastMediaOutTimeSec: 0,
+        firstMediaOutTimeSec: null,
+        mediaClock: null,
+        firstMediaProgressAt: 0,
+        firstMediaProgressMono: 0,
+        firstVideoAt: 0,
+        firstAudioAt: 0,
+        firstVideoPts: null,
+        firstAudioPts: null,
+        ptsDiscontinuityCount: 0,
         mediaStalled: false,
         rotating: false,
         qualitySwitching: false,
         nextStream: null,
+        lastStreamSwitchMono: Number(options.lastStreamSwitchMono || 0),
+        qualityCandidate: null,
+        qualityCandidateConfirmations: 0,
         segmentMinutes,
         segmentDurationSec,
         finished: false,
@@ -3327,8 +3647,10 @@ try {
       });
 
       room.recording = true;
+      room.recordingState = session.state;
       room.currentRecording = {
         startedAt: session.startedAt,
+        liveSessionId,
         cleanPath,
         danmakuPath,
         cssPath,
@@ -3340,6 +3662,9 @@ try {
         mergeGroup,
         mergeSequence,
         mergeOutputPath,
+        segmentReason,
+        diagnosticsPath,
+        recordingState: session.state,
         eventCount: 0,
         rawDanmakuCount: 0,
         capturedDanmakuCount: 0,
@@ -3348,6 +3673,8 @@ try {
         danmakuPopularity: 0,
         ignoredDanmakuCount: 0,
         danmakuCommandCounts: {},
+        danmakuDropCounts: { ...session.danmakuDropCounts },
+        streamMetadata: { ...session.streamMetadata },
         videoInfo: null
       };
       this.recordingSessions.set(room.id, session);
@@ -3358,6 +3685,10 @@ try {
         cancel: () => this.stopRecording(room.id).catch(() => {})
       });
       this.reconnectPendingRooms.delete(room.id);
+      this.getOrCreateLiveDiagnostics(room, session);
+      this.writeActiveSegmentMetadata(room, session).catch((error) => {
+        this.log('warn', `${roomLabel(room)} 写入断电恢复标记失败：${error.message}`);
+      });
       this.armRecordingRotation(room, session);
       this.armNoMediaWatch(room, session);
       this.armQualityUpgradeWatch(room, session);
@@ -3387,11 +3718,13 @@ try {
       ffmpeg.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8');
         session.ffmpegLogBuffer = `${session.ffmpegLogBuffer}${text}`.slice(-12000);
+        this.processRecordingFfmpegOutput(room, session, text);
         if (!session.videoInfo) {
           session.ffmpegProbeBuffer = `${session.ffmpegProbeBuffer}${text}`.slice(-6000);
           const videoInfo = parseFfmpegVideoInfo(session.ffmpegProbeBuffer);
           if (videoInfo) {
             session.videoInfo = videoInfo;
+            this.maybeEnterRecordingState(room, session);
             clearTimeout(session.streamStableTimer);
             session.streamStableTimer = setTimeout(() => {
               session.streamReconnectAttempt = 0;
@@ -3462,8 +3795,12 @@ try {
     } catch (error) {
       room.lastError = error.message;
       room.recording = false;
+      room.recordingState = 'failed';
       this.reconnectPendingRooms.delete(room.id);
       this.log('error', `${roomLabel(room)} 开始录制失败：${error.message}`);
+      if (autoStart && !streamResolved && room.monitoring && room.liveStatus === 1) {
+        this.scheduleInitialStreamRetry(room, options, error.message);
+      }
       this.emitState();
     } finally {
       this.recordingStartLocks.delete(room.id);
@@ -3473,6 +3810,185 @@ try {
       this.emitState();
     }
     return this.getState();
+  }
+
+  scheduleInitialStreamRetry(room, previousOptions = {}, reason = '') {
+    if (!room?.id || this.draining || this.streamStartRetryTimers.has(room.id) || !room.monitoring || room.liveStatus !== 1) {
+      return;
+    }
+    const attempt = Math.min(8, Number(previousOptions.streamStartRetryAttempt || 0) + 1);
+    const delayMs = Math.min(20_000, 1_000 * 2 ** Math.min(attempt - 1, 4));
+    this.streamStartRetryRooms.add(room.id);
+    room.recordingState = 'waiting-stream';
+    this.log(
+      'info',
+      `${roomLabel(room)} 直播流尚未稳定，${(delayMs / 1000).toFixed(1)} 秒后重试第 ${attempt} 次${reason ? `：${reason}` : ''}`
+    );
+    const timer = setTimeout(() => {
+      this.streamStartRetryTimers.delete(room.id);
+      this.streamStartRetryRooms.delete(room.id);
+      if (!room.monitoring || room.liveStatus !== 1 || this.hasActiveRecordingSession(room)) {
+        this.emitState();
+        return;
+      }
+      this.startRecording(room.id, true, {
+        ...previousOptions,
+        streamStartRetryAttempt: attempt,
+        silentNotify: true
+      }).catch((error) => {
+        this.log('warn', `${roomLabel(room)} 等待稳定流重试失败：${error.message}`);
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.streamStartRetryTimers.set(room.id, timer);
+    this.emitState();
+  }
+
+  incrementDanmakuDrop(session, reason, count = 1) {
+    if (!session) return;
+    const key = String(reason || 'unsupportedCommand');
+    session.danmakuDropCounts ||= {};
+    session.danmakuDropCounts[key] = Number(session.danmakuDropCounts[key] || 0) + Math.max(1, Number(count || 1));
+    session.ignoredCommandCount = Object.values(session.danmakuDropCounts).reduce((sum, value) => sum + Number(value || 0), 0);
+  }
+
+  resolveSessionVideoTime(session, receivedMono) {
+    const eventMono = Number(receivedMono || monotonicNowMs());
+    const originMono = Number(session?.mediaClock?.originMono);
+    if (!Number.isFinite(originMono)) {
+      // Events received before the first frame belong at the beginning of the
+      // media timeline; do not add FFmpeg connection/startup wait.
+      return 0;
+    }
+    return Math.max(0, (eventMono - originMono) / 1000);
+  }
+
+  getSessionMediaDurationSec(session) {
+    const last = Number(session?.lastMediaOutTimeSec);
+    const first = Number(session?.firstMediaOutTimeSec);
+    if (!Number.isFinite(last) || !Number.isFinite(first)) return 0;
+    return Math.max(0, last - first);
+  }
+
+  transitionRecordingState(room, session, state) {
+    if (!session || session.state === state) return;
+    session.state = state;
+    if (this.shouldUpdateCurrentRecording(room, session)) {
+      room.currentRecording.recordingState = state;
+      room.recordingState = state;
+    }
+  }
+
+  maybeEnterRecordingState(room, session) {
+    if (
+      session &&
+      !session.finished &&
+      !session.stopping &&
+      session.mediaClock &&
+      session.videoInfo &&
+      session.firstVideoAt &&
+      ['connecting', 'waiting-first-frame'].includes(session.state)
+    ) {
+      this.transitionRecordingState(room, session, 'recording');
+      this.log('success', `${roomLabel(room)} 已确认首帧与媒体时间轴，正式进入录制。`);
+      this.emitState();
+    }
+  }
+
+  processRecordingMediaProgress(room, session, outTimeSec, observedMono = monotonicNowMs(), observedAt = Date.now()) {
+    const outTime = Number(outTimeSec);
+    if (!Number.isFinite(outTime) || outTime < 0 || session.finished || session.stopping) return;
+    const previousTime = Number(session.lastMediaOutTimeSec || 0);
+    const previousMono = Number(session.lastMediaProgressMono || 0);
+    if (previousMono) {
+      const mediaDelta = outTime - previousTime;
+      const wallDelta = Math.max(0, (observedMono - previousMono) / 1000);
+      const jumpedForward = mediaDelta > Math.max(15, wallDelta * 4 + MEDIA_PROGRESS_JUMP_TOLERANCE_SEC);
+      const movedBackward = mediaDelta < -MEDIA_PROGRESS_BACKWARD_TOLERANCE_SEC;
+      if (jumpedForward || movedBackward) {
+        this.triggerTimelineDiscontinuity(
+          room,
+          session,
+          jumpedForward
+            ? `FFmpeg media progress 突然前跳 ${mediaDelta.toFixed(3)}s`
+            : `FFmpeg media progress 回退 ${Math.abs(mediaDelta).toFixed(3)}s`
+        );
+        return;
+      }
+    }
+    const mediaAdvanced = !previousMono || outTime > previousTime + 0.0005;
+    if (!mediaAdvanced) return;
+    session.lastMediaOutTimeSec = Math.max(0, outTime);
+    if (!Number.isFinite(Number(session.firstMediaOutTimeSec))) {
+      session.firstMediaOutTimeSec = outTime;
+    }
+    session.lastMediaProgressMono = observedMono;
+    session.lastMediaProgressAt = observedAt;
+    session.lastMediaGrowthAt = observedAt;
+    if (!session.mediaClock) {
+      session.mediaClock = {
+        // Segment time zero is the first media timestamp, not FFmpeg spawn
+        // time and not an arbitrary positive source PTS carried by a CDN.
+        originMono: observedMono,
+        firstProgressMono: observedMono,
+        firstOutTimeSec: outTime
+      };
+      session.firstMediaProgressMono = observedMono;
+      session.firstMediaProgressAt = observedAt;
+    } else {
+      session.mediaClock.originMono = observedMono - this.getSessionMediaDurationSec(session) * 1000;
+    }
+    this.maybeEnterRecordingState(room, session);
+  }
+
+  triggerTimelineDiscontinuity(room, session, detail) {
+    this.triggerSegmentRotate(room, session, 'pts-discontinuity', detail);
+  }
+
+  triggerSegmentRotate(room, session, reason, detail) {
+    if (!session || session.finished || session.stopping || session.rotating || session.timelineDiscontinuityPending) return;
+    session.timelineDiscontinuityPending = true;
+    if (reason === 'pts-discontinuity') {
+      session.ptsDiscontinuityCount = Number(session.ptsDiscontinuityCount || 0) + 1;
+    }
+    session.segmentReason = reason || 'network-error';
+    session.rotating = true;
+    this.recordStreamHealth(session.liveSessionId, session.stream, session.segmentReason);
+    this.transitionRecordingState(room, session, 'rotating');
+    this.log(
+      'error',
+      `${roomLabel(room)} ${session.segmentReason === 'pts-discontinuity' ? '检测到时间轴不连续' : '检测到首包/流异常'}：${detail}；将结束当前分段并新建文件。`
+    );
+    requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
+    this.emitState();
+  }
+
+  processRecordingFfmpegOutput(room, session, text) {
+    if (!session || session.finished) return;
+    const nowMono = monotonicNowMs();
+    const now = Date.now();
+    const progressMatches = Array.from(String(text || '').matchAll(/out_time_us=(-?\d+)/g));
+    if (progressMatches.length) {
+      for (const match of progressMatches) {
+        this.processRecordingMediaProgress(room, session, Number(match[1]) / 1_000_000, nowMono, now);
+      }
+    } else {
+      const fallbackProgress = parseFfmpegProgressTime(text);
+      if (Number.isFinite(fallbackProgress)) this.processRecordingMediaProgress(room, session, fallbackProgress, nowMono, now);
+    }
+    const frameMatches = Array.from(String(text || '').matchAll(/(?:^|\n)frame=\s*(\d+)/g));
+    if (frameMatches.some((match) => Number(match[1]) > 0)) session.firstVideoAt ||= now;
+    this.maybeEnterRecordingState(room, session);
+    if (!session.firstAudioAt && /\bAudio:\s*/i.test(String(text || ''))) session.firstAudioAt = now;
+    if (/(?:non[- ]monoton(?:ous|ically)|timestamp discontinuity|invalid.*(?:pts|dts)|pts.*(?:backward|regress)|dts.*(?:backward|regress))/i.test(String(text || ''))) {
+      this.triggerTimelineDiscontinuity(room, session, compactLogLine(text));
+    }
+    if (
+      !session.mediaClock &&
+      /(?:corrupt|invalid nal|missing picture|error while decoding|could not find codec parameters)/i.test(String(text || ''))
+    ) {
+      this.triggerSegmentRotate(room, session, 'network-error', compactLogLine(text));
+    }
   }
 
   async startDanmakuCapture(room, session) {
@@ -3493,6 +4009,7 @@ try {
       hosts: info.data?.host_list || [],
       onOpen: () => {
         if (!session.finished) {
+          session.danmakuWsConnectedAt ||= Date.now();
           this.updateDanmakuStatus(room, session, 'connecting', '弹幕通道已连接，正在认证');
         }
       },
@@ -3506,6 +4023,10 @@ try {
           return;
         }
         this.updateDanmakuStatus(room, session, 'error', `弹幕认证失败：${reply?.message || reply?.code || '未知错误'}`, 'warn');
+        // Authentication failures do not recover on the same socket. Close it
+        // so onClose enters the single reconnect path instead of leaving the
+        // client in an authenticated-looking error state.
+        client.close('auth failed');
       },
       onHeartbeat: (popularity) => {
         if (session.finished) {
@@ -3528,7 +4049,41 @@ try {
           this.updateDanmakuStatus(room, session, 'error', `弹幕通道错误：${error.message}`, 'warn');
         }
       },
-      onCommand: (command) => {
+      onPacketMetrics: (metrics) => {
+        if (session.finished) return;
+        if (metrics.phase === 'received') {
+          session.websocketPackets = Number(session.websocketPackets || 0) + 1;
+        }
+        if (metrics.phase === 'processed') {
+          session.queueLagTotalMs = Number(session.queueLagTotalMs || 0) + Number(metrics.latestQueueLagMs || 0);
+          session.queueLagSampleCount = Number(session.queueLagSampleCount || 0) + 1;
+        }
+        session.danmakuQueueMetrics = {
+          queueLength: Number(metrics.queueLength || 0),
+          oldestPacketWaitMs: Number(metrics.oldestPacketWaitMs || 0),
+          maxQueueLagMs: Math.max(Number(session.danmakuQueueMetrics?.maxQueueLagMs || 0), Number(metrics.maxQueueLagMs || 0)),
+          averageQueueLagMs: Number(session.queueLagSampleCount || 0)
+            ? Number(session.queueLagTotalMs || 0) / Number(session.queueLagSampleCount || 1)
+            : 0
+        };
+        this.updateLiveDiagnosticsFromSession(room, session);
+      },
+      onDecodeError: (detail) => {
+        if (session.finished) return;
+        this.incrementDanmakuDrop(session, 'decodeFailed');
+        const now = Date.now();
+        if (now - Number(session.lastDanmakuDecodeWarningAt || 0) > 10_000) {
+          session.lastDanmakuDecodeWarningAt = now;
+          this.log(
+            'warn',
+            `${roomLabel(room)} 弹幕解码/JSON 失败（累计 ${session.danmakuDropCounts.decodeFailed}）：${
+              detail?.context?.phase || 'unknown'
+            } protocol=${detail?.context?.protocolVersion ?? '-'} cmd=${detail?.context?.operation ?? '-'}`
+          );
+        }
+        this.updateLiveDiagnosticsFromSession(room, session);
+      },
+      onCommand: (command, receiveMeta = {}) => {
         if (session.finished || this.recordingSessions.get(room.id) !== session) {
           return;
         }
@@ -3539,11 +4094,17 @@ try {
           room.currentRecording.rawDanmakuCount = session.rawDanmakuCount;
           room.currentRecording.danmakuCommandCounts = { ...session.danmakuCommandCounts };
         }
-        const event = normalizeDanmakuEvent(command, session.startedAt);
+        const receivedMono = Number(receiveMeta.receivedMono || monotonicNowMs());
+        const event = normalizeDanmakuEvent(command, {
+          receivedAt: Number(receiveMeta.receivedAt || Date.now()),
+          receivedMono,
+          videoTime: this.resolveSessionVideoTime(session, receivedMono)
+        });
         if (!event) {
-          session.ignoredCommandCount = (session.ignoredCommandCount || 0) + 1;
+          this.incrementDanmakuDrop(session, classifyDanmakuEventIgnore(command, event));
           if (this.shouldUpdateCurrentRecording(room, session)) {
             room.currentRecording.ignoredDanmakuCount = session.ignoredCommandCount;
+            room.currentRecording.danmakuDropCounts = { ...session.danmakuDropCounts };
           }
           const now = Date.now();
           if (session.ignoredCommandCount === 1 || now - session.lastIgnoredEmitAt > 5000) {
@@ -3561,9 +4122,27 @@ try {
           }
           return;
         }
+        const dedupe = session.deduper.checkAndRemember(event, command, event.receivedAt);
+        if (dedupe.duplicate) {
+          this.incrementDanmakuDrop(session, 'duplicateDropped');
+          if (this.shouldUpdateCurrentRecording(room, session)) {
+            room.currentRecording.ignoredDanmakuCount = session.ignoredCommandCount;
+            room.currentRecording.danmakuDropCounts = { ...session.danmakuDropCounts };
+          }
+          this.updateLiveDiagnosticsFromSession(room, session);
+          return;
+        }
+        const writeDroppedBefore = Number(session.danmakuDropCounts?.writeDropped || 0);
         const written = session.eventStream.write(`${JSON.stringify(event)}\n`);
         if (!written) {
-          session.danmakuWriteDropped = Number(session.danmakuWriteDropped || 0) + 1;
+          if (Number(session.danmakuDropCounts?.writeDropped || 0) === writeDroppedBefore) {
+            this.incrementDanmakuDrop(session, 'writeDropped');
+          }
+          session.danmakuWriteDropped = Number(session.danmakuDropCounts.writeDropped || 0);
+          if (this.shouldUpdateCurrentRecording(room, session)) {
+            room.currentRecording.ignoredDanmakuCount = session.ignoredCommandCount;
+            room.currentRecording.danmakuDropCounts = { ...session.danmakuDropCounts };
+          }
           const now = Date.now();
           if (now - Number(session.lastDanmakuWriteWarningAt || 0) > 5000) {
             session.lastDanmakuWriteWarningAt = now;
@@ -3579,12 +4158,15 @@ try {
         }
         session.eventCount += 1;
         session.capturedDanmakuCount = session.eventCount;
+        session.firstDanmakuAt ||= event.receivedAt;
         if (this.shouldUpdateCurrentRecording(room, session)) {
           room.currentRecording.eventCount = session.eventCount;
           room.currentRecording.capturedDanmakuCount = session.capturedDanmakuCount;
           room.currentRecording.danmakuStatus = 'connected';
           room.currentRecording.danmakuMessage = `已捕获 ${session.eventCount} 条可烧录事件`;
+          room.currentRecording.danmakuDropCounts = { ...session.danmakuDropCounts };
         }
+        this.updateLiveDiagnosticsFromSession(room, session);
         const now = Date.now();
         if (session.eventCount === 1 || now - session.lastEventEmitAt > 2000) {
           session.lastEventEmitAt = now;
@@ -3608,6 +4190,7 @@ try {
     }
     const attempt = Math.min(12, Number(session.danmakuReconnectAttempt || 0) + 1);
     session.danmakuReconnectAttempt = attempt;
+    session.danmakuReconnectCount = Number(session.danmakuReconnectCount || 0) + 1;
     const baseDelay = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5));
     const delayMs = baseDelay + Math.floor(Math.random() * Math.min(1000, baseDelay * 0.2));
     this.updateDanmakuStatus(
@@ -3674,31 +4257,25 @@ try {
         session.lastMediaGrowthAt = now;
       }
 
-      if (!session.videoInfo && now - Number(session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS && fileSize >= MIN_PLAYABLE_BYTES) {
-        this.log(
-          'warn',
-          `${roomLabel(room)} 录制已写入 ${formatBytes(fileSize)}，但还没解析到视频信息；继续观察。`
-        );
-      }
-
-      if (!session.videoInfo && now - Number(session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS && fileSize < MIN_PLAYABLE_BYTES) {
+      if (!session.mediaClock && now - Number(session.ffmpegSpawnAt || session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS) {
         session.noMediaDetected = true;
+        session.segmentReason = 'no-media-progress';
+        this.recordStreamHealth(session.liveSessionId, session.stream, session.segmentReason);
         this.log(
           'error',
-          `${roomLabel(room)} 录制 ${Math.round(NO_MEDIA_TIMEOUT_MS / 1000)} 秒仍未写入有效视频数据，正在重连直播流。`
+          `${roomLabel(room)} 录制 ${Math.round(NO_MEDIA_TIMEOUT_MS / 1000)} 秒仍未产生可用媒体进度（当前 ${formatBytes(fileSize)}），正在重连直播流。`
         );
         requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
         return;
       }
 
-      if (
-        fileSize >= MIN_PLAYABLE_BYTES &&
-        now - Number(session.lastMediaGrowthAt || session.startedAt || now) >= MEDIA_STALL_TIMEOUT_MS
-      ) {
+      if (session.mediaClock && now - Number(session.lastMediaProgressAt || session.ffmpegSpawnAt || now) >= MEDIA_PROGRESS_STALL_TIMEOUT_MS) {
         session.mediaStalled = true;
+        session.segmentReason = 'no-media-progress';
+        this.recordStreamHealth(session.liveSessionId, session.stream, session.segmentReason);
         this.log(
           'error',
-          `${roomLabel(room)} 临时录像 ${Math.round(MEDIA_STALL_TIMEOUT_MS / 1000)} 秒没有继续增长，正在重连直播流。`
+          `${roomLabel(room)} FFmpeg ${Math.round(MEDIA_PROGRESS_STALL_TIMEOUT_MS / 1000)} 秒没有媒体进度，正在重连直播流。`
         );
         requestFfmpegStop(session.ffmpeg, { graceful: false, timeoutMs: 1500 });
         return;
@@ -3743,19 +4320,44 @@ try {
     if (currentQn >= targetQn) {
       return;
     }
+    const nowMono = monotonicNowMs();
+    if (Number(session.lastStreamSwitchMono || 0) && nowMono - Number(session.lastStreamSwitchMono) < QUALITY_SWITCH_COOLDOWN_MS) {
+      return;
+    }
     const previousStream = session.stream ? { ...session.stream } : null;
-    const nextStream = await this.resolvePlayStream(room, { purpose: '清晰度升级检查' });
+    const nextStream = await this.resolvePlayStream(room, {
+      purpose: '清晰度升级检查',
+      liveSessionId: session.liveSessionId
+    });
     if (!nextStream?.url || !previousStream?.url) {
       return;
     }
     const betterQuality = Number(nextStream.qn || 0) > currentQn;
-    const betterScore = streamScore(nextStream, this.settings) > streamScore(previousStream, this.settings);
-    if (!betterQuality && !betterScore) {
+    if (!betterQuality) {
       room.stream = previousStream;
+      session.qualityCandidate = null;
+      session.qualityCandidateConfirmations = 0;
+      return;
+    }
+    const candidateKey = `${nextStream.qn}|${nextStream.codec}|${nextStream.protocol}|${nextStream.format}|${this.getStreamHealthKey(nextStream)}`;
+    if (session.qualityCandidate === candidateKey) {
+      session.qualityCandidateConfirmations = Number(session.qualityCandidateConfirmations || 0) + 1;
+    } else {
+      session.qualityCandidate = candidateKey;
+      session.qualityCandidateConfirmations = 1;
+    }
+    if (session.qualityCandidateConfirmations < QUALITY_UPGRADE_CONFIRMATIONS) {
+      room.stream = previousStream;
+      this.log(
+        'info',
+        `${roomLabel(room)} 发现更高 qn ${currentQn || '未知'} -> ${nextStream.qn || '未知'}，等待第 ${QUALITY_UPGRADE_CONFIRMATIONS} 次稳定确认。`
+      );
       return;
     }
     session.nextStream = { ...nextStream };
     session.qualitySwitching = true;
+    session.segmentReason = 'quality-upgrade';
+    session.lastStreamSwitchMono = nowMono;
     this.log(
       'success',
       `${roomLabel(room)} 检测到更合适的直播流：qn ${currentQn || '未知'} -> ${nextStream.qn || '未知'}，正在切换到新文件。`
@@ -3771,6 +4373,8 @@ try {
       return this.getState();
     }
     session.rotating = true;
+    session.segmentReason = 'duration-limit';
+    this.transitionRecordingState(room, session, 'rotating');
     this.log('info', `${roomLabel(room)} 已达到 ${session.segmentMinutes} 分钟分段时长，正在切换到新文件。`);
     requestFfmpegStop(session.ffmpeg, { graceful: true, timeoutMs: 5000 });
     this.emitState();
@@ -3781,9 +4385,15 @@ try {
     const room = this.getRoom(roomId);
     const session = this.recordingSessions.get(room.id);
     if (!session) {
+      const retryTimer = this.streamStartRetryTimers.get(room.id);
+      if (retryTimer) clearTimeout(retryTimer);
+      this.streamStartRetryTimers.delete(room.id);
+      this.streamStartRetryRooms.delete(room.id);
+      if (room.recordingState === 'waiting-stream') room.recordingState = 'completed';
       return this.getState();
     }
     session.stopping = true;
+    this.transitionRecordingState(room, session, 'finalizing');
     clearTimeout(session.danmakuReconnectTimer);
     clearTimeout(session.streamStableTimer);
     clearTimeout(session.rotateTimer);
@@ -3809,16 +4419,28 @@ try {
     clearTimeout(session.danmakuReconnectTimer);
     clearTimeout(session.streamStableTimer);
     session.finished = true;
+    this.transitionRecordingState(room, session, 'finalizing');
     session.danmakuClient?.close('录制结束');
     await new Promise((resolve) => session.eventStream.end(resolve));
     if (wasActiveSession) {
       room.recording = false;
     }
-    const elapsedSec = Math.max(0, (Date.now() - session.startedAt) / 1000);
+    const wallElapsedSec = Math.max(0, (Date.now() - session.startedAt) / 1000);
+    const elapsedSec = this.getSessionMediaDurationSec(session);
     const shouldContinueSegment =
       wasActiveSession &&
       (session.rotating || session.qualitySwitching || hasReachedSegmentLimit(session, elapsedSec)) &&
       !session.stopping;
+    if (!shouldContinueSegment && wasActiveSession && !session.stopping) {
+      if (!session.segmentReason || session.segmentReason === 'initial') {
+        session.segmentReason = session.noMediaDetected || session.mediaStalled
+          ? 'no-media-progress'
+          : code === 0
+            ? 'stream-eof'
+            : 'network-error';
+      }
+      this.recordStreamHealth(session.liveSessionId, session.stream, session.segmentReason);
+    }
     if (shouldContinueSegment) {
       session.releaseMediaJob?.();
       this.recordingSessions.delete(roomId);
@@ -3829,7 +4451,7 @@ try {
     const fileSizeBeforeFinalize = await getFileSize(capturePath);
     const validBeforeFinalize = isRecordingFileLikelyPlayable({
       fileSize: fileSizeBeforeFinalize,
-      elapsedSec,
+      elapsedSec: wallElapsedSec,
       videoInfo: session.videoInfo
     });
     if (!validBeforeFinalize) {
@@ -3857,6 +4479,29 @@ try {
     if (mediaInfo.videoInfo) {
       session.videoInfo = mediaInfo.videoInfo;
     }
+    let timelineHealth = null;
+    if (finalized && mediaInfo.videoInfo) {
+      try {
+        timelineHealth = await probeMediaTimelineHealth(this.ffmpegPath, session.cleanPath, mediaInfo, { timeoutMs: 120000 });
+        session.firstVideoPts = timelineHealth.firstVideoPts;
+        session.firstAudioPts = timelineHealth.firstAudioPts;
+        if (timelineHealth.timelineHealth !== 'healthy') {
+          this.log(
+            timelineHealth.timelineHealth === 'broken' ? 'error' : 'warn',
+            `${roomLabel(room)} 分段时间轴检查为 ${timelineHealth.timelineHealth}：${timelineHealth.warnings.join('；') || '媒体时间轴异常'}`
+          );
+        }
+      } catch (error) {
+        timelineHealth = {
+          timelineHealth: 'warning',
+          warnings: [`时间轴检查失败：${error.message}`],
+          videoDurationSec: Number(mediaInfo.durationSec || 0),
+          audioDurationSec: 0,
+          avDeltaSec: 0
+        };
+        this.log('warn', `${roomLabel(room)} 分段时间轴检查失败：${error.message}`);
+      }
+    }
     const actualDurationSec = resolveReliableDurationSec({
       mediaDurationSec: mediaInfo.durationSec,
       elapsedSec,
@@ -3864,7 +4509,7 @@ try {
     });
     const valid = isRecordingFileLikelyPlayable({
       fileSize,
-      elapsedSec,
+      elapsedSec: wallElapsedSec,
       videoInfo: session.videoInfo
     }) && finalized;
     if (!valid && !session.validReason) {
@@ -3873,8 +4518,24 @@ try {
         ? `最终文件过小或没有视频流：${formatBytes(fileSize)}`
         : '最终 MP4 封装失败，已保留临时文件。';
     }
+    session.streamMetadata = {
+      ...session.streamMetadata,
+      codec: String(session.videoInfo?.codec || session.streamMetadata?.codec || ''),
+      width: Number(session.videoInfo?.width || 0),
+      height: Number(session.videoInfo?.height || 0),
+      fps: Number(session.videoInfo?.fps || 0),
+      ffmpegStartTime: Number(session.ffmpegSpawnAt || 0),
+      firstMediaProgressTime: Number(session.firstMediaProgressAt || 0),
+      firstMediaOutTimeSec: Number(session.firstMediaOutTimeSec || 0),
+      firstVideoPts: timelineHealth?.firstVideoPts ?? null,
+      firstAudioPts: timelineHealth?.firstAudioPts ?? null,
+      segmentDurationSec: actualDurationSec,
+      reconnectReason: session.segmentReason || 'initial'
+    };
+    const danmakuDurationSec = await readDanmakuDurationSec(session.danmakuPath).catch(() => 0);
     const finishedRecording = {
       startedAt: session.startedAt,
+      liveSessionId: session.liveSessionId,
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
       cssPath: session.cssPath,
@@ -3886,7 +4547,10 @@ try {
       mergeGroup: session.mergeGroup,
       mergeSequence: session.mergeSequence,
       mergeOutputPath: session.mergeOutputPath,
+      segmentReason: session.segmentReason || 'initial',
+      diagnosticsPath: session.diagnosticsPath,
       durationSec: actualDurationSec,
+      danmakuDurationSec,
       fileSize,
       valid,
       eventCount: session.eventCount,
@@ -3897,10 +4561,25 @@ try {
       danmakuPopularity: session.danmakuPopularity,
       ignoredDanmakuCount: session.ignoredCommandCount,
       danmakuCommandCounts: session.danmakuCommandCounts,
-      videoInfo: session.videoInfo
+      danmakuDropCounts: session.danmakuDropCounts,
+      videoInfo: session.videoInfo,
+      timingInfo: timelineHealth
+        ? {
+            videoDurationSec: Number(timelineHealth.videoDurationSec || 0),
+            audioDurationSec: Number(timelineHealth.audioDurationSec || 0),
+            avDeltaSec: Number(timelineHealth.avDeltaSec || 0),
+            timingSafeForCopy: Boolean(timelineHealth.timingSafeForCopy)
+          }
+        : null,
+      timelineHealth,
+      timelineHealthStatus: String(timelineHealth?.timelineHealth || ''),
+      streamMetadata: session.streamMetadata,
+      recordingState: valid ? 'completed' : 'failed'
     };
+    session.state = finishedRecording.recordingState;
     if (this.shouldUpdateCurrentRecording(room, session)) {
       Object.assign(room.currentRecording, finishedRecording);
+      room.recordingState = session.state;
     }
     if (valid) {
       this.rememberRecording(room, finishedRecording);
@@ -3918,10 +4597,14 @@ try {
         }${session.validReason ? `原因：${session.validReason}` : ''}`
       );
     }
+    await this.appendSegmentDiagnostics(room, session, finishedRecording).catch((error) => {
+      this.log('warn', `${roomLabel(room)} 写入本场 diagnostics 失败：${error.message}`);
+    });
     const unexpectedStreamEnd = wasActiveSession && !session.stopping && !shouldContinueSegment;
     const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
     if (shouldReconnectLiveStream) {
       this.reconnectPendingRooms.add(roomId);
+      room.recordingState = 'reconnecting';
     }
     if (this.recordingSessions.get(roomId) === session) {
       session.releaseMediaJob?.();
@@ -3996,6 +4679,10 @@ try {
         this.startRecording(roomId, true, {
           streamReconnect: true,
           streamReconnectAttempt: reconnectAttempt,
+          liveSessionId: session.liveSessionId,
+          diagnosticsPath: session.diagnosticsPath,
+          segmentReason: session.segmentReason || 'stream-eof',
+          lastStreamSwitchMono: session.lastStreamSwitchMono,
           silentNotify: true,
           outputDir: session.outputDir,
           outputContainer: session.outputContainer,
@@ -4034,6 +4721,10 @@ try {
       silentNotify: true,
       stream: session.nextStream || undefined,
       fallbackStream: session.stream,
+      liveSessionId: session.liveSessionId,
+      diagnosticsPath: session.diagnosticsPath,
+      segmentReason: session.segmentReason || (session.qualitySwitching ? 'quality-upgrade' : 'duration-limit'),
+      lastStreamSwitchMono: session.lastStreamSwitchMono,
       outputDir: session.outputDir,
       outputContainer: session.outputContainer,
       segmentMinutes: session.segmentMinutes,
@@ -4216,6 +4907,11 @@ try {
   }
   async finalizeReconnectGroup(room, mergeGroup, fallbackRecording) {
     const recording = await this.mergeReconnectGroupIfNeeded(room, mergeGroup, fallbackRecording);
+    if (recording) {
+      await this.finalizeLiveDiagnostics(room, recording, recording.mergedFrom?.length ? 'merged' : 'completed').catch((error) => {
+        this.log('warn', `${roomLabel(room)} 写入最终 diagnostics 失败：${error.message}`);
+      });
+    }
     if (this.settings.autoBurnDanmaku && recording?.valid !== false && Number(recording?.eventCount || 0) > 0) {
       setTimeout(() => {
         this.enqueueBurnRecording(room, recording, { automatic: true }).catch((error) => {
@@ -4224,6 +4920,12 @@ try {
       }, 500);
     } else {
       this.scheduleQueuedUpdateCheck();
+    }
+    const liveSessionId = String(recording?.liveSessionId || fallbackRecording?.liveSessionId || '');
+    if (liveSessionId) {
+      this.liveDanmakuDedupers.delete(liveSessionId);
+      this.liveStreamHealth.delete(liveSessionId);
+      this.liveDiagnostics.delete(liveSessionId);
     }
     return recording;
   }
@@ -4247,6 +4949,8 @@ try {
     if (segments.length < 2) {
       return fallbackRecording;
     }
+
+    room.recordingState = 'merging';
 
     const outputPath = segments[0].mergeOutputPath || deriveSiblingPath(segments[0].cleanPath, 'merged');
     const container = getContainerFromPath(outputPath);
@@ -4492,6 +5196,7 @@ try {
         roomTitle: room.title || '',
         anchor: room.anchor || '',
         startedAt: segments[0].startedAt,
+        liveSessionId: segments[0].liveSessionId || '',
         cleanPath: outputPath,
         danmakuPath,
         cssPath,
@@ -4500,6 +5205,8 @@ try {
         mergeGroup: groupId,
         mergeSequence: 0,
         mergeOutputPath: outputPath,
+        segmentReason: 'merged',
+        diagnosticsPath: segments[0].diagnosticsPath || '',
         mergedFrom: segments.map((segment) => segment.cleanPath),
         cleanupId,
         durationSec: Number(mergedMediaInfo.durationSec) || mergeDurationSec,
@@ -4513,7 +5220,9 @@ try {
         ),
         ignoredDanmakuCount: segments.reduce((sum, segment) => sum + Number(segment.ignoredDanmakuCount || 0), 0),
         danmakuCommandCounts: mergeCommandCounts(segments.map((segment) => segment.danmakuCommandCounts)),
+        danmakuDropCounts: mergeCommandCounts(segments.map((segment) => segment.danmakuDropCounts)),
         videoInfo: mergedMediaInfo.videoInfo,
+        danmakuDurationSec: await readDanmakuDurationSec(danmakuPath).catch(() => 0),
         timingInfo: mergedTimingInfo
           ? {
               ...mergedTimingInfo,
@@ -4525,6 +5234,13 @@ try {
                 timingSafeForCopy: Boolean(timingInfo.timingSafeForCopy),
                 error: timingInfo.error || ''
               }))
+            }
+          : null,
+        timelineHealth: mergedTimingInfo
+          ? {
+              ...mergedTimingInfo,
+              timelineHealth: mergedTimingInfo.timingSafeForCopy ? 'healthy' : 'warning',
+              warnings: mergedTimingInfo.timingSafeForCopy ? [] : ['合并后存在 A/V duration 差']
             }
           : null
       });
@@ -4542,6 +5258,7 @@ try {
       });
       if (!this.isRoomRecording(room)) {
         room.currentRecording = mergedRecording;
+        room.recordingState = 'completed';
       }
       this.pendingSegmentCleanups.set(cleanupId, {
         cleanupId,
@@ -4603,20 +5320,204 @@ try {
     const metadataPath = `${cleanPath}.metadata.json`;
     const temporaryPath = `${metadataPath}.${process.pid}.tmp`;
     const payload = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       createdByVersion: APP_VERSION,
+      status: recording.recordingState === 'recording' ? 'recording' : 'completed',
       cleanPath: path.basename(cleanPath),
       fileSize: stat.size,
       fileMtimeMs: stat.mtimeMs,
       durationSec: Number(recording.durationSec || 0),
-      danmakuDurationSec: Number(recording.durationSec || 0),
+      danmakuDurationSec: Number(recording.danmakuDurationSec || 0),
       eventCount: Number(recording.eventCount || 0),
       videoInfo: recording.videoInfo || null,
+      liveSessionId: String(recording.liveSessionId || ''),
+      mergeGroup: String(recording.mergeGroup || ''),
+      mergeSequence: Number(recording.mergeSequence || 0),
+      segmentReason: String(recording.segmentReason || 'initial'),
+      streamMetadata: recording.streamMetadata || null,
+      timelineHealth: String(recording.timelineHealth?.timelineHealth || recording.timelineHealthStatus || recording.timelineHealth || 'warning'),
+      timelineDetails: typeof recording.timelineHealth === 'object' ? recording.timelineHealth : null,
+      timingInfo: recording.timingInfo || null,
+      danmakuDropCounts: recording.danmakuDropCounts || {},
+      diagnosticsPath: recording.diagnosticsPath ? path.basename(recording.diagnosticsPath) : '',
+      recovery: recording.recovery || null,
       updatedAt: new Date().toISOString()
     };
     await fsp.writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o660 });
     await atomicReplaceFile(temporaryPath, metadataPath);
     return metadataPath;
+  }
+
+  async writeActiveSegmentMetadata(room, session) {
+    if (!session?.cleanPath) return '';
+    const metadataPath = `${session.cleanPath}.metadata.json`;
+    const temporaryPath = `${metadataPath}.${process.pid}.${Date.now()}.tmp`;
+    const payload = {
+      schemaVersion: 2,
+      createdByVersion: APP_VERSION,
+      status: 'recording',
+      liveSessionId: session.liveSessionId,
+      roomId: String(room?.id || session.roomId || ''),
+      roomTitle: String(room?.title || ''),
+      anchor: String(room?.anchor || ''),
+      startedAt: Number(session.startedAt || Date.now()),
+      cleanPath: path.basename(session.cleanPath),
+      capturePath: path.basename(session.capturePath || session.cleanPath),
+      outputContainer: session.outputContainer,
+      mergeGroup: session.mergeGroup,
+      mergeSequence: Number(session.mergeSequence || 0),
+      mergeOutputPath: path.basename(session.mergeOutputPath || ''),
+      segmentReason: session.segmentReason || 'initial',
+      danmakuPath: path.basename(session.danmakuPath || ''),
+      diagnosticsPath: path.basename(session.diagnosticsPath || ''),
+      streamMetadata: session.streamMetadata || null,
+      updatedAt: new Date().toISOString()
+    };
+    await fsp.writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o660 });
+    await atomicReplaceFile(temporaryPath, metadataPath);
+    return metadataPath;
+  }
+
+  async findInterruptedCaptureFiles(rootDir, maxDepth = 4) {
+    const root = path.resolve(String(rootDir || ''));
+    const rootStat = await fsp.stat(root).catch(() => null);
+    if (!rootStat?.isDirectory()) return [];
+    const found = [];
+    let directories = [{ directory: root, depth: 0 }];
+    while (directories.length) {
+      const current = directories;
+      directories = [];
+      for (const { directory, depth } of current) {
+        const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          const filePath = path.join(directory, entry.name);
+          if (entry.isDirectory() && depth < maxDepth) {
+            directories.push({ directory: filePath, depth: depth + 1 });
+          } else if (entry.isFile() && /\.recording\.mkv$/i.test(entry.name)) {
+            found.push(filePath);
+          }
+        }
+      }
+    }
+    return found;
+  }
+
+  async recoverInterruptedRecordings() {
+    const captures = await this.findInterruptedCaptureFiles(this.settings.outputDir);
+    if (!captures.length) return [];
+    const recovered = [];
+    const resumableRooms = new Map();
+    for (const capturePath of captures) {
+      const directory = path.dirname(capturePath);
+      const fallbackCleanPath = capturePath.replace(/\.recording\.mkv$/i, '.clean.mp4');
+      const metadataPath = `${fallbackCleanPath}.metadata.json`;
+      const metadata = await fsp.readFile(metadataPath, 'utf8').then(JSON.parse).catch(() => null);
+      if (metadata?.status && metadata.status !== 'recording') continue;
+      const declaredClean = String(metadata?.cleanPath || path.basename(fallbackCleanPath));
+      const cleanPath = path.resolve(directory, path.basename(declaredClean));
+      if (path.dirname(cleanPath) !== path.resolve(directory) || (await isExistingFile(cleanPath))) continue;
+      const captureSize = await getFileSize(capturePath);
+      if (captureSize < MIN_PLAYABLE_BYTES) {
+        this.log('warn', `发现未完成临时录像但文件过小，保留原文件待人工检查：${capturePath}`);
+        continue;
+      }
+      try {
+        const capturedInfo = await probeMediaFileInfo(this.ffmpegPath, capturePath, { timeoutMs: 20_000 });
+        if (!capturedInfo.videoInfo) {
+          this.log('warn', `发现未完成临时录像但无法探测视频流，保留原文件：${capturePath}`);
+          continue;
+        }
+        const tmpPath = replaceExtension(cleanPath, '.recovered.tmp.mp4');
+        await fsp.rm(tmpPath, { force: true });
+        await runFfmpegJob(
+          this.ffmpegPath,
+          createMp4FinalizeArgs({ inputPath: capturePath, outputPath: tmpPath, streamCodec: capturedInfo.videoInfo.codec }),
+          () => {}
+        );
+        const recoveredInfo = await probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 20_000 });
+        if (!recoveredInfo.videoInfo || (await getFileSize(tmpPath)) < MIN_PLAYABLE_BYTES) {
+          throw new Error('恢复封装后没有可用视频流');
+        }
+        await atomicReplaceFile(tmpPath, cleanPath);
+        const timelineHealth = await probeMediaTimelineHealth(this.ffmpegPath, cleanPath, recoveredInfo, {
+          timeoutMs: 120_000
+        }).catch((error) => ({
+          timelineHealth: 'warning',
+          warnings: [`恢复后的时间轴检查失败：${error.message}`],
+          videoDurationSec: Number(recoveredInfo.durationSec || 0),
+          audioDurationSec: 0,
+          avDeltaSec: 0
+        }));
+        const danmakuPath = metadata?.danmakuPath
+          ? path.resolve(directory, path.basename(metadata.danmakuPath))
+          : deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
+        const recording = this.normalizeRecording({
+          id: `${cleanPath}:recovered`,
+          roomId: String(metadata?.roomId || ''),
+          roomTitle: String(metadata?.roomTitle || ''),
+          anchor: String(metadata?.anchor || ''),
+          liveSessionId: String(metadata?.liveSessionId || crypto.randomUUID()),
+          startedAt: Number(metadata?.startedAt || Date.now()),
+          cleanPath,
+          capturePath,
+          danmakuPath,
+          cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
+          assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
+          burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
+          mergeGroup: String(metadata?.mergeGroup || path.basename(cleanPath)),
+          mergeSequence: Number(metadata?.mergeSequence || 0),
+          mergeOutputPath: metadata?.mergeOutputPath
+            ? path.resolve(directory, path.basename(metadata.mergeOutputPath))
+            : '',
+          segmentReason: 'crash-recovery',
+          diagnosticsPath: metadata?.diagnosticsPath ? path.resolve(directory, path.basename(metadata.diagnosticsPath)) : path.join(directory, 'diagnostics.json'),
+          durationSec: Number(recoveredInfo.durationSec || timelineHealth.videoDurationSec || 0),
+          danmakuDurationSec: await readDanmakuDurationSec(danmakuPath).catch(() => 0),
+          fileSize: await getFileSize(cleanPath),
+          valid: true,
+          eventCount: await countDanmakuLines(danmakuPath).catch(() => 0),
+          videoInfo: recoveredInfo.videoInfo,
+          timingInfo: timelineHealth,
+          timelineHealth,
+          streamMetadata: metadata?.streamMetadata || null,
+          recovery: 'recovered-after-crash',
+          recordingState: 'completed'
+        });
+        this.rememberRecording({ id: recording.roomId, title: recording.roomTitle, anchor: recording.anchor }, recording);
+        await this.writeRecordingMetadata(recording);
+        recovered.push(recording);
+        this.log('success', `已恢复异常中断录像：${path.basename(cleanPath)}（原临时文件已保留）。`);
+        if (recording.roomId) resumableRooms.set(recording.roomId, recording);
+      } catch (error) {
+        this.log('warn', `恢复临时录像失败，已保留原文件 ${capturePath}：${error.message}`);
+      }
+    }
+    if (recovered.length) await this.saveStore();
+    for (const [roomId, recording] of resumableRooms) {
+      const room = this.rooms.get(String(roomId));
+      if (!room?.monitoring || !room.autoRecord || this.hasActiveRecordingSession(room)) continue;
+      try {
+        const live = await this.fetchRoomLiveStatus(room.id);
+        room.realRoomId = live.realRoomId || room.realRoomId;
+        await this.applyDetectedLiveStatus(room, live.liveStatus, '崩溃恢复检查');
+        if (live.liveStatus === 1 && !this.hasActiveRecordingSession(room)) {
+          await this.startRecording(room.id, true, {
+            streamReconnect: true,
+            liveSessionId: recording.liveSessionId,
+            diagnosticsPath: recording.diagnosticsPath,
+            segmentReason: 'crash-recovery',
+            outputDir: path.dirname(recording.cleanPath),
+            outputContainer: getContainerFromPath(recording.cleanPath),
+            mergeGroup: recording.mergeGroup,
+            mergeSequence: Number(recording.mergeSequence || 0) + 1,
+            mergeOutputPath: recording.mergeOutputPath
+          });
+        }
+      } catch (error) {
+        this.log('warn', `${roomLabel(room)} 崩溃恢复后检查续录失败：${error.message}`);
+      }
+    }
+    return recovered;
   }
 
   async cancelMerge(roomId) {
@@ -6197,6 +7098,7 @@ try {
       this.recordingSessions.size > 0 ||
       this.recordingStartLocks.size > 0 ||
       this.reconnectPendingRooms.size > 0 ||
+      this.streamStartRetryRooms.size > 0 ||
       this.burnSessions.size > 0 ||
       this.burnQueueRunning ||
       this.burnQueue.length > 0 ||
@@ -6299,6 +7201,11 @@ try {
     for (const roomId of Array.from(this.livePushMonitors.keys())) {
       this.stopLivePushMonitor(roomId);
     }
+    for (const timer of this.streamStartRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.streamStartRetryTimers.clear();
+    this.streamStartRetryRooms.clear();
     const activeSessions = Array.from(this.recordingSessions.values());
     for (const session of activeSessions) {
       clearTimeout(session?.rotateTimer);
