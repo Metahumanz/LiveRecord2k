@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
-const { readDanmakuEvents } = require('../danmaku/ass.cjs');
+const { readDanmakuEvents, getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -27,29 +27,20 @@ function escapeFilterPath(filePath) {
 function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec, streamProtocol, streamFormat }) {
   const args = [
     '-hide_banner',
-    '-stats',
+    '-nostats',
+    '-progress',
+    'pipe:2',
     '-y',
     '-fflags',
-    '+genpts+discardcorrupt',
+    '+discardcorrupt',
     '-err_detect',
     'ignore_err',
     '-rw_timeout',
     '30000000'
   ];
-  args.push(
-    '-reconnect',
-    '1',
-    '-reconnect_streamed',
-    '1',
-    '-reconnect_at_eof',
-    '1',
-    '-reconnect_on_network_error',
-    '1',
-    '-reconnect_on_http_error',
-    '4xx,5xx',
-    '-reconnect_delay_max',
-    '10'
-  );
+  // Do not let FFmpeg transparently reconnect into the same Matroska file.
+  // A reconnect can restart source timestamps and make one segment internally
+  // discontinuous.  The service owns reconnects and starts a fresh segment.
   args.push('-user_agent', USER_AGENT, '-headers', headers, '-i', streamUrl);
   if (Number.isFinite(Number(maxDurationSec)) && Number(maxDurationSec) > 0) {
     args.push('-t', formatFfmpegSeconds(maxDurationSec));
@@ -463,7 +454,8 @@ async function mergeDanmakuFiles(segments, outputPath) {
     const segment = segments[index];
     const events = await readDanmakuEvents(segment.danmakuPath);
     for (const event of events) {
-      lines.push(JSON.stringify({ ...event, time: Math.max(0, Number(event.time || 0) + offset) }));
+      const videoTime = Math.max(0, getDanmakuEventVideoTime(event) + offset);
+      lines.push(JSON.stringify({ ...event, videoTime, time: videoTime }));
     }
     offset += getSegmentDurationForMerge(segment, segments[index + 1]);
   }
@@ -471,13 +463,17 @@ async function mergeDanmakuFiles(segments, outputPath) {
 }
 
 function getSegmentDurationForMerge(segment, nextSegment) {
-  const duration = Number(segment.durationSec || 0);
+  const duration = Number(
+    segment?.timelineHealth?.videoDurationSec ||
+      segment?.timingInfo?.videoDurationSec ||
+      segment?.durationSec ||
+      0
+  );
   if (Number.isFinite(duration) && duration > 0) {
     return duration;
   }
-  if (nextSegment?.startedAt && segment.startedAt) {
-    return Math.max(0, (Number(nextSegment.startedAt) - Number(segment.startedAt)) / 1000);
-  }
+  // Wall-clock gaps include reconnect/network wait and must never become media
+  // timeline gaps. Keep unknown duration at zero until a media probe fills it.
   return 0;
 }
 

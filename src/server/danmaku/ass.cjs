@@ -1,6 +1,10 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const readline = require('node:readline');
+const {
+  sourceTimestampFromCommand,
+  sourceIdFromCommand
+} = require('./dedupe.cjs');
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
@@ -21,32 +25,91 @@ function danmakuCommandType(command) {
   return String(command?.cmd || 'UNKNOWN').split(':')[0] || 'UNKNOWN';
 }
 
-function normalizeDanmakuEvent(command, startedAt) {
+function getDanmakuEventVideoTime(event) {
+  const videoTime = Number(event?.videoTime);
+  if (Number.isFinite(videoTime)) return Math.max(0, videoTime);
+  const legacyTime = Number(event?.time);
+  return Number.isFinite(legacyTime) ? Math.max(0, legacyTime) : 0;
+}
+
+function normalizeEventTiming(timing) {
+  if (typeof timing === 'number') {
+    const time = Math.max(0, (Date.now() - timing) / 1000);
+    return { receivedAt: Date.now(), receivedMono: 0, videoTime: time };
+  }
+  const receivedAt = Number(timing?.receivedAt || Date.now());
+  const receivedMono = Number(timing?.receivedMono || 0);
+  const videoTime = Number(timing?.videoTime);
+  return {
+    receivedAt: Number.isFinite(receivedAt) ? receivedAt : Date.now(),
+    receivedMono: Number.isFinite(receivedMono) ? receivedMono : 0,
+    videoTime: Number.isFinite(videoTime) ? Math.max(0, videoTime) : 0
+  };
+}
+
+function normalizeSourceMeta(command, data, timing) {
+  const sourceTimestamp = sourceTimestampFromCommand(command, data);
+  return {
+    schemaVersion: 2,
+    videoTime: timing.videoTime,
+    // Keep a mirrored legacy time field so existing external JSONL readers do
+    // not break.  Internal ASS generation always prefers videoTime.
+    time: timing.videoTime,
+    receivedAt: timing.receivedAt,
+    receivedMono: timing.receivedMono,
+    sourceTimestamp: sourceTimestamp || undefined,
+    sourceCmd: danmakuCommandType(command),
+    sourceId: sourceIdFromCommand(command, data) || undefined
+  };
+}
+
+function commandData(command) {
+  const raw = command?.data;
+  if (Array.isArray(raw)) {
+    return raw.find((item) => item && typeof item === 'object') || {};
+  }
+  if (raw && typeof raw === 'object' && raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data)) {
+    // USER_TOAST_MSG_V2 has appeared both as a direct payload and as a
+    // wrapper around the business payload across Bilibili deployments.
+    return { ...raw, ...raw.data };
+  }
+  return raw && typeof raw === 'object' ? raw : {};
+}
+
+function normalizeDanmakuEvent(command, timing) {
   const type = danmakuCommandType(command);
-  const time = Math.max(0, (Date.now() - startedAt) / 1000);
+  const normalizedTiming = normalizeEventTiming(timing);
 
   if (type === 'DANMU_MSG') {
     const info = command.info || [];
+    const text = String(info[1] || '');
+    if (!text.trim()) return null;
+    const uid = Number(info[2]?.[0] || 0);
     return {
+      ...normalizeSourceMeta(command, commandData(command), normalizedTiming),
       type: 'danmaku',
-      time,
-      text: String(info[1] || ''),
+      uid,
+      text,
       user: String(info[2]?.[1] || ''),
       color: Number(info[0]?.[3] || 0xffffff)
     };
   }
 
-  if (type === 'SEND_GIFT' || type === 'COMBO_SEND') {
-    const data = command.data || {};
+  // COMBO_SEND is an update notification for a gift already represented by
+  // SEND_GIFT.  It must never become a second standalone event or it inflates
+  // the count during ASS aggregation.
+  if (type === 'SEND_GIFT') {
+    const data = commandData(command);
     const count = Number(data.num || data.combo_num || data.combo_count || 1);
     const unitPrice = Number(data.price || data.discount_price || 0) / 1000;
     const totalPrice = Number(data.total_coin || data.total_price || 0) / 1000 || unitPrice * count;
     return {
+      ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'gift',
-      time,
       uid: Number(data.uid || 0),
       user: String(data.uname || data.username || ''),
       giftName: String(data.giftName || data.gift_name || '礼物'),
+      giftId: String(data.gift_id || data.giftId || ''),
       count,
       unitPrice,
       totalPrice,
@@ -55,10 +118,10 @@ function normalizeDanmakuEvent(command, startedAt) {
   }
 
   if (type === 'SUPER_CHAT_MESSAGE' || type === 'SUPER_CHAT_MESSAGE_JPN') {
-    const data = command.data || {};
+    const data = commandData(command);
     return {
+      ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'superchat',
-      time,
       uid: Number(data.uid || 0),
       user: String(data.user_info?.uname || data.uname || ''),
       text: String(data.message || ''),
@@ -67,13 +130,13 @@ function normalizeDanmakuEvent(command, startedAt) {
     };
   }
 
-  if (type === 'GUARD_BUY' || type === 'USER_TOAST_MSG') {
-    const data = command.data || {};
+  if (type === 'GUARD_BUY' || type === 'USER_TOAST_MSG' || type === 'USER_TOAST_MSG_V2') {
+    const data = commandData(command);
     const count = Number(data.num || 1);
     const unitPrice = Number(data.price || 0) / 1000;
     return {
+      ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'guard',
-      time,
       uid: Number(data.uid || 0),
       user: String(data.username || data.uname || data.user_show_info?.uname || ''),
       giftName: String(data.gift_name || data.role_name || guardName(data.guard_level)),
@@ -86,6 +149,17 @@ function normalizeDanmakuEvent(command, startedAt) {
   }
 
   return null;
+}
+
+function classifyDanmakuEventIgnore(command, event) {
+  const type = danmakuCommandType(command);
+  if (event) return '';
+  if (type === 'COMBO_SEND') return 'deliberatelyIgnored';
+  if (type === 'DANMU_MSG') return 'filteredEvent';
+  if (['SEND_GIFT', 'SUPER_CHAT_MESSAGE', 'SUPER_CHAT_MESSAGE_JPN', 'GUARD_BUY', 'USER_TOAST_MSG', 'USER_TOAST_MSG_V2'].includes(type)) {
+    return 'malformedEvent';
+  }
+  return 'unsupportedCommand';
 }
 
 const DEFAULT_CJK_FONT = process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei';
@@ -177,7 +251,7 @@ async function inspectDanmakuFile(danmakuPath, options = {}) {
       result.eventCount += 1;
       try {
         const event = JSON.parse(line);
-        const time = Number(event?.time || 0);
+        const time = getDanmakuEventVideoTime(event);
         if (Number.isFinite(time) && time > result.durationSec) {
           result.durationSec = time;
         }
@@ -343,7 +417,7 @@ function prepareAssEvents(events, options = {}) {
       if (!['danmaku', 'superchat', 'gift', 'guard'].includes(event.type)) {
         return false;
       }
-      const eventStart = Number(event.time || 0);
+      const eventStart = getDanmakuEventVideoTime(event);
       const eventEnd = eventStart + getDanmakuEventDuration(event, {
         messageDuration: options.messageDuration
       });
@@ -355,11 +429,13 @@ function prepareAssEvents(events, options = {}) {
       }
       return true;
     })
-    .map((event) => ({
-      ...event,
-      time: options.shiftTime && hasStart ? Math.max(0, Number(event.time || 0) - startTime) : Number(event.time || 0)
-    }))
-    .sort((a, b) => a.time - b.time);
+    .map((event) => {
+      const videoTime = options.shiftTime && hasStart
+        ? Math.max(0, getDanmakuEventVideoTime(event) - startTime)
+        : getDanmakuEventVideoTime(event);
+      return { ...event, videoTime, time: videoTime };
+    })
+    .sort((a, b) => getDanmakuEventVideoTime(a) - getDanmakuEventVideoTime(b));
 }
 
 function getDanmakuEventDuration(event, options = {}) {
@@ -426,8 +502,11 @@ function createAss(events, options = {}) {
     if (event.type === 'danmaku') {
       const duration = style.danmakuDuration;
       const lane = danmakuLayout.avoidOverlap
-        ? chooseLaneWithoutOverlap(danmakuRows, event.time, duration)
-        : { row: chooseLane(danmakuRows, event.time, duration), start: event.time };
+        ? chooseLaneWithoutOverlap(danmakuRows, getDanmakuEventVideoTime(event), duration)
+        : {
+            row: chooseLane(danmakuRows, getDanmakuEventVideoTime(event), duration),
+            start: getDanmakuEventVideoTime(event)
+          };
       const y = danmakuLayout.top + lane.row * style.danmakuLineHeight;
       const width = estimateTextWidth(event.text, style.danmakuFontSize);
       const color = assColorFromRgb(event.color || 0xffffff);
@@ -454,13 +533,13 @@ function createAss(events, options = {}) {
 function createMessageItems(events, style) {
   const items = [];
   const liveGiftByKey = new Map();
-  const sorted = [...events].sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
+  const sorted = [...events].sort((a, b) => getDanmakuEventVideoTime(a) - getDanmakuEventVideoTime(b));
 
   for (const sourceEvent of sorted) {
     if (!['gift', 'superchat', 'guard'].includes(sourceEvent.type)) {
       continue;
     }
-    const time = Math.max(0, Number(sourceEvent.time) || 0);
+    const time = getDanmakuEventVideoTime(sourceEvent);
     const duration = getDanmakuEventDuration(sourceEvent, { messageDuration: style.messageDuration });
     if (sourceEvent.type === 'gift') {
       const key = `${sourceEvent.uid || sourceEvent.user || ''}|${sourceEvent.giftName || ''}`;
@@ -1312,7 +1391,9 @@ function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
 
 module.exports = {
   danmakuCommandType,
+  getDanmakuEventVideoTime,
   normalizeDanmakuEvent,
+  classifyDanmakuEventIgnore,
   DANMAKU_DISPLAY_AREAS,
   normalizeDanmakuDisplayArea,
   danmakuDisplayAreaLabel,

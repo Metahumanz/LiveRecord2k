@@ -1,5 +1,6 @@
 const zlib = require('node:zlib');
 const { promisify } = require('node:util');
+const { performance } = require('node:perf_hooks');
 const WebSocket = require('ws');
 
 const inflate = promisify(zlib.inflate);
@@ -19,6 +20,12 @@ const DANMAKU_OP = {
   AUTH_REPLY: 8
 };
 
+// Wall clock can jump when the system time is corrected.  Packet ordering and
+// recording alignment must therefore use a monotonic source instead.
+function monotonicNowMs() {
+  return performance.now();
+}
+
 class DanmakuClient {
   constructor(options) {
     this.roomId = options.roomId;
@@ -32,9 +39,24 @@ class DanmakuClient {
     this.onClose = options.onClose;
     this.onError = options.onError;
     this.onCommand = options.onCommand;
+    this.onPacketMetrics = options.onPacketMetrics;
+    this.onDecodeError = options.onDecodeError;
+    this.decodePacket = typeof options.decodePacket === 'function' ? options.decodePacket : decodeDanmakuPacket;
+    this.nowMono = typeof options.nowMono === 'function' ? options.nowMono : monotonicNowMs;
+    this.nowWall = typeof options.nowWall === 'function' ? options.nowWall : Date.now;
     this.ws = null;
     this.heartbeatTimer = null;
     this.messageQueue = Promise.resolve();
+    this.queuedPackets = 0;
+    this.oldestQueuedMono = 0;
+    this.queuedPacketMonos = [];
+    this.packetMetrics = {
+      received: 0,
+      processed: 0,
+      decodeErrors: 0,
+      maxQueueLagMs: 0,
+      totalQueueLagMs: 0
+    };
   }
 
   connect() {
@@ -47,16 +69,37 @@ class DanmakuClient {
       this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
       this.sendHeartbeat();
     });
-    this.ws.on('message', (data) => {
-      this.messageQueue = this.messageQueue
-        .then(() => this.handleMessage(Buffer.from(data)))
-        .catch((error) => this.onError?.(error));
-    });
+    this.ws.on('message', (data) => this.enqueueRawPacket(data));
     this.ws.on('error', (error) => this.onError?.(error));
     this.ws.on('close', (_code, reason) => {
       clearInterval(this.heartbeatTimer);
       this.onClose?.(reason?.toString() || 'closed');
     });
+  }
+
+  enqueueRawPacket(data) {
+    // Capture this before Buffer conversion, decompression, and JSON parsing.
+    // A congested decoder queue must never shift a danmaku event later on the
+    // media timeline merely because it was parsed later.
+    const receivedMono = this.nowMono();
+    const envelope = {
+      buffer: Buffer.from(data),
+      receivedAt: this.nowWall(),
+      receivedMono
+    };
+    this.queuedPackets += 1;
+    this.queuedPacketMonos.push(receivedMono);
+    this.oldestQueuedMono = this.queuedPacketMonos[0] || 0;
+    this.packetMetrics.received += 1;
+    this.emitPacketMetrics('received', envelope);
+    this.messageQueue = this.messageQueue
+      .then(() => this.handleMessage(envelope))
+      .catch((error) => {
+        this.reportDecodeError(error, { phase: 'queue' }, envelope);
+        this.onError?.(error);
+      })
+      .finally(() => this.finishQueuedPacket(envelope));
+    return this.messageQueue;
   }
 
   pickHost() {
@@ -102,10 +145,20 @@ class DanmakuClient {
     this.ws.send(buffer);
   }
 
-  async handleMessage(buffer) {
-    for (const packet of unpackDanmakuPackets(buffer)) {
+  async handleMessage(envelope) {
+    const { buffer } = envelope;
+    const packets = unpackDanmakuPackets(buffer);
+    const consumedBytes = packets.reduce((sum, packet) => sum + Number(packet.packetLength || 0), 0);
+    if ((!packets.length || consumedBytes !== buffer.length) && buffer.length) {
+      this.reportDecodeError(new Error('弹幕包头无效或不完整'), {
+        phase: 'unpack',
+        bytes: buffer.length,
+        consumedBytes
+      }, envelope);
+    }
+    for (const packet of packets) {
       if (packet.operation === DANMAKU_OP.AUTH_REPLY) {
-        this.onAuthReply?.(decodeAuthReply(packet));
+        this.onAuthReply?.(decodeAuthReply(packet), envelope);
         continue;
       }
       if (packet.operation === DANMAKU_OP.HEARTBEAT_REPLY) {
@@ -117,15 +170,72 @@ class DanmakuClient {
       if (packet.operation !== DANMAKU_OP.MESSAGE) {
         continue;
       }
-      for (const body of await safeDecodeDanmakuPacket(packet)) {
+      if (![0, 1, 2, 3].includes(Number(packet.version))) {
+        this.reportDecodeError(new Error(`不支持的弹幕协议版本 ${packet.version}`), packetContext(packet, 'protocol'), envelope);
+        continue;
+      }
+      let bodies;
+      try {
+        bodies = await this.decodePacket(packet);
+      } catch (error) {
+        this.reportDecodeError(error, packetContext(packet, 'decode'), envelope);
+        continue;
+      }
+      for (const body of bodies) {
         try {
           const command = JSON.parse(body);
-          this.onCommand?.(command);
-        } catch {
-          // Bilibili occasionally sends non-JSON payloads.
+          this.onCommand?.(command, envelope);
+        } catch (error) {
+          this.reportDecodeError(error, {
+            ...packetContext(packet, 'json'),
+            preview: String(body).slice(0, 180)
+          }, envelope);
         }
       }
     }
+  }
+
+  finishQueuedPacket(envelope) {
+    const lagMs = Math.max(0, this.nowMono() - Number(envelope?.receivedMono || this.nowMono()));
+    this.packetMetrics.processed += 1;
+    this.packetMetrics.totalQueueLagMs += lagMs;
+    this.packetMetrics.maxQueueLagMs = Math.max(this.packetMetrics.maxQueueLagMs, lagMs);
+    this.queuedPackets = Math.max(0, this.queuedPackets - 1);
+    this.queuedPacketMonos.shift();
+    this.oldestQueuedMono = this.queuedPacketMonos[0] || 0;
+    this.emitPacketMetrics('processed', envelope, lagMs);
+  }
+
+  emitPacketMetrics(phase, envelope, latestQueueLagMs = 0) {
+    const now = this.nowMono();
+    const oldestPacketWaitMs = this.oldestQueuedMono ? Math.max(0, now - this.oldestQueuedMono) : 0;
+    this.onPacketMetrics?.({
+      phase,
+      receivedAt: envelope?.receivedAt,
+      receivedMono: envelope?.receivedMono,
+      queueLength: this.queuedPackets,
+      oldestPacketWaitMs,
+      latestQueueLagMs,
+      maxQueueLagMs: this.packetMetrics.maxQueueLagMs,
+      averageQueueLagMs: this.packetMetrics.processed
+        ? this.packetMetrics.totalQueueLagMs / this.packetMetrics.processed
+        : 0,
+      websocketPackets: this.packetMetrics.received,
+      processedPackets: this.packetMetrics.processed,
+      decodeErrors: this.packetMetrics.decodeErrors
+    });
+  }
+
+  reportDecodeError(error, context, envelope) {
+    this.packetMetrics.decodeErrors += 1;
+    this.onDecodeError?.({
+      error,
+      context,
+      receivedAt: envelope?.receivedAt,
+      receivedMono: envelope?.receivedMono,
+      decodeErrors: this.packetMetrics.decodeErrors
+    });
+    this.emitPacketMetrics('decode-error', envelope);
   }
 
   close(reason) {
@@ -134,6 +244,16 @@ class DanmakuClient {
       this.ws.close(1000, reason || 'closed');
     }
   }
+}
+
+function packetContext(packet, phase) {
+  return {
+    phase,
+    operation: Number(packet?.operation || 0),
+    protocolVersion: Number(packet?.version || 0),
+    sequence: Number(packet?.sequence || 0),
+    bytes: Number(packet?.body?.length || 0)
+  };
 }
 
 function unpackDanmakuPackets(buffer) {
@@ -145,13 +265,14 @@ function unpackDanmakuPackets(buffer) {
     const version = buffer.readUInt16BE(offset + 6);
     const operation = buffer.readUInt32BE(offset + 8);
     const sequence = buffer.readUInt32BE(offset + 12);
-    if (packetLength <= 0 || offset + packetLength > buffer.length) {
+    if (packetLength <= 0 || headerLength < 16 || headerLength > packetLength || offset + packetLength > buffer.length) {
       break;
     }
     packets.push({
       version,
       operation,
       sequence,
+      packetLength,
       body: buffer.subarray(offset + headerLength, offset + packetLength)
     });
     offset += packetLength;
@@ -207,6 +328,7 @@ function decodeAuthReply(packet) {
 
 module.exports = {
   DanmakuClient,
+  monotonicNowMs,
   unpackDanmakuPackets,
   decodeDanmakuPacket,
   safeDecodeDanmakuPacket,
