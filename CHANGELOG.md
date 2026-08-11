@@ -5,7 +5,7 @@
 - 修复 Linux 受控更新在 `runuser` 失败后可能使 Deb 停留在 `half-configured`：安装配置改由 root 安全执行，再将 settings 交回服务用户；已有配置只在首次 bootstrap 时迁移，升级不会重置既有配置。
 - 受控 updater 现在以单事务锁和不可覆盖的 requestId 队列处理 pending/processing 请求；失败或遗留 processing 会隔离归档，更新 path 只监听新的 pending 请求，更新服务也不再因 `Restart=on-failure` 死循环。
 - Deb 更新完成必须由 `dpkg-query` 确认 `install ok installed`，且 Deb/tarball 都必须在主服务获得有效 MainPID 并通过 `/api/state` 健康检查后才记录 success。
-- 新增 WebUI 更新并发保护和 Linux Docker 升级集成测试，覆盖旧版 Deb/tarball 到新版本、配置保留、服务启动与 Deb 安装状态；发布工作流会在 Linux x64 包构建后执行该测试。
+- 新增 WebUI 更新并发保护及 Linux 受控更新回归测试，覆盖请求并发、遗留 processing 隔离、Deb 安装状态和服务健康检查。
 
 ## 0.4.2 - 2026-08-11
 
