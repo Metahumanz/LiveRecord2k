@@ -93,6 +93,17 @@ async function readNoFollow(filePath, options = {}) {
   }
 }
 
+async function sanitizeBootstrapEnvironment(environmentPath, environment) {
+  const configRoot = String(environment.BILI_RECORD_CONFIG_DIR || '/var/lib/bili-record-2k').trim() || '/var/lib/bili-record-2k';
+  const payload = [
+    `BILI_RECORD_CONFIG_DIR=${configRoot}`,
+    'BILI_RECORD_MANAGED_UPDATE=1',
+    'BILI_RECORD_SYSTEMD=1',
+    ''
+  ].join('\n');
+  await writeAtomic(environmentPath, payload, 0o640);
+}
+
 async function main() {
   const environmentRaw = await readNoFollow(ENV_PATH, { maxBytes: 1024 * 1024 }).catch((error) => {
     if (error.code === 'ENOENT') return '';
@@ -107,9 +118,13 @@ async function main() {
   } catch (error) {
     if (error.code !== 'ENOENT') throw new Error(`拒绝覆盖无法解析或不安全的 settings.json：${error.message}`);
   }
+  const firstBootstrap = Number(store?.settings?.configBootstrapVersion || 0) < 1;
   store = await migrateBootstrapStore(store, environment);
   if (storeRaw) await writeAtomic(`${STORE_PATH}.backup`, storeRaw, 0o600);
   await writeAtomic(STORE_PATH, `${JSON.stringify(store, null, 2)}\n`);
+  if (firstBootstrap) {
+    await sanitizeBootstrapEnvironment(ENV_PATH, environment);
+  }
 }
 
 if (require.main === module) {
@@ -119,4 +134,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseEnvironment, migrateBootstrapStore, writeAtomic, readNoFollow };
+module.exports = { parseEnvironment, migrateBootstrapStore, writeAtomic, readNoFollow, sanitizeBootstrapEnvironment };

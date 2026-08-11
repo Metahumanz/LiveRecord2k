@@ -10,7 +10,7 @@ CONFIG_ROOT=/etc/bili-record-2k
 ENV_FILE="$CONFIG_ROOT/environment"
 INITIAL_PASSWORD_FILE="$CONFIG_ROOT/initial-admin-password"
 
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+if [ "${BILI_RECORD_UPDATE_APPLYING:-0}" != "1" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   if systemctl is-active --quiet bili-record-2k.service; then
     systemctl stop bili-record-2k.service
   fi
@@ -40,6 +40,10 @@ install -d -m 0770 -o root -g "$SERVICE_GROUP" "$UPDATE_ROOT"
 install -d -m 2770 -o root -g "$SERVICE_GROUP" "$STATE_ROOT/recordings"
 install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_ROOT"
 
+if [ -L "$ENV_FILE" ] || { [ -e "$ENV_FILE" ] && [ ! -f "$ENV_FILE" ]; }; then
+  echo "Refusing unsafe environment file: $ENV_FILE" >&2
+  exit 1
+fi
 if [ ! -f "$ENV_FILE" ]; then
   if command -v openssl >/dev/null 2>&1; then
     INITIAL_PASSWORD="$(openssl rand -hex 18)"
@@ -66,21 +70,15 @@ fi
 
 chmod 0640 "$ENV_FILE"
 chown root:"$SERVICE_GROUP" "$ENV_FILE"
-if command -v runuser >/dev/null 2>&1; then
-  runuser -u "$SERVICE_USER" -- /usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/bootstrap-config.cjs
-else
-  su -s /bin/sh -c '/usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/bootstrap-config.cjs' "$SERVICE_USER"
-fi
-SANITIZED_ENV_FILE=$(mktemp "$CONFIG_ROOT/.environment.XXXXXXXX")
-umask 077
-{
-  echo 'BILI_RECORD_CONFIG_DIR=/var/lib/bili-record-2k'
-  echo 'BILI_RECORD_MANAGED_UPDATE=1'
-  echo 'BILI_RECORD_SYSTEMD=1'
-} >"$SANITIZED_ENV_FILE"
-chmod 0640 "$SANITIZED_ENV_FILE"
-chown root:"$SERVICE_GROUP" "$SANITIZED_ENV_FILE"
-mv -f "$SANITIZED_ENV_FILE" "$ENV_FILE"
+/usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/bootstrap-config.cjs
+for state_file in "$STATE_ROOT/BiliRecord2K/settings.json" "$STATE_ROOT/BiliRecord2K/settings.json.backup"; do
+  if [ -f "$state_file" ]; then
+    chmod 0600 "$state_file"
+    chown "$SERVICE_USER":"$SERVICE_GROUP" "$state_file"
+  fi
+done
+chmod 0640 "$ENV_FILE"
+chown root:"$SERVICE_GROUP" "$ENV_FILE"
 rm -f "$INITIAL_PASSWORD_FILE"
 
 chmod 0755 /usr/bin/bili-record-2k /usr/bin/bili-record-2k-update

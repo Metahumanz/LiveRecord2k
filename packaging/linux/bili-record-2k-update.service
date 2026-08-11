@@ -21,5 +21,4 @@ ProtectControlGroups=true
 LockPersonality=true
 RestrictRealtime=true
 SystemCallArchitectures=native
-Restart=on-failure
-RestartSec=5s
+Restart=no

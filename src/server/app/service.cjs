@@ -442,6 +442,8 @@ class LiveRecordService {
     };
     this.queuedUpdateTimer = null;
     this.autoUpdateTimer = null;
+    this.updateApplyPromise = null;
+    this.managedLinuxUpdateRequestPromise = null;
     this.ffmpegPath = findFfmpegPath();
     this.ffmpegCapabilities = {
       burnCodecs: BURN_CODEC_CANDIDATES.filter((codec) => codec.kind === 'software'),
@@ -6648,6 +6650,21 @@ try {
   }
 
   async applyUpdate() {
+    if (this.updateApplyPromise) {
+      return this.updateApplyPromise;
+    }
+    const operation = this.applyUpdateInternal();
+    this.updateApplyPromise = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.updateApplyPromise === operation) {
+        this.updateApplyPromise = null;
+      }
+    }
+  }
+
+  async applyUpdateInternal() {
     if (this.hasActiveJobs()) {
       this.updateState = {
         ...this.updateState,
@@ -6687,12 +6704,14 @@ try {
 
       const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
       if (process.platform === 'linux' && this.supportsManagedLinuxUpdate()) {
-        await this.requestManagedLinuxUpdate(manifest, packagePath);
+        const managedRequest = await this.requestManagedLinuxUpdate(manifest, packagePath);
         this.updateState = {
           ...this.updateState,
           status: 'applying',
           queued: false,
-          message: `已验证 ${manifest.version} 更新包，systemd 更新服务将自动安装并重启后台服务。`,
+          message: managedRequest.existing
+            ? `已有 ${managedRequest.version || manifest.version} root 更新请求正在处理中，未覆盖原请求。`
+            : `已验证 ${manifest.version} 更新包，systemd 更新服务将自动安装并重启后台服务。`,
           downloadProgress: 100,
           packagePath
         };
@@ -6856,9 +6875,11 @@ try {
 
   async loadLastUpdateStatus() {
     const statusPath = this.getUpdateStatusPath();
+    let loadedStatus = '';
     try {
       const status = JSON.parse(await fsp.readFile(statusPath, 'utf8'));
       const updateStatus = String(status.status || '');
+      loadedStatus = updateStatus;
       const version = normalizeVersion(status.version || '');
       const message = String(status.message || '');
       if (updateStatus === 'error' || updateStatus === 'applying') {
@@ -6884,7 +6905,7 @@ try {
           message:
             updateStatus === 'pending'
               ? `官方签名更新 ${version || ''} 已交给 root 更新服务，等待处理。`
-              : `root 更新服务正在处理 ${version || '目标版本'}；若上次中断，将从 processing 状态恢复。`,
+              : `root 更新服务正在处理 ${version || '目标版本'}；异常 processing 请求会被隔离，不会循环重复安装。`,
           checkedAt: Date.now(),
           statusPath,
           updateLogPath: status.logPath || this.getUpdateLogPath()
@@ -6913,6 +6934,36 @@ try {
     } catch (error) {
       if (error.code !== 'ENOENT') {
         this.log('warn', `读取更新状态失败：${error.message}`);
+      }
+    }
+    if (process.platform === 'linux' && process.env.BILI_RECORD_MANAGED_UPDATE === '1') {
+      const activeRequest = await findManagedUpdateRequest(this.getUpdateDir()).catch(() => null);
+      if (activeRequest?.phase === 'pending') {
+        this.updateState = {
+          ...this.updateState,
+          status: 'queued',
+          queued: true,
+          latestVersion: activeRequest.version || this.updateState.latestVersion,
+          message: `官方签名更新 ${activeRequest.version || ''} 已写入 root 更新队列，等待 systemd 处理。`,
+          checkedAt: Date.now(),
+          statusPath,
+          updateLogPath: this.getUpdateLogPath()
+        };
+        this.log('info', this.updateState.message);
+      } else if (activeRequest?.phase === 'processing' && isStaleManagedUpdateRequest(activeRequest)) {
+        this.updateState = {
+          ...this.updateState,
+          status: 'error',
+          queued: false,
+          latestVersion: activeRequest.version || this.updateState.latestVersion,
+          message: '发现超时的 processing 更新请求；它不会被 .path 反复触发，下一次受控更新会先隔离该请求。',
+          checkedAt: Date.now(),
+          statusPath,
+          updateLogPath: this.getUpdateLogPath()
+        };
+        this.log('warn', this.updateState.message);
+      } else if (loadedStatus === 'processing' && activeRequest?.phase !== 'processing') {
+        this.log('warn', '更新状态仍为 processing，但活动请求文件已不存在；保留状态供管理员检查更新日志。');
       }
     }
   }
@@ -7040,6 +7091,21 @@ try {
   }
 
   async requestManagedLinuxUpdate(manifest, packagePath) {
+    if (this.managedLinuxUpdateRequestPromise) {
+      return this.managedLinuxUpdateRequestPromise;
+    }
+    const operation = this.requestManagedLinuxUpdateInternal(manifest, packagePath);
+    this.managedLinuxUpdateRequestPromise = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.managedLinuxUpdateRequestPromise === operation) {
+        this.managedLinuxUpdateRequestPromise = null;
+      }
+    }
+  }
+
+  async requestManagedLinuxUpdateInternal(manifest, packagePath) {
     if (!this.supportsManagedLinuxUpdate(manifest)) {
       throw new Error('Linux root 自动安装只接受官方 Ed25519 签名更新清单；自定义或未签名更新源只能手动安装。');
     }
@@ -7048,27 +7114,41 @@ try {
       throw new Error('更新包不在受控下载目录中，拒绝交给系统更新服务。');
     }
     const requestPath = path.join(this.getUpdateDir(), 'apply-request.json');
-    const tmpPath = `${requestPath}.${process.pid}.tmp`;
+    const updateDir = this.getUpdateDir();
+    const requestId = crypto.randomUUID();
     const request = {
       schemaVersion: 2,
       app: 'bili-record-2k',
+      requestId,
+      version: normalizeVersion(manifest.version),
+      packageType: manifest.packageType,
       packagePath: resolvedPackagePath,
       signed: manifest.signed,
       signatureAlgorithm: manifest.signatureAlgorithm,
       signature: manifest.signature,
       requestedAt: new Date().toISOString()
     };
-    await fsp.mkdir(this.getUpdateDir(), { recursive: true });
-    await fsp.writeFile(tmpPath, `${JSON.stringify(request, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    await fsp.rename(tmpPath, requestPath);
-    const statusPath = this.getUpdateStatusPath();
-    const statusTmpPath = `${statusPath}.${process.pid}.tmp`;
-    await fsp.writeFile(
-      statusTmpPath,
-      `${JSON.stringify({ status: 'pending', version: normalizeVersion(manifest.version), packagePath: resolvedPackagePath, message: '官方签名更新已排队。', updatedAt: new Date().toISOString() }, null, 2)}\n`,
-      { encoding: 'utf8', mode: 0o600 }
-    );
-    await fsp.rename(statusTmpPath, statusPath);
+    await fsp.mkdir(updateDir, { recursive: true });
+    const existing = await findManagedUpdateRequest(updateDir);
+    if (existing && !(existing.phase === 'processing' && isStaleManagedUpdateRequest(existing))) {
+      if (isSameManagedUpdateRequest(existing, request)) {
+        return { ...existing, existing: true, requestId: existing.requestId || '' };
+      }
+      throw new Error(
+        `已有 ${existing.phase === 'processing' ? '正在处理' : '等待处理'} 的系统更新请求${
+          existing.version ? `（${existing.version}）` : ''
+        }，不会覆盖。`
+      );
+    }
+    const published = await publishJsonWithoutOverwrite(requestPath, request, 0o600);
+    if (!published) {
+      const winner = await findManagedUpdateRequest(updateDir);
+      if (winner && isSameManagedUpdateRequest(winner, request)) {
+        return { ...winner, existing: true, requestId: winner.requestId || '' };
+      }
+      throw new Error('另一个更新请求已先写入受控队列，当前请求未覆盖它。');
+    }
+    return { phase: 'pending', requestId, version: request.version, packagePath: resolvedPackagePath, existing: false };
   }
 
   scheduleAutomaticUpdateCheck(delayMs = AUTO_UPDATE_INTERVAL_MS) {
@@ -7254,6 +7334,84 @@ try {
 
   shutdown() {
     return this.beginShutdown('legacy');
+  }
+}
+
+const MANAGED_UPDATE_PROCESSING_STALE_MS = 17 * 60 * 1000;
+
+async function findManagedUpdateRequest(updateDir) {
+  for (const [phase, fileName] of [
+    ['pending', 'apply-request.json'],
+    ['processing', 'apply-request.processing.json']
+  ]) {
+    const filePath = path.join(updateDir, fileName);
+    const stat = await fsp.lstat(filePath).catch(() => null);
+    if (!stat) continue;
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      return { phase, filePath, unsafe: true, requestId: '', version: '', packagePath: '', mtimeMs: Number(stat.mtimeMs || 0) };
+    }
+    let payload = {};
+    try {
+      const raw = await fsp.readFile(filePath, 'utf8');
+      payload = JSON.parse(raw);
+    } catch {
+      return { phase, filePath, unsafe: true, requestId: '', version: '', packagePath: '', mtimeMs: Number(stat.mtimeMs || 0) };
+    }
+    return {
+      phase,
+      filePath,
+      unsafe: false,
+      requestId: normalizeManagedUpdateRequestId(payload.requestId),
+      version: normalizeVersion(payload.version || payload.signed?.version || ''),
+      packagePath: String(payload.packagePath || ''),
+      mtimeMs: Number(stat.mtimeMs || 0)
+    };
+  }
+  return null;
+}
+
+function normalizeManagedUpdateRequestId(value) {
+  const requestId = String(value || '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(requestId) ? requestId : '';
+}
+
+function isStaleManagedUpdateRequest(request) {
+  return (
+    request?.phase === 'processing' &&
+    !request.unsafe &&
+    Date.now() - Number(request.mtimeMs || 0) >= MANAGED_UPDATE_PROCESSING_STALE_MS
+  );
+}
+
+function isSameManagedUpdateRequest(existing, request) {
+  return (
+    Boolean(existing) &&
+    (Boolean(existing.requestId) && existing.requestId === request.requestId ||
+      (existing.version === request.version && existing.packagePath === request.packagePath))
+  );
+}
+
+async function publishJsonWithoutOverwrite(targetPath, value, mode = 0o600) {
+  const temporaryPath = `${targetPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0);
+  let handle = null;
+  try {
+    handle = await fsp.open(temporaryPath, flags, mode);
+    await handle.chmod(mode);
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    try {
+      await fsp.link(temporaryPath, targetPath);
+      return true;
+    } catch (error) {
+      if (error.code === 'EEXIST') return false;
+      throw error;
+    }
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await fsp.rm(temporaryPath, { force: true }).catch(() => {});
   }
 }
 
