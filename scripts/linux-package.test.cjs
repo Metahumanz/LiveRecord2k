@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const {
   compareVersions: compareAppVersions,
   createUpdateDownloadSources,
@@ -12,14 +13,17 @@ const {
   updatePackageFileName
 } = require('../src/server/shared/helpers.cjs');
 const {
+  main: applyLinuxUpdate,
   getPaths,
   validateRequestShape,
   assertUpgradeVersion,
   compareVersions,
+  queryDebPackageState,
   appendLog,
   copyUntrustedPackage
 } = require('../packaging/linux/linux-update.cjs');
 const { migrateBootstrapStore } = require('../packaging/linux/bootstrap-config.cjs');
+const { LiveRecordService } = require('../src/server/app/service.cjs');
 
 const files = [
   {
@@ -55,6 +59,85 @@ const files = [
     sha256: '4'.repeat(64)
   }
 ];
+
+async function createSignedUpdateRequest(tempDir, options = {}) {
+  const version = options.version || '1.2.4';
+  const packageType = options.packageType || 'deb';
+  const paths = getPaths({ BILI_RECORD_UPDATE_DIR: tempDir });
+  const extension = packageType === 'deb' ? 'deb' : 'tar.gz';
+  const packageName = `bili-record-2k_${version}_${process.arch}.${extension}`;
+  const packagePath = path.join(tempDir, packageName);
+  await fsp.mkdir(tempDir, { recursive: true });
+  await fsp.writeFile(packagePath, `package-${version}`, 'utf8');
+  const sha256 = crypto.createHash('sha256').update(await fsp.readFile(packagePath)).digest('hex');
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+  const signed = {
+    schemaVersion: 1,
+    app: 'bili-record-2k',
+    version,
+    files: [
+      {
+        name: packageName,
+        platform: 'linux',
+        kind: packageType,
+        arch: process.arch,
+        sha256
+      }
+    ]
+  };
+  const request = {
+    schemaVersion: 2,
+    app: 'bili-record-2k',
+    requestId: crypto.randomUUID(),
+    version,
+    packageType,
+    packagePath,
+    signed,
+    signatureAlgorithm: 'ed25519',
+    signature: crypto.sign(null, Buffer.from(stableJson(signed)), privateKey).toString('base64')
+  };
+  await fsp.writeFile(paths.requestPath, `${JSON.stringify(request)}\n`, 'utf8');
+  return { paths, request, publicKey, packagePath };
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function createUpdaterCommandRunner(options = {}) {
+  const calls = [];
+  let dpkgState = options.initialDpkgState || { status: 'install ok installed', version: '1.2.3' };
+  const targetState = options.targetDpkgState || { status: 'install ok installed', version: options.version || '1.2.4' };
+  const runner = async (command, args) => {
+    calls.push([command, ...args]);
+    if (command === 'dpkg-deb') {
+      const arch = process.arch === 'x64' ? 'amd64' : process.arch;
+      return { code: 0, stdout: `bili-record-2k\n${options.version || '1.2.4'}\n${arch}\n`, stderr: '' };
+    }
+    if (command === 'dpkg-query') {
+      return { code: 0, stdout: `${dpkgState.status}\n${dpkgState.version}\n`, stderr: '' };
+    }
+    if (command === 'dpkg') {
+      dpkgState = targetState;
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    if (command === 'systemctl' && args[0] === 'show') {
+      return { code: 0, stdout: '4242\n', stderr: '' };
+    }
+    if (command === 'systemctl' && args[0] === 'is-active') {
+      return { code: 0, stdout: 'active\n', stderr: '' };
+    }
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  return { runner, calls };
+}
 
 test('update manifest selects the package matching platform, architecture, and install type', () => {
   const payload = {
@@ -188,6 +271,133 @@ test('root updater rejects downgrade and repeated installation requests', () => 
   assert.equal(compareAppVersions('1.2.3+build.2', '1.2.3+build.1'), 0);
 });
 
+test('Deb success requires dpkg install ok installed instead of version.json alone', async () => {
+  const state = await queryDebPackageState({
+    runCommand: async () => ({ code: 0, stdout: 'install ok half-configured\n1.2.4\n', stderr: '' })
+  });
+  assert.equal(state.version, '1.2.4');
+  assert.equal(state.configured, false);
+
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-updater-half-configured-'));
+  try {
+    const { paths, publicKey } = await createSignedUpdateRequest(tempDir);
+    const { runner, calls } = createUpdaterCommandRunner({
+      targetDpkgState: { status: 'install ok half-configured', version: '1.2.4' }
+    });
+    await assert.rejects(
+      applyLinuxUpdate({
+        paths,
+        allowNonLinux: true,
+        allowNonRoot: true,
+        publicKey,
+        runCommand: runner,
+        probeService: async () => true,
+        delay: async () => {}
+      }),
+      /Deb 安装未完成.*install ok installed/
+    );
+    const status = JSON.parse(await fsp.readFile(paths.statusPath, 'utf8'));
+    assert.equal(status.status, 'error');
+    assert.equal(calls.some((call) => call[0] === 'systemctl' && call[1] === 'show'), false);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('root updater writes success only after configured Deb and a real service health probe', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-updater-success-'));
+  try {
+    const { paths, publicKey } = await createSignedUpdateRequest(tempDir);
+    const { runner, calls } = createUpdaterCommandRunner();
+    let probes = 0;
+    const result = await applyLinuxUpdate({
+      paths,
+      allowNonLinux: true,
+      allowNonRoot: true,
+      publicKey,
+      runCommand: runner,
+      probeService: async () => {
+        probes += 1;
+        return true;
+      },
+      delay: async () => {}
+    });
+    assert.equal(result.status, 'success');
+    assert.equal(probes, 1);
+    const status = JSON.parse(await fsp.readFile(paths.statusPath, 'utf8'));
+    assert.equal(status.status, 'success');
+    assert.match(status.message, /主服务健康检查通过/);
+    assert.equal(calls.some((call) => call[0] === 'dpkg-query'), true);
+    assert.equal(calls.some((call) => call[0] === 'systemctl' && call[1] === 'show'), true);
+    assert.equal(await fsp.stat(paths.processingPath).then(() => true).catch(() => false), false);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('orphaned processing requests are quarantined without restarting an install loop', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-updater-orphan-'));
+  try {
+    const paths = getPaths({ BILI_RECORD_UPDATE_DIR: tempDir });
+    await fsp.mkdir(tempDir, { recursive: true });
+    await fsp.writeFile(paths.processingPath, '{not-json', 'utf8');
+    const result = await applyLinuxUpdate({
+      paths,
+      allowNonLinux: true,
+      allowNonRoot: true,
+      runCommand: async () => {
+        throw new Error('orphan processing must not execute an installer');
+      }
+    });
+    assert.equal(result.status, 'recovered');
+    assert.equal(await fsp.stat(paths.processingPath).then(() => true).catch(() => false), false);
+    const entries = await fsp.readdir(tempDir);
+    assert.equal(entries.some((entry) => /^apply-request\.error\./.test(entry)), true);
+    const status = JSON.parse(await fsp.readFile(paths.statusPath, 'utf8'));
+    assert.equal(status.status, 'error');
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('managed Linux update requests are single-flight and never overwrite an existing queue item', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-managed-request-'));
+  const packagePath = path.join(tempDir, 'bili-record-2k_1.2.4_amd64.deb');
+  const manifest = {
+    version: '1.2.4',
+    packageType: 'deb',
+    signed: { schemaVersion: 1 },
+    signatureAlgorithm: 'ed25519',
+    signature: 'signature'
+  };
+  try {
+    await fsp.writeFile(packagePath, 'package', 'utf8');
+    const service = new LiveRecordService();
+    service.getUpdateDir = () => tempDir;
+    service.supportsManagedLinuxUpdate = () => true;
+    const [first, second] = await Promise.all([
+      service.requestManagedLinuxUpdate(manifest, packagePath),
+      service.requestManagedLinuxUpdate(manifest, packagePath)
+    ]);
+    assert.equal(first.requestId, second.requestId);
+    const requestPath = path.join(tempDir, 'apply-request.json');
+    const request = JSON.parse(await fsp.readFile(requestPath, 'utf8'));
+    assert.equal(request.version, '1.2.4');
+    assert.equal(await fsp.stat(path.join(tempDir, 'last-update-status.json')).then(() => true).catch(() => false), false);
+
+    const competing = new LiveRecordService();
+    competing.getUpdateDir = () => tempDir;
+    competing.supportsManagedLinuxUpdate = () => true;
+    await assert.rejects(
+      competing.requestManagedLinuxUpdate({ ...manifest, version: '1.2.5' }, path.join(tempDir, 'other.deb')),
+      /不会覆盖/
+    );
+    assert.deepEqual(JSON.parse(await fsp.readFile(requestPath, 'utf8')), request);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('Linux bootstrap hashes legacy plaintext and ignores credentials after the first migration', async () => {
   const legacy = await migrateBootstrapStore(
     { settings: { configBootstrapVersion: 1, accessPassword: 'legacy-password' } },
@@ -248,10 +458,20 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   const provision = fs.readFileSync(path.join(__dirname, '..', 'packaging', 'linux', 'provision.sh'), 'utf8');
   assert.match(provision, /install -d -m 0770 -o root -g "\$SERVICE_GROUP" "\$UPDATE_ROOT"/);
   assert.match(provision, /install -d -m 2770 -o root -g "\$SERVICE_GROUP" "\$STATE_ROOT\/recordings"/);
-  assert.match(provision, /runuser -u "\$SERVICE_USER"/);
+  assert.match(provision, /bootstrap-config\.cjs/);
+  assert.doesNotMatch(provision, /\brunuser\b|\bsu -s\b/);
+  assert.doesNotMatch(provision, /SANITIZED_ENV_FILE/);
+  assert.match(provision, /BILI_RECORD_UPDATE_APPLYING/);
   const updatePathUnit = fs.readFileSync(
     path.join(__dirname, '..', 'packaging', 'linux', 'bili-record-2k-update.path'),
     'utf8'
   );
-  assert.match(updatePathUnit, /apply-request\.processing\.json/);
+  assert.match(updatePathUnit, /apply-request\.json/);
+  assert.doesNotMatch(updatePathUnit, /apply-request\.processing\.json/);
+  const updateServiceUnit = fs.readFileSync(
+    path.join(__dirname, '..', 'packaging', 'linux', 'bili-record-2k-update.service'),
+    'utf8'
+  );
+  assert.match(updateServiceUnit, /Restart=no/);
+  assert.doesNotMatch(updateServiceUnit, /Restart=on-failure/);
 });
