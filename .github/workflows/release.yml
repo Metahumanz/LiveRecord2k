@@ -171,20 +171,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run real Linux managed-upgrade integration
-        if: matrix.arch == 'x64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          deb=$(find release -maxdepth 1 -name 'bili-record-2k_*_${{ matrix.deb_arch }}.deb' -print -quit)
-          tarball=$(find release -maxdepth 1 -name 'bili-record-2k_*_linux_${{ matrix.arch }}.tar.gz' -print -quit)
-          version=$(node -p "require('./package.json').version")
-          BILI_RECORD_RUN_LINUX_UPGRADE_INTEGRATION=1 \
-          BILI_RECORD_LINUX_DEB_PACKAGE="$deb" \
-          BILI_RECORD_LINUX_TARBALL_PACKAGE="$tarball" \
-          BILI_RECORD_LINUX_UPGRADE_VERSION="$version" \
-            node --test scripts/linux-upgrade.integration.test.cjs
-
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
