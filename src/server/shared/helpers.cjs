@@ -1867,6 +1867,16 @@ async function discoverRecordingFiles(outputDir, options = {}) {
       const danmakuPath = deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
       const metadataPath = `${cleanPath}.metadata.json`;
       const metadata = await fsp.readFile(metadataPath, 'utf8').then(JSON.parse).catch(() => null);
+      const metadataDirectory = path.dirname(cleanPath);
+      const resolveMetadataRelativePath = (filePath) => {
+        const value = String(filePath || '').trim();
+        if (!value) return '';
+        const resolved = path.isAbsolute(value) ? path.resolve(value) : path.resolve(metadataDirectory, value);
+        return isPathInsideDirectory(resolved, metadataDirectory) ? resolved : '';
+      };
+      const mergedFrom = Array.isArray(metadata?.mergedFrom)
+        ? [...new Set(metadata.mergedFrom.map(resolveMetadataRelativePath).filter(Boolean))]
+        : [];
       const metadataUsable =
         Number(metadata?.schemaVersion || 0) >= 1 &&
         Number(metadata.fileSize) === Number(stat.size) &&
@@ -1915,6 +1925,9 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         liveSessionId: String(metadata?.liveSessionId || ''),
         mergeGroup: String(metadata?.mergeGroup || ''),
         mergeSequence: Number(metadata?.mergeSequence || 0),
+        mergeOutputPath: resolveMetadataRelativePath(metadata?.mergeOutputPath),
+        mergedFrom,
+        cleanupId: String(metadata?.cleanupId || ''),
         segmentReason: String(metadata?.segmentReason || 'initial'),
         streamMetadata: metadata?.streamMetadata || null,
         timelineHealth:

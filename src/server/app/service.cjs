@@ -726,6 +726,24 @@ class LiveRecordService {
     await this.saveStore();
   }
 
+  async cleanupPendingSegmentCleanupsForRoom(room) {
+    const roomId = String(room?.id || '');
+    if (!roomId || this.isRoomBurning(room)) return;
+    const pendingCleanups = Array.from(this.pendingSegmentCleanups.values()).filter(
+      (cleanup) => String(cleanup.roomId) === roomId
+    );
+    for (const pendingCleanup of pendingCleanups) {
+      if (this.isRoomBurning(room)) break;
+      try {
+        await this.cleanupMergedSegmentFiles(room, pendingCleanup.segments, pendingCleanup.mergedRecording, {
+          cleanupId: pendingCleanup.cleanupId
+        });
+      } catch (error) {
+        this.log('warn', `${roomLabel(room)} 清理合并前小分段失败：${error.message}`);
+      }
+    }
+  }
+
   async bootstrapPersistentConfiguration() {
     const currentVersion = Number(this.settings.configBootstrapVersion || 0);
     const legacyPassword = String(this.settings.legacyAccessPassword || '');
@@ -5321,6 +5339,17 @@ try {
     const stat = await fsp.stat(cleanPath);
     const metadataPath = `${cleanPath}.metadata.json`;
     const temporaryPath = `${metadataPath}.${process.pid}.tmp`;
+    const metadataDirectory = path.dirname(path.resolve(cleanPath));
+    const toMetadataRelativePath = (filePath) => {
+      const value = String(filePath || '').trim();
+      if (!value) return '';
+      const resolved = path.resolve(value);
+      if (!isPathInsideDirectory(resolved, metadataDirectory)) return '';
+      return path.relative(metadataDirectory, resolved).split(path.sep).join('/');
+    };
+    const mergedFrom = Array.isArray(recording.mergedFrom)
+      ? [...new Set(recording.mergedFrom.map(toMetadataRelativePath).filter(Boolean))]
+      : [];
     const payload = {
       schemaVersion: 2,
       createdByVersion: APP_VERSION,
@@ -5335,6 +5364,9 @@ try {
       liveSessionId: String(recording.liveSessionId || ''),
       mergeGroup: String(recording.mergeGroup || ''),
       mergeSequence: Number(recording.mergeSequence || 0),
+      mergeOutputPath: toMetadataRelativePath(recording.mergeOutputPath),
+      mergedFrom,
+      cleanupId: String(recording.cleanupId || ''),
       segmentReason: String(recording.segmentReason || 'initial'),
       streamMetadata: recording.streamMetadata || null,
       timelineHealth: String(recording.timelineHealth?.timelineHealth || recording.timelineHealthStatus || recording.timelineHealth || 'warning'),
@@ -5552,6 +5584,9 @@ try {
     if (!mergedRecording?.cleanPath || !isPathInsideDirectory(mergedRecording.cleanPath, this.settings.outputDir)) {
       throw new Error('合并产物不在当前录像库内，拒绝清理任何源分段。');
     }
+    if (!(await isExistingFile(mergedRecording.cleanPath))) {
+      throw new Error('合并产物不存在，源分段受保护且不会清理。');
+    }
     if (this.isRoomBurning(room)) {
       if (cleanupId) {
         const existing = this.pendingSegmentCleanups.get(cleanupId) || {};
@@ -5729,32 +5764,87 @@ try {
     let deletedCount = 0;
     let failedCount = 0;
     let groupCount = 0;
+    const cleanupCandidates = new Map();
+    const pathKey = (filePath) => {
+      const value = String(filePath || '').trim();
+      return value ? path.resolve(value).toLowerCase() : '';
+    };
+    const createSegmentFromPath = (cleanPath) =>
+      this.normalizeRecording({
+        cleanPath,
+        capturePath: replaceExtension(cleanPath, '.recording.mkv'),
+        danmakuPath: deriveSiblingPath(cleanPath, 'danmaku', 'jsonl'),
+        cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
+        assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass')
+      });
+    const addCleanupCandidate = (mergedRecording, segments, cleanupId = '') => {
+      const key = pathKey(mergedRecording?.cleanPath);
+      const validSegments = Array.isArray(segments) ? segments.filter(Boolean) : [];
+      if (!key || validSegments.length === 0 || cleanupCandidates.has(key)) {
+        return;
+      }
+      cleanupCandidates.set(key, {
+        mergedRecording,
+        segments: validSegments,
+        cleanupId: String(cleanupId || mergedRecording?.cleanupId || '')
+      });
+    };
+    const isMergedRecording = (recording) => {
+      const cleanPathKey = pathKey(recording?.cleanPath);
+      const mergeOutputKey = pathKey(recording?.mergeOutputPath);
+      return Boolean(
+        recording?.segmentReason === 'merged' ||
+          (cleanPathKey && mergeOutputKey && cleanPathKey === mergeOutputKey) ||
+          /\.merged\.(?:mp4|mkv)$/i.test(path.basename(String(recording?.cleanPath || '')))
+      );
+    };
+
+    // The persisted task is authoritative: it keeps the complete artifact list even
+    // after the recording library was refreshed or the service restarted.
+    for (const cleanup of this.pendingSegmentCleanups.values()) {
+      addCleanupCandidate(cleanup?.mergedRecording, cleanup?.segments, cleanup?.cleanupId);
+    }
+
     for (const recording of this.recordings) {
-      if (!Array.isArray(recording.mergedFrom) || recording.mergedFrom.length === 0) {
+      if (!isMergedRecording(recording)) {
         continue;
       }
-      const segments = recording.mergedFrom
-        .map((cleanPath) =>
-          this.normalizeRecording({
-            cleanPath,
-            capturePath: replaceExtension(cleanPath, '.recording.mkv'),
-            danmakuPath: deriveSiblingPath(cleanPath, 'danmaku', 'jsonl'),
-            cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
-            assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass')
+      const mergeGroup = String(recording.mergeGroup || '');
+      const segments = Array.isArray(recording.mergedFrom) && recording.mergedFrom.length > 0
+        ? recording.mergedFrom.map(createSegmentFromPath).filter(Boolean)
+        : mergeGroup
+          ? this.recordings.filter((candidate) => {
+            const mergedPathKey = pathKey(recording.cleanPath);
+            const candidatePathKey = pathKey(candidate.cleanPath);
+            const candidateOutputKey = pathKey(candidate.mergeOutputPath);
+            return (
+              candidatePathKey &&
+              candidatePathKey !== mergedPathKey &&
+              !isMergedRecording(candidate) &&
+              String(candidate.mergeGroup || '') === mergeGroup &&
+              isPathInsideDirectory(candidate.cleanPath, path.dirname(recording.cleanPath)) &&
+              (!candidateOutputKey || candidateOutputKey === mergedPathKey)
+            );
           })
-        )
-        .filter(Boolean);
-      if (segments.length === 0) {
-        continue;
+          : [];
+      addCleanupCandidate(recording, segments, recording.cleanupId);
+    }
+
+    for (const { mergedRecording, segments, cleanupId } of cleanupCandidates.values()) {
+      try {
+        const result = await this.cleanupMergedSegmentFiles(fakeRoom, segments, mergedRecording, { cleanupId });
+        deletedCount += Number(result?.deletedCount || 0);
+        failedCount += Number(result?.failedCount || 0);
+        groupCount += 1;
+      } catch (error) {
+        failedCount += 1;
+        groupCount += 1;
+        this.log('warn', `清理 ${path.basename(mergedRecording.cleanPath)} 的合并残留失败：${error.message}`);
       }
-      const result = await this.cleanupMergedSegmentFiles(fakeRoom, segments, recording);
-      deletedCount += result.deletedCount || 0;
-      failedCount += result.failedCount || 0;
-      groupCount += 1;
     }
     this.log(
       deletedCount > 0 ? 'success' : 'info',
-      `已扫描 ${groupCount} 个 merged 记录，清理残留 ${deletedCount} 个${failedCount > 0 ? `，失败 ${failedCount} 个` : ''}。`
+      `已扫描 ${groupCount} 个合并记录或待清理任务，清理残留 ${deletedCount} 个${failedCount > 0 ? `，失败 ${failedCount} 个` : ''}。`
     );
     this.emitState();
     return this.getState();
@@ -6031,16 +6121,7 @@ try {
             this.emitState();
           }
         }, 5000).unref?.();
-        const pendingCleanup = Array.from(this.pendingSegmentCleanups.values()).find(
-          (cleanup) => String(cleanup.roomId) === room.id
-        );
-        if (pendingCleanup && !this.isRoomBurning(room)) {
-          this.cleanupMergedSegmentFiles(room, pendingCleanup.segments, pendingCleanup.mergedRecording, {
-            cleanupId: pendingCleanup.cleanupId
-          }).catch((error) => {
-            this.log('warn', `${roomLabel(room)} 清理合并前小分段失败：${error.message}`);
-          });
-        }
+        await this.cleanupPendingSegmentCleanupsForRoom(room);
         this.scheduleQueuedUpdateCheck();
       });
     } catch (error) {
