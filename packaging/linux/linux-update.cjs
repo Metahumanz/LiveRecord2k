@@ -467,7 +467,7 @@ async function waitForMainServiceHealthy(paths, options = {}) {
       );
       const mainPid = Number(String(pidResult.stdout || '').trim());
       if (pidResult.code === 0 && Number.isInteger(mainPid) && mainPid > 1) {
-        const health = await probeMainService(options);
+        const health = await probeMainService(paths, options);
         if (health.ok) {
           await appendLog(paths, `主服务健康检查通过（PID ${mainPid}）。`);
           return { mainPid, health };
@@ -484,27 +484,37 @@ async function waitForMainServiceHealthy(paths, options = {}) {
   throw new Error(`主服务启动后未通过健康检查：${lastReason}`);
 }
 
-async function probeMainService(options = {}) {
+async function probeMainService(paths, options = {}) {
   if (typeof options.probeService === 'function') {
     const result = await options.probeService();
     if (result === true) return { ok: true, message: '' };
     if (result && typeof result === 'object') return { ok: result.ok === true, message: String(result.message || '') };
     return { ok: false, message: '测试健康检查未返回成功。' };
   }
-  const target = await getServiceHealthTarget(options);
+  const target = await getServiceHealthTarget(paths, options);
   return probeHttpService(target, Math.min(4000, Number(options.serviceProbeTimeoutMs || 2500)));
 }
 
-async function getServiceHealthTarget(options = {}) {
+async function getServiceHealthTarget(paths = {}, options = {}) {
   const environmentPath = options.environmentPath || '/etc/bili-record-2k/environment';
   const values = await fsp
     .readFile(environmentPath, 'utf8')
     .then(parseEnvironmentFile)
     .catch(() => ({}));
-  const configuredHost = String(values.BILI_RECORD_HOST || '127.0.0.1').trim().toLowerCase();
+  const settingsPath = options.settingsPath || path.join(paths.configRoot || '/var/lib/bili-record-2k', 'BiliRecord2K', 'settings.json');
+  const persistedSettings = await readUntrustedJsonFile(settingsPath)
+    .then((payload) => (payload?.settings && typeof payload.settings === 'object' ? payload.settings : {}))
+    .catch(() => ({}));
+  const configuredHost = String(persistedSettings.serverHost || values.BILI_RECORD_HOST || '127.0.0.1').trim().toLowerCase();
   const host = configuredHost === '::' || configuredHost === '::1' ? '::1' : '127.0.0.1';
-  const configuredPort = Number(values.BILI_RECORD_PORT || 3263);
-  return { host, port: Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535 ? configuredPort : 3263 };
+  const persistedPort = normalizeServicePort(persistedSettings.serverPort);
+  const environmentPort = normalizeServicePort(values.BILI_RECORD_PORT);
+  return { host, port: persistedPort || environmentPort || 3263 };
+}
+
+function normalizeServicePort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0;
 }
 
 function parseEnvironmentFile(text) {
@@ -741,6 +751,7 @@ module.exports = {
   isInstalledPackageVersion,
   startAndVerifyMainService,
   waitForMainServiceHealthy,
+  getServiceHealthTarget,
   assertUpgradeVersion,
   compareVersions,
   normalizeVersion,
