@@ -89,6 +89,23 @@ test('ordinary gifts share the message stack and use the compact two-line card r
   assert.doesNotMatch(ass, /观众A:|礼物互动|COMBO|￥/);
 });
 
+test('large message stacks append ASS lines without overflowing the V8 call stack', () => {
+  const events = Array.from({ length: 15_000 }, (_, index) => ({
+    type: 'gift',
+    videoTime: index * 6,
+    uid: index + 1,
+    user: `用户${index}`,
+    giftName: '小花花',
+    count: 1,
+    price: 1
+  }));
+
+  const ass = createAss(events, { overlayMode: 'danmaku-gift' });
+
+  assert.match(ass, /用户14999/);
+  assert.ok(Buffer.byteLength(ass) > 1_000_000);
+});
+
 test('gift, superchat, and guard use one push/reflow lifecycle', () => {
   const timeline = createMessageTimeline([
     { type: 'gift', time: 1, user: 'A', giftName: '花', count: 1 },
