@@ -7,6 +7,13 @@ const inflate = promisify(zlib.inflate);
 const brotliDecompress = promisify(zlib.brotliDecompress);
 const MAX_WEBSOCKET_PAYLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_DECOMPRESSED_PAYLOAD_BYTES = 32 * 1024 * 1024;
+// A normal Bilibili batch is only one compressed layer deep and contains far
+// fewer commands than these limits.  Keep decoding bounded so a malformed
+// nested payload cannot exhaust the decoder queue or V8's argument stack.
+const MAX_DANMAKU_NESTING_DEPTH = 4;
+const MAX_DANMAKU_PACKETS_PER_PAYLOAD = 50_000;
+const MAX_DECODED_DANMAKU_BODIES = 50_000;
+const MAX_TOTAL_DECOMPRESSED_BYTES = MAX_DECOMPRESSED_PAYLOAD_BYTES;
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -147,7 +154,16 @@ class DanmakuClient {
 
   async handleMessage(envelope) {
     const { buffer } = envelope;
-    const packets = unpackDanmakuPackets(buffer);
+    let packets;
+    try {
+      packets = unpackDanmakuPackets(buffer);
+    } catch (error) {
+      this.reportDecodeError(error, {
+        phase: 'unpack',
+        bytes: buffer.length
+      }, envelope);
+      return;
+    }
     const consumedBytes = packets.reduce((sum, packet) => sum + Number(packet.packetLength || 0), 0);
     if ((!packets.length || consumedBytes !== buffer.length) && buffer.length) {
       this.reportDecodeError(new Error('弹幕包头无效或不完整'), {
@@ -256,7 +272,7 @@ function packetContext(packet, phase) {
   };
 }
 
-function unpackDanmakuPackets(buffer) {
+function unpackDanmakuPackets(buffer, maxPackets = MAX_DANMAKU_PACKETS_PER_PAYLOAD) {
   const packets = [];
   let offset = 0;
   while (offset + 16 <= buffer.length) {
@@ -267,6 +283,12 @@ function unpackDanmakuPackets(buffer) {
     const sequence = buffer.readUInt32BE(offset + 12);
     if (packetLength <= 0 || headerLength < 16 || headerLength > packetLength || offset + packetLength > buffer.length) {
       break;
+    }
+    if (packets.length >= maxPackets) {
+      throw createDanmakuDecodeLimitError(
+        'DANMAKU_PACKET_LIMIT',
+        `弹幕包数量超过上限（${maxPackets}）`
+      );
     }
     packets.push({
       version,
@@ -281,26 +303,68 @@ function unpackDanmakuPackets(buffer) {
 }
 
 async function decodeDanmakuPacket(packet) {
-  if (packet.version === 0 || packet.version === 1) {
-    return [packet.body.toString('utf8')].filter(Boolean);
-  }
-  if (packet.version === 2) {
-    const inflated = await inflate(packet.body, { maxOutputLength: MAX_DECOMPRESSED_PAYLOAD_BYTES });
-    return decodeNestedDanmakuPackets(inflated);
-  }
-  if (packet.version === 3) {
-    const decompressed = await brotliDecompress(packet.body, { maxOutputLength: MAX_DECOMPRESSED_PAYLOAD_BYTES });
-    return decodeNestedDanmakuPackets(decompressed);
-  }
-  return [];
+  const bodies = [];
+  await collectDanmakuPacketBodies(packet, bodies, {
+    packetCount: 0,
+    bodyCount: 0,
+    decompressedBytes: 0
+  }, 0);
+  return bodies;
 }
 
-async function decodeNestedDanmakuPackets(buffer) {
-  const bodies = [];
-  for (const packet of unpackDanmakuPackets(buffer)) {
-    bodies.push(...(await decodeDanmakuPacket(packet)));
+async function collectDanmakuPacketBodies(packet, bodies, state, compressionDepth) {
+  if (packet.version === 0 || packet.version === 1) {
+    const body = packet.body.toString('utf8');
+    if (!body) return;
+    if (state.bodyCount >= MAX_DECODED_DANMAKU_BODIES) {
+      throw createDanmakuDecodeLimitError(
+        'DANMAKU_BODY_LIMIT',
+        `弹幕命令数量超过上限（${MAX_DECODED_DANMAKU_BODIES}）`
+      );
+    }
+    state.bodyCount += 1;
+    bodies.push(body);
+    return;
   }
-  return bodies;
+  if (packet.version !== 2 && packet.version !== 3) return;
+  if (compressionDepth >= MAX_DANMAKU_NESTING_DEPTH) {
+    throw createDanmakuDecodeLimitError(
+      'DANMAKU_NESTING_LIMIT',
+      `弹幕嵌套压缩层数超过上限（${MAX_DANMAKU_NESTING_DEPTH}）`
+    );
+  }
+
+  const remainingOutputBytes = MAX_TOTAL_DECOMPRESSED_BYTES - state.decompressedBytes;
+  if (remainingOutputBytes <= 0) {
+    throw createDanmakuDecodeLimitError(
+      'DANMAKU_DECOMPRESSED_LIMIT',
+      `弹幕解压数据超过上限（${MAX_TOTAL_DECOMPRESSED_BYTES}）`
+    );
+  }
+  const decompressed = packet.version === 2
+    ? await inflate(packet.body, { maxOutputLength: Math.min(MAX_DECOMPRESSED_PAYLOAD_BYTES, remainingOutputBytes) })
+    : await brotliDecompress(packet.body, { maxOutputLength: Math.min(MAX_DECOMPRESSED_PAYLOAD_BYTES, remainingOutputBytes) });
+  state.decompressedBytes += decompressed.length;
+  await decodeNestedDanmakuPackets(decompressed, bodies, state, compressionDepth + 1);
+}
+
+async function decodeNestedDanmakuPackets(buffer, bodies, state, compressionDepth) {
+  for (const packet of unpackDanmakuPackets(buffer)) {
+    if (state.packetCount >= MAX_DANMAKU_PACKETS_PER_PAYLOAD) {
+      throw createDanmakuDecodeLimitError(
+        'DANMAKU_PACKET_LIMIT',
+        `弹幕嵌套包数量超过上限（${MAX_DANMAKU_PACKETS_PER_PAYLOAD}）`
+      );
+    }
+    state.packetCount += 1;
+    await collectDanmakuPacketBodies(packet, bodies, state, compressionDepth);
+  }
+}
+
+function createDanmakuDecodeLimitError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 async function safeDecodeDanmakuPacket(packet) {

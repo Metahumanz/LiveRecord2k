@@ -3,8 +3,9 @@ const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const zlib = require('node:zlib');
 
-const { DanmakuClient } = require('../src/server/danmaku/client.cjs');
+const { DanmakuClient, decodeDanmakuPacket, unpackDanmakuPackets } = require('../src/server/danmaku/client.cjs');
 const { SessionEventDeduper } = require('../src/server/danmaku/dedupe.cjs');
 const {
   normalizeDanmakuEvent,
@@ -17,7 +18,7 @@ const { runCapturedProcess } = require('../src/server/shared/helpers.cjs');
 const ffmpegPath = require('ffmpeg-static');
 
 function makePacket(operation, body, version = 1) {
-  const payload = Buffer.from(body, 'utf8');
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8');
   const packet = Buffer.alloc(16 + payload.length);
   packet.writeUInt32BE(packet.length, 0);
   packet.writeUInt16BE(16, 4);
@@ -26,6 +27,15 @@ function makePacket(operation, body, version = 1) {
   packet.writeUInt32BE(1, 12);
   payload.copy(packet, 16);
   return packet;
+}
+
+function makeCompressedPacket(body) {
+  return makePacket(5, zlib.deflateSync(body), 2);
+}
+
+function decodePacketBuffer(buffer) {
+  const [packet] = unpackDanmakuPackets(buffer);
+  return decodeDanmakuPacket(packet);
 }
 
 function timing(videoTime = 1) {
@@ -127,6 +137,39 @@ test('raw websocket receipt time survives an intentionally delayed decode queue'
   assert.equal(received.receivedMono, 1000);
   assert.equal(received.receivedAt, 1_786_432_101_000);
   assert.equal(metrics.maxQueueLagMs, 7000);
+});
+
+test('nested compressed danmaku batches are accumulated without variadic stack expansion', async () => {
+  const bodies = Buffer.concat(Array.from(
+    { length: 20_000 },
+    (_, index) => makePacket(5, JSON.stringify({ cmd: 'DANMU_MSG', index }))
+  ));
+  const nestedCompressed = makeCompressedPacket(bodies);
+  const decoded = await decodePacketBuffer(makeCompressedPacket(nestedCompressed));
+
+  assert.equal(decoded.length, 20_000);
+  assert.match(decoded.at(-1), /"index":19999/);
+});
+
+test('oversized or excessively nested danmaku packets fail with a bounded decode error', async () => {
+  const oversizedBodies = Buffer.concat(Array.from(
+    { length: 50_001 },
+    () => makePacket(5, '{}')
+  ));
+  const oversized = makeCompressedPacket(makeCompressedPacket(oversizedBodies));
+  await assert.rejects(
+    () => decodePacketBuffer(oversized),
+    (error) => error?.code === 'DANMAKU_PACKET_LIMIT' || error?.code === 'DANMAKU_BODY_LIMIT'
+  );
+
+  let deeplyNested = makePacket(5, '{}');
+  for (let index = 0; index < 5; index += 1) {
+    deeplyNested = makeCompressedPacket(deeplyNested);
+  }
+  await assert.rejects(
+    () => decodePacketBuffer(deeplyNested),
+    (error) => error?.code === 'DANMAKU_NESTING_LIMIT'
+  );
 });
 
 test('media clock uses first FFmpeg progress rather than FFmpeg spawn wall time', () => {

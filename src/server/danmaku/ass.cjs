@@ -524,7 +524,12 @@ function createAss(events, options = {}) {
   }
 
   if (overlayMode === 'danmaku-gift') {
-    lines.push(...renderMessageStack(sorted.filter((event) => event.type !== 'danmaku'), style));
+    // A busy multi-hour stream can produce far more lines than V8 accepts as
+    // one function-call argument list. Append them one by one instead of using
+    // `push(...messageLines)`, which otherwise throws RangeError here.
+    for (const line of renderMessageStack(sorted.filter((event) => event.type !== 'danmaku'), style)) {
+      lines.push(line);
+    }
   }
 
   return `${lines.join('\n')}\n`;
