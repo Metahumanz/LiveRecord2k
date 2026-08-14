@@ -19,6 +19,7 @@ const {
   assertUpgradeVersion,
   compareVersions,
   queryDebPackageState,
+  getServiceHealthTarget,
   appendLog,
   copyUntrustedPackage
 } = require('../packaging/linux/linux-update.cjs');
@@ -330,6 +331,23 @@ test('root updater writes success only after configured Deb and a real service h
     assert.equal(calls.some((call) => call[0] === 'dpkg-query'), true);
     assert.equal(calls.some((call) => call[0] === 'systemctl' && call[1] === 'show'), true);
     assert.equal(await fsp.stat(paths.processingPath).then(() => true).catch(() => false), false);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('root updater health probe uses persisted serverPort after bootstrap strips the environment port', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-updater-health-port-'));
+  try {
+    const configRoot = path.join(tempDir, 'config');
+    const environmentPath = path.join(tempDir, 'environment');
+    const paths = getPaths({ BILI_RECORD_CONFIG_DIR: configRoot, BILI_RECORD_UPDATE_DIR: path.join(tempDir, 'updates') });
+    const settingsPath = path.join(configRoot, 'BiliRecord2K', 'settings.json');
+    await fsp.mkdir(path.dirname(settingsPath), { recursive: true });
+    await fsp.writeFile(settingsPath, JSON.stringify({ settings: { serverHost: '127.0.0.1', serverPort: 47654 } }), 'utf8');
+    await fsp.writeFile(environmentPath, 'BILI_RECORD_CONFIG_DIR=/var/lib/bili-record-2k\nBILI_RECORD_MANAGED_UPDATE=1\n', 'utf8');
+
+    assert.deepEqual(await getServiceHealthTarget(paths, { environmentPath }), { host: '127.0.0.1', port: 47654 });
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
