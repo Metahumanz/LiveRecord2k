@@ -174,3 +174,121 @@ test('manual cleanup can safely reconstruct a legacy merge group that predates p
     await fsp.rm(outputDir, { recursive: true, force: true });
   }
 });
+
+test('manual cleanup removes orphaned source sidecars only when their metadata points to an existing merged output', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-orphan-sidecars-'));
+  const sourcePath = path.join(outputDir, 'orphan.clean.mp4');
+  const sourceCapturePath = path.join(outputDir, 'orphan.recording.mkv');
+  const sourceDanmakuPath = path.join(outputDir, 'orphan.danmaku.jsonl');
+  const sourceCssPath = path.join(outputDir, 'orphan.danmaku.css');
+  const sourceAssPath = path.join(outputDir, 'orphan.danmaku.ass');
+  const sourceFinalizingPath = path.join(outputDir, 'orphan.clean.finalizing.mp4');
+  const legacyFinalizingPath = path.join(outputDir, 'orphan.finalizing.mp4');
+  const mergedPath = path.join(outputDir, 'orphan.merged.mp4');
+  const mergedDanmakuPath = path.join(outputDir, 'orphan.merged.danmaku.jsonl');
+  const unrelatedPath = path.join(outputDir, 'unrelated.clean.mp4');
+  const unrelatedDanmakuPath = path.join(outputDir, 'unrelated.danmaku.jsonl');
+  try {
+    await Promise.all([
+      writeRecordingFile(sourcePath),
+      writeRecordingFile(sourceCapturePath),
+      writeRecordingFile(sourceDanmakuPath),
+      writeRecordingFile(sourceCssPath),
+      writeRecordingFile(sourceAssPath),
+      writeRecordingFile(sourceFinalizingPath),
+      writeRecordingFile(legacyFinalizingPath),
+      writeRecordingFile(mergedPath),
+      writeRecordingFile(mergedDanmakuPath),
+      writeRecordingFile(unrelatedPath),
+      writeRecordingFile(unrelatedDanmakuPath)
+    ]);
+    await Promise.all([
+      writeLegacyMetadata(mergedPath, {
+        mergeGroup: 'orphan-group',
+        mergeOutputPath: path.basename(mergedPath),
+        segmentReason: 'merged'
+      }),
+      writeLegacyMetadata(sourcePath, {
+        status: 'completed',
+        mergeGroup: 'orphan-group',
+        mergeOutputPath: path.basename(mergedPath),
+        segmentReason: 'stream-eof'
+      }),
+      writeLegacyMetadata(unrelatedPath, {
+        status: 'completed',
+        mergeGroup: 'orphan-group',
+        mergeOutputPath: 'not-a-real-merged-output.merged.mp4',
+        segmentReason: 'stream-eof'
+      })
+    ]);
+    await Promise.all([fsp.rm(sourcePath), fsp.rm(unrelatedPath)]);
+
+    const discovered = await discoverRecordingFiles(outputDir, { concurrency: 1 });
+    assert.deepEqual(discovered.map((recording) => recording.cleanPath), [mergedPath]);
+    const cleaner = createService(outputDir);
+    cleaner.recordings = discovered.map((recording) => cleaner.normalizeRecording(recording)).filter(Boolean);
+    await cleaner.cleanupMergedSegmentResiduals();
+
+    for (const filePath of [
+      `${sourcePath}.metadata.json`,
+      sourceCapturePath,
+      sourceDanmakuPath,
+      sourceCssPath,
+      sourceAssPath,
+      sourceFinalizingPath,
+      legacyFinalizingPath
+    ]) {
+      assert.equal(await fileExists(filePath), false, `expected stale source artifact to be deleted: ${path.basename(filePath)}`);
+    }
+    assert.equal(await fileExists(mergedPath), true);
+    assert.equal(await fileExists(`${mergedPath}.metadata.json`), true);
+    assert.equal(await fileExists(mergedDanmakuPath), true);
+    assert.equal(await fileExists(`${unrelatedPath}.metadata.json`), true);
+    assert.equal(await fileExists(unrelatedDanmakuPath), true);
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('crash recovery removes only a zero-byte capture owned by an interrupted recording metadata file', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-empty-capture-'));
+  const cleanPath = path.join(outputDir, 'empty.clean.mp4');
+  const capturePath = path.join(outputDir, 'empty.recording.mkv');
+  const danmakuPath = path.join(outputDir, 'empty.danmaku.jsonl');
+  const cssPath = path.join(outputDir, 'empty.danmaku.css');
+  const assPath = path.join(outputDir, 'empty.danmaku.ass');
+  const diagnosticsPath = path.join(outputDir, 'diagnostics.json');
+  const unownedCapturePath = path.join(outputDir, 'unowned.recording.mkv');
+  try {
+    await Promise.all([
+      fsp.writeFile(capturePath, ''),
+      fsp.writeFile(danmakuPath, '{"videoTime":0}\n'),
+      fsp.writeFile(cssPath, '/* danmaku */'),
+      fsp.writeFile(assPath, '[Script Info]'),
+      fsp.writeFile(diagnosticsPath, '{}\n'),
+      fsp.writeFile(unownedCapturePath, '')
+    ]);
+    await fsp.writeFile(
+      `${cleanPath}.metadata.json`,
+      `${JSON.stringify({
+        schemaVersion: 2,
+        status: 'recording',
+        cleanPath: path.basename(cleanPath),
+        capturePath: path.basename(capturePath),
+        danmakuPath: path.basename(danmakuPath)
+      })}\n`
+    );
+
+    const service = createService(outputDir);
+    const recovered = await service.recoverInterruptedRecordings();
+
+    assert.deepEqual(recovered, []);
+    for (const filePath of [capturePath, `${cleanPath}.metadata.json`, danmakuPath, cssPath, assPath]) {
+      assert.equal(await fileExists(filePath), false, `expected owned empty artifact to be deleted: ${path.basename(filePath)}`);
+    }
+    assert.equal(await fileExists(diagnosticsPath), true, 'session diagnostics are not a disposable capture sidecar');
+    assert.equal(await fileExists(unownedCapturePath), true, 'an unowned empty capture remains available for manual inspection');
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
