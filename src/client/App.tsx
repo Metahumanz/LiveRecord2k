@@ -55,6 +55,8 @@ export default function App() {
     mode: 'clean',
     overlayMode: 'danmaku-gift',
     danmakuArea: 'half',
+    stylePreset: 'current',
+    styleLayout: {},
     outputDir: ''
   });
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
@@ -187,6 +189,8 @@ export default function App() {
       endTime: duration > 0 ? formatTimelineTime(duration) : '',
       overlayMode: state?.settings.burnOverlayMode || current.overlayMode,
       danmakuArea: state?.settings.burnDanmakuArea || current.danmakuArea,
+      stylePreset: state?.settings.burnDanmakuStylePreset || current.stylePreset,
+      styleLayout: { ...(state?.settings.burnDanmakuStyleLayout || current.styleLayout) },
       outputDir: current.outputDir || state?.settings.outputDir || ''
     }));
   }
@@ -202,6 +206,8 @@ export default function App() {
         endTime: exportDraft.endTime,
         overlayMode: exportDraft.overlayMode,
         danmakuArea: exportDraft.danmakuArea,
+        stylePreset: exportDraft.stylePreset,
+        styleLayout: exportDraft.styleLayout,
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
@@ -228,6 +234,8 @@ export default function App() {
         endTime: exportDraft.endTime,
         overlayMode: exportDraft.overlayMode,
         danmakuArea: exportDraft.danmakuArea,
+        stylePreset: exportDraft.stylePreset,
+        styleLayout: exportDraft.styleLayout,
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
@@ -240,6 +248,16 @@ export default function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  async function saveExportStyleAsDefault() {
+    await saveSettingsWithToast(
+      {
+        burnDanmakuStylePreset: exportDraft.stylePreset,
+        burnDanmakuStyleLayout: exportDraft.styleLayout
+      },
+      '已设为默认烧录样式；自动烧录和下次导出会使用这组参数'
+    );
   }
 
   if (!state || !settingsDraft) {
@@ -325,6 +343,7 @@ export default function App() {
             selectRecording={selectExportRecording}
             prepareSubtitles={prepareExportSubtitles}
             exportClip={exportClip}
+            saveStyleAsDefault={saveExportStyleAsDefault}
             run={run}
           />
         ) : null}

@@ -3,7 +3,7 @@ import { Bell, FileCode2, FolderOpen, HardDrive, LogIn, QrCode, Save, Video } fr
 import { recorder } from '../recorderClient';
 import { PageHeader, SettingPanel, Toggle } from '../components/common';
 import type { AppSettings, AppState, DiskSpaceState } from '../types';
-import { containerOptions, danmakuAreaOptions, overlayModeOptions, qnOptions } from '../ui/options';
+import { containerOptions, danmakuAreaOptions, danmakuStylePresetOptions, overlayModeOptions, qnOptions } from '../ui/options';
 import { burnCodecOptions, burnCodecSummary, formatFileSize, isBilibiliLoggedIn } from '../utils';
 
 export function SettingsPage({
@@ -304,6 +304,27 @@ export function SettingsPage({
                 ))}
               </select>
               <p className="field-help">与 B 站直播的显示区域选项一致；手动生成前也可以临时调整。</p>
+            </label>
+
+            <label className="field">
+              <span>默认弹幕样式</span>
+              <select
+                value={settingsDraft.burnDanmakuStylePreset}
+                onChange={(event) =>
+                  setSettingsDraft({
+                    ...settingsDraft,
+                    burnDanmakuStylePreset: event.target.value as AppSettings['burnDanmakuStylePreset'],
+                    burnDanmakuStyleLayout: {}
+                  })
+                }
+              >
+                {danmakuStylePresetOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="field-help">“当前默认”会保留原有 .danmaku.css；位置和大小可在剪辑导出页预览后设为默认。</p>
             </label>
 
             <label className="field">

@@ -89,6 +89,18 @@ export type RecordingState = {
 
 export type DanmakuArea = 'quarter' | 'half' | 'three-quarter' | 'no-overlap' | 'unlimited';
 
+export type DanmakuStylePreset = 'current' | 'h5-card' | 'bubble' | 'minimal';
+
+export type DanmakuStyleLayout = {
+  panelLeft?: number;
+  superChatBottom?: number;
+  superChatWidth?: number;
+  boxFontSize?: number;
+  danmakuTop?: number;
+  danmakuFontSize?: number;
+  danmakuLineHeight?: number;
+};
+
 export type AppSettings = {
   outputDir: string;
   cookie: string;
@@ -101,6 +113,8 @@ export type AppSettings = {
   autoBurnDanmaku: boolean;
   burnOverlayMode: 'danmaku' | 'danmaku-gift';
   burnDanmakuArea: DanmakuArea;
+  burnDanmakuStylePreset: DanmakuStylePreset;
+  burnDanmakuStyleLayout: DanmakuStyleLayout;
   burnCodec: string;
   burnCrf: number;
   notifyLiveStarted: boolean;
@@ -299,6 +313,8 @@ export type ExportClipRequest = {
   endTime: string;
   overlayMode?: 'danmaku' | 'danmaku-gift';
   danmakuArea?: DanmakuArea;
+  stylePreset?: DanmakuStylePreset;
+  styleLayout?: DanmakuStyleLayout;
   outputDir?: string;
   outputPath?: string;
 };
@@ -381,12 +397,23 @@ export type RecorderApi = {
   cancelExportPreview: () => Promise<AppState>;
   burnDanmaku: (
     roomId: string,
-    options?: { overlayMode?: AppSettings['burnOverlayMode']; danmakuArea?: DanmakuArea; prepareOnly?: boolean }
+    options?: {
+      overlayMode?: AppSettings['burnOverlayMode'];
+      danmakuArea?: DanmakuArea;
+      stylePreset?: DanmakuStylePreset;
+      styleLayout?: DanmakuStyleLayout;
+      prepareOnly?: boolean;
+    }
   ) => Promise<AppState>;
   cancelBurnDanmaku: (roomId: string) => Promise<AppState>;
   prepareDanmaku: (
     roomId: string,
-    options?: { overlayMode?: AppSettings['burnOverlayMode']; danmakuArea?: DanmakuArea }
+    options?: {
+      overlayMode?: AppSettings['burnOverlayMode'];
+      danmakuArea?: DanmakuArea;
+      stylePreset?: DanmakuStylePreset;
+      styleLayout?: DanmakuStyleLayout;
+    }
   ) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
@@ -419,5 +446,7 @@ export type ExportDraft = {
   mode: 'clean' | 'burn';
   overlayMode: AppSettings['burnOverlayMode'];
   danmakuArea: DanmakuArea;
+  stylePreset: DanmakuStylePreset;
+  styleLayout: DanmakuStyleLayout;
   outputDir: string;
 };

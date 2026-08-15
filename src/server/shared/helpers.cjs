@@ -800,7 +800,14 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
         resolve();
         return;
       }
-      reject(new Error(`ffmpeg 退出码 ${code}，信号 ${signal || '-'}：${compactLogLine(stderr)}`));
+      const error = new Error(`ffmpeg 退出码 ${code}，信号 ${signal || '-'}：${compactLogLine(stderr)}`);
+      // Keep machine-readable termination details for callers.  In particular,
+      // SIGKILL can be an OOM killer action rather than an FFmpeg error, and a
+      // retry with another encoder would only make that pressure worse.
+      error.ffmpegExitCode = code;
+      error.ffmpegSignal = signal || '';
+      error.ffmpegStderr = compactLogLine(stderr);
+      reject(error);
     });
   });
 }
