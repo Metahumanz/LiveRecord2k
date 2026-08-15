@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.4.6 - 2026-08-15
+
+- 修复合并完成后源视频已删除、只剩 `.clean.*.metadata.json`、弹幕 JSONL/CSS/ASS 等 sidecar 时，手动清理无法识别并残留的问题；现在只在 metadata 明确关联到仍存在的合并成品时安全清理，最终视频、最终弹幕文件和 diagnostics 会保留。
+- 修复源分段临时 capture 路径推导错误，并在录制失败或崩溃恢复时清理由活动 metadata 明确归属的 0 字节 `.recording.mkv` 及其无用 sidecar；无法验证归属的文件仍保留供人工检查。
+- 崩溃恢复成功后会清理遗留的 `.finalizing.mp4` 收尾临时文件，避免其长期留在录像目录中。
+
 ## 0.4.5 - 2026-08-14
 
 - 修复长时间高互动直播生成弹幕视频时，ASS 消息栈一次性展开大量行导致 `RangeError: Maximum call stack size exceeded`、烧录任务失败的问题；现在逐条写入字幕行。
