@@ -34,6 +34,8 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
       cssPath: current.cssPath || currentRecording.cssPath || '',
       overlayMode: current.overlayMode || state.settings.burnOverlayMode,
       danmakuArea: current.danmakuArea || state.settings.burnDanmakuArea,
+      stylePreset: current.stylePreset || state.settings.burnDanmakuStylePreset,
+      styleLayout: current.styleLayout || { ...state.settings.burnDanmakuStyleLayout },
       outputDir: current.outputDir || state.settings.outputDir
     };
   }
@@ -45,6 +47,8 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
     endTime: '',
     overlayMode: state.settings.burnOverlayMode,
     danmakuArea: state.settings.burnDanmakuArea,
+    stylePreset: state.settings.burnDanmakuStylePreset,
+    styleLayout: { ...state.settings.burnDanmakuStyleLayout },
     outputDir: current.outputDir || state.settings.outputDir
   };
 }

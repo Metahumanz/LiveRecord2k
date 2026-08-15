@@ -7,6 +7,8 @@ const {
   createDefaultDanmakuCss,
   getDanmakuEventDuration,
   normalizeDanmakuStyle,
+  normalizeDanmakuStyleLayout,
+  resolveDanmakuStyle,
   superChatPalette,
   guardCardPalette,
   giftCardPalette,
@@ -30,6 +32,42 @@ test('default message card style matches the compact lower-left reference scale'
   assert.equal(migrated.panelLeft, 5);
   assert.equal(migrated.superChatBottom, 1070);
   assert.equal(migrated.superChatWidth, 375);
+});
+
+test('style presets keep the existing CSS untouched by default and apply preview layout overrides to ASS', () => {
+  const existingCssStyle = {
+    'panel-left': '123',
+    'superchat-bottom': '900',
+    'superchat-width': '555',
+    'box-font-size': '31'
+  };
+  const current = resolveDanmakuStyle(existingCssStyle, 'current', {});
+  assert.equal(current.panelLeft, 123);
+  assert.equal(current.superChatBottom, 900);
+  assert.equal(current.superChatWidth, 555);
+  assert.equal(current.boxFontSize, 31);
+
+  const layout = normalizeDanmakuStyleLayout({
+    panelLeft: 90,
+    superChatBottom: 1000,
+    superChatWidth: 500,
+    boxFontSize: 34,
+    ignoredField: 9999
+  });
+  assert.deepEqual(layout, { panelLeft: 90, superChatBottom: 1000, superChatWidth: 500, boxFontSize: 34 });
+
+  const styled = resolveDanmakuStyle(existingCssStyle, 'h5-card', layout);
+  assert.equal(styled.visualPreset, 'h5-card');
+  assert.equal(styled.panelLeft, 90);
+  assert.equal(styled.superChatBottom, 1000);
+  assert.equal(styled.superChatWidth, 500);
+  const event = { type: 'superchat', time: 1, user: '预览用户', price: 30, text: '样式预览应与烧录一致' };
+  const legacyAss = createAss([event], { style: resolveDanmakuStyle(existingCssStyle, 'current', {}) });
+  const currentAss = createAss([event], { stylePreset: 'current', style: existingCssStyle, styleLayout: {} });
+  const styledAss = createAss([event], { style: styled });
+  assert.equal(legacyAss, currentAss);
+  assert.match(styledAss, /\\clip\(90,0,590,1000\)/);
+  assert.match(styledAss, /\\pos\(90,/);
 });
 
 test('superchat uses the DanmakuFactory information hierarchy and low-price palette', () => {

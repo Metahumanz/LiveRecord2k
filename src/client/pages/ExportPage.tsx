@@ -15,8 +15,9 @@ import {
 } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
+import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
-import { danmakuAreaOptions, exportModeOptions, overlayModeOptions } from '../ui/options';
+import { danmakuAreaOptions, danmakuStylePresetOptions, exportModeOptions, overlayModeOptions } from '../ui/options';
 import {
   clampNumber,
   filename,
@@ -36,6 +37,7 @@ export function ExportPage({
   selectRecording,
   prepareSubtitles,
   exportClip,
+  saveStyleAsDefault,
   run
 }: {
   state: AppState;
@@ -46,6 +48,7 @@ export function ExportPage({
   selectRecording: (recording: RecordingState) => void;
   prepareSubtitles: () => Promise<void>;
   exportClip: () => Promise<void>;
+  saveStyleAsDefault: () => Promise<void>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   const recordings = state.recordings.filter((recording) => recording.cleanPath);
@@ -498,6 +501,12 @@ export function ExportPage({
                     void describePreviewError(event.currentTarget);
                   }}
                 />
+                <DanmakuStylePreview
+                  preset={draft.stylePreset}
+                  layout={draft.styleLayout}
+                  overlayMode={draft.overlayMode}
+                  onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
+                />
                 {activePreviewProgress ? (
                   <div className="clip-preview-progress">
                     <JobProgress progress={activePreviewProgress} />
@@ -715,6 +724,40 @@ export function ExportPage({
               </select>
             </label>
           </div>
+
+          <section className="danmaku-style-editor" aria-label="烧录样式与预览">
+            <div className="danmaku-style-editor-heading">
+              <div>
+                <strong>弹幕烧录样式</strong>
+                <span>先在视频上预览，再导出；互动卡片可以直接拖动和缩放。</span>
+              </div>
+              <button
+                className="wide-button"
+                type="button"
+                disabled={busy === 'save-settings'}
+                onClick={saveStyleAsDefault}
+              >
+                设为默认
+              </button>
+            </div>
+            <div className="danmaku-style-presets">
+              {danmakuStylePresetOptions.map((option) => (
+                <button
+                  key={option.value}
+                  className={draft.stylePreset === option.value ? 'danmaku-style-preset active' : 'danmaku-style-preset'}
+                  type="button"
+                  aria-pressed={draft.stylePreset === option.value}
+                  onClick={() => setDraft({ ...draft, stylePreset: option.value, styleLayout: {} })}
+                >
+                  <strong>{option.shortLabel}</strong>
+                  <span>{option.description}</span>
+                </button>
+              ))}
+            </div>
+            <p className="field-help">
+              “当前默认”保留已有 .danmaku.css；其余是本地可复现的预设，不依赖第三方 H5 页面或网络。
+            </p>
+          </section>
 
           <div className="split-buttons export-actions">
             <button

@@ -3,6 +3,7 @@ const fsp = require('node:fs/promises');
 const {
   readDanmakuEvents,
   readDanmakuStyle,
+  resolveDanmakuStyle,
   createAss
 } = require('./ass.cjs');
 
@@ -30,7 +31,8 @@ async function runAssWorker() {
   if (!danmakuPath || !cssPath || !assPath) {
     throw new Error('字幕任务缺少输入或输出路径。');
   }
-  const [events, style] = await Promise.all([readDanmakuEvents(danmakuPath), readDanmakuStyle(cssPath)]);
+  const [events, baseStyle] = await Promise.all([readDanmakuEvents(danmakuPath), readDanmakuStyle(cssPath)]);
+  const style = resolveDanmakuStyle(baseStyle, request.stylePreset, request.styleLayout);
   const ass = createAss(events, {
     overlayMode: request.overlayMode,
     danmakuArea: request.danmakuArea,

@@ -1,0 +1,68 @@
+{
+  "current": {
+    "label": "当前默认",
+    "shortLabel": "默认",
+    "description": "沿用录像的 .danmaku.css，与现有烧录结果完全兼容。",
+    "style": {}
+  },
+  "h5-card": {
+    "label": "互动卡片（H5 风）",
+    "shortLabel": "互动卡片",
+    "description": "较宽的圆角互动卡片，适合礼物、舰长和醒目留言。",
+    "style": {
+      "danmakuFontSize": 34,
+      "danmakuOutline": 2,
+      "danmakuLanes": 7,
+      "danmakuDuration": 8,
+      "danmakuTop": 44,
+      "danmakuLineHeight": 48,
+      "boxFontSize": 30,
+      "panelLeft": 28,
+      "superChatBottom": 1040,
+      "superChatWidth": 450,
+      "superChatGap": 12,
+      "giftRadius": 18,
+      "giftFontSize": 23
+    }
+  },
+  "bubble": {
+    "label": "聊天气泡",
+    "shortLabel": "聊天气泡",
+    "description": "半透明深色气泡和柔和圆角，适合游戏或深色直播画面。",
+    "style": {
+      "danmakuFontSize": 32,
+      "danmakuOutline": 1,
+      "danmakuLanes": 6,
+      "danmakuDuration": 8,
+      "danmakuTop": 64,
+      "danmakuLineHeight": 46,
+      "boxFontSize": 28,
+      "panelLeft": 54,
+      "superChatBottom": 1018,
+      "superChatWidth": 420,
+      "superChatGap": 10,
+      "giftRadius": 28,
+      "giftFontSize": 22
+    }
+  },
+  "minimal": {
+    "label": "极简字幕",
+    "shortLabel": "极简",
+    "description": "更小、更克制的字幕与信息条，尽量减少对画面的遮挡。",
+    "style": {
+      "danmakuFontSize": 29,
+      "danmakuOutline": 1,
+      "danmakuLanes": 6,
+      "danmakuDuration": 7,
+      "danmakuTop": 30,
+      "danmakuLineHeight": 39,
+      "boxFontSize": 22,
+      "panelLeft": 24,
+      "superChatBottom": 1052,
+      "superChatWidth": 360,
+      "superChatGap": 6,
+      "giftRadius": 8,
+      "giftFontSize": 18
+    }
+  }
+}

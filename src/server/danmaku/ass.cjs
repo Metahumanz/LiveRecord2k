@@ -5,6 +5,7 @@ const {
   sourceTimestampFromCommand,
   sourceIdFromCommand
 } = require('./dedupe.cjs');
+const DANMAKU_STYLE_PRESETS = require('../../shared/danmaku-style-presets.json');
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
@@ -191,6 +192,23 @@ const DEFAULT_DANMAKU_STYLE = {
   giftScrollDuration: 5
 };
 
+const DEFAULT_DANMAKU_STYLE_PRESET = 'current';
+const DANMAKU_STYLE_LAYOUT_LIMITS = {
+  panelLeft: [0, 2000],
+  superChatBottom: [0, 4000],
+  superChatWidth: [220, 1200],
+  boxFontSize: [12, 80],
+  danmakuTop: [0, 2000],
+  danmakuFontSize: [12, 96],
+  danmakuLineHeight: [16, 180]
+};
+const DANMAKU_STYLE_CAMEL_KEYS = {
+  'superchat-lanes': 'superChatLanes',
+  'superchat-bottom': 'superChatBottom',
+  'superchat-width': 'superChatWidth',
+  'superchat-gap': 'superChatGap'
+};
+
 const LEGACY_DEFAULT_DANMAKU_STYLE = {
   boxFontSize: 30,
   panelLeft: 34,
@@ -203,6 +221,48 @@ const LEGACY_DEFAULT_DANMAKU_STYLE = {
   giftRadius: 12,
   giftFontSize: 18
 };
+
+function normalizeDanmakuStylePreset(value) {
+  const preset = String(value || '').trim();
+  return Object.prototype.hasOwnProperty.call(DANMAKU_STYLE_PRESETS, preset)
+    ? preset
+    : DEFAULT_DANMAKU_STYLE_PRESET;
+}
+
+function getDanmakuStylePreset(value) {
+  const id = normalizeDanmakuStylePreset(value);
+  return { id, ...DANMAKU_STYLE_PRESETS[id] };
+}
+
+function normalizeDanmakuStyleLayout(values = {}) {
+  const source = values && typeof values === 'object' && !Array.isArray(values) ? values : {};
+  const layout = {};
+  for (const [key, [min, max]] of Object.entries(DANMAKU_STYLE_LAYOUT_LIMITS)) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    const value = Number(source[key]);
+    if (!Number.isFinite(value)) continue;
+    layout[key] = clamp(value, min, max);
+  }
+  return layout;
+}
+
+function resolveDanmakuStyle(values = {}, presetValue, layoutValues = {}) {
+  const base = normalizeDanmakuStyle(values);
+  const preset = getDanmakuStylePreset(presetValue);
+  return normalizeDanmakuStyle({
+    ...base,
+    ...(preset.style || {}),
+    ...normalizeDanmakuStyleLayout(layoutValues),
+    visualPreset: preset.id
+  });
+}
+
+function styleValue(values, key) {
+  if (!values || typeof values !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(values, key)) return values[key];
+  const camelKey = DANMAKU_STYLE_CAMEL_KEYS[key] || key.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+  return values[camelKey];
+}
 
 // Match DanmakuFactory's lower-left SC/guard hierarchy while keeping this renderer's ASS pipeline.
 // Reference: https://github.com/hihkm/DanmakuFactory/blob/master/src/AssFile/AssFile.c
@@ -339,7 +399,7 @@ function parseCssVariables(css) {
 
 function normalizeDanmakuStyle(values = {}) {
   const pickNumber = (key, fallback, min, max, options = {}) => {
-    const raw = values[key];
+    const raw = styleValue(values, key);
     const numeric = Number(raw ?? fallback);
     if (
       options.upgradeLegacyDefault !== undefined &&
@@ -351,7 +411,7 @@ function normalizeDanmakuStyle(values = {}) {
     }
     return clamp(numeric, min, max);
   };
-  const fontFamily = String(values['font-family'] || DEFAULT_DANMAKU_STYLE.fontFamily)
+  const fontFamily = String(styleValue(values, 'font-family') || DEFAULT_DANMAKU_STYLE.fontFamily)
     .replace(/["']/g, '')
     .trim();
   return {
@@ -399,7 +459,8 @@ function normalizeDanmakuStyle(values = {}) {
     giftFontSize: pickNumber('gift-font-size', DEFAULT_DANMAKU_STYLE.giftFontSize, 10, 60, {
       upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftFontSize
     }),
-    giftScrollDuration: pickNumber('gift-scroll-duration', DEFAULT_DANMAKU_STYLE.giftScrollDuration, 2, 20)
+    giftScrollDuration: pickNumber('gift-scroll-duration', DEFAULT_DANMAKU_STYLE.giftScrollDuration, 2, 20),
+    visualPreset: normalizeDanmakuStylePreset(styleValue(values, 'visual-preset') || values.visualPreset)
   };
 }
 
@@ -469,7 +530,10 @@ function resolveGiftTotalPrice(event) {
 function createAss(events, options = {}) {
   const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
   const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea);
-  const style = normalizeDanmakuStyle(options.style);
+  const style =
+    Object.prototype.hasOwnProperty.call(options, 'stylePreset') || Object.prototype.hasOwnProperty.call(options, 'styleLayout')
+      ? resolveDanmakuStyle(options.style, options.stylePreset, options.styleLayout)
+      : normalizeDanmakuStyle(options.style);
   const sorted = prepareAssEvents(events, {
     overlayMode,
     startTime: options.startTime,
@@ -832,7 +896,7 @@ function segmentShapeOptions(segment, clip, offsetX = 0, offsetY = 0, corners) {
 
 function renderSuperChatCardSegment(event, style, segment, clip) {
   const metrics = getMessageCardMetrics(style, event.text);
-  const palette = superChatPalette(event.price || 0);
+  const palette = superChatPalette(event.price || 0, style);
   const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
   const price = formatSuperChatPrice(event.price);
   const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
@@ -879,7 +943,7 @@ function renderSuperChatCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
         metrics.metaFontSize
-      )}\\1c&H00313131&\\b0}${assEscape(`SuperChat CNY ${price}`)}`
+      )}\\1c${palette.detail || '&H00313131&'}\\b0}${assEscape(`SuperChat CNY ${price}`)}`
     ),
     dialogue(
       7,
@@ -888,14 +952,14 @@ function renderSuperChatCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.headerHeight)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c&H00FFFFFF&\\b0}${assEscape(metrics.wrappedText)}`
+      )}\\1c${palette.bodyText || '&H00FFFFFF&'}\\b0}${assEscape(metrics.wrappedText)}`
     )
   ];
 }
 
 function renderGuardCardSegment(event, style, segment, clip) {
   const metrics = getGuardCardMetrics(style);
-  const palette = guardCardPalette(event.guardLevel, resolveGiftTotalPrice(event));
+  const palette = guardCardPalette(event.guardLevel, resolveGiftTotalPrice(event), style);
   const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
   const role = event.giftName || guardName(event.guardLevel);
   const count = Math.max(1, Number(event.count) || 1);
@@ -930,7 +994,7 @@ function renderGuardCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
         metrics.metaFontSize
-      )}\\1c&H00313131&\\b0}${assEscape(
+      )}\\1c${palette.detail || '&H00313131&'}\\b0}${assEscape(
         truncateTextToWidth(welcome, metrics.textWidth, metrics.metaFontSize)
       )}`
     )
@@ -939,7 +1003,7 @@ function renderGuardCardSegment(event, style, segment, clip) {
 
 function renderGiftCardSegment(event, style, segment, clip) {
   const metrics = getGuardCardMetrics(style);
-  const palette = giftCardPalette(resolveGiftTotalPrice(event));
+  const palette = giftCardPalette(resolveGiftTotalPrice(event), style);
   const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
   const count = Math.max(1, Number(event.count) || 1);
   const giftText = `赠送 ${event.giftName || '礼物'} x${count}`;
@@ -994,8 +1058,8 @@ function renderGiftCardSegment(event, style, segment, clip) {
 
 function getMessageCardMetrics(style, text, maxLines = MESSAGE_CARD.maxBodyLines) {
   const fontSize = Math.max(12, Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize);
-  const radius = fontSize / 2;
   const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const radius = getCardRadius(style, fontSize, width, fontSize * 2.5);
   const insetX = radius / 2;
   const metaFontSize = Math.max(12, Math.floor(fontSize * MESSAGE_CARD.metaFontScale));
   const headerHeight = fontSize + metaFontSize + radius / 2;
@@ -1019,18 +1083,27 @@ function getMessageCardMetrics(style, text, maxLines = MESSAGE_CARD.maxBodyLines
 
 function getGuardCardMetrics(style) {
   const fontSize = Math.max(12, Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize);
-  const radius = fontSize / 2;
   const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
   const metaFontSize = Math.max(12, Math.floor(fontSize * MESSAGE_CARD.metaFontScale));
+  const radius = getCardRadius(style, fontSize, width, fontSize + metaFontSize + fontSize / 2);
+  const height = fontSize + metaFontSize + radius;
   return {
     width,
-    height: fontSize + metaFontSize + radius,
+    height,
     radius,
     insetX: radius / 2,
     fontSize,
     metaFontSize,
     textWidth: width - radius
   };
+}
+
+function getCardRadius(style, fontSize, width, height) {
+  if (normalizeDanmakuStylePreset(style?.visualPreset) === DEFAULT_DANMAKU_STYLE_PRESET) {
+    return fontSize / 2;
+  }
+  const configured = Number(style?.giftRadius);
+  return clamp(Number.isFinite(configured) && configured > 0 ? configured : fontSize / 2, 0, Math.min(width, height) / 2);
 }
 
 function drawRect(layer, start, end, x, y, width, height, color) {
@@ -1168,7 +1241,39 @@ function hex2(value) {
   return Number(value).toString(16).padStart(2, '0').toUpperCase();
 }
 
-function superChatPalette(price) {
+function visualPresetFromStyle(style) {
+  return normalizeDanmakuStylePreset(typeof style === 'string' ? style : style?.visualPreset);
+}
+
+function superChatPalette(price, style) {
+  const visualPreset = visualPresetFromStyle(style);
+  if (visualPreset === 'h5-card') {
+    return {
+      header: '&H00FFE9C8&',
+      body: '&H00B85A25&',
+      username: '&H00462A14&',
+      detail: '&H00583B25&',
+      bodyText: '&H00FFFFFF&'
+    };
+  }
+  if (visualPreset === 'bubble') {
+    return {
+      header: '&H24484444&',
+      body: '&H1A251F24&',
+      username: '&H00FDF4FF&',
+      detail: '&H00E5CFDE&',
+      bodyText: '&H00FFFFFF&'
+    };
+  }
+  if (visualPreset === 'minimal') {
+    return {
+      header: '&H2A1E1B18&',
+      body: '&H32151412&',
+      username: '&H00FFFFFF&',
+      detail: '&H00D8D2CE&',
+      bodyText: '&H00FFFFFF&'
+    };
+  }
   if (price >= 2000) {
     return { header: '&H00D8D8FF&', body: '&H00321AAB&', username: '&H001B0E5E&' };
   }
@@ -1187,7 +1292,17 @@ function superChatPalette(price) {
   return { header: '&H00FFF5ED&', body: '&H00B2602A&', username: '&H00653617&' };
 }
 
-function guardCardPalette(level, price) {
+function guardCardPalette(level, price, style) {
+  const visualPreset = visualPresetFromStyle(style);
+  if (visualPreset === 'h5-card') {
+    return { background: '&H00FBE6D0&', username: '&H00723B21&', detail: '&H0062422B&' };
+  }
+  if (visualPreset === 'bubble') {
+    return { background: '&H20433B44&', username: '&H00FFF6FD&', detail: '&H00E8D8E3&' };
+  }
+  if (visualPreset === 'minimal') {
+    return { background: '&H381D1B19&', username: '&H00FFFFFF&', detail: '&H00D8D2CE&' };
+  }
   const rank = Number(level) || 0;
   if (rank === 1) {
     return { background: '&H00E5E5FF&', username: '&H000F0F75&' };
@@ -1207,7 +1322,32 @@ function guardCardPalette(level, price) {
   return { background: '&H00FCE8D8&', username: '&H008A3619&' };
 }
 
-function giftCardPalette(price = 0) {
+function giftCardPalette(price = 0, style) {
+  const visualPreset = visualPresetFromStyle(style);
+  if (visualPreset === 'h5-card') {
+    return {
+      background: '&H08FFF2E5&',
+      accent: '&H00E0873A&',
+      username: '&H00613A22&',
+      detail: '&H006A4A35&'
+    };
+  }
+  if (visualPreset === 'bubble') {
+    return {
+      background: '&H2450444E&',
+      accent: '&H00E0A6D3&',
+      username: '&H00FFF7FD&',
+      detail: '&H00E4D2E0&'
+    };
+  }
+  if (visualPreset === 'minimal') {
+    return {
+      background: '&H361D1B19&',
+      accent: '&H00D6CEC7&',
+      username: '&H00FFFFFF&',
+      detail: '&H00D8D2CE&'
+    };
+  }
   const amount = Number(price) || 0;
   if (amount >= 1000) {
     return {
@@ -1409,6 +1549,11 @@ module.exports = {
   createDefaultDanmakuCss,
   parseCssVariables,
   normalizeDanmakuStyle,
+  normalizeDanmakuStylePreset,
+  getDanmakuStylePreset,
+  normalizeDanmakuStyleLayout,
+  resolveDanmakuStyle,
+  DANMAKU_STYLE_PRESETS,
   prepareAssEvents,
   getDanmakuEventDuration,
   createMessageTimeline,

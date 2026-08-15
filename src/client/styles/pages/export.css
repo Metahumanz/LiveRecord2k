@@ -26,6 +26,87 @@
   margin-top: 16px;
 }
 
+.danmaku-style-editor {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid rgba(121, 222, 213, 0.16);
+  border-radius: 8px;
+  background: rgba(121, 222, 213, 0.055);
+}
+
+.danmaku-style-editor-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.danmaku-style-editor-heading > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.danmaku-style-editor-heading strong {
+  color: #eef9f6;
+  font-size: 14px;
+}
+
+.danmaku-style-editor-heading span {
+  color: #9db2ac;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.danmaku-style-editor-heading .wide-button {
+  min-height: 34px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.danmaku-style-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.danmaku-style-preset {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-height: 90px;
+  padding: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: #dce9e6;
+  background: rgba(8, 16, 19, 0.35);
+  text-align: left;
+}
+
+.danmaku-style-preset:hover,
+.danmaku-style-preset.active {
+  border-color: rgba(121, 222, 213, 0.58);
+  background: rgba(121, 222, 213, 0.14);
+}
+
+.danmaku-style-preset strong {
+  color: #ecfaf7;
+  font-size: 13px;
+}
+
+.danmaku-style-preset span {
+  color: #9cb2ac;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.danmaku-style-editor .field-help {
+  margin: 0;
+}
+
 .export-queue {
   display: grid;
   gap: 8px;
@@ -241,6 +322,251 @@
   font-weight: 900;
 }
 
+.danmaku-style-preview {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+}
+
+.danmaku-preview-caption {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  z-index: 2;
+  max-width: calc(100% - 20px);
+  padding: 4px 7px;
+  border-radius: 5px;
+  color: rgba(244, 255, 253, 0.9);
+  background: rgba(7, 12, 15, 0.7);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+  text-shadow: 0 1px 2px #000;
+}
+
+.preview-rolling-danmaku {
+  position: absolute;
+  left: 0;
+  z-index: 1;
+  max-width: 70%;
+  overflow: hidden;
+  color: #fff;
+  font-weight: 900;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-shadow: 1px 1px 2px #000, -1px -1px 1px rgba(0, 0, 0, 0.8);
+  animation: preview-danmaku-scroll 7s linear infinite;
+}
+
+.preview-rolling-danmaku.second {
+  animation-delay: -3.4s;
+}
+
+@keyframes preview-danmaku-scroll {
+  from {
+    transform: translateX(145%);
+  }
+
+  to {
+    transform: translateX(-150%);
+  }
+}
+
+.preview-message-stack {
+  position: absolute;
+  z-index: 3;
+  display: grid;
+  gap: 4px;
+  min-width: 80px;
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+}
+
+.preview-message-stack.is-adjusting,
+.preview-message-stack.is-adjusting * {
+  cursor: grabbing !important;
+}
+
+.preview-card {
+  position: relative;
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.34);
+  color: #fff;
+  line-height: 1.2;
+}
+
+.preview-card strong,
+.preview-card small,
+.preview-card p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-card strong {
+  padding-right: 18px;
+  font-size: clamp(10px, 1.18vw, 15px);
+}
+
+.preview-card small {
+  opacity: 0.9;
+  font-size: clamp(8px, 0.92vw, 12px);
+}
+
+.preview-card p {
+  margin: 2px 0 0;
+  font-size: clamp(9px, 1.02vw, 13px);
+  font-weight: 700;
+}
+
+.preview-card-grab {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  opacity: 0.82;
+}
+
+.preview-superchat {
+  border-radius: 9px;
+  background: linear-gradient(135deg, rgba(255, 240, 220, 0.98) 0 38%, rgba(178, 96, 42, 0.96) 38%);
+  color: #352014;
+}
+
+.preview-superchat p {
+  color: #fff;
+}
+
+.preview-gift {
+  border-left: 4px solid #c46cff;
+  background: rgba(247, 243, 255, 0.9);
+  color: #502980;
+}
+
+.preview-card-resize {
+  position: absolute;
+  right: -7px;
+  bottom: -7px;
+  z-index: 4;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.82);
+  border-radius: 50%;
+  color: #132323;
+  background: #79ded5;
+  cursor: nwse-resize;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36);
+}
+
+.preset-h5-card .preview-superchat {
+  background: linear-gradient(135deg, rgba(255, 233, 200, 0.98) 0 38%, rgba(184, 90, 37, 0.96) 38%);
+}
+
+.preset-h5-card .preview-gift {
+  border-left-color: #e0873a;
+  background: rgba(255, 242, 229, 0.93);
+  color: #613a22;
+}
+
+.preset-bubble .preview-card {
+  border: 1px solid rgba(255, 226, 246, 0.24);
+  border-radius: 19px;
+  color: #fff5fd;
+  background: rgba(42, 30, 40, 0.84);
+  backdrop-filter: blur(4px);
+}
+
+.preset-bubble .preview-superchat p,
+.preset-bubble .preview-gift {
+  color: #ead7e5;
+}
+
+.preset-bubble .preview-gift {
+  border-left-color: #e0a6d3;
+}
+
+.preset-minimal .preview-card {
+  gap: 0;
+  padding: 5px 8px;
+  border-radius: 3px;
+  background: rgba(17, 15, 14, 0.78);
+  color: #fff;
+  box-shadow: 0 3px 9px rgba(0, 0, 0, 0.28);
+}
+
+.preset-minimal .preview-card p {
+  display: none;
+}
+
+.preset-minimal .preview-gift {
+  border-left-color: #d6cec7;
+}
+
+.preview-cards-disabled {
+  position: absolute;
+  right: 10px;
+  bottom: 44px;
+  max-width: min(70%, 340px);
+  padding: 7px 9px;
+  border-radius: 7px;
+  color: #d5e2de;
+  background: rgba(7, 12, 15, 0.75);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.danmaku-preview-toolbar {
+  position: absolute;
+  right: 8px;
+  bottom: 7px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: calc(100% - 16px);
+  padding: 4px 5px 4px 8px;
+  border-radius: 6px;
+  color: #dbe8e5;
+  background: rgba(7, 12, 15, 0.78);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 800;
+  pointer-events: auto;
+}
+
+.danmaku-preview-toolbar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.danmaku-preview-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 25px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  color: #c5f5ef;
+  background: rgba(121, 222, 213, 0.15);
+  font: inherit;
+  white-space: nowrap;
+}
+
 .timeline-editor {
   display: grid;
   gap: 12px;
@@ -439,4 +765,18 @@
 .cut-time-row input:focus {
   border-color: #75d9d0;
   box-shadow: 0 0 0 3px rgba(117, 217, 208, 0.14);
+}
+
+@media (max-width: 760px) {
+  .danmaku-style-presets {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .danmaku-style-editor-heading {
+    align-items: flex-start;
+  }
+
+  .danmaku-style-editor-heading .wide-button {
+    min-width: auto;
+  }
 }

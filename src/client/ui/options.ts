@@ -1,4 +1,14 @@
-import type { AppSettings, FfmpegCodecOption } from '../types';
+import danmakuStylePresetData from '../../shared/danmaku-style-presets.json';
+import type { AppSettings, DanmakuStylePreset, FfmpegCodecOption } from '../types';
+
+type DanmakuStylePresetDefinition = {
+  label: string;
+  shortLabel: string;
+  description: string;
+  style: Record<string, number>;
+};
+
+export const danmakuStylePresets = danmakuStylePresetData as Record<DanmakuStylePreset, DanmakuStylePresetDefinition>;
 
 export const qnOptions = [
   { label: '4K / 超高清优先', value: 25000 },
@@ -31,6 +41,8 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'autoBurnDanmaku',
   'burnOverlayMode',
   'burnDanmakuArea',
+  'burnDanmakuStylePreset',
+  'burnDanmakuStyleLayout',
   'burnCodec',
   'burnCrf',
   'notifyLiveStarted',
@@ -65,6 +77,10 @@ export const danmakuAreaOptions = [
   { label: '不重叠（全屏避让）', value: 'no-overlap' },
   { label: '不限（全屏）', value: 'unlimited' }
 ] as const;
+
+export const danmakuStylePresetOptions = (Object.entries(danmakuStylePresets) as Array<
+  [DanmakuStylePreset, DanmakuStylePresetDefinition]
+>).map(([value, definition]) => ({ value, ...definition }));
 
 export const exportModeOptions = [
   { label: '纯净片段', value: 'clean' },

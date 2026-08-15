@@ -24,6 +24,8 @@ const {
   createDefaultDanmakuCss,
   parseCssVariables,
   normalizeDanmakuStyle,
+  normalizeDanmakuStylePreset,
+  normalizeDanmakuStyleLayout,
   prepareAssEvents,
   getDanmakuEventDuration,
   createRecordingArgs,
@@ -481,6 +483,8 @@ class LiveRecordService {
       autoBurnDanmaku: true,
       burnOverlayMode: 'danmaku-gift',
       burnDanmakuArea: 'half',
+      burnDanmakuStylePreset: 'current',
+      burnDanmakuStyleLayout: {},
       burnCodec: 'libx265',
       burnCrf: 24,
       notifyLiveStarted: true,
@@ -809,6 +813,8 @@ class LiveRecordService {
       autoBurnDanmaku: Boolean(settings.autoBurnDanmaku),
       burnOverlayMode: normalizeBurnOverlayMode(settings.burnOverlayMode),
       burnDanmakuArea: normalizeDanmakuDisplayArea(settings.burnDanmakuArea),
+      burnDanmakuStylePreset: normalizeDanmakuStylePreset(settings.burnDanmakuStylePreset),
+      burnDanmakuStyleLayout: normalizeDanmakuStyleLayout(settings.burnDanmakuStyleLayout),
       notifyLiveStarted: settings.notifyLiveStarted !== false,
       notifyLiveEnded: settings.notifyLiveEnded !== false,
       notifyRecordingStarted: settings.notifyRecordingStarted !== false,
@@ -6186,7 +6192,9 @@ try {
     }
     const assets = await this.generateSubtitleAssets(recording, {
       overlayMode: options.overlayMode || this.settings.burnOverlayMode,
-      danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea
+      danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea,
+      stylePreset: options.stylePreset,
+      styleLayout: options.styleLayout
     });
     this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
     this.emitState();
@@ -6206,6 +6214,8 @@ try {
     try {
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
       const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
+      const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+      const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
       this.burnCancelRequests.delete(room.id);
       const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
       const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
@@ -6215,7 +6225,7 @@ try {
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
       }
-      const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea });
+      const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout });
       if (options.prepareOnly) {
         this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
         return true;
@@ -6257,7 +6267,7 @@ try {
         'info',
         `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(
           overlayMode
-        )}，${danmakuDisplayAreaLabel(danmakuArea)}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
+        )}，${danmakuDisplayAreaLabel(danmakuArea)}，样式 ${stylePreset}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
           codecInfo.label
         }）`
       );
@@ -6387,6 +6397,8 @@ try {
     await this.ensurePlatformCjkFont();
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
+    const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+    const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
     const cssPath = options.cssPath || recording.cssPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'css');
     await ensureDanmakuCss(cssPath);
     const assPath =
@@ -6399,6 +6411,8 @@ try {
       assPath: temporaryAssPath,
       overlayMode,
       danmakuArea,
+      stylePreset,
+      styleLayout,
       startTime: options.startTime,
       endTime: options.endTime,
       shiftTime: options.shiftTime
@@ -6411,7 +6425,7 @@ try {
     await atomicReplaceFile(temporaryAssPath, assPath);
     recording.cssPath = cssPath;
     recording.assPath = assPath;
-    return { cssPath, assPath, eventCount: result.eventCount };
+    return { cssPath, assPath, eventCount: result.eventCount, stylePreset, styleLayout };
   }
 
   async prepareSubtitleExport(options = {}) {
@@ -6444,10 +6458,14 @@ try {
     }
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
+    const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+    const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
     const suffix = createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea);
     const assets = await this.generateSubtitleAssets(recording, {
       overlayMode,
       danmakuArea,
+      stylePreset,
+      styleLayout,
       startTime,
       endTime,
       shiftTime: Number.isFinite(startTime),
@@ -6480,6 +6498,8 @@ try {
     const mode = normalizeExportMode(options.mode);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
+    const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+    const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const durationSec = await this.resolveRecordingDuration(recording, {}, Number(recording.durationSec || 0));
@@ -6522,6 +6542,8 @@ try {
         endTime: endTimeText,
         overlayMode,
         danmakuArea,
+        stylePreset,
+        styleLayout,
         outputDir,
         outputPath
       }
@@ -6599,6 +6621,8 @@ try {
     const mode = normalizeExportMode(options.mode);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
+    const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+    const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
@@ -6649,6 +6673,8 @@ try {
       const assets = await this.generateSubtitleAssets(recording, {
         overlayMode,
         danmakuArea,
+        stylePreset,
+        styleLayout,
         startTime,
         endTime,
         shiftTime: true,
