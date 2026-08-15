@@ -245,6 +245,8 @@ const QUALITY_SWITCH_COOLDOWN_MS = 3 * 60 * 1000;
 const MEDIA_PROGRESS_STALL_TIMEOUT_MS = 75 * 1000;
 const MEDIA_PROGRESS_JUMP_TOLERANCE_SEC = 8;
 const MEDIA_PROGRESS_BACKWARD_TOLERANCE_SEC = 0.75;
+const CLEANUP_METADATA_SCAN_MAX_DEPTH = 4;
+const CLEANUP_METADATA_SCAN_LIMIT = 2000;
 const RECORDING_MEDIA_FILE_PATTERN =
   /(?:\.(?:clean|merged|danmaku|danmaku-only)|\.clip_[^.]+\.(?:clean|danmaku|danmaku-only))\.(?:mp4|mkv)$/i;
 const EXPORT_PREVIEW_EXTENSIONS = new Set(['.m3u8', '.ts']);
@@ -357,6 +359,16 @@ function createDanmakuAssSuffix(overlayMode, danmakuArea) {
 
 function createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea) {
   return `${createClipSuffix(startTime, endTime, overlayMode)}.${normalizeDanmakuDisplayArea(danmakuArea)}`;
+}
+
+function deriveCapturePath(cleanPath) {
+  const parsed = path.parse(String(cleanPath || ''));
+  const base = parsed.name.replace(/\.clean$/i, '');
+  return base ? path.join(parsed.dir, `${base}.recording.mkv`) : '';
+}
+
+function isRecordingMetadataSidecar(fileName) {
+  return /\.(?:clean|merged)\.(?:mp4|mkv)\.metadata\.json$/i.test(String(fileName || ''));
 }
 
 class LiveRecordService {
@@ -4620,6 +4632,15 @@ try {
     await this.appendSegmentDiagnostics(room, session, finishedRecording).catch((error) => {
       this.log('warn', `${roomLabel(room)} 写入本场 diagnostics 失败：${error.message}`);
     });
+    if (fileSizeBeforeFinalize === 0) {
+      const cleanupResult = await this.cleanupEmptyCaptureArtifacts(session);
+      if (cleanupResult.deletedCount > 0) {
+        this.log('info', `${roomLabel(room)} 已清理未写入媒体的空临时录像及其 sidecar ${cleanupResult.deletedCount} 个。`);
+      }
+      if (cleanupResult.failedCount > 0) {
+        this.log('warn', `${roomLabel(room)} 有 ${cleanupResult.failedCount} 个空临时录像 sidecar 未能删除。`);
+      }
+    }
     const unexpectedStreamEnd = wasActiveSession && !session.stopping && !shouldContinueSegment;
     const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
     if (shouldReconnectLiveStream) {
@@ -5412,6 +5433,68 @@ try {
     return metadataPath;
   }
 
+  async cleanupEmptyCaptureArtifacts(session) {
+    const cleanPath = String(session?.cleanPath || '').trim();
+    const capturePath = String(session?.capturePath || cleanPath).trim();
+    if (!cleanPath || !capturePath) {
+      return { deletedCount: 0, failedCount: 0 };
+    }
+    const captureStat = await fsp.stat(capturePath).catch(() => null);
+    if (!captureStat?.isFile() || Number(captureStat.size || 0) !== 0) {
+      return { deletedCount: 0, failedCount: 0 };
+    }
+
+    const outputDir = path.resolve(String(session?.outputDir || path.dirname(cleanPath)));
+    const normalizedCleanPath = path.resolve(cleanPath);
+    const normalizedCapturePath = path.resolve(capturePath);
+    if (
+      !isPathInsideDirectory(normalizedCleanPath, outputDir) ||
+      !isPathInsideDirectory(normalizedCapturePath, outputDir)
+    ) {
+      return { deletedCount: 0, failedCount: 0 };
+    }
+
+    const cleanStat =
+      normalizedCleanPath === normalizedCapturePath ? captureStat : await fsp.stat(normalizedCleanPath).catch(() => null);
+    const hasSeparateCleanMedia =
+      normalizedCleanPath !== normalizedCapturePath && cleanStat?.isFile() && Number(cleanStat.size || 0) > 0;
+    const artifactPaths = hasSeparateCleanMedia
+      ? [normalizedCapturePath]
+      : [
+          normalizedCapturePath,
+          normalizedCleanPath,
+          `${normalizedCleanPath}.metadata.json`,
+          String(session?.danmakuPath || deriveSiblingPath(normalizedCleanPath, 'danmaku', 'jsonl')),
+          String(session?.cssPath || deriveSiblingPath(normalizedCleanPath, 'danmaku', 'css')),
+          String(session?.assPath || deriveSiblingPath(normalizedCleanPath, 'danmaku', 'ass')),
+          deriveSiblingPath(normalizedCleanPath, 'danmaku-only', 'ass'),
+          String(session?.burnedPath || deriveBurnedPath(normalizedCleanPath, 'danmaku-gift')),
+          deriveBurnedPath(normalizedCleanPath, 'danmaku')
+        ];
+    const uniquePaths = [
+      ...new Set(
+        artifactPaths
+          .map((filePath) => String(filePath || '').trim())
+          .filter(Boolean)
+          .map((filePath) => path.resolve(filePath))
+      )
+    ];
+    let deletedCount = 0;
+    let failedCount = 0;
+    for (const filePath of uniquePaths) {
+      if (!isPathInsideDirectory(filePath, outputDir)) continue;
+      const stat = await fsp.stat(filePath).catch(() => null);
+      if (!stat?.isFile()) continue;
+      try {
+        await fsp.rm(filePath, { force: true });
+        deletedCount += 1;
+      } catch {
+        failedCount += 1;
+      }
+    }
+    return { deletedCount, failedCount };
+  }
+
   async findInterruptedCaptureFiles(rootDir, maxDepth = 4) {
     const root = path.resolve(String(rootDir || ''));
     const rootStat = await fsp.stat(root).catch(() => null);
@@ -5451,6 +5534,31 @@ try {
       const cleanPath = path.resolve(directory, path.basename(declaredClean));
       if (path.dirname(cleanPath) !== path.resolve(directory) || (await isExistingFile(cleanPath))) continue;
       const captureSize = await getFileSize(capturePath);
+      const declaredCapture = String(metadata?.capturePath || path.basename(capturePath));
+      const metadataOwnsCapture =
+        String(metadata?.status || '') === 'recording' &&
+        path.basename(declaredCapture) === path.basename(capturePath);
+      if (captureSize === 0 && metadataOwnsCapture) {
+        const danmakuPath = metadata?.danmakuPath
+          ? path.resolve(directory, path.basename(metadata.danmakuPath))
+          : deriveSiblingPath(cleanPath, 'danmaku', 'jsonl');
+        const cleanupResult = await this.cleanupEmptyCaptureArtifacts({
+          cleanPath,
+          capturePath,
+          danmakuPath,
+          cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
+          assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
+          burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
+          outputDir: directory
+        });
+        if (cleanupResult.deletedCount > 0) {
+          this.log('info', `已清理崩溃后未写入媒体的空临时录像及其 sidecar ${cleanupResult.deletedCount} 个：${capturePath}`);
+        }
+        if (cleanupResult.failedCount > 0) {
+          this.log('warn', `清理崩溃后的空临时录像残留失败 ${cleanupResult.failedCount} 个：${capturePath}`);
+        }
+        continue;
+      }
       if (captureSize < MIN_PLAYABLE_BYTES) {
         this.log('warn', `发现未完成临时录像但文件过小，保留原文件待人工检查：${capturePath}`);
         continue;
@@ -5473,6 +5581,13 @@ try {
           throw new Error('恢复封装后没有可用视频流');
         }
         await atomicReplaceFile(tmpPath, cleanPath);
+        // A process can die after the regular MP4 finalizer has produced its
+        // temporary output but before it swaps it into place.  Once recovery has
+        // independently produced a valid clean file, that stale temporary is no
+        // longer needed and would otherwise be invisible to the recording library.
+        await fsp.rm(replaceExtension(cleanPath, '.finalizing.mp4'), { force: true }).catch((error) => {
+          this.log('warn', `恢复录像后清理遗留收尾临时文件失败：${error.message}`);
+        });
         const timelineHealth = await probeMediaTimelineHealth(this.ffmpegPath, cleanPath, recoveredInfo, {
           timeoutMs: 120_000
         }).catch((error) => ({
@@ -5759,6 +5874,46 @@ try {
     return { deletedCount, failedCount };
   }
 
+  async findRecordingMetadataSidecars() {
+    const rootDir = path.resolve(String(this.settings.outputDir || ''));
+    const rootStat = await fsp.stat(rootDir).catch(() => null);
+    if (!rootStat?.isDirectory()) {
+      return { entries: [], truncated: false };
+    }
+    const entries = [];
+    let truncated = false;
+    let directories = [rootDir];
+    for (let depth = 0; depth <= CLEANUP_METADATA_SCAN_MAX_DEPTH && directories.length && !truncated; depth += 1) {
+      const currentDirectories = directories;
+      const nextDirectories = [];
+      for (const directory of currentDirectories) {
+        const directoryEntries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+        for (const entry of directoryEntries) {
+          const filePath = path.join(directory, entry.name);
+          if (entry.isDirectory()) {
+            if (depth < CLEANUP_METADATA_SCAN_MAX_DEPTH) nextDirectories.push(filePath);
+            continue;
+          }
+          if (!entry.isFile() || !isRecordingMetadataSidecar(entry.name)) continue;
+          const metadata = await fsp.readFile(filePath, 'utf8').then(JSON.parse).catch(() => null);
+          if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
+          entries.push({
+            metadataPath: filePath,
+            mediaPath: filePath.slice(0, -'.metadata.json'.length),
+            metadata
+          });
+          if (entries.length >= CLEANUP_METADATA_SCAN_LIMIT) {
+            truncated = true;
+            break;
+          }
+        }
+        if (truncated) break;
+      }
+      directories = nextDirectories;
+    }
+    return { entries, truncated };
+  }
+
   async cleanupMergedSegmentResiduals() {
     const fakeRoom = { id: 'maintenance', title: '维护', anchor: '历史录像' };
     let deletedCount = 0;
@@ -5772,7 +5927,7 @@ try {
     const createSegmentFromPath = (cleanPath) =>
       this.normalizeRecording({
         cleanPath,
-        capturePath: replaceExtension(cleanPath, '.recording.mkv'),
+        capturePath: deriveCapturePath(cleanPath),
         danmakuPath: deriveSiblingPath(cleanPath, 'danmaku', 'jsonl'),
         cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
         assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass')
@@ -5780,7 +5935,19 @@ try {
     const addCleanupCandidate = (mergedRecording, segments, cleanupId = '') => {
       const key = pathKey(mergedRecording?.cleanPath);
       const validSegments = Array.isArray(segments) ? segments.filter(Boolean) : [];
-      if (!key || validSegments.length === 0 || cleanupCandidates.has(key)) {
+      if (!key || validSegments.length === 0) {
+        return;
+      }
+      const existing = cleanupCandidates.get(key);
+      if (existing) {
+        const knownSegmentPaths = new Set(existing.segments.map((segment) => pathKey(segment.cleanPath)).filter(Boolean));
+        for (const segment of validSegments) {
+          const segmentKey = pathKey(segment.cleanPath);
+          if (!segmentKey || knownSegmentPaths.has(segmentKey)) continue;
+          existing.segments.push(segment);
+          knownSegmentPaths.add(segmentKey);
+        }
+        if (!existing.cleanupId && cleanupId) existing.cleanupId = String(cleanupId);
         return;
       }
       cleanupCandidates.set(key, {
@@ -5798,10 +5965,25 @@ try {
           /\.merged\.(?:mp4|mkv)$/i.test(path.basename(String(recording?.cleanPath || '')))
       );
     };
+    const knownMergedRecordings = new Map();
+    const rememberMergedRecording = (recording) => {
+      const key = pathKey(recording?.cleanPath);
+      if (key && isMergedRecording(recording) && !knownMergedRecordings.has(key)) {
+        knownMergedRecordings.set(key, recording);
+      }
+    };
+    const resolveMetadataPath = (metadataPath, value) => {
+      const rawPath = String(value || '').trim();
+      if (!rawPath) return '';
+      const metadataDirectory = path.dirname(metadataPath);
+      const resolvedPath = path.resolve(metadataDirectory, rawPath);
+      return isPathInsideDirectory(resolvedPath, metadataDirectory) ? resolvedPath : '';
+    };
 
     // The persisted task is authoritative: it keeps the complete artifact list even
     // after the recording library was refreshed or the service restarted.
     for (const cleanup of this.pendingSegmentCleanups.values()) {
+      rememberMergedRecording(cleanup?.mergedRecording);
       addCleanupCandidate(cleanup?.mergedRecording, cleanup?.segments, cleanup?.cleanupId);
     }
 
@@ -5809,6 +5991,7 @@ try {
       if (!isMergedRecording(recording)) {
         continue;
       }
+      rememberMergedRecording(recording);
       const mergeGroup = String(recording.mergeGroup || '');
       const segments = Array.isArray(recording.mergedFrom) && recording.mergedFrom.length > 0
         ? recording.mergedFrom.map(createSegmentFromPath).filter(Boolean)
@@ -5828,6 +6011,48 @@ try {
           })
           : [];
       addCleanupCandidate(recording, segments, recording.cleanupId);
+    }
+
+    // A past partial cleanup can leave only sidecars behind.  They no longer appear
+    // in discoverRecordingFiles(), so rebuild their lineage from metadata instead
+    // of guessing from a filename or deleting by merge group alone.
+    const metadataScan = await this.findRecordingMetadataSidecars();
+    if (metadataScan.truncated) {
+      this.log('warn', `合并残留 metadata 扫描已达到 ${CLEANUP_METADATA_SCAN_LIMIT} 个文件上限，为避免长时间阻塞，未扫描的目录暂未处理。`);
+    }
+    for (const entry of metadataScan.entries) {
+      if (!(await isExistingFile(entry.mediaPath))) continue;
+      const metadata = entry.metadata;
+      const mergedFrom = Array.isArray(metadata.mergedFrom)
+        ? metadata.mergedFrom.map((sourcePath) => resolveMetadataPath(entry.metadataPath, sourcePath)).filter(Boolean)
+        : [];
+      const recording = this.normalizeRecording({
+        cleanPath: entry.mediaPath,
+        mergeGroup: String(metadata.mergeGroup || ''),
+        mergeOutputPath: resolveMetadataPath(entry.metadataPath, metadata.mergeOutputPath) || entry.mediaPath,
+        segmentReason: String(metadata.segmentReason || ''),
+        mergedFrom,
+        cleanupId: String(metadata.cleanupId || '')
+      });
+      if (!isMergedRecording(recording)) continue;
+      rememberMergedRecording(recording);
+      if (mergedFrom.length > 0) {
+        addCleanupCandidate(recording, mergedFrom.map(createSegmentFromPath).filter(Boolean), recording.cleanupId);
+      }
+    }
+
+    for (const entry of metadataScan.entries) {
+      const metadata = entry.metadata;
+      if (!/\.clean\.(?:mp4|mkv)$/i.test(entry.mediaPath)) continue;
+      if (String(metadata.status || '').toLowerCase() === 'recording') continue;
+      if (await isExistingFile(entry.mediaPath)) continue;
+      const mergeOutputPath = resolveMetadataPath(entry.metadataPath, metadata.mergeOutputPath);
+      const mergedRecording = knownMergedRecordings.get(pathKey(mergeOutputPath));
+      if (!mergedRecording) continue;
+      const sourceGroup = String(metadata.mergeGroup || '');
+      const mergedGroup = String(mergedRecording.mergeGroup || '');
+      if (sourceGroup && mergedGroup && sourceGroup !== mergedGroup) continue;
+      addCleanupCandidate(mergedRecording, [createSegmentFromPath(entry.mediaPath)], mergedRecording.cleanupId);
     }
 
     for (const { mergedRecording, segments, cleanupId } of cleanupCandidates.values()) {

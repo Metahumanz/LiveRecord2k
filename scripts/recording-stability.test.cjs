@@ -505,6 +505,7 @@ test('crash recovery finalizes an interrupted recording segment and retains the 
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-crash-recovery-'));
   const capturePath = path.join(tempDir, 'session.recording.mkv');
   const cleanPath = path.join(tempDir, 'session.clean.mp4');
+  const finalizingPath = path.join(tempDir, 'session.clean.finalizing.mp4');
   const metadataPath = `${cleanPath}.metadata.json`;
   try {
     const generated = await runCapturedProcess(
@@ -518,6 +519,7 @@ test('crash recovery finalizes an interrupted recording segment and retains the 
       { timeoutMs: 30_000 }
     );
     assert.equal(generated.status, 0, generated.stderr);
+    await fsp.writeFile(finalizingPath, 'stale partial finalization');
     await fsp.writeFile(
       metadataPath,
       JSON.stringify({
@@ -546,6 +548,7 @@ test('crash recovery finalizes an interrupted recording segment and retains the 
     assert.notEqual(recovered[0].timelineHealth.firstVideoPts, null);
     assert.equal(await fsp.stat(cleanPath).then((stat) => stat.isFile()), true);
     assert.equal(await fsp.stat(capturePath).then((stat) => stat.isFile()), true);
+    assert.equal(await fsp.stat(finalizingPath).then(() => true).catch(() => false), false);
     const persisted = JSON.parse(await fsp.readFile(metadataPath, 'utf8'));
     assert.equal(persisted.schemaVersion, 2);
     assert.ok(['healthy', 'warning', 'broken'].includes(persisted.timelineHealth));
