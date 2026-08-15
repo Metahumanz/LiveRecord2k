@@ -206,11 +206,126 @@ function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, contai
   return args;
 }
 
-function createConcatCopyArgs({ concatPath, outputPath, container }) {
+function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec }) {
   const args = ['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
   if (container === 'mp4') {
+    if (isHevcCodec(streamCodec)) {
+      args.push('-tag:v', 'hvc1');
+    }
     args.push('-movflags', '+faststart');
   }
+  args.push(outputPath);
+  return args;
+}
+
+function resolveMergePixelFormat(targetVideoInfo, videoCodec) {
+  const sourcePixelFormat = String(targetVideoInfo?.pixelFormat || '').toLowerCase();
+  const hardwareCodec = /(?:nvenc|qsv|amf)/.test(String(videoCodec || ''));
+  const bitDepth = Number(targetVideoInfo?.bitDepth || 8);
+  const softwarePixelFormats = new Set([
+    'yuv420p', 'yuv422p', 'yuv444p',
+    'yuv420p10le', 'yuv422p10le', 'yuv444p10le',
+    'yuv420p12le', 'yuv422p12le', 'yuv444p12le'
+  ]);
+  if (hardwareCodec && bitDepth > 8) {
+    return 'p010le';
+  }
+  if (softwarePixelFormats.has(sourcePixelFormat)) {
+    return sourcePixelFormat;
+  }
+  return bitDepth > 8 ? 'yuv420p10le' : 'yuv420p';
+}
+
+function appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, softwareThreads = 4 }) {
+  const codec = String(videoCodec || '').trim() || 'libx264';
+  args.push('-c:v', codec);
+  if (codec.includes('nvenc')) {
+    args.push('-preset', 'p5', '-cq', isHevcCodec(codec) ? '24' : '20', '-b:v', '0');
+  } else if (codec.includes('qsv')) {
+    args.push('-global_quality', isHevcCodec(codec) ? '24' : '20');
+  } else if (codec.includes('amf')) {
+    const qp = isHevcCodec(codec) ? '24' : '20';
+    args.push('-quality', 'balanced', '-qp_i', qp, '-qp_p', qp);
+  } else {
+    args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20', '-threads', String(Math.max(1, Number(softwareThreads) || 4)));
+  }
+  if (targetVideoInfo?.colorPrimaries) args.push('-color_primaries', String(targetVideoInfo.colorPrimaries));
+  if (targetVideoInfo?.colorTransfer) args.push('-color_trc', String(targetVideoInfo.colorTransfer));
+  if (targetVideoInfo?.colorSpace) args.push('-colorspace', String(targetVideoInfo.colorSpace));
+  args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-dn', '-sn', '-avoid_negative_ts', 'make_zero');
+  if (container === 'mp4') {
+    if (isHevcCodec(codec)) {
+      args.push('-tag:v', 'hvc1');
+    }
+    args.push('-movflags', '+faststart');
+  }
+  return codec;
+}
+
+function createNormalizeSegmentArgs({
+  inputPath,
+  outputPath,
+  container,
+  durationSec,
+  hasAudio,
+  targetVideoInfo,
+  videoCodec,
+  softwareThreads = 4
+}) {
+  const width = makeEvenDimension(targetVideoInfo?.width);
+  const height = makeEvenDimension(targetVideoInfo?.height);
+  if (!inputPath || !outputPath) {
+    throw new Error('规范化分段缺少输入或输出路径。');
+  }
+  if (!width || !height) {
+    throw new Error('规范化分段缺少有效的目标分辨率。');
+  }
+
+  // This is intentionally a single-input graph.  Feeding every reconnect
+  // segment into one concat filter keeps one decoder and several frame queues
+  // alive per source, which can push a long 2K merge over the host memory
+  // limit.  The service normalizes segments one at a time, then concat-copies
+  // the uniform intermediates.
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-filter_threads',
+    '1',
+    '-filter_complex_threads',
+    '1',
+    '-threads',
+    '2',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-i',
+    inputPath
+  ];
+  const targetFps = normalizeMergeFps(targetVideoInfo?.fps);
+  const fpsFilter = targetFps ? `,fps=${targetFps}` : '';
+  const normalizedDuration = Number(durationSec);
+  const videoDurationFilter = normalizedDuration > 0 ? `trim=duration=${formatFfmpegSeconds(normalizedDuration)},` : '';
+  const audioDurationFilter = normalizedDuration > 0 ? `apad,atrim=duration=${formatFfmpegSeconds(normalizedDuration)},` : '';
+  const pixelFormat = resolveMergePixelFormat(targetVideoInfo, videoCodec);
+  const filters = [
+    `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
+      `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
+      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=${pixelFormat}[vout]`
+  ];
+  if (hasAudio) {
+    filters.push(
+      `[0:a:0]aresample=48000:async=1:first_pts=0,${audioDurationFilter}` +
+        'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[aout]'
+    );
+  } else {
+    const fallbackDurationSec = Math.max(0.001, normalizedDuration || 0.001);
+    filters.push(
+      `anullsrc=r=48000:cl=stereo,atrim=duration=${formatFfmpegSeconds(fallbackDurationSec)},asetpts=PTS-STARTPTS[aout]`
+    );
+  }
+  args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-map', '[aout]');
+  appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, softwareThreads });
   args.push(outputPath);
   return args;
 }
@@ -231,6 +346,7 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
   }
 
   const targetFps = normalizeMergeFps(targetVideoInfo?.fps);
+  const pixelFormat = resolveMergePixelFormat(targetVideoInfo, videoCodec);
   const filters = [];
   const concatInputs = [];
   segments.forEach((segment, index) => {
@@ -241,21 +357,6 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     const audioDurationFilter = Number(segment.durationSec) > 0
       ? `apad,atrim=duration=${formatFfmpegSeconds(segment.durationSec)},`
       : '';
-    const sourcePixelFormat = String(targetVideoInfo?.pixelFormat || '').toLowerCase();
-    const hardwareCodec = /(?:nvenc|qsv|amf)/.test(String(videoCodec || ''));
-    const bitDepth = Number(targetVideoInfo?.bitDepth || 8);
-    const softwarePixelFormats = new Set([
-      'yuv420p', 'yuv422p', 'yuv444p',
-      'yuv420p10le', 'yuv422p10le', 'yuv444p10le',
-      'yuv420p12le', 'yuv422p12le', 'yuv444p12le'
-    ]);
-    const pixelFormat = hardwareCodec && bitDepth > 8
-      ? 'p010le'
-      : softwarePixelFormats.has(sourcePixelFormat)
-        ? sourcePixelFormat
-        : bitDepth > 8
-          ? 'yuv420p10le'
-          : 'yuv420p';
     filters.push(
       `[${index}:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
         `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
@@ -277,28 +378,8 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
   });
   filters.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=1[vout][aout]`);
 
-  const codec = String(videoCodec || '').trim() || 'libx264';
-  args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-map', '[aout]', '-c:v', codec);
-  if (codec.includes('nvenc')) {
-    args.push('-preset', 'p5', '-cq', isHevcCodec(codec) ? '24' : '20', '-b:v', '0');
-  } else if (codec.includes('qsv')) {
-    args.push('-global_quality', isHevcCodec(codec) ? '24' : '20');
-  } else if (codec.includes('amf')) {
-    const qp = isHevcCodec(codec) ? '24' : '20';
-    args.push('-quality', 'balanced', '-qp_i', qp, '-qp_p', qp);
-  } else {
-    args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20', '-threads', String(Math.max(1, Number(softwareThreads) || 4)));
-  }
-  if (targetVideoInfo?.colorPrimaries) args.push('-color_primaries', String(targetVideoInfo.colorPrimaries));
-  if (targetVideoInfo?.colorTransfer) args.push('-color_trc', String(targetVideoInfo.colorTransfer));
-  if (targetVideoInfo?.colorSpace) args.push('-colorspace', String(targetVideoInfo.colorSpace));
-  args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-dn', '-sn', '-avoid_negative_ts', 'make_zero');
-  if (container === 'mp4') {
-    if (isHevcCodec(codec)) {
-      args.push('-tag:v', 'hvc1');
-    }
-    args.push('-movflags', '+faststart');
-  }
+  args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-map', '[aout]');
+  appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, softwareThreads });
   args.push(outputPath);
   return args;
 }
@@ -499,6 +580,7 @@ module.exports = {
   createPreviewHlsArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
+  createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
   createAudioAlignArgs,
   selectHighestResolutionVideoInfo,

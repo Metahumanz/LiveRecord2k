@@ -5,10 +5,12 @@ const path = require('node:path');
 const test = require('node:test');
 const ffmpegPath = require('ffmpeg-static');
 
-const { LiveRecordService } = require('../src/server/app/service.cjs');
+const { LiveRecordService, isFfmpegMemoryPressureError } = require('../src/server/app/service.cjs');
 const { createAss } = require('../src/server/danmaku/ass.cjs');
 const {
   createBurnArgs,
+  createConcatCopyArgs,
+  createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
@@ -69,6 +71,13 @@ test('a lower quality stream remains usable while the requested quality is unava
   assert.match(room.qualityWarning, /实际选中 10000/);
 });
 
+test('merge memory-pressure detection covers Linux signals and Windows allocation failures', () => {
+  assert.equal(isFfmpegMemoryPressureError({ ffmpegSignal: 'SIGKILL' }), true);
+  assert.equal(isFfmpegMemoryPressureError({ ffmpegExitCode: -1073741801 }), true);
+  assert.equal(isFfmpegMemoryPressureError({ ffmpegStderr: 'Cannot allocate memory while opening encoder' }), true);
+  assert.equal(isFfmpegMemoryPressureError({ message: 'Unknown encoder h264_not_real' }), false);
+});
+
 test('mixed segment specifications select the highest resolution and require transcoding', () => {
   const mediaInfos = [
     {
@@ -106,6 +115,30 @@ test('mixed segment specifications select the highest resolution and require tra
   assert.match(filter, /anullsrc=r=48000:cl=stereo/);
   assert.match(filter, /concat=n=2:v=1:a=1/);
   assert.ok(args.includes('hvc1'));
+
+  const normalizeArgs = createNormalizeSegmentArgs({
+    inputPath: 'first.mp4',
+    outputPath: 'first.normalized.mkv',
+    container: 'mkv',
+    durationSec: 1,
+    hasAudio: false,
+    targetVideoInfo: mediaInfos[1].videoInfo,
+    videoCodec: 'libx265'
+  });
+  const normalizeFilter = normalizeArgs[normalizeArgs.indexOf('-filter_complex') + 1];
+  assert.equal(normalizeArgs.filter((arg) => arg === '-i').length, 1);
+  assert.match(normalizeFilter, /scale=w=3840:h=2160/);
+  assert.match(normalizeFilter, /anullsrc=r=48000:cl=stereo/);
+  assert.doesNotMatch(normalizeFilter, /concat=n=/);
+  assert.equal(normalizeArgs[normalizeArgs.indexOf('-filter_threads') + 1], '1');
+
+  const copyArgs = createConcatCopyArgs({
+    concatPath: 'normalized.concat.txt',
+    outputPath: 'merged.mp4',
+    container: 'mp4',
+    streamCodec: 'hevc (Main)'
+  });
+  assert.ok(copyArgs.includes('hvc1'));
 
   const realProfileTarget = selectHighestResolutionVideoInfo([
     { videoInfo: { codec: 'h264 (High)', width: 3840, height: 2160, fps: 30, pixelFormat: 'yuv420p10le', bitDepth: 10 } },
@@ -258,6 +291,72 @@ test('a 900ms merged A/V gap is repaired and the verified output is kept', async
     const timing = await probeMediaTimelineInfo(ffmpegPath, outputPath, mediaInfo);
     assert.equal(timing.timingSafeForCopy, true, JSON.stringify(timing));
     assert.ok(Math.abs(timing.avDeltaSec) <= 0.08, JSON.stringify(timing));
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('eleven mixed reconnect segments are normalized sequentially before the final copy concat', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-bounded-merge-'));
+  const sourcePaths = Array.from({ length: 11 }, (_unused, index) =>
+    path.join(tempDir, `segment-${String(index + 1).padStart(2, '0')}.clean.mp4`)
+  );
+  const outputPath = path.join(tempDir, 'session.merged.mp4');
+  const generate = async (output, size, rate, tone) => {
+    const result = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', `testsrc2=size=${size}:rate=${rate}:duration=0.5`,
+        '-f', 'lavfi', '-i', `sine=frequency=${tone}:sample_rate=48000:duration=0.5`,
+        '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', output
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(result.status, 0, result.stderr);
+  };
+
+  try {
+    for (let index = 0; index < sourcePaths.length; index += 1) {
+      await generate(sourcePaths[index], index % 3 === 1 ? '640x360' : '320x180', index % 3 === 1 ? 30 : 24, 440 + index * 40);
+    }
+    const service = new LiveRecordService();
+    const logs = [];
+    service.log = (_level, message) => logs.push(message);
+    service.emitState = () => {};
+    service.saveStore = async () => {};
+    service.writeRecordingMetadata = async () => {};
+    service.cleanupMergedSegmentFiles = async () => {};
+    service.getMergeEncoderPlan = () => ({ preferred: 'libx264', fallback: '' });
+    const room = { id: 'bounded', title: 'bounded', anchor: 'test', recording: false };
+    const segments = sourcePaths.map((cleanPath, index) => ({
+      id: `segment-${index}`,
+      roomId: room.id,
+      startedAt: Date.now() + index * 1000,
+      cleanPath,
+      danmakuPath: path.join(tempDir, `segment-${index}.danmaku.jsonl`),
+      cssPath: '',
+      mergeGroup: 'bounded-group',
+      mergeSequence: index + 1,
+      mergeOutputPath: outputPath,
+      durationSec: 0.5,
+      valid: true,
+      eventCount: 0
+    }));
+    service.recordings = segments;
+
+    const merged = await service.mergeReconnectGroupIfNeeded(room, 'bounded-group', segments.at(-1));
+
+    assert.equal(merged.cleanPath, outputPath);
+    const mergedInfo = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.equal(mergedInfo.videoInfo.width, 640);
+    assert.equal(mergedInfo.videoInfo.height, 360);
+    assert.ok(mergedInfo.durationSec >= 5.2, `expected all eleven segments, got ${mergedInfo.durationSec}s`);
+    const timing = await probeMediaTimelineInfo(ffmpegPath, outputPath, mergedInfo);
+    assert.equal(timing.timingSafeForCopy, true, JSON.stringify(timing));
+    assert.ok(logs.some((message) => /逐段重建时间轴/.test(message)));
+    const leftovers = (await fsp.readdir(tempDir)).filter((name) => name.startsWith('.br2k-merge-'));
+    assert.deepEqual(leftovers, []);
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }

@@ -34,7 +34,7 @@ const {
   createPreviewHlsArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
-  createConcatTranscodeArgs,
+  createNormalizeSegmentArgs,
   createAudioAlignArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
@@ -371,6 +371,25 @@ function deriveCapturePath(cleanPath) {
 
 function isRecordingMetadataSidecar(fileName) {
   return /\.(?:clean|merged)\.(?:mp4|mkv)\.metadata\.json$/i.test(String(fileName || ''));
+}
+
+function isFfmpegMemoryPressureError(error) {
+  const signal = String(error?.ffmpegSignal || '').toUpperCase();
+  // Linux's OOM killer reports SIGKILL.  Windows may instead expose the
+  // STATUS_NO_MEMORY process status (signed or unsigned), or FFmpeg may exit
+  // normally after printing an allocation failure.  Keep this platform-neutral
+  // so a fallback encoder does not immediately recreate the same pressure.
+  if (signal === 'SIGKILL') {
+    return true;
+  }
+  const exitCode = Number(error?.ffmpegExitCode);
+  if (exitCode === 3221225495 || exitCode === -1073741801) {
+    return true;
+  }
+  const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
+  return /(?:out of memory|cannot allocate memory|not enough memory|insufficient memory|memory allocation (?:failed|error)|could not allocate .*memory|std::bad_alloc|av_malloc)/i.test(
+    detail
+  );
 }
 
 class LiveRecordService {
@@ -5010,7 +5029,11 @@ try {
     const cssTmpPath = `${cssPath}.${process.pid}.tmp`;
     const assPath = deriveSiblingPath(outputPath, 'danmaku', 'ass');
     const burnedPath = deriveBurnedPath(outputPath, this.settings.burnOverlayMode);
-    const mergeDurationSec = segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0);
+    const fallbackMergeDurationSec = segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0);
+    const normalizeTempDir = path.join(
+      path.dirname(outputPath),
+      `.br2k-merge-${process.pid}-${crypto.randomUUID().slice(0, 8)}`
+    );
     const segmentMediaInfos = [];
     const segmentTimelineInfos = [];
     for (let index = 0; index < segments.length; index += 1) {
@@ -5035,6 +5058,9 @@ try {
         auditMode: 'metadata'
       });
     }
+    const mergeDurationSec =
+      segmentTimelineInfos.reduce((sum, timingInfo) => sum + Number(timingInfo.videoDurationSec || 0), 0) ||
+      fallbackMergeDurationSec;
     const targetVideoInfo = selectHighestResolutionVideoInfo(segmentMediaInfos);
     if (!targetVideoInfo) {
       throw new Error('没有找到可用于合并的目标分辨率。');
@@ -5054,8 +5080,21 @@ try {
       roomId: room.id
     });
     room.mergeProgress = progress;
+    const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
+    const sourceBytes = segmentFileSizes.reduce((sum, fileSize) => sum + Number(fileSize || 0), 0);
+    const targetPixels = Number(targetVideoInfo.width || 0) * Number(targetVideoInfo.height || 0);
+    const normalizedBytesEstimate = segmentMediaInfos.reduce((sum, mediaInfo, index) => {
+      const sourcePixels = Number(mediaInfo?.videoInfo?.width || 0) * Number(mediaInfo?.videoInfo?.height || 0);
+      const scaleFactor = targetPixels > 0 && sourcePixels > 0 ? Math.max(1, targetPixels / sourcePixels) : 1;
+      return sum + Math.ceil(Number(segmentFileSizes[index] || 0) * scaleFactor);
+    }, 0);
+    // A cross-spec merge first creates uniform intermediates and only then
+    // concat-copies them.  Reserve both the intermediates and the final output
+    // up front so a low-disk failure cannot leave a half-written merge behind.
+    const boundedTranscodeTemporaryBytes = Math.max(sourceBytes, normalizedBytesEstimate) * 2;
+    const estimatedTemporaryBytes = requiresTranscode ? boundedTranscodeTemporaryBytes : sourceBytes;
     await assertDiskSpace(outputPath, {
-      estimatedBytes: segments.reduce((sum, segment) => sum + Number(segment.fileSize || 0), 0)
+      estimatedBytes: estimatedTemporaryBytes
     });
     const mergeLease = await this.mediaJobs.acquire({
       id: progress.id,
@@ -5069,7 +5108,7 @@ try {
       'info',
       `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}。${
         requiresTranscode
-          ? `检测到分辨率、帧率或编码规格变化，将重建各段时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height} 后合并`
+          ? `检测到分辨率、帧率或编码规格变化，将逐段重建时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height}，再无损拼接（临时工作区预留 ${formatBytes(estimatedTemporaryBytes)}）`
           : '各分段规格一致，使用快速无损合并'
       }`
     );
@@ -5079,46 +5118,119 @@ try {
       await fsp.rm(syncTmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
       await fsp.rm(cssTmpPath, { force: true });
-      const transcodeArgs = (videoCodec) =>
-        createConcatTranscodeArgs({
-          segments: segments.map((segment, index) => ({
-            filePath: segment.cleanPath,
-            durationSec:
-              Number(segmentTimelineInfos[index]?.videoDurationSec) || Number(segmentMediaInfos[index].durationSec),
-            hasAudio: Boolean(segmentMediaInfos[index].audioInfo)
-          })),
-          outputPath: tmpPath,
-          container,
-          targetVideoInfo,
-          videoCodec,
-          softwareThreads: Math.max(1, Math.min(4, Math.floor((os.cpus()?.length || 4) / 2)))
-        });
-      const runMergeFfmpeg = async (args) => {
+      const mergeSoftwareThreads = Math.max(1, Math.min(2, Math.floor((os.cpus()?.length || 4) / 2)));
+      const runMergeFfmpeg = async (args, options = {}) => {
         if (this.mergeCancelRequests.has(room.id)) throw new Error('合并已取消');
-        await runFfmpegJob(this.ffmpegPath, args, (line) => {
-          if (room.mergeProgress?.id === progress.id && updateFfmpegJobProgress(room.mergeProgress, line)) {
+        const progressOffsetSec = Math.max(0, Number(options.progressOffsetSec || 0));
+        const trackProgress = options.trackProgress !== false;
+        let child = null;
+        try {
+          await runFfmpegJob(this.ffmpegPath, args, (line) => {
+            if (trackProgress && room.mergeProgress?.id === progress.id) {
+              const processedSec = parseFfmpegProgressTime(line);
+              const progressLine = Number.isFinite(processedSec)
+                ? `time=${formatFfmpegSeconds(progressOffsetSec + Math.max(0, processedSec))}`
+                : line;
+              if (updateFfmpegJobProgress(room.mergeProgress, progressLine)) {
+                this.emitState();
+              }
+            }
+            if (/error|failed|invalid/i.test(line)) {
+              this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
+            }
+          }, {
+            onChild: (nextChild) => {
+              child = nextChild;
+              this.mergeProcesses.set(room.id, nextChild);
+            }
+          });
+        } finally {
+          if (!child || this.mergeProcesses.get(room.id) === child) {
+            this.mergeProcesses.delete(room.id);
+          }
+        }
+      };
+      const runBoundedTranscode = async (videoCodec) => {
+        await fsp.rm(normalizeTempDir, { recursive: true, force: true });
+        await fsp.mkdir(normalizeTempDir, { recursive: true });
+        const normalizedPaths = [];
+        let progressOffsetSec = 0;
+        for (let index = 0; index < segments.length; index += 1) {
+          if (this.mergeCancelRequests.has(room.id)) throw new Error('合并已取消');
+          const sourceDurationSec =
+            Number(segmentTimelineInfos[index]?.videoDurationSec) || Number(segmentMediaInfos[index].durationSec) || 0;
+          const normalizedPath = path.join(normalizeTempDir, `${String(index + 1).padStart(3, '0')}.normalized.mkv`);
+          if (room.mergeProgress?.id === progress.id) {
+            room.mergeProgress.message = `正在规范化分段 ${index + 1}/${segments.length}`;
+            room.mergeProgress.updatedAt = Date.now();
             this.emitState();
           }
-          if (/error|failed|invalid/i.test(line)) {
-            this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
+          await runMergeFfmpeg(
+            createNormalizeSegmentArgs({
+              inputPath: segments[index].cleanPath,
+              outputPath: normalizedPath,
+              container: 'mkv',
+              durationSec: sourceDurationSec,
+              hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
+              targetVideoInfo,
+              videoCodec,
+              softwareThreads: mergeSoftwareThreads
+            }),
+            { progressOffsetSec }
+          );
+          const normalizedInfo = await probeMediaFileInfo(this.ffmpegPath, normalizedPath, { timeoutMs: 15000 });
+          if (!normalizedInfo.videoInfo) {
+            throw new Error(`规范化分段后没有检测到视频流：${path.basename(segments[index].cleanPath)}`);
           }
-        }, {
-          onChild: (child) => this.mergeProcesses.set(room.id, child)
-        });
-        this.mergeProcesses.delete(room.id);
+          normalizedPaths.push(normalizedPath);
+          progressOffsetSec += sourceDurationSec;
+        }
+        if (room.mergeProgress?.id === progress.id) {
+          room.mergeProgress.message = '正在无损拼接已规范化分段';
+          room.mergeProgress.currentTimeSec = mergeDurationSec;
+          room.mergeProgress.percent = 99.4;
+          room.mergeProgress.updatedAt = Date.now();
+          this.emitState();
+        }
+        await writeConcatFile(concatPath, normalizedPaths);
+        await fsp.rm(tmpPath, { force: true });
+        await runMergeFfmpeg(
+          createConcatCopyArgs({
+            concatPath,
+            outputPath: tmpPath,
+            container,
+            streamCodec: targetVideoInfo.codec
+          }),
+          { trackProgress: false }
+        );
       };
       const runSafeTranscode = async () => {
+        // A healthy-looking copy merge can still fail because of malformed
+        // timestamps.  Its fallback uses the same bounded workspace, so make
+        // the larger disk reservation immediately before starting it too.
+        await assertDiskSpace(outputPath, { estimatedBytes: boundedTranscodeTemporaryBytes });
         try {
-          await runMergeFfmpeg(transcodeArgs(mergeEncoderPlan.preferred));
+          await runBoundedTranscode(mergeEncoderPlan.preferred);
         } catch (error) {
           this.mergeProcesses.delete(room.id);
-          if (!mergeEncoderPlan.fallback || this.mergeCancelRequests.has(room.id)) throw error;
+          // Retrying under known memory pressure with another encoder can
+          // immediately recreate the pressure, so leave source segments intact
+          // and report it.  This covers Linux OOM SIGKILL and Windows FFmpeg
+          // allocation/status failures alike.
+          if (
+            !mergeEncoderPlan.fallback ||
+            this.mergeCancelRequests.has(room.id) ||
+            isFfmpegMemoryPressureError(error)
+          ) {
+            throw error;
+          }
           this.log(
             'warn',
-            `${roomLabel(room)} ${mergeEncoderPlan.preferred} 合并失败，将仅回退一次 ${mergeEncoderPlan.fallback} 软件编码：${error.message}`
+            `${roomLabel(room)} ${mergeEncoderPlan.preferred} 分段规范化失败，将仅回退一次 ${mergeEncoderPlan.fallback} 软件编码：${error.message}`
           );
           await fsp.rm(tmpPath, { force: true });
-          await runMergeFfmpeg(transcodeArgs(mergeEncoderPlan.fallback));
+          await fsp.rm(normalizeTempDir, { recursive: true, force: true });
+          await runBoundedTranscode(mergeEncoderPlan.fallback);
         }
       };
       if (requiresTranscode) {
@@ -5126,7 +5238,9 @@ try {
       } else {
         await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
         try {
-          await runMergeFfmpeg(createConcatCopyArgs({ concatPath, outputPath: tmpPath, container }));
+          await runMergeFfmpeg(
+            createConcatCopyArgs({ concatPath, outputPath: tmpPath, container, streamCodec: targetVideoInfo.codec })
+          );
         } catch (error) {
           this.mergeProcesses.delete(room.id);
           if (this.mergeCancelRequests.has(room.id)) throw error;
@@ -5204,7 +5318,8 @@ try {
               outputPath: syncTmpPath,
               container,
               videoDurationSec: mergedTimingInfo.videoDurationSec
-            })
+            }),
+            { trackProgress: false }
           );
           const repairedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, syncTmpPath, { timeoutMs: 15000 });
           const repairedTimingInfo = await probeMediaTimelineInfo(this.ffmpegPath, syncTmpPath, repairedMediaInfo, {
@@ -5337,14 +5452,18 @@ try {
       return mergedRecording;
     } catch (error) {
       const cancelled = this.mergeCancelRequests.has(room.id);
+      const memoryPressure = !cancelled && isFfmpegMemoryPressureError(error);
+      const failureMessage = memoryPressure
+        ? `合并 FFmpeg 疑似因内存不足而中止（请检查系统内存/事件日志）：${error.message}`
+        : `合并失败：${error.message}`;
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(
           room.mergeProgress,
           cancelled ? 'cancelled' : 'error',
-          cancelled ? '合并已取消，所有源分段均已保留' : `合并失败：${error.message}；所有源分段均已保留`
+          cancelled ? '合并已取消，所有源分段均已保留' : `${failureMessage}；所有源分段均已保留`
         );
       }
-      this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : `合并失败：${error.message}`}；源分段未删除。`);
+      this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : failureMessage}；源分段未删除。`);
       this.emitState();
       if (cancelled) return fallbackRecording;
       throw error;
@@ -5357,6 +5476,7 @@ try {
       await fsp.rm(syncTmpPath, { force: true }).catch(() => {});
       await fsp.rm(danmakuTmpPath, { force: true }).catch(() => {});
       await fsp.rm(cssTmpPath, { force: true }).catch(() => {});
+      await fsp.rm(normalizeTempDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -7820,6 +7940,7 @@ function isSingleExecutableRuntime() {
 
 module.exports = {
   LiveRecordService,
+  isFfmpegMemoryPressureError,
   createUiCapabilities,
   DEFAULT_HOST,
   DEV_MODE,
