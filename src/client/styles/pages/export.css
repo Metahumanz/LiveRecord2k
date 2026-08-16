@@ -42,21 +42,9 @@
   gap: 12px;
 }
 
-.danmaku-style-editor-heading > div {
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-}
-
 .danmaku-style-editor-heading strong {
   color: #eef9f6;
   font-size: 14px;
-}
-
-.danmaku-style-editor-heading span {
-  color: #9db2ac;
-  font-size: 12px;
-  line-height: 1.4;
 }
 
 .danmaku-style-editor-heading .wide-button {
@@ -73,10 +61,7 @@
 
 .danmaku-style-preset {
   min-width: 0;
-  display: grid;
-  align-content: start;
-  gap: 4px;
-  min-height: 90px;
+  min-height: 42px;
   padding: 9px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 7px;
@@ -94,17 +79,6 @@
 .danmaku-style-preset strong {
   color: #ecfaf7;
   font-size: 13px;
-}
-
-.danmaku-style-preset span {
-  color: #9cb2ac;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.4;
-}
-
-.danmaku-style-editor .field-help {
-  margin: 0;
 }
 
 .export-queue {
@@ -331,22 +305,6 @@
   font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
 }
 
-.danmaku-preview-caption {
-  position: absolute;
-  top: 8px;
-  left: 10px;
-  z-index: 2;
-  max-width: calc(100% - 20px);
-  padding: 4px 7px;
-  border-radius: 5px;
-  color: rgba(244, 255, 253, 0.9);
-  background: rgba(7, 12, 15, 0.7);
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 1.35;
-  text-shadow: 0 1px 2px #000;
-}
-
 .preview-rolling-danmaku {
   position: absolute;
   left: 0;
@@ -475,6 +433,16 @@
   background: linear-gradient(135deg, rgba(255, 233, 200, 0.98) 0 38%, rgba(184, 90, 37, 0.96) 38%);
 }
 
+.preset-h5-card .preview-rolling-danmaku {
+  max-width: 62%;
+  padding: 5px 10px;
+  border-radius: 11px;
+  color: #422816;
+  background: rgba(255, 233, 200, 0.94);
+  font-weight: 800;
+  text-shadow: none;
+}
+
 .preset-h5-card .preview-gift {
   border-left-color: #e0873a;
   background: rgba(255, 242, 229, 0.93);
@@ -487,6 +455,17 @@
   color: #fff5fd;
   background: rgba(42, 30, 40, 0.84);
   backdrop-filter: blur(4px);
+}
+
+.preset-bubble .preview-rolling-danmaku {
+  max-width: 62%;
+  padding: 5px 11px;
+  border: 1px solid rgba(255, 226, 246, 0.24);
+  border-radius: 999px;
+  color: #fff5fd;
+  background: rgba(48, 34, 47, 0.88);
+  font-weight: 700;
+  text-shadow: none;
 }
 
 .preset-bubble .preview-superchat p,
@@ -507,26 +486,18 @@
   box-shadow: 0 3px 9px rgba(0, 0, 0, 0.28);
 }
 
+.preset-minimal .preview-rolling-danmaku {
+  color: rgba(255, 255, 255, 0.88);
+  font-weight: 700;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.82);
+}
+
 .preset-minimal .preview-card p {
   display: none;
 }
 
 .preset-minimal .preview-gift {
   border-left-color: #d6cec7;
-}
-
-.preview-cards-disabled {
-  position: absolute;
-  right: 10px;
-  bottom: 44px;
-  max-width: min(70%, 340px);
-  padding: 7px 9px;
-  border-radius: 7px;
-  color: #d5e2de;
-  background: rgba(7, 12, 15, 0.75);
-  font-size: 12px;
-  font-weight: 800;
-  line-height: 1.4;
 }
 
 .danmaku-preview-toolbar {

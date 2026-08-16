@@ -4,7 +4,6 @@ import type { AppSettings, DanmakuStylePreset, FfmpegCodecOption } from '../type
 type DanmakuStylePresetDefinition = {
   label: string;
   shortLabel: string;
-  description: string;
   style: Record<string, number>;
 };
 
@@ -39,6 +38,7 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'outputContainer',
   'segmentMinutes',
   'autoBurnDanmaku',
+  'deleteSourceAfterBurn',
   'burnOverlayMode',
   'burnDanmakuArea',
   'burnDanmakuStylePreset',

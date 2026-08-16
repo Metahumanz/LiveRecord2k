@@ -2306,6 +2306,9 @@ function normalizeUpdatePackageType(value, platform = process.platform) {
   if (text === 'tarball' || text === 'linux-tar' || /\.(?:tar\.gz|tgz)(?:$|[?#])/i.test(text)) {
     return 'tarball';
   }
+  if (text === 'msix' || /\.msix(?:$|[?#])/i.test(text)) {
+    return 'msix';
+  }
   if (text === 'installer' || isInstallerFileName(text)) {
     return 'installer';
   }
@@ -2328,7 +2331,7 @@ function inferUpdatePlatform(value, packageType = '') {
   }
   const text = String(value || '').toLowerCase();
   if (packageType === 'deb' || packageType === 'tarball' || /\.(?:deb|tar\.gz|tgz)(?:$|[?#])/i.test(text)) return 'linux';
-  if (packageType === 'installer' || packageType === 'portable' || /\.(?:exe|msi|msix|zip)(?:$|[?#])/i.test(text)) return 'win32';
+  if (packageType === 'installer' || packageType === 'portable' || packageType === 'msix' || /\.(?:exe|msi|msix|zip)(?:$|[?#])/i.test(text)) return 'win32';
   return '';
 }
 
@@ -2347,7 +2350,7 @@ function selectUpdatePackageFile(files, { platform, arch, preferredPackageType }
     .filter((file) => file.url)
     .filter((file) => !file.platform || file.platform === platform)
     .filter((file) => file.arch === 'all' || !arch || file.arch === arch);
-  const typeOrder = platform === 'linux' ? ['deb', 'tarball'] : platform === 'win32' ? ['installer', 'portable'] : [];
+  const typeOrder = platform === 'linux' ? ['deb', 'tarball'] : platform === 'win32' ? ['msix', 'installer', 'portable'] : [];
   candidates.sort((left, right) => {
     const score = (file) => {
       if (file.packageType === preferredPackageType) return 0;
@@ -2396,7 +2399,7 @@ function getAppPackageType(options = {}) {
 
 function isInstallerFileName(value) {
   const text = String(value || '').toLowerCase();
-  return /\.(?:exe|msi|msix|appinstaller)(?:$|[?#])/i.test(text) && /(setup|install|installer)/i.test(text);
+  return /\.(?:exe|msi|appinstaller)(?:$|[?#])/i.test(text) && /(setup|install|installer)/i.test(text);
 }
 
 function isInstallerUpdatePackage(manifest, packagePath) {
@@ -2459,6 +2462,7 @@ function updatePackageLabel(manifest) {
   const packageType = normalizeUpdatePackageType(manifest?.packageType || manifest?.packageUrl, process.platform);
   if (packageType === 'deb') return 'Debian 安装包';
   if (packageType === 'tarball') return 'Linux 更新包';
+  if (packageType === 'msix') return 'MSIX 安装包';
   return isInstallerUpdatePackage(manifest, manifest?.packageUrl) ? '安装器' : '更新包';
 }
 

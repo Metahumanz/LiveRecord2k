@@ -572,17 +572,9 @@ function createAss(events, options = {}) {
             start: getDanmakuEventVideoTime(event)
           };
       const y = danmakuLayout.top + lane.row * style.danmakuLineHeight;
-      const width = estimateTextWidth(event.text, style.danmakuFontSize);
-      const color = assColorFromRgb(event.color || 0xffffff);
-      lines.push(
-        dialogue(
-          1,
-          lane.start,
-          lane.start + duration,
-          'Danmaku',
-          `{\\1c${color}\\move(${style.playWidth + 60},${y},-${width},${y})}${assEscape(event.text)}`
-        )
-      );
+      for (const line of renderRollingDanmaku(event, style, lane.start, y, duration)) {
+        lines.push(line);
+      }
       continue;
     }
   }
@@ -597,6 +589,90 @@ function createAss(events, options = {}) {
   }
 
   return `${lines.join('\n')}\n`;
+}
+
+function renderRollingDanmaku(event, style, start, y, duration) {
+  const visualPreset = visualPresetFromStyle(style);
+  const fontSize = Math.max(12, Number(style.danmakuFontSize) || DEFAULT_DANMAKU_STYLE.danmakuFontSize);
+  const playWidth = Math.max(1, Number(style.playWidth) || DEFAULT_DANMAKU_STYLE.playWidth);
+  const playHeight = Math.max(1, Number(style.playHeight) || DEFAULT_DANMAKU_STYLE.playHeight);
+  const color = assColorFromRgb(event.color || 0xffffff);
+
+  // Preserve the established ASS output for the default preset exactly.
+  if (visualPreset === DEFAULT_DANMAKU_STYLE_PRESET) {
+    const width = estimateTextWidth(event.text, style.danmakuFontSize);
+    return [
+      dialogue(
+        1,
+        start,
+        start + duration,
+        'Danmaku',
+        `{\\1c${color}\\move(${style.playWidth + 60},${y},-${width},${y})}${assEscape(event.text)}`
+      )
+    ];
+  }
+
+  if (visualPreset === 'minimal') {
+    const width = estimateTextWidth(event.text, fontSize);
+    return [
+      dialogue(
+        1,
+        start,
+        start + duration,
+        'Danmaku',
+        `{\\1c${color}\\1a&H20&\\bord0\\shad0\\move(${playWidth + 44},${y},-${width},${y})}${assEscape(event.text)}`
+      )
+    ];
+  }
+
+  const palette = rollingDanmakuPalette(visualPreset);
+  const username = String(event.user || '').trim();
+  const rawText = username ? `${username} · ${String(event.text || '')}` : String(event.text || '');
+  const maxTextWidth = Math.max(fontSize * 3, Math.floor(playWidth * 0.68) - palette.paddingX * 2);
+  const text = truncateTextToWidth(rawText, maxTextWidth, fontSize);
+  const cardWidth = Math.max(fontSize * 3, estimateTextWidth(text, fontSize) + palette.paddingX * 2);
+  const cardHeight = fontSize + palette.paddingY * 2;
+  const cardY = clamp(y - Math.round((cardHeight - fontSize) / 2), 0, Math.max(0, playHeight - cardHeight));
+  const textY = cardY + palette.paddingY;
+  const cardStartX = playWidth + 48;
+  const cardEndX = -cardWidth - 48;
+  const movement = { x1: cardStartX, y1: cardY, x2: cardEndX, y2: cardY };
+
+  return [
+    drawRoundedRect(1, start, start + duration, cardStartX, cardY, cardWidth, cardHeight, palette.radius, palette.background, {
+      move: movement
+    }),
+    dialogue(
+      2,
+      start,
+      start + duration,
+      'BoxText',
+      `{\\an7\\bord0\\shad0\\b${palette.bold ? 1 : 0}\\fs${assNumber(fontSize)}\\1c${palette.text}\\move(${assNumber(
+        cardStartX + palette.paddingX
+      )},${assNumber(textY)},${assNumber(cardEndX + palette.paddingX)},${assNumber(textY)})}${assEscape(text)}`
+    )
+  ];
+}
+
+function rollingDanmakuPalette(visualPreset) {
+  if (visualPreset === 'h5-card') {
+    return {
+      background: assColorFromRgbWithAlpha(0xffe9c8, 0x08),
+      text: assColorFromRgb(0x422816),
+      paddingX: 18,
+      paddingY: 6,
+      radius: 14,
+      bold: true
+    };
+  }
+  return {
+    background: assColorFromRgbWithAlpha(0x30222f, 0x1c),
+    text: assColorFromRgb(0xfff5fd),
+    paddingX: 16,
+    paddingY: 6,
+    radius: 22,
+    bold: false
+  };
 }
 
 function createMessageItems(events, style) {
@@ -1237,6 +1313,10 @@ function assColorFromRgb(rgb) {
   return `&H00${hex2(b)}${hex2(g)}${hex2(r)}&`;
 }
 
+function assColorFromRgbWithAlpha(rgb, alpha) {
+  return assColorFromRgb(rgb).replace('&H00', `&H${hex2(clamp(alpha, 0, 255))}`);
+}
+
 function hex2(value) {
   return Number(value).toString(16).padStart(2, '0').toUpperCase();
 }
@@ -1249,29 +1329,29 @@ function superChatPalette(price, style) {
   const visualPreset = visualPresetFromStyle(style);
   if (visualPreset === 'h5-card') {
     return {
-      header: '&H00FFE9C8&',
-      body: '&H00B85A25&',
-      username: '&H00462A14&',
-      detail: '&H00583B25&',
-      bodyText: '&H00FFFFFF&'
+      header: assColorFromRgb(0xffe9c8),
+      body: assColorFromRgb(0xb85a25),
+      username: assColorFromRgb(0x462a14),
+      detail: assColorFromRgb(0x583b25),
+      bodyText: assColorFromRgb(0xffffff)
     };
   }
   if (visualPreset === 'bubble') {
     return {
-      header: '&H24484444&',
-      body: '&H1A251F24&',
-      username: '&H00FDF4FF&',
-      detail: '&H00E5CFDE&',
-      bodyText: '&H00FFFFFF&'
+      header: assColorFromRgbWithAlpha(0x484444, 0x24),
+      body: assColorFromRgbWithAlpha(0x251f24, 0x1a),
+      username: assColorFromRgb(0xfdf4ff),
+      detail: assColorFromRgb(0xe5cfde),
+      bodyText: assColorFromRgb(0xffffff)
     };
   }
   if (visualPreset === 'minimal') {
     return {
-      header: '&H2A1E1B18&',
-      body: '&H32151412&',
-      username: '&H00FFFFFF&',
-      detail: '&H00D8D2CE&',
-      bodyText: '&H00FFFFFF&'
+      header: assColorFromRgbWithAlpha(0x1e1b18, 0x2a),
+      body: assColorFromRgbWithAlpha(0x151412, 0x32),
+      username: assColorFromRgb(0xffffff),
+      detail: assColorFromRgb(0xd8d2ce),
+      bodyText: assColorFromRgb(0xffffff)
     };
   }
   if (price >= 2000) {
@@ -1295,13 +1375,25 @@ function superChatPalette(price, style) {
 function guardCardPalette(level, price, style) {
   const visualPreset = visualPresetFromStyle(style);
   if (visualPreset === 'h5-card') {
-    return { background: '&H00FBE6D0&', username: '&H00723B21&', detail: '&H0062422B&' };
+    return {
+      background: assColorFromRgb(0xfbe6d0),
+      username: assColorFromRgb(0x723b21),
+      detail: assColorFromRgb(0x62422b)
+    };
   }
   if (visualPreset === 'bubble') {
-    return { background: '&H20433B44&', username: '&H00FFF6FD&', detail: '&H00E8D8E3&' };
+    return {
+      background: assColorFromRgbWithAlpha(0x433b44, 0x20),
+      username: assColorFromRgb(0xfff6fd),
+      detail: assColorFromRgb(0xe8d8e3)
+    };
   }
   if (visualPreset === 'minimal') {
-    return { background: '&H381D1B19&', username: '&H00FFFFFF&', detail: '&H00D8D2CE&' };
+    return {
+      background: assColorFromRgbWithAlpha(0x1d1b19, 0x38),
+      username: assColorFromRgb(0xffffff),
+      detail: assColorFromRgb(0xd8d2ce)
+    };
   }
   const rank = Number(level) || 0;
   if (rank === 1) {
@@ -1326,26 +1418,26 @@ function giftCardPalette(price = 0, style) {
   const visualPreset = visualPresetFromStyle(style);
   if (visualPreset === 'h5-card') {
     return {
-      background: '&H08FFF2E5&',
-      accent: '&H00E0873A&',
-      username: '&H00613A22&',
-      detail: '&H006A4A35&'
+      background: assColorFromRgbWithAlpha(0xfff2e5, 0x08),
+      accent: assColorFromRgb(0xe0873a),
+      username: assColorFromRgb(0x613a22),
+      detail: assColorFromRgb(0x6a4a35)
     };
   }
   if (visualPreset === 'bubble') {
     return {
-      background: '&H2450444E&',
-      accent: '&H00E0A6D3&',
-      username: '&H00FFF7FD&',
-      detail: '&H00E4D2E0&'
+      background: assColorFromRgbWithAlpha(0x50444e, 0x24),
+      accent: assColorFromRgb(0xe0a6d3),
+      username: assColorFromRgb(0xfff7fd),
+      detail: assColorFromRgb(0xe4d2e0)
     };
   }
   if (visualPreset === 'minimal') {
     return {
-      background: '&H361D1B19&',
-      accent: '&H00D6CEC7&',
-      username: '&H00FFFFFF&',
-      detail: '&H00D8D2CE&'
+      background: assColorFromRgbWithAlpha(0x1d1b19, 0x36),
+      accent: assColorFromRgb(0xd6cec7),
+      username: assColorFromRgb(0xffffff),
+      detail: assColorFromRgb(0xd8d2ce)
     };
   }
   const amount = Number(price) || 0;

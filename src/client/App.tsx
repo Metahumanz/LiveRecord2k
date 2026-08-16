@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type React from 'react';
 import {
   Activity,
@@ -62,6 +62,7 @@ export default function App() {
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [previewRoomId, setPreviewRoomId] = useState<string | null>(null);
   const [initialLoadError, setInitialLoadError] = useState('');
+  const settingsSaveQueueRef = useRef<Promise<boolean>>(Promise.resolve(true));
 
   useEffect(() => {
     let cancelled = false;
@@ -136,11 +137,53 @@ export default function App() {
     window.setTimeout(() => closeToast(id), 4200);
   }
 
+  async function persistSettings(settings: Partial<AppSettings>, successMessage = ''): Promise<boolean> {
+    const save = async () => {
+      setBusy('save-settings');
+      try {
+        const result = await recorder.saveSettings(settings);
+        setState(result);
+        setSettingsDraft((current) => {
+          if (!current) {
+            return result.settings;
+          }
+          const savedPatch = Object.fromEntries(
+            (Object.keys(settings) as Array<keyof AppSettings>).map((key) => [key, result.settings[key]])
+          ) as Partial<AppSettings>;
+          return { ...current, ...savedPatch };
+        });
+        if (result.operationNotice) {
+          showToast(result.operationNotice);
+        }
+        if (successMessage) {
+          showToast({ title: '保存成功', message: successMessage });
+        }
+        return true;
+      } catch (error) {
+        showToast({
+          kind: 'error',
+          title: '设置未保存',
+          message: error instanceof Error ? error.message : '请求未能完成，请稍后重试。'
+        });
+        return false;
+      } finally {
+        setBusy(null);
+      }
+    };
+    const queued = settingsSaveQueueRef.current.then(save, save);
+    settingsSaveQueueRef.current = queued.then(
+      () => true,
+      () => true
+    );
+    return queued;
+  }
+
   async function saveSettingsWithToast(settings: Partial<AppSettings>, message = '录制配置已保存') {
-    const succeeded = await run('save-settings', () => recorder.saveSettings(settings));
-    if (succeeded) {
-      showToast({ title: '保存成功', message });
-    }
+    await persistSettings(settings, message);
+  }
+
+  async function saveSettingsImmediately(settings: Partial<AppSettings>) {
+    await persistSettings(settings);
   }
 
   async function addRoom() {
@@ -162,6 +205,7 @@ export default function App() {
       const selected = await recorder.chooseOutputDir(settingsDraft?.outputDir || '');
       if (selected && settingsDraft) {
         setSettingsDraft({ ...settingsDraft, outputDir: selected });
+        void saveSettingsImmediately({ outputDir: selected });
       }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '系统路径选择器打开失败。');
@@ -174,7 +218,8 @@ export default function App() {
     if (!state || state.settings.roomImageMode === mode) {
       return;
     }
-    await run('image-mode', () => recorder.saveSettings({ roomImageMode: mode }));
+    setSettingsDraft((current) => (current ? { ...current, roomImageMode: mode } : current));
+    await saveSettingsImmediately({ roomImageMode: mode });
   }
 
   function selectExportRecording(recording: RecordingState) {
@@ -354,6 +399,7 @@ export default function App() {
             busy={busy}
             run={run}
             saveSettings={saveSettingsWithToast}
+            saveSettingsImmediately={saveSettingsImmediately}
             chooseOutputDir={chooseOutputDir}
             setSettingsDraft={setSettingsDraft}
           />
@@ -365,6 +411,7 @@ export default function App() {
             busy={busy}
             run={run}
             saveSettings={saveSettingsWithToast}
+            saveSettingsImmediately={saveSettingsImmediately}
             setSettingsDraft={setSettingsDraft}
           />
         ) : null}

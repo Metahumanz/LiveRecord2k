@@ -17,7 +17,8 @@
 
 打开 GitHub Release 页面后，一般只需要看这几个附件：
 
-- 新用户推荐下载 `bili-record-2k-setup.exe`：这是 Windows 安装器，双击安装后从开始菜单或桌面入口启动。
+- 新用户推荐下载 `bili-record-2k-setup.exe`：这是免管理员权限的单用户 Windows 安装器，双击安装后从开始菜单启动。
+- 配置了 MSIX 发布源后，推荐下载 `BiliRecord2K.appinstaller`：Windows App Installer 会在后台或后续启动时静默更新；首次安装需要受信任的签名证书。
 - 不想安装或想便携使用时，下载 `bili-record-2k-webui.zip`：解压到固定文件夹，双击里面的 `BiliRecord2K.exe` 启动。
 - `update.json` 是应用内更新检测用的清单文件，不需要手动下载或打开。
 
@@ -365,6 +366,8 @@ release/webui/BiliRecord2K.exe
 release/webui/BiliRecord2K.Service.exe
 release/bili-record-2k-setup.exe
 release/bili-record-2k-webui.zip
+release/bili-record-2k-版本-x64.msix
+release/BiliRecord2K.appinstaller
 release/bili-record-2k_版本_amd64.deb
 release/bili-record-2k_版本_arm64.deb
 release/bili-record-2k_版本_linux_x64.tar.gz
@@ -374,6 +377,8 @@ release/update.json
 ```
 
 官方 Release 在发布前会依次通过单测、FFmpeg smoke、Windows x64 构建、Linux x64/ARM64 原生构建，并用仓库 Secret `UPDATE_SIGNING_PRIVATE_KEY_B64` 生成和复验签名清单；缺少任何架构产物或签名验证失败时不会发布。
+
+Windows MSIX 的单用户安装、签名和静默更新源配置见 [docs/windows-msix.md](docs/windows-msix.md)。
 
 如果不想构建结束后自动打开资源管理器，可以设置：
 

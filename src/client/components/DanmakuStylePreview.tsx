@@ -86,6 +86,7 @@ export function DanmakuStylePreview({
   const stackLeftPercent = (effective.panelLeft / PLAY_WIDTH) * 100;
   const stackTopPercent = (stackTop / PLAY_HEIGHT) * 100;
   const showCards = overlayMode === 'danmaku-gift';
+  const rollingIncludesUsername = preset === 'h5-card' || preset === 'bubble';
 
   function canvasPoint(clientX: number, clientY: number) {
     const rect = previewRef.current?.getBoundingClientRect();
@@ -161,12 +162,11 @@ export function DanmakuStylePreview({
 
   return (
     <div className={`danmaku-style-preview preset-${preset}`} ref={previewRef}>
-      <div className="danmaku-preview-caption">示意预览：位置、宽度和字号会按相同参数写入 ASS 后烧录。</div>
       <span
         className="preview-rolling-danmaku first"
         style={{ top: `${(effective.danmakuTop / PLAY_HEIGHT) * 100}%`, fontSize: `${Math.max(11, effective.danmakuFontSize * 0.34)}px` }}
       >
-        这个样式很适合录播！
+        {rollingIncludesUsername ? '小紫 · ' : ''}这个样式很适合录播！
       </span>
       <span
         className="preview-rolling-danmaku second"
@@ -175,7 +175,7 @@ export function DanmakuStylePreview({
           fontSize: `${Math.max(10, effective.danmakuFontSize * 0.31)}px`
         }}
       >
-        弹幕预览 ✨
+        {rollingIncludesUsername ? '观众A · ' : ''}弹幕预览 ✨
       </span>
 
       {showCards ? (
@@ -197,7 +197,7 @@ export function DanmakuStylePreview({
             </span>
             <strong>小电视同学</strong>
             <small>SuperChat CNY 30</small>
-            <p>这一条互动会以卡片样式显示。</p>
+            <p>直播顺利！</p>
           </div>
           <div className="preview-card preview-gift" onPointerDown={(event) => beginInteraction(event, 'move')}>
             <strong>录播观众</strong>
@@ -213,9 +213,7 @@ export function DanmakuStylePreview({
             <Maximize2 size={13} />
           </button>
         </div>
-      ) : (
-        <div className="preview-cards-disabled">当前为“仅弹幕”，互动卡片不会烧录；切换为“弹幕和礼物”即可拖动和缩放。</div>
-      )}
+      ) : null}
 
       <div className="danmaku-preview-toolbar">
         <span>

@@ -70,6 +70,25 @@ test('style presets keep the existing CSS untouched by default and apply preview
   assert.match(styledAss, /\\pos\(90,/);
 });
 
+test('non-default presets visibly change ordinary rolling danmaku in the generated ASS', () => {
+  const event = { type: 'danmaku', time: 1, user: '预览用户', text: '普通弹幕也要有样式', color: 0x70d6ff };
+  const current = createAss([event], { stylePreset: 'current' });
+  const h5Card = createAss([event], { stylePreset: 'h5-card' });
+  const bubble = createAss([event], { stylePreset: 'bubble' });
+  const minimal = createAss([event], { stylePreset: 'minimal' });
+
+  assert.match(current, /\\move\(1980,36,-/);
+  assert.doesNotMatch(current, /预览用户 · 普通弹幕也要有样式/);
+  assert.match(h5Card, /\\p1\\move\(1968,/);
+  assert.match(h5Card, /预览用户 · 普通弹幕也要有样式/);
+  assert.match(h5Card, /\\1c&HC8E9FF&\\1a&H08&/);
+  assert.match(bubble, /\\p1\\move\(1968,/);
+  assert.match(bubble, /\\1c&H2F2230&\\1a&H1C&/);
+  assert.match(minimal, /\\1a&H20&\\bord0\\shad0/);
+  assert.notEqual(h5Card, bubble);
+  assert.notEqual(bubble, minimal);
+});
+
 test('superchat uses the DanmakuFactory information hierarchy and low-price palette', () => {
   const ass = createAss([
     {

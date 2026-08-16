@@ -131,6 +131,7 @@ const {
   getAppRoot,
   findFfmpegPath,
   getAppVersion,
+  getAppPackageType,
   requestUrlBuffer,
   requestUrlBufferOnce,
   requestUrlDirect,
@@ -222,6 +223,7 @@ const UI_PLATFORM = ['win32', 'linux', 'darwin'].includes(DEV_PLATFORM_OVERRIDE)
 const APP_ROOT = getAppRoot();
 const DIST_ROOT = path.join(APP_ROOT, 'dist');
 const APP_VERSION = getAppVersion();
+const APP_PACKAGE_TYPE = getAppPackageType({ platform: process.platform, appRoot: APP_ROOT });
 const DEFAULT_UPDATE_MANIFEST_URL =
   process.env.BILI_RECORD_UPDATE_URL ||
   'https://github.com/Metahumanz/LiveRecord2k/releases/latest/download/update.json';
@@ -500,6 +502,7 @@ class LiveRecordService {
       outputContainer: 'mp4',
       segmentMinutes: 60,
       autoBurnDanmaku: true,
+      deleteSourceAfterBurn: false,
       burnOverlayMode: 'danmaku-gift',
       burnDanmakuArea: 'half',
       burnDanmakuStylePreset: 'current',
@@ -779,6 +782,44 @@ class LiveRecordService {
     }
   }
 
+  async deleteBurnSourceAfterSuccess(room, recording, burnedPath) {
+    const sourcePath = String(recording?.cleanPath || '').trim();
+    const completedPath = String(burnedPath || '').trim();
+    if (!sourcePath || !completedPath) {
+      throw new Error('缺少源录像或已完成的弹幕版路径，拒绝自动删除。');
+    }
+    const resolvedSourcePath = path.resolve(sourcePath);
+    const resolvedCompletedPath = path.resolve(completedPath);
+    if (resolvedSourcePath.toLowerCase() === resolvedCompletedPath.toLowerCase()) {
+      throw new Error('弹幕版输出与源录像指向同一文件，拒绝自动删除。');
+    }
+    if (
+      !isPathInsideDirectory(resolvedSourcePath, this.settings.outputDir) ||
+      !isPathInsideDirectory(resolvedCompletedPath, this.settings.outputDir)
+    ) {
+      throw new Error('源录像或弹幕版不在当前录像库内，拒绝自动删除。');
+    }
+    if (!(await isExistingFile(resolvedCompletedPath))) {
+      throw new Error('弹幕版成片不存在，源录像受保护且不会删除。');
+    }
+    const sourceStat = await fsp.stat(resolvedSourcePath).catch(() => null);
+    if (!sourceStat?.isFile()) {
+      return { deleted: false, missing: true };
+    }
+
+    await fsp.rm(resolvedSourcePath, { force: true });
+    const sourceKey = resolvedSourcePath.toLowerCase();
+    this.recordings = this.recordings.filter(
+      (item) => path.resolve(String(item?.cleanPath || '')).toLowerCase() !== sourceKey
+    );
+    if (path.resolve(String(room?.currentRecording?.cleanPath || '')).toLowerCase() === sourceKey) {
+      delete room.currentRecording;
+    }
+    await this.saveStore();
+    this.log('success', `${roomLabel(room)} 弹幕版验证成功，已自动删除无弹幕源文件：${path.basename(resolvedSourcePath)}。`);
+    return { deleted: true, missing: false };
+  }
+
   async bootstrapPersistentConfiguration() {
     const currentVersion = Number(this.settings.configBootstrapVersion || 0);
     const legacyPassword = String(this.settings.legacyAccessPassword || '');
@@ -830,6 +871,7 @@ class LiveRecordService {
       preferHevc: Boolean(settings.preferHevc),
       roomImageMode: normalizeRoomImageMode(settings.roomImageMode),
       autoBurnDanmaku: Boolean(settings.autoBurnDanmaku),
+      deleteSourceAfterBurn: Boolean(settings.autoBurnDanmaku) && Boolean(settings.deleteSourceAfterBurn),
       burnOverlayMode: normalizeBurnOverlayMode(settings.burnOverlayMode),
       burnDanmakuArea: normalizeDanmakuDisplayArea(settings.burnDanmakuArea),
       burnDanmakuStylePreset: normalizeDanmakuStylePreset(settings.burnDanmakuStylePreset),
@@ -1162,8 +1204,38 @@ class LiveRecordService {
       ...this.updateState,
       currentVersion: APP_VERSION,
       activeJobs: this.hasActiveJobs(),
-      autoApplySupported: this.supportsManagedLinuxUpdate()
+      autoApplySupported: this.supportsManagedLinuxUpdate(),
+      msixManaged: this.usesMsixAppInstallerUpdate()
     };
+  }
+
+  usesMsixAppInstallerUpdate() {
+    return process.platform === 'win32' && APP_PACKAGE_TYPE === 'msix';
+  }
+
+  createMsixUpdateMessage(version = this.updateState.latestVersion) {
+    const versionLabel = String(version || '').trim();
+    return versionLabel
+      ? `发现新版本 ${versionLabel}。此 MSIX 安装由 Windows App Installer 在后台或后续启动时静默更新。`
+      : '此 MSIX 安装由 Windows App Installer 在后台或后续启动时静默更新。';
+  }
+
+  async deferMsixUpdateToAppInstaller() {
+    if (!this.updateState.manifest || compareVersions(this.updateState.latestVersion, APP_VERSION) <= 0) {
+      await this.checkUpdate();
+    }
+    if (this.updateState.manifest && compareVersions(this.updateState.latestVersion, APP_VERSION) > 0) {
+      this.updateState = {
+        ...this.updateState,
+        status: 'available',
+        queued: false,
+        downloadProgress: null,
+        message: this.createMsixUpdateMessage()
+      };
+      this.log('info', this.updateState.message);
+      this.emitState();
+    }
+    return this.getState();
   }
 
   getPublicLoginState() {
@@ -4980,7 +5052,10 @@ try {
     }
     if (this.settings.autoBurnDanmaku && recording?.valid !== false && Number(recording?.eventCount || 0) > 0) {
       setTimeout(() => {
-        this.enqueueBurnRecording(room, recording, { automatic: true }).catch((error) => {
+        this.enqueueBurnRecording(room, recording, {
+          automatic: true,
+          deleteSourceAfterSuccess: this.settings.deleteSourceAfterBurn
+        }).catch((error) => {
           this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
         });
       }, 500);
@@ -6355,6 +6430,12 @@ try {
       recording.burnedPath = burnedPath;
       const codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
       const burnSourcePath = recording.cleanPath;
+      const deleteSourceAfterSuccess = Boolean(
+        options.automatic &&
+          options.deleteSourceAfterSuccess &&
+          this.settings.autoBurnDanmaku &&
+          this.settings.deleteSourceAfterBurn
+      );
 
       await assertDiskSpace(burnedPath, { estimatedBytes: Number(recording.fileSize || 0) });
       await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
@@ -6423,6 +6504,7 @@ try {
         const progressId = room.burnProgress?.id;
         const cancelled = this.burnCancelRequests.delete(room.id);
         let validationError = null;
+        let burnedSuccessfully = false;
         if (!cancelled && code === 0) {
           try {
             const result = await probeMediaFileInfo(this.ffmpegPath, burnedTmpPath, { timeoutMs: 15000 });
@@ -6444,6 +6526,7 @@ try {
           fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
           this.log('info', `${roomLabel(room)} 已取消生成弹幕视频：${path.basename(burnedPath)}`);
         } else if (code === 0) {
+          burnedSuccessfully = true;
           finishFfmpegJobProgress(room.burnProgress, 'completed', '弹幕版已生成');
           this.log('success', `${roomLabel(room)} 有弹幕版已生成：${path.basename(burnedPath)}`);
           if (this.settings.notifyBurnEnded) {
@@ -6469,6 +6552,14 @@ try {
             });
           }
         }
+        await this.cleanupPendingSegmentCleanupsForRoom(room);
+        if (burnedSuccessfully && deleteSourceAfterSuccess) {
+          try {
+            await this.deleteBurnSourceAfterSuccess(room, recording, burnedPath);
+          } catch (error) {
+            this.log('warn', `${roomLabel(room)} 弹幕版已生成，但自动删除源文件失败：${error.message}`);
+          }
+        }
         this.emitState();
         setTimeout(() => {
           if (room.burnProgress?.id === progressId) {
@@ -6476,7 +6567,6 @@ try {
             this.emitState();
           }
         }, 5000).unref?.();
-        await this.cleanupPendingSegmentCleanupsForRoom(room);
         this.scheduleQueuedUpdateCheck();
       });
     } catch (error) {
@@ -6987,12 +7077,17 @@ try {
       acceptingStatus = false;
       const latestVersion = manifest.version || manifest.tagName || '';
       const hasUpdate = compareVersions(latestVersion, APP_VERSION) > 0;
+      const updateMessage = hasUpdate
+        ? this.usesMsixAppInstallerUpdate()
+          ? this.createMsixUpdateMessage(latestVersion)
+          : `发现新版本 ${latestVersion}`
+        : `当前已是最新版本 ${APP_VERSION}`;
       this.updateState = {
         ...this.updateState,
         status: hasUpdate ? 'available' : 'up-to-date',
         currentVersion: APP_VERSION,
         latestVersion,
-        message: hasUpdate ? `发现新版本 ${latestVersion}` : `当前已是最新版本 ${APP_VERSION}`,
+        message: updateMessage,
         checkedAt: Date.now(),
         downloadReceivedBytes: 0,
         downloadTotalBytes: 0,
@@ -7028,6 +7123,9 @@ try {
     if (!this.updateState.manifest || compareVersions(this.updateState.latestVersion, APP_VERSION) <= 0) {
       return this.getState();
     }
+    if (this.usesMsixAppInstallerUpdate()) {
+      return this.deferMsixUpdateToAppInstaller();
+    }
     if (!this.hasActiveJobs()) {
       return this.applyUpdate();
     }
@@ -7054,6 +7152,9 @@ try {
     const manifest = this.updateState.manifest;
     if (!manifest || compareVersions(manifest.version, APP_VERSION) <= 0) {
       return this.getState();
+    }
+    if (this.usesMsixAppInstallerUpdate()) {
+      return this.deferMsixUpdateToAppInstaller();
     }
 
     try {
@@ -7117,6 +7218,9 @@ try {
   }
 
   async applyUpdateInternal() {
+    if (this.usesMsixAppInstallerUpdate()) {
+      return this.deferMsixUpdateToAppInstaller();
+    }
     if (this.hasActiveJobs()) {
       this.updateState = {
         ...this.updateState,
