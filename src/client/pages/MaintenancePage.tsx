@@ -21,6 +21,7 @@ export function MaintenancePage({
   busy,
   run,
   saveSettings,
+  saveSettingsImmediately,
   setSettingsDraft
 }: {
   state: AppState;
@@ -28,6 +29,7 @@ export function MaintenancePage({
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
+  saveSettingsImmediately: (settings: Partial<AppSettings>) => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
   const importInputRef = useRef<HTMLInputElement | null>(null);
@@ -40,6 +42,13 @@ export function MaintenancePage({
     .filter((codec) => codec.kind === 'hardware')
     .map((codec) => `${codec.label}：${codec.reason || '不可用'}`)
     .join('；');
+
+  function updateSetting(nextSettings: Partial<AppSettings>, persist = true) {
+    setSettingsDraft({ ...settingsDraft, ...nextSettings });
+    if (persist) {
+      void saveSettingsImmediately(nextSettings);
+    }
+  }
 
   function exportSettings() {
     if (
@@ -83,8 +92,8 @@ export function MaintenancePage({
       <PageHeader
         title="软件维护"
         subtitle={isLinux
-          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。'
-          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。'}
+          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。选项会立即保存，输入框在失去焦点后保存。'
+          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。选项会立即保存，输入框在失去焦点后保存。'}
         actions={
           <button
             className="wide-button primary"
@@ -150,9 +159,12 @@ export function MaintenancePage({
               <Toggle
                 label="自动更新（每 6 小时检查，任务结束后安装）"
                 checked={settingsDraft.autoUpdateEnabled}
-                onChange={(checked) => setSettingsDraft({ ...settingsDraft, autoUpdateEnabled: checked })}
+                onChange={(checked) => updateSetting({ autoUpdateEnabled: checked })}
               />
             </div>
+          ) : null}
+          {state.update.msixManaged ? (
+            <p className="field-help">MSIX 版本由 Windows App Installer 在后台或后续启动时更新，此处无需下载安装包。</p>
           ) : null}
           <div className="split-buttons">
             <button
@@ -164,19 +176,21 @@ export function MaintenancePage({
               <RefreshCw size={18} />
               检查更新
             </button>
-            <button
-              className="wide-button fill"
-              type="button"
-              disabled={
-                busy === 'update-apply' ||
-                ['checking', 'queued', 'downloading', 'ready', 'applying'].includes(state.update.status)
-              }
-              onClick={() => run('update-apply', recorder.applyUpdate)}
-            >
-              <Download size={18} />
-              {state.update.autoApplySupported ? '自动安装更新' : '下载更新包'}
-            </button>
-            {(state.update.status === 'available' || state.update.status === 'blocked') && hasActiveJobs ? (
+            {!state.update.msixManaged ? (
+              <button
+                className="wide-button fill"
+                type="button"
+                disabled={
+                  busy === 'update-apply' ||
+                  ['checking', 'queued', 'downloading', 'ready', 'applying'].includes(state.update.status)
+                }
+                onClick={() => run('update-apply', recorder.applyUpdate)}
+              >
+                <Download size={18} />
+                {state.update.autoApplySupported ? '自动安装更新' : '下载更新包'}
+              </button>
+            ) : null}
+            {!state.update.msixManaged && (state.update.status === 'available' || state.update.status === 'blocked') && hasActiveJobs ? (
               <button
                 className="wide-button fill active"
                 type="button"
@@ -222,8 +236,7 @@ export function MaintenancePage({
               <select
                 value={settingsDraft.serverHost}
                 onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
+                  updateSetting({
                     serverHost: event.target.value as AppSettings['serverHost']
                   })
                 }
@@ -240,9 +253,8 @@ export function MaintenancePage({
                 min={1}
                 max={65535}
                 value={settingsDraft.serverPort}
-                onChange={(event) =>
-                  setSettingsDraft({ ...settingsDraft, serverPort: Number(event.target.value) })
-                }
+                onChange={(event) => updateSetting({ serverPort: Number(event.target.value) }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ serverPort: Number(event.target.value) })}
               />
               <p className="field-help">端口只在保存并重启后台服务后生效。</p>
             </label>
@@ -252,7 +264,8 @@ export function MaintenancePage({
                 value={settingsDraft.accessUsername}
                 maxLength={64}
                 autoComplete="username"
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, accessUsername: event.target.value })}
+                onChange={(event) => updateSetting({ accessUsername: event.target.value }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ accessUsername: event.target.value })}
               />
               <p className="field-help">默认 admin；只用于 WebUI 远程管理登录。</p>
             </label>
@@ -264,7 +277,8 @@ export function MaintenancePage({
                 value={settingsDraft.accessPassword}
                 autoComplete="new-password"
                 placeholder={settingsDraft.accessAuthConfigured ? '已配置；留空表示不修改' : '至少 8 个字符'}
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, accessPassword: event.target.value })}
+                onChange={(event) => updateSetting({ accessPassword: event.target.value }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ accessPassword: event.target.value })}
               />
               <p className="field-help">密码只提交一次，服务端使用 scrypt 加盐哈希保存，不会回传明文。</p>
             </label>
@@ -274,10 +288,12 @@ export function MaintenancePage({
                 value={(settingsDraft.trustedProxies || []).join(', ')}
                 placeholder="127.0.0.1, 10.0.0.10/32"
                 onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
+                  updateSetting({
                     trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean)
-                  })
+                  }, false)
+                }
+                onBlur={(event) =>
+                  void saveSettingsImmediately({ trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean) })
                 }
               />
               <p className="field-help">仅这些直连地址的 Forwarded/X-Forwarded-* 会被信任；配置不会让代理请求免登录。</p>
@@ -286,7 +302,8 @@ export function MaintenancePage({
               <span>更新源</span>
               <input
                 value={settingsDraft.updateManifestUrl}
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, updateManifestUrl: event.target.value })}
+                onChange={(event) => updateSetting({ updateManifestUrl: event.target.value }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ updateManifestUrl: event.target.value })}
               />
             </label>
           </div>

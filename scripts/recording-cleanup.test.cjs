@@ -292,3 +292,52 @@ test('crash recovery removes only a zero-byte capture owned by an interrupted re
     await fsp.rm(outputDir, { recursive: true, force: true });
   }
 });
+
+test('source deletion setting is disabled whenever automatic burn is disabled', () => {
+  const service = new LiveRecordService();
+  const disabled = service.normalizeSettings({
+    ...service.settings,
+    autoBurnDanmaku: false,
+    deleteSourceAfterBurn: true
+  });
+  const enabled = service.normalizeSettings({
+    ...service.settings,
+    autoBurnDanmaku: true,
+    deleteSourceAfterBurn: true
+  });
+
+  assert.equal(disabled.deleteSourceAfterBurn, false);
+  assert.equal(enabled.deleteSourceAfterBurn, true);
+});
+
+test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-delete-source-after-burn-'));
+  const sourcePath = path.join(outputDir, 'session.clean.mp4');
+  const burnedPath = path.join(outputDir, 'session.danmaku.mp4');
+  const sourceDanmakuPath = path.join(outputDir, 'session.danmaku.jsonl');
+  const room = { id: 'delete-source', title: 'Delete source', anchor: 'test', currentRecording: { cleanPath: sourcePath } };
+  try {
+    await Promise.all([writeRecordingFile(sourcePath), writeRecordingFile(sourceDanmakuPath)]);
+    const service = createService(outputDir);
+    const sourceRecording = service.normalizeRecording({ cleanPath: sourcePath, danmakuPath: sourceDanmakuPath });
+    service.recordings = [sourceRecording];
+
+    await assert.rejects(
+      () => service.deleteBurnSourceAfterSuccess(room, sourceRecording, burnedPath),
+      /弹幕版成片不存在/
+    );
+    assert.equal(await fileExists(sourcePath), true);
+
+    await writeRecordingFile(burnedPath);
+    const result = await service.deleteBurnSourceAfterSuccess(room, sourceRecording, burnedPath);
+
+    assert.deepEqual(result, { deleted: true, missing: false });
+    assert.equal(await fileExists(sourcePath), false);
+    assert.equal(await fileExists(burnedPath), true);
+    assert.equal(await fileExists(sourceDanmakuPath), true);
+    assert.equal(service.recordings.length, 0);
+    assert.equal(room.currentRecording, undefined);
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});

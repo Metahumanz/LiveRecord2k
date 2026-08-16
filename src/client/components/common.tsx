@@ -22,8 +22,9 @@ export function UpdateNotice({
   }
 
   const activeJobs = Boolean(update.activeJobs) || stats.recording > 0 || stats.burning > 0;
+  const msixManaged = Boolean(update.msixManaged);
   const busyUpdating = ['checking', 'downloading', 'ready', 'applying'].includes(update.status);
-  const canInstall = update.status === 'available' || update.status === 'blocked';
+  const canInstall = !msixManaged && (update.status === 'available' || update.status === 'blocked');
   const showQueue = canInstall && activeJobs;
   const kind =
     update.status === 'error' || update.status === 'blocked'

@@ -111,6 +111,7 @@ export type AppSettings = {
   outputContainer: 'mp4' | 'mkv';
   segmentMinutes: number;
   autoBurnDanmaku: boolean;
+  deleteSourceAfterBurn: boolean;
   burnOverlayMode: 'danmaku' | 'danmaku-gift';
   burnDanmakuArea: DanmakuArea;
   burnDanmakuStylePreset: DanmakuStylePreset;
@@ -166,10 +167,11 @@ export type UpdateState = {
   queued?: boolean;
   activeJobs?: boolean;
   autoApplySupported?: boolean;
+  msixManaged?: boolean;
   manifest?: {
     version: string;
     tagName?: string;
-    packageType?: 'installer' | 'portable' | 'deb' | 'tarball';
+    packageType?: 'installer' | 'portable' | 'msix' | 'deb' | 'tarball';
     packageUrl: string;
     sha256?: string;
     installerArgs?: string[] | string;

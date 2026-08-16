@@ -12,6 +12,7 @@ export function SettingsPage({
   busy,
   run,
   saveSettings,
+  saveSettingsImmediately,
   chooseOutputDir,
   setSettingsDraft
 }: {
@@ -20,6 +21,7 @@ export function SettingsPage({
   busy: string | null;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
+  saveSettingsImmediately: (settings: Partial<AppSettings>) => Promise<void>;
   chooseOutputDir: () => Promise<void>;
   setSettingsDraft: (settings: AppSettings) => void;
 }) {
@@ -38,6 +40,13 @@ export function SettingsPage({
     .map((option) => `${option.label}：${option.reason || '不可用'}`)
     .join('；');
   const [diskSpace, setDiskSpace] = useState<DiskSpaceState | null>(state.outputDiskSpace || null);
+
+  function updateSetting(nextSettings: Partial<AppSettings>, persist = true) {
+    setSettingsDraft({ ...settingsDraft, ...nextSettings });
+    if (persist) {
+      void saveSettingsImmediately(nextSettings);
+    }
+  }
 
   useEffect(() => {
     const targetPath = settingsDraft.outputDir.trim();
@@ -78,8 +87,8 @@ export function SettingsPage({
       <PageHeader
         title="录制配置"
         subtitle={isLinux
-          ? '先完成登录和服务端录像目录；画质、弹幕视频和监听参数按需要再调整。'
-          : '先完成登录和输出目录；画质、弹幕视频和通知按需要再调整。'}
+          ? '先完成登录和服务端录像目录；画质、弹幕视频和监听参数按需要再调整。选项会立即保存，输入框在失去焦点后保存。'
+          : '先完成登录和输出目录；画质、弹幕视频和通知按需要再调整。选项会立即保存，输入框在失去焦点后保存。'}
         actions={
           <button
             className="wide-button primary"
@@ -128,7 +137,8 @@ export function SettingsPage({
               <textarea
                 rows={4}
                 value={settingsDraft.cookie}
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, cookie: event.target.value })}
+                onChange={(event) => updateSetting({ cookie: event.target.value }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ cookie: event.target.value })}
                 placeholder="扫码成功后自动写入"
               />
             </label>
@@ -140,7 +150,8 @@ export function SettingsPage({
             <div className="path-row">
               <input
                 value={settingsDraft.outputDir}
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, outputDir: event.target.value })}
+                onChange={(event) => updateSetting({ outputDir: event.target.value }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ outputDir: event.target.value })}
                 placeholder={isLinux ? '/var/lib/bili-record-2k/recordings' : '例如 C:\\Users\\你的用户名\\Videos\\哔哩录播2K'}
               />
               {canPickServerPath ? (
@@ -191,9 +202,7 @@ export function SettingsPage({
               <span>清晰度优先级</span>
               <select
                 value={settingsDraft.targetQn}
-                onChange={(event) =>
-                  setSettingsDraft({ ...settingsDraft, targetQn: Number(event.target.value) })
-                }
+                onChange={(event) => updateSetting({ targetQn: Number(event.target.value) })}
               >
                 {qnOptions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -208,12 +217,7 @@ export function SettingsPage({
               <span>最终输出容器</span>
               <select
                 value={settingsDraft.outputContainer}
-                onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
-                    outputContainer: event.target.value as AppSettings['outputContainer']
-                  })
-                }
+                onChange={(event) => updateSetting({ outputContainer: event.target.value as AppSettings['outputContainer'] })}
               >
                 {containerOptions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -231,9 +235,8 @@ export function SettingsPage({
                 min={1}
                 max={1440}
                 value={settingsDraft.segmentMinutes}
-                onChange={(event) =>
-                  setSettingsDraft({ ...settingsDraft, segmentMinutes: Number(event.target.value) })
-                }
+                onChange={(event) => updateSetting({ segmentMinutes: Number(event.target.value) }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ segmentMinutes: Number(event.target.value) })}
               />
               <p className="field-help">长时间录制会按这个时长分段，便于保存和导出。</p>
             </label>
@@ -243,15 +246,13 @@ export function SettingsPage({
             <Toggle
               label="H.265 优先"
               checked={settingsDraft.preferHevc}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, preferHevc: checked })}
+              onChange={(checked) => updateSetting({ preferHevc: checked })}
             />
             <p className="field-help">开启后会优先选择 H.265 源流，但实际编码仍以平台返回为准。</p>
             <Toggle
               label="直播间卡片默认显示预览图"
               checked={settingsDraft.roomImageMode === 'keyframe'}
-              onChange={(checked) =>
-                setSettingsDraft({ ...settingsDraft, roomImageMode: checked ? 'keyframe' : 'cover' })
-              }
+              onChange={(checked) => updateSetting({ roomImageMode: checked ? 'keyframe' : 'cover' })}
             />
           </div>
         </SettingPanel>
@@ -261,8 +262,22 @@ export function SettingsPage({
             <Toggle
               label="录制结束后自动生成弹幕视频"
               checked={settingsDraft.autoBurnDanmaku}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, autoBurnDanmaku: checked })}
+              onChange={(checked) =>
+                updateSetting({
+                  autoBurnDanmaku: checked,
+                  deleteSourceAfterBurn: checked ? settingsDraft.deleteSourceAfterBurn : false
+                })
+              }
             />
+            <Toggle
+              label="弹幕视频烧录完成后自动删除无弹幕源文件"
+              checked={settingsDraft.deleteSourceAfterBurn}
+              disabled={!settingsDraft.autoBurnDanmaku}
+              onChange={(checked) => updateSetting({ deleteSourceAfterBurn: checked })}
+            />
+            <p className="field-help">
+              仅自动烧录生效：有弹幕成片已验证、且续录分段清理完成后才删除无弹幕源视频；手动烧录、取消或失败都不会删除。
+            </p>
           </div>
 
           <div className="settings-grid">
@@ -271,10 +286,7 @@ export function SettingsPage({
               <select
                 value={settingsDraft.burnOverlayMode}
                 onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
-                    burnOverlayMode: event.target.value as AppSettings['burnOverlayMode']
-                  })
+                  updateSetting({ burnOverlayMode: event.target.value as AppSettings['burnOverlayMode'] })
                 }
               >
                 {overlayModeOptions.map((option) => (
@@ -291,10 +303,7 @@ export function SettingsPage({
               <select
                 value={settingsDraft.burnDanmakuArea}
                 onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
-                    burnDanmakuArea: event.target.value as AppSettings['burnDanmakuArea']
-                  })
+                  updateSetting({ burnDanmakuArea: event.target.value as AppSettings['burnDanmakuArea'] })
                 }
               >
                 {danmakuAreaOptions.map((option) => (
@@ -311,8 +320,7 @@ export function SettingsPage({
               <select
                 value={settingsDraft.burnDanmakuStylePreset}
                 onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
+                  updateSetting({
                     burnDanmakuStylePreset: event.target.value as AppSettings['burnDanmakuStylePreset'],
                     burnDanmakuStyleLayout: {}
                   })
@@ -324,14 +332,13 @@ export function SettingsPage({
                   </option>
                 ))}
               </select>
-              <p className="field-help">“当前默认”会保留原有 .danmaku.css；位置和大小可在剪辑导出页预览后设为默认。</p>
             </label>
 
             <label className="field">
               <span>弹幕视频编码</span>
               <select
                 value={settingsDraft.burnCodec}
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, burnCodec: event.target.value })}
+                onChange={(event) => updateSetting({ burnCodec: event.target.value })}
               >
                 {codecOptions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -352,9 +359,8 @@ export function SettingsPage({
                 min={16}
                 max={35}
                 value={settingsDraft.burnCrf}
-                onChange={(event) =>
-                  setSettingsDraft({ ...settingsDraft, burnCrf: Number(event.target.value) })
-                }
+                onChange={(event) => updateSetting({ burnCrf: Number(event.target.value) }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ burnCrf: Number(event.target.value) })}
               />
               <p className="field-help">数字越小画质越高、文件越大；常用范围是 18 到 28。</p>
             </label>
@@ -398,7 +404,7 @@ export function SettingsPage({
               <Toggle
                 label="启动时打开浏览器"
                 checked={settingsDraft.openBrowserOnStart}
-                onChange={(checked) => setSettingsDraft({ ...settingsDraft, openBrowserOnStart: checked })}
+                onChange={(checked) => updateSetting({ openBrowserOnStart: checked })}
               />
             ) : null}
             <label className="field">
@@ -408,21 +414,20 @@ export function SettingsPage({
                 min={1}
                 max={300}
                 value={settingsDraft.pollIntervalSec}
-                onChange={(event) =>
-                  setSettingsDraft({ ...settingsDraft, pollIntervalSec: Number(event.target.value) })
-                }
+                onChange={(event) => updateSetting({ pollIntervalSec: Number(event.target.value) }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ pollIntervalSec: Number(event.target.value) })}
               />
               <p className="field-help">HTTP 轮询是推送断线时的兜底；正常情况下会由直播弹幕连接即时触发开播。</p>
             </label>
             <Toggle
               label="总览页显示下一步提示"
               checked={!settingsDraft.hideOverviewNextStep}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, hideOverviewNextStep: !checked })}
+              onChange={(checked) => updateSetting({ hideOverviewNextStep: !checked })}
             />
             <Toggle
               label="启用通用 Webhook"
               checked={settingsDraft.webhookEnabled}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, webhookEnabled: checked })}
+              onChange={(checked) => updateSetting({ webhookEnabled: checked })}
             />
             <label className="field">
               <span>Webhook 接收地址</span>
@@ -431,7 +436,8 @@ export function SettingsPage({
                 inputMode="url"
                 placeholder="https://example.com/webhook"
                 value={settingsDraft.webhookUrl}
-                onChange={(event) => setSettingsDraft({ ...settingsDraft, webhookUrl: event.target.value })}
+                onChange={(event) => updateSetting({ webhookUrl: event.target.value }, false)}
+                onBlur={(event) => void saveSettingsImmediately({ webhookUrl: event.target.value })}
               />
               <p className="field-help">
                 公网地址必须使用 HTTPS；DNS 和每一跳地址都会经过 SSRF 检查，重定向默认拒绝。
@@ -440,7 +446,7 @@ export function SettingsPage({
             <Toggle
               label="允许 Webhook 访问本机/私有网络"
               checked={settingsDraft.webhookAllowPrivateNetwork}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, webhookAllowPrivateNetwork: checked })}
+              onChange={(checked) => updateSetting({ webhookAllowPrivateNetwork: checked })}
             />
             <label className="field">
               <span>Bearer Token（可选）</span>
@@ -455,8 +461,13 @@ export function SettingsPage({
                 }
                 value={settingsDraft.webhookBearerToken}
                 onChange={(event) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
+                  updateSetting({
+                    webhookBearerToken: event.target.value,
+                    webhookBearerTokenClear: false
+                  }, false)
+                }
+                onBlur={(event) =>
+                  void saveSettingsImmediately({
                     webhookBearerToken: event.target.value,
                     webhookBearerTokenClear: false
                   })
@@ -471,8 +482,7 @@ export function SettingsPage({
                 label="保存时清除已配置的 Bearer Token"
                 checked={settingsDraft.webhookBearerTokenClear}
                 onChange={(checked) =>
-                  setSettingsDraft({
-                    ...settingsDraft,
+                  updateSetting({
                     webhookBearerToken: '',
                     webhookBearerTokenClear: checked
                   })
@@ -486,32 +496,32 @@ export function SettingsPage({
             <Toggle
               label="开播通知"
               checked={settingsDraft.notifyLiveStarted}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, notifyLiveStarted: checked })}
+              onChange={(checked) => updateSetting({ notifyLiveStarted: checked })}
             />
             <Toggle
               label="下播通知"
               checked={settingsDraft.notifyLiveEnded}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, notifyLiveEnded: checked })}
+              onChange={(checked) => updateSetting({ notifyLiveEnded: checked })}
             />
             <Toggle
               label="开始录制通知"
               checked={settingsDraft.notifyRecordingStarted}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, notifyRecordingStarted: checked })}
+              onChange={(checked) => updateSetting({ notifyRecordingStarted: checked })}
             />
             <Toggle
               label="结束录制通知"
               checked={settingsDraft.notifyRecordingEnded}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, notifyRecordingEnded: checked })}
+              onChange={(checked) => updateSetting({ notifyRecordingEnded: checked })}
             />
             <Toggle
               label="开始生成弹幕视频通知"
               checked={settingsDraft.notifyBurnStarted}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, notifyBurnStarted: checked })}
+              onChange={(checked) => updateSetting({ notifyBurnStarted: checked })}
             />
             <Toggle
               label="弹幕视频完成通知"
               checked={settingsDraft.notifyBurnEnded}
-              onChange={(checked) => setSettingsDraft({ ...settingsDraft, notifyBurnEnded: checked })}
+              onChange={(checked) => updateSetting({ notifyBurnEnded: checked })}
             />
           </div>
           <div className="split-buttons">
