@@ -340,6 +340,7 @@
   display: grid;
   gap: 4px;
   min-width: 80px;
+  padding-bottom: 20px;
   cursor: grab;
   pointer-events: auto;
   touch-action: none;
@@ -349,6 +350,150 @@
 .preview-message-stack.is-adjusting,
 .preview-message-stack.is-adjusting * {
   cursor: grabbing !important;
+}
+
+.preview-side-stream {
+  display: block;
+  min-width: 100px;
+}
+
+.preview-side-stream-content {
+  display: grid;
+  gap: 5px;
+  cursor: grab;
+}
+
+.preview-side-chat-row {
+  --side-avatar: clamp(22px, 18%, 42px);
+  display: grid;
+  grid-template-columns: var(--side-avatar) minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: clamp(9px, 1vw, 15px);
+}
+
+.preview-side-avatar {
+  display: grid;
+  width: var(--side-avatar, clamp(22px, 18%, 42px));
+  aspect-ratio: 1;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.56);
+  border-radius: 50%;
+  color: #fff;
+  background: linear-gradient(135deg, #86d8dc, #4d9abe);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.27);
+  font-size: 0.88em;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.preview-side-chat-content {
+  display: grid;
+  justify-items: start;
+  gap: 2px;
+  min-width: 0;
+}
+
+.preview-side-chat-content small,
+.preview-side-chat-content strong,
+.preview-side-event strong,
+.preview-side-event small,
+.preview-side-event em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-side-chat-content small {
+  max-width: 78%;
+  padding: 1px 5px;
+  border-radius: 999px;
+  color: #e8ffff;
+  background: rgba(187, 235, 238, 0.56);
+  font-size: 0.69em;
+  font-weight: 900;
+  line-height: 1.15;
+}
+
+.preview-side-chat-content strong {
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 3px 12px 12px 12px;
+  color: #fff;
+  background: linear-gradient(135deg, rgba(101, 208, 217, 0.96), rgba(68, 166, 206, 0.94));
+  box-shadow: 0 3px 9px rgba(10, 39, 42, 0.22);
+  font-size: 1em;
+  font-weight: 900;
+  line-height: 1.24;
+}
+
+.preview-side-chat-row.tone-blue .preview-side-avatar {
+  background: linear-gradient(135deg, #a2a5ec, #5885c8);
+}
+
+.preview-side-chat-row.tone-blue .preview-side-chat-content strong {
+  background: linear-gradient(135deg, rgba(105, 181, 232, 0.96), rgba(77, 151, 210, 0.94));
+}
+
+.preview-side-chat-row.tone-mint .preview-side-avatar {
+  background: linear-gradient(135deg, #9bd5a9, #57a983);
+}
+
+.preview-side-event {
+  --side-avatar: clamp(22px, 18%, 42px);
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--side-avatar) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 11px;
+  color: #fff;
+  background: linear-gradient(135deg, rgba(233, 188, 113, 0.97), rgba(224, 153, 57, 0.96));
+  box-shadow: 0 4px 11px rgba(88, 53, 17, 0.25);
+  font-size: clamp(9px, 0.98vw, 15px);
+  line-height: 1.18;
+}
+
+.preview-side-event .preview-side-avatar {
+  width: var(--side-avatar);
+  font-size: 0.88em;
+}
+
+.preview-side-event > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.preview-side-event strong {
+  font-size: 0.92em;
+  font-weight: 900;
+}
+
+.preview-side-event small {
+  color: rgba(255, 255, 255, 0.96);
+  font-size: 0.82em;
+  font-weight: 800;
+}
+
+.preview-side-event em {
+  align-self: start;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #b56b25;
+  background: rgba(255, 255, 255, 0.96);
+  font-size: 0.78em;
+  font-style: normal;
+  font-weight: 900;
+}
+
+.preview-side-superchat {
+  background: linear-gradient(135deg, rgba(240, 207, 139, 0.97), rgba(226, 163, 64, 0.96));
 }
 
 .preview-card {
@@ -413,8 +558,8 @@
 
 .preview-card-resize {
   position: absolute;
-  right: -7px;
-  bottom: -7px;
+  right: 2px;
+  bottom: 2px;
   z-index: 4;
   width: 22px;
   height: 22px;
@@ -449,6 +594,14 @@
   color: #613a22;
 }
 
+.preset-h5-card .preview-side-stream-content {
+  gap: 6px;
+}
+
+.preset-h5-card .preview-side-chat-content strong {
+  border-radius: 3px 13px 13px 13px;
+}
+
 .preset-bubble .preview-card {
   border: 1px solid rgba(255, 226, 246, 0.24);
   border-radius: 19px;
@@ -477,6 +630,39 @@
   border-left-color: #e0a6d3;
 }
 
+.preset-bubble .preview-side-chat-content {
+  gap: 0;
+}
+
+.preset-bubble .preview-side-chat-content small {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.preset-bubble .preview-side-chat-content strong {
+  border: 1px solid rgba(255, 226, 246, 0.3);
+  border-radius: 999px;
+  color: #fff5fd;
+  background: rgba(48, 34, 47, 0.88);
+  box-shadow: 0 3px 9px rgba(28, 12, 24, 0.32);
+}
+
+.preset-bubble .preview-side-event {
+  border: 1px solid rgba(255, 226, 246, 0.28);
+  border-radius: 18px;
+  color: #fff5fd;
+  background: rgba(57, 39, 52, 0.9);
+}
+
+.preset-bubble .preview-side-event em {
+  color: #743d62;
+  background: rgba(255, 232, 247, 0.95);
+}
+
 .preset-minimal .preview-card {
   gap: 0;
   padding: 5px 8px;
@@ -498,6 +684,73 @@
 
 .preset-minimal .preview-gift {
   border-left-color: #d6cec7;
+}
+
+.preset-minimal .preview-side-stream-content {
+  gap: 3px;
+}
+
+.preset-minimal .preview-side-chat-row {
+  --side-avatar: 10px;
+  grid-template-columns: var(--side-avatar) minmax(0, 1fr);
+  gap: 5px;
+}
+
+.preset-minimal .preview-side-chat-content {
+  display: block;
+  min-width: 0;
+}
+
+.preset-minimal .preview-side-chat-content small {
+  display: inline;
+  max-width: none;
+  padding: 0;
+  border-radius: 0;
+  color: rgba(220, 232, 232, 0.9);
+  background: transparent;
+  font-size: 0.72em;
+}
+
+.preset-minimal .preview-side-chat-content small::after {
+  content: " · ";
+}
+
+.preset-minimal .preview-side-chat-content strong {
+  display: inline;
+  padding: 0;
+  border-radius: 0;
+  color: rgba(255, 255, 255, 0.94);
+  background: transparent;
+  box-shadow: none;
+  font-size: 0.9em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.76);
+}
+
+.preset-minimal .preview-side-avatar {
+  border: 0;
+  color: transparent;
+  background: rgba(232, 241, 240, 0.86);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32);
+}
+
+.preset-minimal .preview-side-event {
+  --side-avatar: 10px;
+  grid-template-columns: var(--side-avatar) minmax(0, 1fr) auto;
+  gap: 5px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  background: rgba(13, 20, 22, 0.76);
+  box-shadow: none;
+}
+
+.preset-minimal .preview-side-event small {
+  color: rgba(224, 232, 232, 0.9);
+}
+
+.preset-minimal .preview-side-event em {
+  padding: 2px 4px;
+  color: #263133;
+  background: rgba(237, 243, 242, 0.92);
 }
 
 .danmaku-preview-toolbar {

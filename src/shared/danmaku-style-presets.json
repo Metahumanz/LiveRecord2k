@@ -5,8 +5,8 @@
     "style": {}
   },
   "h5-card": {
-    "label": "互动卡片（H5 风）",
-    "shortLabel": "互动卡片",
+    "label": "侧边互动流",
+    "shortLabel": "互动流",
     "style": {
       "danmakuFontSize": 34,
       "danmakuOutline": 2,
@@ -24,8 +24,8 @@
     }
   },
   "bubble": {
-    "label": "聊天气泡",
-    "shortLabel": "聊天气泡",
+    "label": "侧边气泡流",
+    "shortLabel": "气泡流",
     "style": {
       "danmakuFontSize": 32,
       "danmakuOutline": 1,
@@ -43,8 +43,8 @@
     }
   },
   "minimal": {
-    "label": "极简字幕",
-    "shortLabel": "极简",
+    "label": "极简侧栏",
+    "shortLabel": "极简侧栏",
     "style": {
       "danmakuFontSize": 29,
       "danmakuOutline": 1,
