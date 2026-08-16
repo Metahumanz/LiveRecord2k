@@ -729,7 +729,6 @@ export function ExportPage({
             <div className="danmaku-style-editor-heading">
               <div>
                 <strong>弹幕烧录样式</strong>
-                <span>先在视频上预览，再导出；互动卡片可以直接拖动和缩放。</span>
               </div>
               <button
                 className="wide-button"
@@ -750,13 +749,9 @@ export function ExportPage({
                   onClick={() => setDraft({ ...draft, stylePreset: option.value, styleLayout: {} })}
                 >
                   <strong>{option.shortLabel}</strong>
-                  <span>{option.description}</span>
                 </button>
               ))}
             </div>
-            <p className="field-help">
-              “当前默认”保留已有 .danmaku.css；其余是本地可复现的预设，不依赖第三方 H5 页面或网络。
-            </p>
           </section>
 
           <div className="split-buttons export-actions">
