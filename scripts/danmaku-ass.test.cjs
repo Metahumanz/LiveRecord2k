@@ -70,7 +70,7 @@ test('style presets keep the existing CSS untouched by default and apply preview
   assert.match(styledAss, /\\pos\(90,/);
 });
 
-test('non-default presets visibly change ordinary rolling danmaku in the generated ASS', () => {
+test('non-default presets turn ordinary danmaku into a fixed side conversation stream', () => {
   const event = { type: 'danmaku', time: 1, user: '预览用户', text: '普通弹幕也要有样式', color: 0x70d6ff };
   const current = createAss([event], { stylePreset: 'current' });
   const h5Card = createAss([event], { stylePreset: 'h5-card' });
@@ -79,14 +79,38 @@ test('non-default presets visibly change ordinary rolling danmaku in the generat
 
   assert.match(current, /\\move\(1980,36,-/);
   assert.doesNotMatch(current, /预览用户 · 普通弹幕也要有样式/);
-  assert.match(h5Card, /\\p1\\move\(1968,/);
-  assert.match(h5Card, /预览用户 · 普通弹幕也要有样式/);
-  assert.match(h5Card, /\\1c&HC8E9FF&\\1a&H08&/);
-  assert.match(bubble, /\\p1\\move\(1968,/);
-  assert.match(bubble, /\\1c&H2F2230&\\1a&H1C&/);
-  assert.match(minimal, /\\1a&H20&\\bord0\\shad0/);
+  assert.match(h5Card, /\\clip\(28,0,478,1040\)/);
+  assert.match(h5Card, /\\move\(28,/);
+  assert.match(h5Card, /预览用户/);
+  assert.match(h5Card, /\\1c&HD7CF59&\\1a&H04&/);
+  assert.match(bubble, /\\clip\(54,0,474,1018\)/);
+  assert.match(bubble, /\\1c&H2F2230&\\1a&H12&/);
+  assert.match(minimal, /\\clip\(24,0,384,1052\)/);
+  assert.match(minimal, /预览用户\\b0 · 普通弹幕也要有样式/);
+  assert.doesNotMatch(minimal, /\\1c&H191710&\\1a&H30&/);
+  assert.doesNotMatch(h5Card, /\\move\(1968,/);
+  assert.doesNotMatch(bubble, /\\move\(1968,/);
+  assert.doesNotMatch(minimal, /\\move\(1968,/);
   assert.notEqual(h5Card, bubble);
   assert.notEqual(bubble, minimal);
+});
+
+test('side-stream presets stack chat and interaction events in one vertical timeline', () => {
+  const style = resolveDanmakuStyle({}, 'h5-card');
+  const events = [
+    { type: 'danmaku', time: 1, user: '观众A', text: '普通聊天' },
+    { type: 'gift', time: 2, user: '观众B', giftName: '足迹', count: 2, price: 0.1 },
+    { type: 'danmaku', time: 3, user: '观众C', text: '又一条聊天' }
+  ];
+  const timeline = createMessageTimeline(events, style, { includeDanmaku: true, sideStream: true });
+  const ass = createAss(events, { stylePreset: 'h5-card', overlayMode: 'danmaku-gift' });
+
+  assert.deepEqual(timeline.items.map((item) => item.type), ['danmaku', 'gift', 'danmaku']);
+  assert.ok(timeline.items.every((item) => item.segments.every((segment) => segment.x1 === segment.x2)));
+  assert.ok(timeline.items[0].changes.some((change) => change.reason === 'push'));
+  assert.match(ass, /观众A/);
+  assert.match(ass, /投喂 足迹 x2/);
+  assert.match(ass, /CNY0.2/);
 });
 
 test('superchat uses the DanmakuFactory information hierarchy and low-price palette', () => {

@@ -271,21 +271,11 @@ jobs:
           tag=${RELEASE_TAG//[[:space:]]/}
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           title="BiliRecord2K $tag"
-          notes=$(cat <<'EOF'
-          Windows：新用户使用 `bili-record-2k-setup.exe`；免安装使用 `bili-record-2k-webui.zip`。
-
-          Debian/Ubuntu x64 或 ARM64：下载架构匹配的 `.deb` 后运行 `sudo apt install ./bili-record-2k_版本_架构.deb`。
-
-          其他使用 systemd 的 x64/ARM64 Linux：下载架构匹配的 `_linux_架构.tar.gz`，解压后运行 `sudo ./install.sh`。
-
-          Linux 包会安装 systemd 主服务和独立的受控更新服务。官方自动更新必须通过 Ed25519 签名验证；自定义更新源不会交给 root 自动安装。
-
-          Linux 一键安装：`curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh`
-          EOF
-          )
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          node scripts/generate-release-notes.cjs "$tag" > "$notes_file"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release/* --clobber
-            gh release edit "$tag" --title "$title" --notes "$notes"
+            gh release edit "$tag" --title "$title" --notes-file "$notes_file"
           else
-            gh release create "$tag" release/* --verify-tag --title "$title" --notes "$notes"
+            gh release create "$tag" release/* --verify-tag --title "$title" --notes-file "$notes_file"
           fi

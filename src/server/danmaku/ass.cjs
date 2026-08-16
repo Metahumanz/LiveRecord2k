@@ -501,6 +501,10 @@ function prepareAssEvents(events, options = {}) {
 
 function getDanmakuEventDuration(event, options = {}) {
   if (event.type === 'danmaku') {
+    const configuredDuration = Number(options.danmakuDuration);
+    if (Number.isFinite(configuredDuration) && configuredDuration > 0) {
+      return clamp(configuredDuration, 0.01, MESSAGE_CARD.maxDuration);
+    }
     return 8;
   }
   if (['gift', 'superchat', 'guard'].includes(event.type)) {
@@ -539,7 +543,8 @@ function createAss(events, options = {}) {
     startTime: options.startTime,
     endTime: options.endTime,
     shiftTime: options.shiftTime,
-    messageDuration: style.messageDuration
+    messageDuration: style.messageDuration,
+    danmakuDuration: style.danmakuDuration
   });
   const lines = [
     '[Script Info]',
@@ -559,11 +564,13 @@ function createAss(events, options = {}) {
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text'
   ];
 
-  const danmakuLayout = getDanmakuLayoutMetrics(style, danmakuArea);
-  const danmakuRows = Array(danmakuLayout.lanes).fill(0);
+  const visualPreset = visualPresetFromStyle(style);
+  if (visualPreset === DEFAULT_DANMAKU_STYLE_PRESET) {
+    const danmakuLayout = getDanmakuLayoutMetrics(style, danmakuArea);
+    const danmakuRows = Array(danmakuLayout.lanes).fill(0);
 
-  for (const event of sorted) {
-    if (event.type === 'danmaku') {
+    for (const event of sorted) {
+      if (event.type !== 'danmaku') continue;
       const duration = style.danmakuDuration;
       const lane = danmakuLayout.avoidOverlap
         ? chooseLaneWithoutOverlap(danmakuRows, getDanmakuEventVideoTime(event), duration)
@@ -575,15 +582,20 @@ function createAss(events, options = {}) {
       for (const line of renderRollingDanmaku(event, style, lane.start, y, duration)) {
         lines.push(line);
       }
-      continue;
     }
-  }
 
-  if (overlayMode === 'danmaku-gift') {
-    // A busy multi-hour stream can produce far more lines than V8 accepts as
-    // one function-call argument list. Append them one by one instead of using
-    // `push(...messageLines)`, which otherwise throws RangeError here.
-    for (const line of renderMessageStack(sorted.filter((event) => event.type !== 'danmaku'), style)) {
+    if (overlayMode === 'danmaku-gift') {
+      // A busy multi-hour stream can produce far more lines than V8 accepts as
+      // one function-call argument list. Append them one by one instead of using
+      // `push(...messageLines)`, which otherwise throws RangeError here.
+      for (const line of renderMessageStack(sorted.filter((event) => event.type !== 'danmaku'), style)) {
+        lines.push(line);
+      }
+    }
+  } else {
+    // The alternate presets are a fixed side conversation stream. They are
+    // deliberately not variations of the legacy rolling danmaku renderer.
+    for (const line of renderMessageStack(sorted, style, { includeDanmaku: true, sideStream: true })) {
       lines.push(line);
     }
   }
@@ -592,100 +604,35 @@ function createAss(events, options = {}) {
 }
 
 function renderRollingDanmaku(event, style, start, y, duration) {
-  const visualPreset = visualPresetFromStyle(style);
-  const fontSize = Math.max(12, Number(style.danmakuFontSize) || DEFAULT_DANMAKU_STYLE.danmakuFontSize);
-  const playWidth = Math.max(1, Number(style.playWidth) || DEFAULT_DANMAKU_STYLE.playWidth);
-  const playHeight = Math.max(1, Number(style.playHeight) || DEFAULT_DANMAKU_STYLE.playHeight);
   const color = assColorFromRgb(event.color || 0xffffff);
-
-  // Preserve the established ASS output for the default preset exactly.
-  if (visualPreset === DEFAULT_DANMAKU_STYLE_PRESET) {
-    const width = estimateTextWidth(event.text, style.danmakuFontSize);
-    return [
-      dialogue(
-        1,
-        start,
-        start + duration,
-        'Danmaku',
-        `{\\1c${color}\\move(${style.playWidth + 60},${y},-${width},${y})}${assEscape(event.text)}`
-      )
-    ];
-  }
-
-  if (visualPreset === 'minimal') {
-    const width = estimateTextWidth(event.text, fontSize);
-    return [
-      dialogue(
-        1,
-        start,
-        start + duration,
-        'Danmaku',
-        `{\\1c${color}\\1a&H20&\\bord0\\shad0\\move(${playWidth + 44},${y},-${width},${y})}${assEscape(event.text)}`
-      )
-    ];
-  }
-
-  const palette = rollingDanmakuPalette(visualPreset);
-  const username = String(event.user || '').trim();
-  const rawText = username ? `${username} · ${String(event.text || '')}` : String(event.text || '');
-  const maxTextWidth = Math.max(fontSize * 3, Math.floor(playWidth * 0.68) - palette.paddingX * 2);
-  const text = truncateTextToWidth(rawText, maxTextWidth, fontSize);
-  const cardWidth = Math.max(fontSize * 3, estimateTextWidth(text, fontSize) + palette.paddingX * 2);
-  const cardHeight = fontSize + palette.paddingY * 2;
-  const cardY = clamp(y - Math.round((cardHeight - fontSize) / 2), 0, Math.max(0, playHeight - cardHeight));
-  const textY = cardY + palette.paddingY;
-  const cardStartX = playWidth + 48;
-  const cardEndX = -cardWidth - 48;
-  const movement = { x1: cardStartX, y1: cardY, x2: cardEndX, y2: cardY };
-
   return [
-    drawRoundedRect(1, start, start + duration, cardStartX, cardY, cardWidth, cardHeight, palette.radius, palette.background, {
-      move: movement
-    }),
     dialogue(
-      2,
+      1,
       start,
       start + duration,
-      'BoxText',
-      `{\\an7\\bord0\\shad0\\b${palette.bold ? 1 : 0}\\fs${assNumber(fontSize)}\\1c${palette.text}\\move(${assNumber(
-        cardStartX + palette.paddingX
-      )},${assNumber(textY)},${assNumber(cardEndX + palette.paddingX)},${assNumber(textY)})}${assEscape(text)}`
+      'Danmaku',
+      `{\\1c${color}\\move(${style.playWidth + 60},${y},-${estimateTextWidth(event.text, style.danmakuFontSize)},${y})}${assEscape(
+        event.text
+      )}`
     )
   ];
 }
 
-function rollingDanmakuPalette(visualPreset) {
-  if (visualPreset === 'h5-card') {
-    return {
-      background: assColorFromRgbWithAlpha(0xffe9c8, 0x08),
-      text: assColorFromRgb(0x422816),
-      paddingX: 18,
-      paddingY: 6,
-      radius: 14,
-      bold: true
-    };
-  }
-  return {
-    background: assColorFromRgbWithAlpha(0x30222f, 0x1c),
-    text: assColorFromRgb(0xfff5fd),
-    paddingX: 16,
-    paddingY: 6,
-    radius: 22,
-    bold: false
-  };
-}
-
-function createMessageItems(events, style) {
+function createMessageItems(events, style, options = {}) {
   const items = [];
   const liveGiftByKey = new Map();
+  const includeDanmaku = options.includeDanmaku === true;
   const sorted = [...events].sort((a, b) => getDanmakuEventVideoTime(a) - getDanmakuEventVideoTime(b));
 
   for (const sourceEvent of sorted) {
-    if (!['gift', 'superchat', 'guard'].includes(sourceEvent.type)) {
+    if (!['gift', 'superchat', 'guard'].includes(sourceEvent.type) && !(includeDanmaku && sourceEvent.type === 'danmaku')) {
       continue;
     }
     const time = getDanmakuEventVideoTime(sourceEvent);
-    const duration = getDanmakuEventDuration(sourceEvent, { messageDuration: style.messageDuration });
+    const duration =
+      sourceEvent.type === 'danmaku'
+        ? Math.max(2, Number(style.danmakuDuration) || DEFAULT_DANMAKU_STYLE.danmakuDuration)
+        : getDanmakuEventDuration(sourceEvent, { messageDuration: style.messageDuration });
     if (sourceEvent.type === 'gift') {
       const key = `${sourceEvent.uid || sourceEvent.user || ''}|${sourceEvent.giftName || ''}`;
       const previous = liveGiftByKey.get(key);
@@ -739,6 +686,15 @@ function createMessageItems(events, style) {
 }
 
 function getMessageItemHeight(event, style) {
+  if (event.type === 'danmaku') {
+    if (visualPresetFromStyle(style) === 'minimal') {
+      return getMinimalSideChatMetrics(style, event.text).height;
+    }
+    return getSideChatMetrics(style, event.text).height;
+  }
+  if (visualPresetFromStyle(style) === 'minimal') {
+    return getMinimalSideInteractionMetrics(style).height;
+  }
   if (event.type === 'superchat') {
     return getMessageCardMetrics(style, event.text).height;
   }
@@ -748,11 +704,11 @@ function getMessageItemHeight(event, style) {
   return getGuardCardMetrics(style).height;
 }
 
-function createMessageTimeline(events, styleValues = {}) {
+function createMessageTimeline(events, styleValues = {}, options = {}) {
   const style = Object.prototype.hasOwnProperty.call(styleValues, 'playWidth')
     ? { ...DEFAULT_DANMAKU_STYLE, ...styleValues }
     : normalizeDanmakuStyle(styleValues);
-  const items = createMessageItems(events, style);
+  const items = createMessageItems(events, style, options);
   const boundaries = new Map();
   const addBoundary = (time, kind, item) => {
     if (!boundaries.has(time)) {
@@ -803,7 +759,7 @@ function createMessageTimeline(events, styleValues = {}) {
 
   for (const item of items) {
     item.changes = changesById.get(item.id);
-    item.segments = buildMessageMotionSegments(item, item.changes, style);
+    item.segments = buildMessageMotionSegments(item, item.changes, style, options);
   }
   return { style, items };
 }
@@ -822,7 +778,7 @@ function layoutMessageItems(items, style) {
   return positions;
 }
 
-function buildMessageMotionSegments(item, changes, style) {
+function buildMessageMotionSegments(item, changes, style, options = {}) {
   if (!changes.length || item.end <= item.start) {
     return [];
   }
@@ -876,6 +832,7 @@ function buildMessageMotionSegments(item, changes, style) {
   const panelLeft = Number(style.panelLeft) || 0;
   const exitWidth = Math.max(1, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
   const xAt = (time) => {
+    if (options.sideStream === true) return panelLeft;
     if (time <= exitStart) return panelLeft;
     if (time >= item.end) return panelLeft - exitWidth;
     return panelLeft - (exitWidth * (time - exitStart)) / (item.end - exitStart);
@@ -884,7 +841,8 @@ function buildMessageMotionSegments(item, changes, style) {
     ...segment,
     x1: xAt(segment.start),
     x2: xAt(segment.end),
-    event: messageVersionAt(item, segment.start)
+    event: messageVersionAt(item, segment.start),
+    sideStream: options.sideStream === true
   }));
 }
 
@@ -919,8 +877,9 @@ function messageVersionAt(item, time) {
   return event;
 }
 
-function renderMessageStack(events, style) {
-  const timeline = createMessageTimeline(events, style);
+function renderMessageStack(events, style, options = {}) {
+  const timeline = createMessageTimeline(events, style, options);
+  const sideStream = options.sideStream === true;
   const clip = {
     x1: style.panelLeft,
     y1: 0,
@@ -931,6 +890,14 @@ function renderMessageStack(events, style) {
   for (const item of timeline.items) {
     for (const segment of item.segments) {
       if (segment.end - segment.start < 0.001) continue;
+      if (sideStream) {
+        if (item.type === 'danmaku') {
+          lines.push(...renderSideChatSegment(segment.event, style, segment, clip));
+        } else {
+          lines.push(...renderSideInteractionCardSegment(segment.event, style, segment, clip));
+        }
+        continue;
+      }
       if (item.type === 'superchat') {
         lines.push(...renderSuperChatCardSegment(segment.event, style, segment, clip));
       } else if (item.type === 'guard') {
@@ -968,6 +935,491 @@ function segmentShapeOptions(segment, clip, offsetX = 0, offsetY = 0, corners) {
         ? undefined
         : { x1, y1, x2, y2 }
   };
+}
+
+function getSideChatMetrics(style, text) {
+  const showMeta = visualPresetFromStyle(style) === 'h5-card';
+  const fontSize = Math.max(16, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.92));
+  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const avatarSize = Math.max(28, Math.round(fontSize * 1.42));
+  const avatarGap = Math.max(6, Math.round(fontSize * 0.28));
+  const contentWidth = Math.max(fontSize * 4, width - avatarSize - avatarGap);
+  const metaFontSize = Math.max(12, Math.floor(fontSize * 0.57));
+  const paddingX = Math.max(8, Math.round(fontSize * 0.38));
+  const paddingY = Math.max(5, Math.round(fontSize * 0.28));
+  const textWidth = Math.max(fontSize * 3, contentWidth - paddingX * 2);
+  const wrappedLines = wrapTextToWidthLines(text, textWidth, fontSize / 1.22, 2);
+  const lineHeight = Math.max(fontSize, Math.round(fontSize * 1.13));
+  const bubbleHeight = Math.max(lineHeight + paddingY * 2, wrappedLines.length * lineHeight + paddingY * 2);
+  const bubbleWidth = Math.min(
+    contentWidth,
+    Math.max(
+      fontSize * 3,
+      ...wrappedLines.map((line) => estimateTextWidth(line, fontSize / 1.22) + paddingX * 2)
+    )
+  );
+  const metaHeight = showMeta ? metaFontSize + Math.max(3, Math.round(fontSize * 0.12)) : 0;
+  const bubbleTop = showMeta ? metaHeight + Math.max(2, Math.round(fontSize * 0.12)) : 0;
+  return {
+    width,
+    height: Math.max(avatarSize, bubbleTop + bubbleHeight),
+    avatarSize,
+    avatarGap,
+    contentX: avatarSize + avatarGap,
+    contentWidth,
+    metaFontSize,
+    metaHeight,
+    bubbleTop,
+    bubbleHeight,
+    bubbleWidth,
+    paddingX,
+    paddingY,
+    fontSize,
+    textWidth,
+    wrappedText: (wrappedLines.length ? wrappedLines : ['']).join('\\N')
+  };
+}
+
+function getMinimalSideChatMetrics(style, text) {
+  const fontSize = Math.max(14, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.72));
+  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const dotSize = Math.max(8, Math.round(fontSize * 0.55));
+  const gap = Math.max(5, Math.round(fontSize * 0.34));
+  const textWidth = Math.max(fontSize * 4, width - dotSize - gap);
+  return {
+    width,
+    height: Math.max(dotSize, Math.round(fontSize * 1.25)),
+    dotSize,
+    gap,
+    fontSize,
+    textWidth,
+    text: truncateTextToWidth(text, textWidth, fontSize / 1.22)
+  };
+}
+
+function getSideInteractionCardMetrics(style) {
+  const fontSize = Math.max(16, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.86));
+  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const padding = Math.max(8, Math.round(fontSize * 0.42));
+  const avatarSize = Math.max(28, Math.round(fontSize * 1.36));
+  const avatarGap = Math.max(6, Math.round(fontSize * 0.3));
+  const metaFontSize = Math.max(12, Math.floor(fontSize * 0.66));
+  const contentX = padding + avatarSize + avatarGap;
+  const priceReserve = Math.max(fontSize * 3.8, 78);
+  return {
+    width,
+    height: avatarSize + padding * 2,
+    radius: getCardRadius(style, fontSize, width, avatarSize + padding * 2),
+    padding,
+    avatarSize,
+    avatarGap,
+    contentX,
+    fontSize,
+    metaFontSize,
+    textWidth: Math.max(fontSize * 3, width - contentX - padding),
+    textWidthWithPrice: Math.max(fontSize * 3, width - contentX - padding - priceReserve)
+  };
+}
+
+function getMinimalSideInteractionMetrics(style) {
+  const fontSize = Math.max(13, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.62));
+  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const dotSize = Math.max(8, Math.round(fontSize * 0.62));
+  const gap = Math.max(5, Math.round(fontSize * 0.35));
+  const paddingY = Math.max(4, Math.round(fontSize * 0.32));
+  const priceReserve = Math.max(60, fontSize * 4);
+  return {
+    width,
+    height: Math.max(dotSize, fontSize) + paddingY * 2,
+    radius: 3,
+    dotSize,
+    gap,
+    paddingY,
+    fontSize,
+    textWidth: Math.max(fontSize * 4, width - dotSize - gap),
+    textWidthWithPrice: Math.max(fontSize * 4, width - dotSize - gap - priceReserve)
+  };
+}
+
+function sideChatPalette(style) {
+  const visualPreset = visualPresetFromStyle(style);
+  if (visualPreset === 'h5-card') {
+    return {
+      avatarText: assColorFromRgb(0xffffff),
+      metaBackground: assColorFromRgbWithAlpha(0xd8f5f3, 0x08),
+      metaText: assColorFromRgb(0xf8ffff),
+      bubbleBackground: assColorFromRgbWithAlpha(0x59cfd7, 0x04),
+      bubbleText: assColorFromRgb(0xffffff),
+      radius: 16
+    };
+  }
+  if (visualPreset === 'bubble') {
+    return {
+      avatarText: assColorFromRgb(0xfff5fd),
+      metaBackground: assColorFromRgbWithAlpha(0x74486a, 0x1a),
+      metaText: assColorFromRgb(0xffe8f8),
+      bubbleBackground: assColorFromRgbWithAlpha(0x30222f, 0x12),
+      bubbleText: assColorFromRgb(0xfff5fd),
+      radius: 28
+    };
+  }
+  return {
+    avatarText: assColorFromRgb(0xffffff),
+    metaBackground: assColorFromRgbWithAlpha(0x0d1518, 0x32),
+    metaText: assColorFromRgb(0xdce8e8),
+    bubbleBackground: assColorFromRgbWithAlpha(0x101719, 0x30),
+    bubbleText: assColorFromRgb(0xffffff),
+    radius: 5
+  };
+}
+
+function sideInteractionPalette(style, event) {
+  const visualPreset = visualPresetFromStyle(style);
+  if (visualPreset === 'h5-card') {
+    return {
+      background: assColorFromRgbWithAlpha(event.type === 'superchat' ? 0xd88a3d : 0xe3a346, 0x03),
+      accent: assColorFromRgb(0xffe4b7),
+      username: assColorFromRgb(0xffffff),
+      detail: assColorFromRgb(0xffffff),
+      avatarText: assColorFromRgb(0xffffff),
+      priceBackground: assColorFromRgbWithAlpha(0xffffff, 0x00),
+      priceText: assColorFromRgb(0xb26a27)
+    };
+  }
+  if (visualPreset === 'bubble') {
+    return {
+      background: assColorFromRgbWithAlpha(event.type === 'superchat' ? 0x71435f : 0x4d3948, 0x12),
+      accent: assColorFromRgb(0xe4acd7),
+      username: assColorFromRgb(0xfff5fd),
+      detail: assColorFromRgb(0xf2dce9),
+      avatarText: assColorFromRgb(0xfff5fd),
+      priceBackground: assColorFromRgbWithAlpha(0xf8d8ed, 0x0a),
+      priceText: assColorFromRgb(0x6e345a)
+    };
+  }
+  return {
+    background: assColorFromRgbWithAlpha(0x0d1416, 0x25),
+    accent: assColorFromRgb(0xc6d1d0),
+    username: assColorFromRgb(0xffffff),
+    detail: assColorFromRgb(0xd7e0df),
+    avatarText: assColorFromRgb(0xffffff),
+    priceBackground: assColorFromRgbWithAlpha(0xe9efed, 0x10),
+    priceText: assColorFromRgb(0x263032)
+  };
+}
+
+function sideAvatarColor(event) {
+  const palette = [0x65cbd4, 0x7c9ce8, 0xe49a6c, 0xa986dc, 0x72b99a, 0xd681aa];
+  const key = `${event.uid || ''}:${event.user || '观众'}`;
+  let hash = 0;
+  for (const character of Array.from(key)) {
+    hash = (hash * 31 + (character.codePointAt(0) || 0)) >>> 0;
+  }
+  return assColorFromRgbWithAlpha(palette[hash % palette.length], 0x03);
+}
+
+function sideUserInitial(event) {
+  return Array.from(String(event.user || '观众').trim())[0] || '观';
+}
+
+function sideInteractionText(event) {
+  const count = Math.max(1, Number(event.count) || 1);
+  if (event.type === 'gift') {
+    return `投喂 ${event.giftName || '礼物'} x${count}`;
+  }
+  if (event.type === 'guard') {
+    return `开通 ${event.giftName || guardName(event.guardLevel)}${count > 1 ? ` x${count}` : ''}`;
+  }
+  return event.text ? `醒目留言 ${event.text}` : '发送醒目留言';
+}
+
+function sideInteractionPrice(event) {
+  const value = event.type === 'superchat' ? Number(event.price) || 0 : resolveGiftTotalPrice(event);
+  return value > 0 ? `CNY${formatSuperChatPrice(value)}` : '';
+}
+
+function renderSideChatSegment(event, style, segment, clip) {
+  if (visualPresetFromStyle(style) === 'minimal') {
+    return renderMinimalSideChatSegment(event, style, segment, clip);
+  }
+  const metrics = getSideChatMetrics(style, event.text);
+  const palette = sideChatPalette(style);
+  const username = truncateTextToWidth(event.user || '观众', metrics.contentWidth * 0.72, metrics.metaFontSize);
+  const nameWidth = Math.min(
+    metrics.contentWidth * 0.78,
+    Math.max(metrics.metaFontSize * 2.3, estimateTextWidth(username, metrics.metaFontSize) + metrics.metaFontSize)
+  );
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  const avatarY = Math.max(0, (metrics.height - metrics.avatarSize) / 2);
+  const bubbleX = metrics.contentX;
+  const bubbleY = metrics.bubbleTop;
+  return [
+    drawRoundedRect(
+      5,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1 + avatarY,
+      metrics.avatarSize,
+      metrics.avatarSize,
+      metrics.avatarSize / 2,
+      sideAvatarColor(event),
+      segmentShapeOptions(segment, clip, 0, avatarY)
+    ),
+    dialogue(
+      6,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.avatarSize / 2, avatarY + metrics.avatarSize / 2)}\\an5\\fs${assNumber(
+        metrics.avatarSize * 0.44
+      )}\\1c${palette.avatarText}\\b1}${assEscape(sideUserInitial(event))}`
+    ),
+    ...(metrics.metaHeight > 0
+      ? [
+          drawRoundedRect(
+            5,
+            segment.start,
+            segment.end,
+            segment.x1 + bubbleX,
+            segment.y1,
+            nameWidth,
+            metrics.metaHeight,
+            metrics.metaHeight / 2,
+            palette.metaBackground,
+            segmentShapeOptions(segment, clip, bubbleX, 0)
+          ),
+          dialogue(
+            6,
+            segment.start,
+            segment.end,
+            'BoxText',
+            `{${textTag}${segmentPositionTag(segment, bubbleX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2))}\\fs${assNumber(
+              metrics.metaFontSize
+            )}\\1c${palette.metaText}\\b1}${assEscape(username)}`
+          )
+        ]
+      : []),
+    drawRoundedRect(
+      5,
+      segment.start,
+      segment.end,
+      segment.x1 + bubbleX,
+      segment.y1 + bubbleY,
+      metrics.bubbleWidth,
+      metrics.bubbleHeight,
+      palette.radius,
+      palette.bubbleBackground,
+      segmentShapeOptions(segment, clip, bubbleX, bubbleY)
+    ),
+    dialogue(
+      6,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, bubbleX + metrics.paddingX, bubbleY + metrics.paddingY)}\\fs${assNumber(
+        metrics.fontSize
+      )}\\1c${palette.bubbleText}\\b1}${assEscape(metrics.wrappedText)}`
+    )
+  ];
+}
+
+function renderMinimalSideChatSegment(event, style, segment, clip) {
+  const metrics = getMinimalSideChatMetrics(style, event.text);
+  const username = truncateTextToWidth(event.user || '观众', metrics.textWidth * 0.35, metrics.fontSize);
+  const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+  return [
+    drawRoundedRect(
+      5,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1 + dotY,
+      metrics.dotSize,
+      metrics.dotSize,
+      metrics.dotSize / 2,
+      sideAvatarColor(event),
+      segmentShapeOptions(segment, clip, 0, dotY)
+    ),
+    dialogue(
+      6,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap, 0)}\\fs${assNumber(metrics.fontSize)}\\1c&H00DCE8E8&\\b1}${assEscape(
+        username
+      )}\\b0 · ${assEscape(detail)}`
+    )
+  ];
+}
+
+function renderSideInteractionCardSegment(event, style, segment, clip) {
+  if (visualPresetFromStyle(style) === 'minimal') {
+    return renderMinimalSideInteractionCardSegment(event, style, segment, clip);
+  }
+  const metrics = getSideInteractionCardMetrics(style);
+  const palette = sideInteractionPalette(style, event);
+  const price = sideInteractionPrice(event);
+  const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
+  const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
+  const detail = truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  const avatarY = metrics.padding;
+  const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
+  const priceWidth = price ? Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2) : 0;
+  const priceX = metrics.width - metrics.padding - priceWidth;
+  return [
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1,
+      metrics.width,
+      metrics.height,
+      metrics.radius,
+      palette.background,
+      segmentShapeOptions(segment, clip)
+    ),
+    drawRoundedRect(
+      7,
+      segment.start,
+      segment.end,
+      segment.x1 + metrics.padding,
+      segment.y1 + avatarY,
+      metrics.avatarSize,
+      metrics.avatarSize,
+      metrics.avatarSize / 2,
+      sideAvatarColor(event),
+      segmentShapeOptions(segment, clip, metrics.padding, avatarY)
+    ),
+    dialogue(
+      8,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.padding + metrics.avatarSize / 2, avatarY + metrics.avatarSize / 2)}\\an5\\fs${assNumber(
+        metrics.avatarSize * 0.44
+      )}\\1c${palette.avatarText}\\b1}${assEscape(sideUserInitial(event))}`
+    ),
+    dialogue(
+      8,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.contentX, textY)}\\fs${assNumber(metrics.fontSize)}\\1c${palette.username}\\b1}${assEscape(
+        username
+      )}`
+    ),
+    dialogue(
+      8,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.contentX, textY + metrics.fontSize)}\\fs${assNumber(
+        metrics.metaFontSize
+      )}\\1c${palette.detail}\\b0}${assEscape(detail)}`
+    ),
+    ...(price
+      ? [
+          drawRoundedRect(
+            8,
+            segment.start,
+            segment.end,
+            segment.x1 + priceX,
+            segment.y1 + metrics.padding,
+            priceWidth,
+            metrics.metaFontSize + metrics.padding,
+            (metrics.metaFontSize + metrics.padding) / 2,
+            palette.priceBackground,
+            segmentShapeOptions(segment, clip, priceX, metrics.padding)
+          ),
+          dialogue(
+            9,
+            segment.start,
+            segment.end,
+            'BoxText',
+            `{${textTag}${segmentPositionTag(segment, priceX + metrics.metaFontSize * 0.6, metrics.padding + metrics.padding / 2)}\\fs${assNumber(
+              metrics.metaFontSize
+            )}\\1c${palette.priceText}\\b1}${assEscape(price)}`
+          )
+        ]
+      : [])
+  ];
+}
+
+function renderMinimalSideInteractionCardSegment(event, style, segment, clip) {
+  const metrics = getMinimalSideInteractionMetrics(style);
+  const price = sideInteractionPrice(event);
+  const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
+  const username = truncateTextToWidth(event.user || '观众', textWidth * 0.35, metrics.fontSize);
+  const detail = truncateTextToWidth(sideInteractionText(event), textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+  const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
+  const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+  const priceWidth = price ? Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize) : 0;
+  const priceX = metrics.width - priceWidth;
+  return [
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      segment.x1,
+      segment.y1,
+      metrics.width,
+      metrics.height,
+      metrics.radius,
+      assColorFromRgbWithAlpha(0x0d1416, 0x25),
+      segmentShapeOptions(segment, clip)
+    ),
+    drawRoundedRect(
+      7,
+      segment.start,
+      segment.end,
+      segment.x1 + metrics.gap,
+      segment.y1 + dotY,
+      metrics.dotSize,
+      metrics.dotSize,
+      metrics.dotSize / 2,
+      sideAvatarColor(event),
+      segmentShapeOptions(segment, clip, metrics.gap, dotY)
+    ),
+    dialogue(
+      8,
+      segment.start,
+      segment.end,
+      'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap * 2, metrics.paddingY)}\\fs${assNumber(
+        metrics.fontSize
+      )}\\1c&H00FFFFFF&\\b1}${assEscape(username)}\\b0 · ${assEscape(detail)}`
+    ),
+    ...(price
+      ? [
+          drawRoundedRect(
+            8,
+            segment.start,
+            segment.end,
+            segment.x1 + priceX,
+            segment.y1 + metrics.paddingY,
+            priceWidth,
+            metrics.fontSize,
+            metrics.fontSize / 2,
+            assColorFromRgbWithAlpha(0xe9efed, 0x10),
+            segmentShapeOptions(segment, clip, priceX, metrics.paddingY)
+          ),
+          dialogue(
+            9,
+            segment.start,
+            segment.end,
+            'BoxText',
+            `{${textTag}${segmentPositionTag(segment, priceX + metrics.fontSize / 2, metrics.paddingY)}\\fs${assNumber(
+              metrics.fontSize * 0.82
+            )}\\1c&H00323026&\\b1}${assEscape(price)}`
+          )
+        ]
+      : [])
+  ];
 }
 
 function renderSuperChatCardSegment(event, style, segment, clip) {
