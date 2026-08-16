@@ -1,5 +1,8 @@
 Unicode true
-RequestExecutionLevel admin
+; The installer only writes to the current user's profile and HKCU.  Keeping it
+; at user level prevents an unnecessary UAC prompt and makes in-place updates
+; work for standard users.
+RequestExecutionLevel user
 
 !ifndef APP_VERSION
   !define APP_VERSION "0.0.0"
@@ -68,6 +71,7 @@ Var UpdateMessage
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 Function .onInit
+  SetShellVarContext current
   Call ParseUpdateArgs
   StrCpy $UpdateStatusValue "applying"
   StrCpy $UpdateMessage "Installer started."
@@ -195,6 +199,10 @@ Function un.IsTrayRunning
   StrCpy $0 "1"
 done:
   Push $0
+FunctionEnd
+
+Function un.onInit
+  SetShellVarContext current
 FunctionEnd
 
 Function un.StopRunningApp

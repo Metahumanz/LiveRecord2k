@@ -102,6 +102,23 @@ jobs:
           BUILD_NO_OPEN: '1'
         run: npm run build
 
+      - name: Validate MSIX package layout
+        env:
+          BUILD_NO_OPEN: '1'
+        run: npm run build:msix -- --skip-webui-build --allow-unsigned --skip-appinstaller --output-dir build\msix-smoke
+
+      - name: Build signed MSIX and App Installer feed
+        if: ${{ vars.MSIX_FEED_BASE_URL != '' && vars.MSIX_PUBLISHER != '' }}
+        env:
+          BUILD_NO_OPEN: '1'
+          MSIX_FEED_BASE_URL: ${{ vars.MSIX_FEED_BASE_URL }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
+          MSIX_SIGNING_CERT_PFX_B64: ${{ secrets.MSIX_SIGNING_CERT_PFX_B64 }}
+          MSIX_SIGNING_CERT_PASSWORD: ${{ secrets.MSIX_SIGNING_CERT_PASSWORD }}
+          MSIX_TIMESTAMP_URL: ${{ vars.MSIX_TIMESTAMP_URL }}
+        run: npm run build:msix -- --skip-webui-build
+
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
         with:
@@ -109,6 +126,18 @@ jobs:
           path: |
             release/bili-record-2k-setup.exe
             release/bili-record-2k-webui.zip
+            release/*.msix
+            release/*.appinstaller
+          if-no-files-found: error
+
+      - name: Upload MSIX feed payload
+        if: ${{ vars.MSIX_FEED_BASE_URL != '' && vars.MSIX_PUBLISHER != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: msix-feed
+          path: |
+            release/*.msix
+            release/*.appinstaller
           if-no-files-found: error
 
   build-linux:

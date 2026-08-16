@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "node src/server/index.cjs --dev",
     "build": "node scripts/build-webui.cjs",
+    "build:msix": "node scripts/build-msix.cjs",
     "build:linux": "node scripts/build-linux.cjs",
     "test": "node --test scripts/*.test.cjs"
   },

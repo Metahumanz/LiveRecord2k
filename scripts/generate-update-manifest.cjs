@@ -25,6 +25,12 @@ async function main() {
   const specs = [
     { pattern: /^bili-record-2k-setup\.exe$/, kind: 'installer', platform: 'win32', arch: 'x64' },
     { pattern: /^bili-record-2k-webui\.zip$/, kind: 'portable', platform: 'win32', arch: 'x64' },
+    {
+      pattern: new RegExp(`^bili-record-2k-${escapeRegex(version)}-x64\\.msix$`),
+      kind: 'msix',
+      platform: 'win32',
+      arch: 'x64'
+    },
     { pattern: new RegExp(`^bili-record-2k_${escapeRegex(version)}_(amd64|arm64)\\.deb$`), kind: 'deb', platform: 'linux' },
     {
       pattern: new RegExp(`^bili-record-2k_${escapeRegex(version)}_linux_(x64|arm64)\\.tar\\.gz$`),

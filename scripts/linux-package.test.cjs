@@ -58,6 +58,14 @@ const files = [
     arch: 'x64',
     url: 'https://example.test/bili-record-2k_1.2.3_linux_x64.tar.gz',
     sha256: '4'.repeat(64)
+  },
+  {
+    name: 'bili-record-2k-1.2.3-x64.msix',
+    kind: 'msix',
+    platform: 'win32',
+    arch: 'x64',
+    url: 'https://example.test/bili-record-2k-1.2.3-x64.msix',
+    sha256: '5'.repeat(64)
   }
 ];
 
@@ -192,6 +200,17 @@ test('legacy Windows setup installs select the EXE while portable folders keep t
     });
     assert.equal(portableManifest.packageType, 'portable');
     assert.equal(portableManifest.packageUrl, files[1].url);
+
+    await fsp.writeFile(path.join(tempDir, 'install-type.json'), JSON.stringify({ packageType: 'msix' }));
+    assert.equal(getAppPackageType({ platform: 'win32', appRoot: tempDir, configuredType: '' }), 'msix');
+    const msixManifest = normalizeUpdateManifest(payload, {
+      platform: 'win32',
+      arch: 'x64',
+      appRoot: tempDir,
+      configuredType: ''
+    });
+    assert.equal(msixManifest.packageType, 'msix');
+    assert.equal(msixManifest.packageUrl, files[4].url);
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
