@@ -793,6 +793,22 @@ test('reachable missing directories can still be created through the bounded pat
   }
 });
 
+test('Windows system-drive directories do not depend on a PowerShell probe startup', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows-specific local-drive behavior');
+    return;
+  }
+  const service = new LiveRecordService();
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-path-local-'));
+  const targetDir = path.join(tempDir, 'new-recording-directory');
+  try {
+    await service.ensureDirectoryReady(targetDir, { label: '本地测试目录', timeoutMs: 250 });
+    assert.equal((await fsp.stat(targetDir)).isDirectory(), true);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('recording scans retain the library when the configured drive is disconnected', async () => {
   const service = new LiveRecordService();
   service.settings.outputDir = 'J:\\recordings';

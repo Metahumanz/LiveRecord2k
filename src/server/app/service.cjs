@@ -280,6 +280,14 @@ const BURN_CODEC_CANDIDATES = [
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 
+function isWindowsSystemDrivePath(targetPath) {
+  if (process.platform !== 'win32') return false;
+  const systemDrive = String(process.env.SystemDrive || '').trim();
+  if (!/^[a-z]:$/i.test(systemDrive)) return false;
+  const targetRoot = path.parse(path.resolve(String(targetPath || ''))).root;
+  return targetRoot.toLowerCase() === `${systemDrive}\\`.toLowerCase();
+}
+
 function isPublicServerHost(value) {
   const host = String(value || '').trim().toLowerCase();
   return host === '0.0.0.0' || host === '::';
@@ -1641,7 +1649,10 @@ class LiveRecordService {
     }
     const resolved = path.resolve(rawPath);
     const timeoutMs = Math.max(250, Number(options.timeoutMs || PATH_PROBE_TIMEOUT_MS));
-    if (process.platform !== 'win32') {
+    // The system drive is never a disconnected mapped volume. Use Node's
+    // filesystem API there so a slow PowerShell process launch cannot turn a
+    // normal local directory into a false "drive disconnected" result.
+    if (process.platform !== 'win32' || isWindowsSystemDrivePath(resolved)) {
       try {
         const stat = await withTimeout(fsp.stat(resolved), timeoutMs, '路径检测超时');
         return { kind: stat.isDirectory() ? 'directory' : 'file', path: resolved, existingPath: resolved };
