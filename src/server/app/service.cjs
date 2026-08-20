@@ -7242,7 +7242,7 @@ try {
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
     let videoInfo = options.videoInfo || recording.videoInfo;
-    if (!hasUsableVideoCanvas(videoInfo) && recording.cleanPath) {
+    if (recording.cleanPath) {
       const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath).catch(() => null);
       if (hasUsableVideoCanvas(mediaInfo?.videoInfo)) {
         videoInfo = mediaInfo.videoInfo;

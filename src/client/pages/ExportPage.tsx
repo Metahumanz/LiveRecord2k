@@ -120,6 +120,14 @@ export function ExportPage({
   const exportQueue = state.exportQueue || [];
   const hasExportBacklog = state.exportProgress?.status === 'running' || exportQueue.length > 0;
   const previewVideoInfo = decodedVideoSize || selectedRecording?.videoInfo || null;
+  const previewWidth = Math.round(Number(previewVideoInfo?.width || 0));
+  const previewHeight = Math.round(Number(previewVideoInfo?.height || 0));
+  const hasPreviewCanvas =
+    Number.isFinite(previewWidth) && Number.isFinite(previewHeight) && previewWidth >= 160 && previewHeight >= 160;
+  const previewFrameStyle: React.CSSProperties | undefined = hasPreviewCanvas
+    ? { aspectRatio: `${previewWidth} / ${previewHeight}` }
+    : undefined;
+  const previewIsPortrait = hasPreviewCanvas && previewHeight > previewWidth;
 
   useEffect(() => {
     setMediaDuration(0);
@@ -463,7 +471,7 @@ export function ExportPage({
             </div>
           </div>
 
-          <div className="clip-preview">
+          <div className={`clip-preview${previewIsPortrait ? ' is-portrait' : ''}`} style={previewFrameStyle}>
             {mediaSource ? (
               <>
                 <video
