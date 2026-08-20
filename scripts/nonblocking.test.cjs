@@ -259,13 +259,29 @@ test('ASS generation runs successfully in the isolated worker process', async ()
       process.execPath,
       [path.join(projectRoot, 'src/server/index.cjs'), '--ass-worker'],
       {
-        input: JSON.stringify({ danmakuPath, cssPath, assPath, overlayMode: 'danmaku', danmakuArea: 'half' }),
+        input: JSON.stringify({
+          danmakuPath,
+          cssPath,
+          assPath,
+          overlayMode: 'danmaku',
+          danmakuArea: 'half',
+          videoInfo: { width: 540, height: 960 }
+        }),
         timeoutMs: 10000
       }
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), { ok: true, eventCount: 1 });
-    assert.match(await fsp.readFile(assPath, 'utf8'), /worker-test/);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      eventCount: 1,
+      playWidth: 540,
+      playHeight: 960,
+      portrait: true
+    });
+    const ass = await fsp.readFile(assPath, 'utf8');
+    assert.match(ass, /PlayResX: 540/);
+    assert.match(ass, /PlayResY: 960/);
+    assert.match(ass, /worker-test/);
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
@@ -293,7 +309,9 @@ test(
         }
       );
       assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(JSON.parse(result.stdout), { ok: true, eventCount: 1 });
+      const response = JSON.parse(result.stdout);
+      assert.equal(response.ok, true);
+      assert.equal(response.eventCount, 1);
       assert.match(await fsp.readFile(assPath, 'utf8'), /sea-worker-test/);
     } finally {
       await fsp.rm(tempDir, { recursive: true, force: true });

@@ -399,10 +399,12 @@ function parseCssVariables(css) {
 }
 
 function normalizeDanmakuStyle(values = {}) {
+  const visualPreset = normalizeDanmakuStylePreset(styleValue(values, 'visual-preset') || values.visualPreset);
   const pickNumber = (key, fallback, min, max, options = {}) => {
     const raw = styleValue(values, key);
     const numeric = Number(raw ?? fallback);
     if (
+      visualPreset === DEFAULT_DANMAKU_STYLE_PRESET &&
       options.upgradeLegacyDefault !== undefined &&
       raw !== undefined &&
       Number.isFinite(numeric) &&
@@ -416,8 +418,8 @@ function normalizeDanmakuStyle(values = {}) {
     .replace(/["']/g, '')
     .trim();
   return {
-    playWidth: pickNumber('play-width', DEFAULT_DANMAKU_STYLE.playWidth, 640, 7680),
-    playHeight: pickNumber('play-height', DEFAULT_DANMAKU_STYLE.playHeight, 360, 4320),
+    playWidth: pickNumber('play-width', DEFAULT_DANMAKU_STYLE.playWidth, 160, 16384),
+    playHeight: pickNumber('play-height', DEFAULT_DANMAKU_STYLE.playHeight, 160, 16384),
     fontFamily: fontFamily || DEFAULT_DANMAKU_STYLE.fontFamily,
     danmakuFontSize: pickNumber('danmaku-font-size', DEFAULT_DANMAKU_STYLE.danmakuFontSize, 12, 96),
     danmakuOutline: pickNumber('danmaku-outline', DEFAULT_DANMAKU_STYLE.danmakuOutline, 0, 8),
@@ -461,7 +463,70 @@ function normalizeDanmakuStyle(values = {}) {
       upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.giftFontSize
     }),
     giftScrollDuration: pickNumber('gift-scroll-duration', DEFAULT_DANMAKU_STYLE.giftScrollDuration, 2, 20),
-    visualPreset: normalizeDanmakuStylePreset(styleValue(values, 'visual-preset') || values.visualPreset)
+    visualPreset
+  };
+}
+
+function normalizeDanmakuCanvas(videoInfo) {
+  const width = Math.round(Number(videoInfo?.width || 0));
+  const height = Math.round(Number(videoInfo?.height || 0));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 160 || height < 160 || width > 16384 || height > 16384) {
+    return null;
+  }
+  return { width, height };
+}
+
+function scaleDanmakuMetric(value, scale) {
+  return Math.round(Math.max(0, Number(value) || 0) * scale * 100) / 100;
+}
+
+// Layout values are stored against the established 1920x1080-style canvas.
+// Rebase them by pixel area, then anchor bottom controls from the bottom edge.
+// This preserves the existing landscape look at 2K/4K while keeping portrait
+// overlays legible and inside the real video frame instead of stretching a
+// landscape ASS canvas across it.
+function adaptDanmakuStyleToVideo(styleValue = {}, videoInfo) {
+  const style = normalizeDanmakuStyle(styleValue);
+  const canvas = normalizeDanmakuCanvas(videoInfo);
+  if (!canvas) {
+    return style;
+  }
+  const baseWidth = Math.max(1, Number(style.playWidth) || DEFAULT_DANMAKU_STYLE.playWidth);
+  const baseHeight = Math.max(1, Number(style.playHeight) || DEFAULT_DANMAKU_STYLE.playHeight);
+  const scale = Math.sqrt((canvas.width * canvas.height) / (baseWidth * baseHeight));
+  const panelLeft = clamp(scaleDanmakuMetric(style.panelLeft, scale), 0, canvas.width);
+  const rightMargin = Math.max(8, scaleDanmakuMetric(12, scale));
+  const maximumPanelWidth = Math.max(1, canvas.width - panelLeft - rightMargin);
+  const minimumPanelWidth = Math.min(220, maximumPanelWidth);
+  const superChatWidth = clamp(
+    Math.max(minimumPanelWidth, scaleDanmakuMetric(style.superChatWidth, scale)),
+    1,
+    maximumPanelWidth
+  );
+  const anchorFromBottom = (value) =>
+    clamp(canvas.height - Math.max(0, baseHeight - (Number(value) || 0)) * scale, 0, canvas.height);
+  const giftWidth = clamp(scaleDanmakuMetric(style.giftWidth, scale), 1, maximumPanelWidth);
+
+  return {
+    ...style,
+    playWidth: canvas.width,
+    playHeight: canvas.height,
+    danmakuFontSize: scaleDanmakuMetric(style.danmakuFontSize, scale),
+    danmakuOutline: scaleDanmakuMetric(style.danmakuOutline, scale),
+    danmakuTop: scaleDanmakuMetric(style.danmakuTop, scale),
+    danmakuLineHeight: Math.max(1, scaleDanmakuMetric(style.danmakuLineHeight, scale)),
+    boxFontSize: scaleDanmakuMetric(style.boxFontSize, scale),
+    panelLeft,
+    superChatBottom: anchorFromBottom(style.superChatBottom),
+    superChatWidth,
+    superChatGap: scaleDanmakuMetric(style.superChatGap, scale),
+    giftBottom: anchorFromBottom(style.giftBottom),
+    giftWidth,
+    giftHeight: Math.max(1, scaleDanmakuMetric(style.giftHeight, scale)),
+    giftAreaHeight: Math.max(1, scaleDanmakuMetric(style.giftAreaHeight, scale)),
+    giftGap: scaleDanmakuMetric(style.giftGap, scale),
+    giftRadius: scaleDanmakuMetric(style.giftRadius, scale),
+    giftFontSize: scaleDanmakuMetric(style.giftFontSize, scale)
   };
 }
 
@@ -535,10 +600,11 @@ function resolveGiftTotalPrice(event) {
 function createAss(events, options = {}) {
   const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
   const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea);
-  const style =
+  const baseStyle =
     Object.prototype.hasOwnProperty.call(options, 'stylePreset') || Object.prototype.hasOwnProperty.call(options, 'styleLayout')
       ? resolveDanmakuStyle(options.style, options.stylePreset, options.styleLayout)
       : normalizeDanmakuStyle(options.style);
+  const style = adaptDanmakuStyleToVideo(baseStyle, options.videoInfo);
   const sorted = prepareAssEvents(events, {
     overlayMode,
     startTime: options.startTime,
@@ -2216,6 +2282,7 @@ module.exports = {
   createDefaultDanmakuCss,
   parseCssVariables,
   normalizeDanmakuStyle,
+  adaptDanmakuStyleToVideo,
   normalizeDanmakuStylePreset,
   getDanmakuStylePreset,
   normalizeDanmakuStyleLayout,

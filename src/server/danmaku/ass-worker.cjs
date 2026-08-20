@@ -4,6 +4,7 @@ const {
   readDanmakuEvents,
   readDanmakuStyle,
   resolveDanmakuStyle,
+  adaptDanmakuStyleToVideo,
   createAss
 } = require('./ass.cjs');
 
@@ -32,7 +33,10 @@ async function runAssWorker() {
     throw new Error('字幕任务缺少输入或输出路径。');
   }
   const [events, baseStyle] = await Promise.all([readDanmakuEvents(danmakuPath), readDanmakuStyle(cssPath)]);
-  const style = resolveDanmakuStyle(baseStyle, request.stylePreset, request.styleLayout);
+  const style = adaptDanmakuStyleToVideo(
+    resolveDanmakuStyle(baseStyle, request.stylePreset, request.styleLayout),
+    request.videoInfo
+  );
   const ass = createAss(events, {
     overlayMode: request.overlayMode,
     danmakuArea: request.danmakuArea,
@@ -42,7 +46,15 @@ async function runAssWorker() {
     shiftTime: request.shiftTime
   });
   await fsp.writeFile(assPath, ass, 'utf8');
-  process.stdout.write(JSON.stringify({ ok: true, eventCount: events.length }));
+  process.stdout.write(
+    JSON.stringify({
+      ok: true,
+      eventCount: events.length,
+      playWidth: style.playWidth,
+      playHeight: style.playHeight,
+      portrait: style.playHeight > style.playWidth
+    })
+  );
 }
 
 module.exports = { runAssWorker };

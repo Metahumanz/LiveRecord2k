@@ -10,6 +10,7 @@ const {
   normalizeDanmakuStyle,
   normalizeDanmakuStyleLayout,
   resolveDanmakuStyle,
+  adaptDanmakuStyleToVideo,
   superChatPalette,
   guardCardPalette,
   giftCardPalette,
@@ -69,6 +70,35 @@ test('style presets keep the existing CSS untouched by default and apply preview
   assert.equal(legacyAss, currentAss);
   assert.match(styledAss, /\\clip\(90,0,590,1000\)/);
   assert.match(styledAss, /\\pos\(90,/);
+});
+
+test('portrait source videos use their real ASS canvas and keep overlays inside it', () => {
+  const h5Style = resolveDanmakuStyle({}, 'h5-card');
+  const portrait = adaptDanmakuStyleToVideo(h5Style, { width: 1080, height: 1920 });
+  assert.equal(portrait.playWidth, 1080);
+  assert.equal(portrait.playHeight, 1920);
+  assert.equal(portrait.panelLeft, 28);
+  assert.equal(portrait.superChatWidth, 450);
+  assert.equal(portrait.superChatBottom, 1880);
+
+  const smallPortrait = adaptDanmakuStyleToVideo(h5Style, { width: 720, height: 1280 });
+  assert.equal(smallPortrait.playWidth, 720);
+  assert.equal(smallPortrait.playHeight, 1280);
+  assert.ok(Math.abs(smallPortrait.panelLeft - 18.67) < 0.01);
+  assert.ok(Math.abs(smallPortrait.superChatWidth - 300) < 0.01);
+  assert.ok(Math.abs(smallPortrait.superChatBottom - 1253.33) < 0.01);
+
+  const sideAss = createAss([{ type: 'danmaku', time: 1, user: '竖屏用户', text: '侧栏需要贴在竖屏内' }], {
+    stylePreset: 'h5-card',
+    videoInfo: { width: 1080, height: 1920 }
+  });
+  const rollingAss = createAss([{ type: 'danmaku', time: 1, text: '竖屏滚动弹幕' }], {
+    videoInfo: { width: 1080, height: 1920 }
+  });
+  assert.match(sideAss, /PlayResX: 1080/);
+  assert.match(sideAss, /PlayResY: 1920/);
+  assert.match(sideAss, /\\clip\(28,0,478,1880\)/);
+  assert.match(rollingAss, /\\move\(1140,36,-/);
 });
 
 test('non-default presets turn ordinary danmaku into a fixed side conversation stream', () => {
