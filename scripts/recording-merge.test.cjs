@@ -416,6 +416,67 @@ test('burn filter waits for the first decodable keyframe and still produces vali
   }
 });
 
+test('portrait burn keeps the source canvas and renders its adaptive ASS overlay', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-portrait-burn-'));
+  const inputPath = path.join(tempDir, 'portrait-input.mp4');
+  const assPath = path.join(tempDir, 'portrait-overlay.ass');
+  const outputPath = path.join(tempDir, 'portrait-output.mp4');
+  try {
+    const generated = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=540x960:rate=30:duration=0.8',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=660:sample_rate=48000:duration=0.8',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        inputPath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(generated.status, 0, generated.stderr);
+    const ass = createAss([{ type: 'danmaku', time: 0.1, user: '观众', text: '竖屏烧录' }], {
+      stylePreset: 'h5-card',
+      videoInfo: { width: 540, height: 960 }
+    });
+    assert.match(ass, /PlayResX: 540/);
+    assert.match(ass, /PlayResY: 960/);
+    await fsp.writeFile(assPath, ass, 'utf8');
+    const burned = await runCapturedProcess(
+      ffmpegPath,
+      createBurnArgs({
+        cleanPath: inputPath,
+        assPath,
+        burnedPath: outputPath,
+        codec: 'libx264',
+        crf: 24,
+        container: 'mp4',
+        fps: 30
+      }),
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(burned.status, 0, burned.stderr);
+    const info = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.equal(info.videoInfo.width, 540);
+    assert.equal(info.videoInfo.height, 960);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('different-resolution segments are retained in a highest-resolution merged file', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-resolution-merge-'));
   const firstPath = path.join(tempDir, 'first.mp4');

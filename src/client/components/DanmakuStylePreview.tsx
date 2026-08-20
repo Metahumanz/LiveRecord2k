@@ -19,6 +19,12 @@ const DEFAULT_LAYOUT = {
 };
 
 type EffectiveLayout = typeof DEFAULT_LAYOUT;
+type PreviewCanvas = {
+  width: number;
+  height: number;
+  scale: number;
+  portrait: boolean;
+};
 type Interaction = {
   kind: 'move' | 'resize';
   pointerId: number;
@@ -36,9 +42,23 @@ function numberValue(value: unknown, fallback: number) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
-function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLayout): EffectiveLayout {
-  const style = danmakuStylePresets[preset]?.style || {};
+function buildPreviewCanvas(videoInfo?: { width?: number; height?: number } | null): PreviewCanvas {
+  const width = Math.round(Number(videoInfo?.width || 0));
+  const height = Math.round(Number(videoInfo?.height || 0));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 160 || height < 160) {
+    return { width: PLAY_WIDTH, height: PLAY_HEIGHT, scale: 1, portrait: false };
+  }
   return {
+    width,
+    height,
+    scale: Math.sqrt((width * height) / (PLAY_WIDTH * PLAY_HEIGHT)),
+    portrait: height > width
+  };
+}
+
+function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLayout, canvas: PreviewCanvas): EffectiveLayout {
+  const style = danmakuStylePresets[preset]?.style || {};
+  const base = {
     panelLeft: clampNumber(numberValue(layout.panelLeft ?? style.panelLeft, DEFAULT_LAYOUT.panelLeft), 0, 2000),
     superChatBottom: clampNumber(
       numberValue(layout.superChatBottom ?? style.superChatBottom, DEFAULT_LAYOUT.superChatBottom),
@@ -67,6 +87,19 @@ function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLa
       2,
       20
     )
+  };
+  const metric = (value: number) => value * canvas.scale;
+  const panelLeft = clampNumber(metric(base.panelLeft), 0, canvas.width);
+  const maximumPanelWidth = Math.max(1, canvas.width - panelLeft - Math.max(8, metric(12)));
+  return {
+    panelLeft,
+    superChatBottom: clampNumber(canvas.height - Math.max(0, PLAY_HEIGHT - base.superChatBottom) * canvas.scale, 0, canvas.height),
+    superChatWidth: clampNumber(Math.max(Math.min(220, maximumPanelWidth), metric(base.superChatWidth)), 1, maximumPanelWidth),
+    boxFontSize: metric(base.boxFontSize),
+    danmakuTop: metric(base.danmakuTop),
+    danmakuFontSize: metric(base.danmakuFontSize),
+    danmakuLineHeight: Math.max(1, metric(base.danmakuLineHeight)),
+    danmakuDuration: base.danmakuDuration
   };
 }
 
@@ -123,11 +156,13 @@ export function DanmakuStylePreview({
   preset,
   layout,
   overlayMode,
+  videoInfo,
   onLayoutChange
 }: {
   preset: DanmakuStylePreset;
   layout: DanmakuStyleLayout;
   overlayMode: AppSettings['burnOverlayMode'];
+  videoInfo?: { width?: number; height?: number } | null;
   onLayoutChange: (nextLayout: DanmakuStyleLayout) => void;
 }) {
   const previewRef = useRef<HTMLDivElement | null>(null);
@@ -138,7 +173,11 @@ export function DanmakuStylePreview({
   const [canvasScale, setCanvasScale] = useState(1);
   const [stackHeight, setStackHeight] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const effective = useMemo(() => buildEffectiveLayout(preset, layout), [layout, preset]);
+  const previewCanvas = useMemo(() => buildPreviewCanvas(videoInfo), [videoInfo?.height, videoInfo?.width]);
+  const effective = useMemo(
+    () => buildEffectiveLayout(preset, layout, previewCanvas),
+    [layout, preset, previewCanvas]
+  );
   const fontScale = effective.boxFontSize / DEFAULT_LAYOUT.boxFontSize;
   const showCards = overlayMode === 'danmaku-gift';
   const sideStream = preset !== 'current';
@@ -149,7 +188,7 @@ export function DanmakuStylePreview({
   const stackTop = clampNumber(
     effective.superChatBottom - measuredStackHeight,
     0,
-    Math.max(0, PLAY_HEIGHT - measuredStackHeight)
+    Math.max(0, previewCanvas.height - measuredStackHeight)
   );
   const canAdjust = sideStream || showCards;
 
@@ -158,7 +197,7 @@ export function DanmakuStylePreview({
     if (!element) return;
     const updateScale = () => {
       const rect = element.getBoundingClientRect();
-      const nextScale = Math.max(0.01, Math.min(rect.width / PLAY_WIDTH, rect.height / PLAY_HEIGHT));
+      const nextScale = Math.max(0.01, Math.min(rect.width / previewCanvas.width, rect.height / previewCanvas.height));
       setCanvasScale((current) => (Math.abs(current - nextScale) > 0.0001 ? nextScale : current));
     };
     updateScale();
@@ -166,7 +205,7 @@ export function DanmakuStylePreview({
     const observer = new ResizeObserver(updateScale);
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+  }, [previewCanvas.height, previewCanvas.width]);
 
   useEffect(() => {
     const element = stackRef.current;
@@ -198,9 +237,29 @@ export function DanmakuStylePreview({
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0 || rect.height <= 0) return null;
     return {
-      x: clampNumber(((clientX - rect.left) / rect.width) * PLAY_WIDTH, 0, PLAY_WIDTH),
-      y: clampNumber(((clientY - rect.top) / rect.height) * PLAY_HEIGHT, 0, PLAY_HEIGHT)
+      x: clampNumber(((clientX - rect.left) / rect.width) * previewCanvas.width, 0, previewCanvas.width),
+      y: clampNumber(((clientY - rect.top) / rect.height) * previewCanvas.height, 0, previewCanvas.height)
     };
+  }
+
+  function updateLayoutFromCanvas(next: Partial<Pick<EffectiveLayout, 'panelLeft' | 'superChatBottom' | 'superChatWidth' | 'boxFontSize'>>) {
+    const scale = Math.max(0.01, previewCanvas.scale);
+    const updated = { ...layout };
+    if (next.panelLeft !== undefined) {
+      updated.panelLeft = Math.round(clampNumber(next.panelLeft / scale, 0, 2000));
+    }
+    if (next.superChatBottom !== undefined) {
+      updated.superChatBottom = Math.round(
+        clampNumber(PLAY_HEIGHT - (previewCanvas.height - next.superChatBottom) / scale, 0, 4000)
+      );
+    }
+    if (next.superChatWidth !== undefined) {
+      updated.superChatWidth = Math.round(clampNumber(next.superChatWidth / scale, 220, 1200));
+    }
+    if (next.boxFontSize !== undefined) {
+      updated.boxFontSize = Math.round(clampNumber(next.boxFontSize / scale, 12, 80));
+    }
+    onLayoutChange(updated);
   }
 
   function beginInteraction(event: ReactPointerEvent<HTMLElement>, kind: Interaction['kind']) {
@@ -236,19 +295,22 @@ export function DanmakuStylePreview({
     const dx = point.x - startPoint.x;
     const dy = point.y - startPoint.y;
     if (activeInteraction.kind === 'move') {
-      const panelLeft = clampNumber(activeInteraction.startLeft + dx, 0, PLAY_WIDTH - activeInteraction.startWidth);
-      const top = clampNumber(activeInteraction.startTop + dy, 0, Math.max(0, PLAY_HEIGHT - activeInteraction.cardHeight));
-      onLayoutChange({
-        ...layout,
+      const panelLeft = clampNumber(activeInteraction.startLeft + dx, 0, previewCanvas.width - activeInteraction.startWidth);
+      const top = clampNumber(
+        activeInteraction.startTop + dy,
+        0,
+        Math.max(0, previewCanvas.height - activeInteraction.cardHeight)
+      );
+      updateLayoutFromCanvas({
         panelLeft: Math.round(panelLeft),
         superChatBottom: Math.round(top + activeInteraction.cardHeight)
       });
       return;
     }
-    const width = clampNumber(activeInteraction.startWidth + dx, 220, 1200);
+    const maximumWidth = Math.max(1, previewCanvas.width - effective.panelLeft - Math.max(8, previewCanvas.scale * 12));
+    const width = clampNumber(activeInteraction.startWidth + dx, Math.min(220, maximumWidth), maximumWidth);
     const boxFontSize = clampNumber(activeInteraction.startFontSize * (width / activeInteraction.startWidth), 12, 80);
-    onLayoutChange({
-      ...layout,
+    updateLayoutFromCanvas({
       superChatWidth: Math.round(width),
       boxFontSize: Math.round(boxFontSize)
     });
@@ -285,13 +347,18 @@ export function DanmakuStylePreview({
     '--preview-font-size': `${effective.boxFontSize}px`,
     '--preview-avatar-size': `${Math.max(28, Math.round(effective.boxFontSize * 1.42))}px`
   } as CSSProperties;
+  const canvasStyle = {
+    transform: `translate(-50%, -50%) scale(${canvasScale})`,
+    '--preview-stage-width': `${previewCanvas.width}px`,
+    '--preview-stage-height': `${previewCanvas.height}px`
+  } as CSSProperties;
 
   return (
     <div className={`danmaku-style-preview preset-${preset}`} ref={previewRef}>
       <div
         className="danmaku-style-preview-canvas"
         ref={canvasRef}
-        style={{ transform: `translate(-50%, -50%) scale(${canvasScale})` }}
+        style={canvasStyle}
       >
         {!sideStream ? (
           <>
@@ -389,7 +456,7 @@ export function DanmakuStylePreview({
       <div className="danmaku-preview-toolbar">
         <span>
           {sideStream ? '侧栏' : '卡片'} x{Math.round(effective.panelLeft)} · y{Math.round(effective.superChatBottom)} · 宽
-          {Math.round(effective.superChatWidth)}
+          {Math.round(effective.superChatWidth)} · {previewCanvas.portrait ? '竖屏' : '横屏'} {previewCanvas.width}×{previewCanvas.height}
         </span>
         <button type="button" onClick={() => void toggleFullscreen()} title="全屏查看画面和弹幕">
           <Maximize2 size={14} />

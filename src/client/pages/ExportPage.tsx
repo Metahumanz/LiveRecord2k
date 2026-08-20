@@ -59,6 +59,7 @@ export function ExportPage({
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
+  const [decodedVideoSize, setDecodedVideoSize] = useState<{ width: number; height: number } | null>(null);
   const [previewError, setPreviewError] = useState('');
   const [previewNeedsProxy, setPreviewNeedsProxy] = useState(false);
   const [previewDeclined, setPreviewDeclined] = useState(false);
@@ -118,10 +119,12 @@ export function ExportPage({
   const playheadLeft = canUseTimeline ? clampNumber((playheadTime / timelineDuration) * 100, 0, 100) : 0;
   const exportQueue = state.exportQueue || [];
   const hasExportBacklog = state.exportProgress?.status === 'running' || exportQueue.length > 0;
+  const previewVideoInfo = decodedVideoSize || selectedRecording?.videoInfo || null;
 
   useEffect(() => {
     setMediaDuration(0);
     setPlaybackTime(0);
+    setDecodedVideoSize(null);
     setPreviewError('');
     setPreviewNeedsProxy(false);
     setPreviewDeclined(false);
@@ -472,6 +475,9 @@ export function ExportPage({
                     setPreviewError('');
                     setPreviewNeedsProxy(false);
                     const duration = event.currentTarget.duration;
+                    if (event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0) {
+                      setDecodedVideoSize({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight });
+                    }
                     if (!activeProxy && event.currentTarget.videoWidth <= 0 && Number.isFinite(duration) && duration > 0) {
                       setPreviewError('浏览器只解码到音频，无法显示这个视频编码的画面。');
                       setPreviewNeedsProxy(true);
@@ -511,6 +517,7 @@ export function ExportPage({
                   preset={draft.stylePreset}
                   layout={draft.styleLayout}
                   overlayMode={draft.overlayMode}
+                  videoInfo={previewVideoInfo}
                   onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
                 />
                 {activePreviewProgress ? (

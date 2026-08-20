@@ -811,9 +811,8 @@
   white-space: nowrap;
 }
 
-/* The overlay is rendered on a fixed 1920x1080 stage, then uniformly scaled.
- * This keeps preview geometry, drag coordinates, and ASS geometry identical
- * at every panel size and in the fullscreen preview. */
+/* The overlay stage follows the actual source video canvas, then scales
+ * uniformly with the contained video in both the panel and fullscreen modes. */
 .clip-preview video {
   object-fit: contain;
 }
@@ -840,15 +839,15 @@
   position: absolute;
   top: 50%;
   left: 50%;
-  width: 1920px;
-  height: 1080px;
+  width: var(--preview-stage-width, 1920px);
+  height: var(--preview-stage-height, 1080px);
   transform-origin: center;
   pointer-events: none;
 }
 
 .preview-rolling-danmaku {
   left: 0;
-  max-width: 1344px;
+  max-width: 70%;
   line-height: 1.25;
   animation-name: preview-danmaku-scroll-stage;
 }
@@ -859,7 +858,7 @@
 
 @keyframes preview-danmaku-scroll-stage {
   from {
-    transform: translateX(1920px);
+    transform: translateX(var(--preview-stage-width, 1920px));
   }
 
   to {

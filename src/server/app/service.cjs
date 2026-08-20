@@ -7102,7 +7102,7 @@ try {
           overlayMode
         )}，${danmakuDisplayAreaLabel(danmakuArea)}，样式 ${stylePreset}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
           codecInfo.label
-        }）`
+        }${assets.playWidth > 0 && assets.playHeight > 0 ? `，${assets.playWidth}x${assets.playHeight}${assets.portrait ? ' 竖屏适配' : ''}` : ''}）`
       );
       if (this.settings.notifyBurnStarted) {
         this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`, 'burn.started', {
@@ -7241,6 +7241,14 @@ try {
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
+    let videoInfo = options.videoInfo || recording.videoInfo;
+    if (!hasUsableVideoCanvas(videoInfo) && recording.cleanPath) {
+      const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath).catch(() => null);
+      if (hasUsableVideoCanvas(mediaInfo?.videoInfo)) {
+        videoInfo = mediaInfo.videoInfo;
+        recording.videoInfo = mediaInfo.videoInfo;
+      }
+    }
     const cssPath = options.cssPath || recording.cssPath || deriveSiblingPath(recording.cleanPath, 'danmaku', 'css');
     await ensureDanmakuCss(cssPath);
     const assPath =
@@ -7255,6 +7263,9 @@ try {
       danmakuArea,
       stylePreset,
       styleLayout,
+      videoInfo: hasUsableVideoCanvas(videoInfo)
+        ? { width: Math.round(Number(videoInfo.width)), height: Math.round(Number(videoInfo.height)) }
+        : undefined,
       startTime: options.startTime,
       endTime: options.endTime,
       shiftTime: options.shiftTime
@@ -7267,7 +7278,16 @@ try {
     await atomicReplaceFile(temporaryAssPath, assPath);
     recording.cssPath = cssPath;
     recording.assPath = assPath;
-    return { cssPath, assPath, eventCount: result.eventCount, stylePreset, styleLayout };
+    return {
+      cssPath,
+      assPath,
+      eventCount: result.eventCount,
+      stylePreset,
+      styleLayout,
+      playWidth: Number(result.playWidth || 0),
+      playHeight: Number(result.playHeight || 0),
+      portrait: result.portrait === true
+    };
   }
 
   async prepareSubtitleExport(options = {}) {
@@ -8639,6 +8659,12 @@ async function isExistingFile(filePath) {
     .stat(filePath)
     .then((stat) => stat.isFile())
     .catch(() => false);
+}
+
+function hasUsableVideoCanvas(videoInfo) {
+  const width = Math.round(Number(videoInfo?.width || 0));
+  const height = Math.round(Number(videoInfo?.height || 0));
+  return Number.isFinite(width) && Number.isFinite(height) && width >= 160 && height >= 160 && width <= 16384 && height <= 16384;
 }
 
 async function runAssWorkerJob(payload) {
