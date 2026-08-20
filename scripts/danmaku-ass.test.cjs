@@ -6,6 +6,7 @@ const {
   createMessageTimeline,
   createDefaultDanmakuCss,
   getDanmakuEventDuration,
+  getRollingDanmakuDuration,
   normalizeDanmakuStyle,
   normalizeDanmakuStyleLayout,
   resolveDanmakuStyle,
@@ -111,6 +112,33 @@ test('side-stream presets stack chat and interaction events in one vertical time
   assert.match(ass, /观众A/);
   assert.match(ass, /投喂 足迹 x2/);
   assert.match(ass, /CNY0.2/);
+});
+
+test('side-stream entries remain queued until later entries push them out of view', () => {
+  const style = resolveDanmakuStyle({}, 'h5-card');
+  const timeline = createMessageTimeline(
+    [
+      { type: 'danmaku', time: 1, user: '观众A', text: '第一条互动' },
+      { type: 'danmaku', time: 3, user: '观众B', text: '第二条互动' }
+    ],
+    style,
+    { includeDanmaku: true, sideStream: true }
+  );
+  const [first] = timeline.items;
+
+  assert.ok(first.end > 60, 'side entry must not use the old short timeout');
+  assert.ok(first.changes.some((change) => change.reason === 'push'));
+  assert.equal(first.changes.some((change) => change.reason === 'reflow'), false);
+});
+
+test('normal rolling danmaku keeps the chosen base speed with a small deterministic spread', () => {
+  const style = normalizeDanmakuStyle({ 'danmaku-duration': 8 });
+  const durations = Array.from({ length: 8 }, (_, index) =>
+    getRollingDanmakuDuration({ type: 'danmaku', time: index, user: `用户${index}`, text: `示例${index}` }, style)
+  );
+
+  assert.ok(durations.every((duration) => duration >= 7.3 && duration <= 8.7));
+  assert.ok(new Set(durations).size > 1, 'messages should not all travel at exactly the same speed');
 });
 
 test('superchat uses the DanmakuFactory information hierarchy and low-price palette', () => {

@@ -200,7 +200,8 @@ const DANMAKU_STYLE_LAYOUT_LIMITS = {
   boxFontSize: [12, 80],
   danmakuTop: [0, 2000],
   danmakuFontSize: [12, 96],
-  danmakuLineHeight: [16, 180]
+  danmakuLineHeight: [16, 180],
+  danmakuDuration: [2, 20]
 };
 const DANMAKU_STYLE_CAMEL_KEYS = {
   'superchat-lanes': 'superChatLanes',
@@ -568,18 +569,18 @@ function createAss(events, options = {}) {
   if (visualPreset === DEFAULT_DANMAKU_STYLE_PRESET) {
     const danmakuLayout = getDanmakuLayoutMetrics(style, danmakuArea);
     const danmakuRows = Array(danmakuLayout.lanes).fill(0);
+    const rollingDanmakuRows = Array(danmakuLayout.lanes).fill(null);
 
     for (const event of sorted) {
       if (event.type !== 'danmaku') continue;
-      const duration = style.danmakuDuration;
       const lane = danmakuLayout.avoidOverlap
-        ? chooseLaneWithoutOverlap(danmakuRows, getDanmakuEventVideoTime(event), duration)
-        : {
-            row: chooseLane(danmakuRows, getDanmakuEventVideoTime(event), duration),
-            start: getDanmakuEventVideoTime(event)
-          };
+        ? (() => {
+            const duration = getRollingDanmakuDuration(event, style);
+            return { ...chooseLaneWithoutOverlap(danmakuRows, getDanmakuEventVideoTime(event), duration), duration };
+          })()
+        : chooseRollingDanmakuLane(rollingDanmakuRows, event, style);
       const y = danmakuLayout.top + lane.row * style.danmakuLineHeight;
-      for (const line of renderRollingDanmaku(event, style, lane.start, y, duration)) {
+      for (const line of renderRollingDanmaku(event, style, lane.start, y, lane.duration)) {
         lines.push(line);
       }
     }
@@ -616,6 +617,54 @@ function renderRollingDanmaku(event, style, start, y, duration) {
       )}`
     )
   ];
+}
+
+function rollingDanmakuVariation(event) {
+  const source = `${event?.uid || ''}|${event?.user || ''}|${event?.text || ''}|${getDanmakuEventVideoTime(event).toFixed(3)}`;
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  // Keep a small deterministic spread around the selected speed. It prevents
+  // a wall of perfectly synchronized messages while making repeat exports
+  // stable and predictable.
+  return [0.92, 0.96, 1, 1.04, 1.08][Math.abs(hash) % 5];
+}
+
+function getRollingDanmakuDuration(event, style) {
+  const base = clamp(Number(style?.danmakuDuration) || DEFAULT_DANMAKU_STYLE.danmakuDuration, 2, 20);
+  return Math.round(clamp(base * rollingDanmakuVariation(event), 2, 20) * 100) / 100;
+}
+
+function chooseRollingDanmakuLane(lanes, event, style) {
+  const requestedStart = getDanmakuEventVideoTime(event);
+  const duration = getRollingDanmakuDuration(event, style);
+  const textWidth = Math.max(1, estimateTextWidth(event.text, style.danmakuFontSize));
+  const travelDistance = Math.max(1, Number(style.playWidth) || DEFAULT_DANMAKU_STYLE.playWidth) + 60 + textWidth;
+  const velocity = travelDistance / duration;
+  let best = { row: 0, start: requestedStart, duration, score: Number.POSITIVE_INFINITY };
+
+  for (let row = 0; row < lanes.length; row += 1) {
+    const previous = lanes[row];
+    let start = requestedStart;
+    if (previous) {
+      // A new message can enter as soon as the prior message's trailing edge
+      // clears the right edge. If it would travel faster and catch up, wait
+      // until the prior one has left the screen instead.
+      const priorEntryClearAt =
+        previous.start + (previous.duration * previous.textWidth) / previous.travelDistance;
+      start = velocity <= previous.velocity + 0.001
+        ? Math.max(start, priorEntryClearAt)
+        : Math.max(start, previous.start + previous.duration);
+    }
+    if (start < best.score - 0.0001) {
+      best = { row, start, duration, score: start };
+    }
+  }
+
+  lanes[best.row] = { start: best.start, duration, textWidth, travelDistance, velocity };
+  return { row: best.row, start: best.start, duration: best.duration };
 }
 
 function createMessageItems(events, style, options = {}) {
@@ -709,6 +758,13 @@ function createMessageTimeline(events, styleValues = {}, options = {}) {
     ? { ...DEFAULT_DANMAKU_STYLE, ...styleValues }
     : normalizeDanmakuStyle(styleValues);
   const items = createMessageItems(events, style, options);
+  if (options.sideStream === true) {
+    return createPersistentSideStreamTimeline(items, style, options);
+  }
+  return createTimedMessageTimeline(items, style, options);
+}
+
+function createTimedMessageTimeline(items, style, options = {}) {
   const boundaries = new Map();
   const addBoundary = (time, kind, item) => {
     if (!boundaries.has(time)) {
@@ -753,6 +809,73 @@ function createMessageTimeline(events, styleValues = {}, options = {}) {
           toY,
           reason: boundary.starts.length ? 'push' : 'reflow'
         });
+      }
+    }
+  }
+
+  for (const item of items) {
+    item.changes = changesById.get(item.id);
+    item.segments = buildMessageMotionSegments(item, item.changes, style, options);
+  }
+  return { style, items };
+}
+
+function createPersistentSideStreamTimeline(items, style, options = {}) {
+  const startsByTime = new Map();
+  const addStart = (time, item) => {
+    if (!startsByTime.has(time)) startsByTime.set(time, []);
+    startsByTime.get(time).push(item);
+  };
+  for (const item of items) {
+    // Side-stream entries leave only when newer entries push them out of the
+    // clipped queue. A long finite end keeps the final visible queue on screen
+    // instead of making it vanish after the old five-second card timeout.
+    item.end = item.start + MESSAGE_CARD.maxDuration;
+    addStart(item.start, item);
+  }
+
+  const active = new Map();
+  const changesById = new Map(items.map((item) => [item.id, []]));
+  const animationDuration = MESSAGE_CARD.animationDuration;
+  const orderedStarts = [...startsByTime.entries()].sort(([left], [right]) => left - right);
+  for (const [time, starts] of orderedStarts) {
+    // An item which was already pushed entirely past the upper clip edge does
+    // not take part in later layout passes. Removing the oldest item cannot
+    // pull remaining entries down, so there is intentionally no timed reflow.
+    for (const item of [...active.values()]) {
+      if (item.end <= time + 0.0001) active.delete(item.id);
+    }
+
+    const before = layoutMessageItems([...active.values()], style);
+    for (const item of starts) active.set(item.id, item);
+    const after = layoutMessageItems([...active.values()], style);
+    const startedIds = new Set(starts.map((item) => item.id));
+    for (const item of active.values()) {
+      const toY = after.get(item.id);
+      if (startedIds.has(item.id)) {
+        changesById.get(item.id).push({
+          time,
+          fromY: style.superChatBottom,
+          toY,
+          reason: 'entry'
+        });
+        continue;
+      }
+      const fromY = before.get(item.id);
+      if (Number.isFinite(fromY) && Math.abs(fromY - toY) > 0.001) {
+        changesById.get(item.id).push({
+          time,
+          fromY,
+          toY,
+          reason: 'push'
+        });
+      }
+    }
+
+    for (const item of active.values()) {
+      const top = after.get(item.id);
+      if (Number.isFinite(top) && top + item.height <= 0) {
+        item.end = Math.min(item.end, time + animationDuration);
       }
     }
   }
@@ -2100,6 +2223,8 @@ module.exports = {
   DANMAKU_STYLE_PRESETS,
   prepareAssEvents,
   getDanmakuEventDuration,
+  getRollingDanmakuDuration,
+  chooseRollingDanmakuLane,
   createMessageTimeline,
   createAss,
   drawRect,
