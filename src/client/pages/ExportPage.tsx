@@ -77,6 +77,12 @@ export function ExportPage({
   const timelineEnd = Number.isFinite(draftEnd)
     ? clampNumber(draftEnd, 0, canUseTimeline ? timelineDuration : 0)
     : timelineDuration;
+  const selectedStylePreset = danmakuStylePresetOptions.find((option) => option.value === draft.stylePreset);
+  const rollingDanmakuDuration = clampNumber(
+    Number(draft.styleLayout.danmakuDuration ?? selectedStylePreset?.style.danmakuDuration ?? 8),
+    2,
+    20
+  );
   const selectedValid = selectedRecording?.valid !== false;
   const requiresDanmaku = draft.mode !== 'clean';
   const exportBlockReason = !selectedRecording
@@ -752,6 +758,25 @@ export function ExportPage({
                 </button>
               ))}
             </div>
+            {draft.stylePreset === 'current' ? (
+              <label className="danmaku-style-speed">
+                <span>滚动速度</span>
+                <select
+                  value={String(rollingDanmakuDuration)}
+                  onChange={(event) =>
+                    setDraft({
+                      ...draft,
+                      styleLayout: { ...draft.styleLayout, danmakuDuration: Number(event.target.value) }
+                    })
+                  }
+                >
+                  <option value="10">慢</option>
+                  <option value="8">标准</option>
+                  <option value="6">快</option>
+                  <option value="4">很快</option>
+                </select>
+              </label>
+            ) : null}
           </section>
 
           <div className="split-buttons export-actions">

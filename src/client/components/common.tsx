@@ -133,9 +133,10 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
 
 export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const hasPercent = typeof progress.percent === 'number' && Number.isFinite(progress.percent);
+  const indeterminate = progress.status === 'retrying' || !hasPercent;
   const percent = hasPercent ? clampNumber(progress.percent || 0, 0, 100) : 0;
   const hasEta =
-    progress.status === 'running' &&
+    (progress.status === 'running' || progress.status === 'retrying') &&
     typeof progress.estimatedRemainingSec === 'number' &&
     Number.isFinite(progress.estimatedRemainingSec);
   const codecLabel = progress.codec
@@ -148,6 +149,8 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         ? '已取消'
       : progress.status === 'error'
         ? '失败'
+        : progress.status === 'retrying'
+          ? '等待重试'
         : hasPercent
           ? `${Math.round(percent)}%`
           : '处理中';
@@ -157,8 +160,8 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         <span>{progress.label}</span>
         <strong>{statusLabel}</strong>
       </div>
-      <div className={hasPercent ? 'job-progress-track' : 'job-progress-track indeterminate'}>
-        <span style={hasPercent ? { width: `${percent}%` } : undefined} />
+      <div className={indeterminate ? 'job-progress-track indeterminate' : 'job-progress-track'}>
+        <span style={indeterminate ? undefined : { width: `${percent}%` }} />
       </div>
       <span className="job-progress-message" title={progress.outputPath || ''}>
         {[

@@ -1,6 +1,6 @@
 import { Maximize2, Move, RotateCcw } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import type { AppSettings, DanmakuStyleLayout, DanmakuStylePreset } from '../types';
 import { danmakuStylePresets } from '../ui/options';
 import { clampNumber } from '../utils';
@@ -14,7 +14,8 @@ const DEFAULT_LAYOUT = {
   boxFontSize: 29,
   danmakuTop: 36,
   danmakuFontSize: 38,
-  danmakuLineHeight: 46
+  danmakuLineHeight: 46,
+  danmakuDuration: 8
 };
 
 type EffectiveLayout = typeof DEFAULT_LAYOUT;
@@ -60,6 +61,11 @@ function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLa
       numberValue(layout.danmakuLineHeight ?? style.danmakuLineHeight, DEFAULT_LAYOUT.danmakuLineHeight),
       16,
       180
+    ),
+    danmakuDuration: clampNumber(
+      numberValue(layout.danmakuDuration ?? style.danmakuDuration, DEFAULT_LAYOUT.danmakuDuration),
+      2,
+      20
     )
   };
 }
@@ -125,30 +131,75 @@ export function DanmakuStylePreview({
   onLayoutChange: (nextLayout: DanmakuStyleLayout) => void;
 }) {
   const previewRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
   const stackRef = useRef<HTMLDivElement | null>(null);
   const interactionRef = useRef<Interaction | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
+  const [canvasScale, setCanvasScale] = useState(1);
+  const [stackHeight, setStackHeight] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const effective = useMemo(() => buildEffectiveLayout(preset, layout), [layout, preset]);
   const fontScale = effective.boxFontSize / DEFAULT_LAYOUT.boxFontSize;
   const showCards = overlayMode === 'danmaku-gift';
   const sideStream = preset !== 'current';
   const estimatedCardHeight = sideStream
-    ? Math.max(196, (showCards ? 520 : 340) * fontScale)
-    : Math.max(114, 150 * fontScale);
-  const stackTop = clampNumber(effective.superChatBottom - estimatedCardHeight, 0, PLAY_HEIGHT - 34);
-  const stackWidthPercent = (effective.superChatWidth / PLAY_WIDTH) * 100;
-  const stackLeftPercent = (effective.panelLeft / PLAY_WIDTH) * 100;
-  const stackTopPercent = (stackTop / PLAY_HEIGHT) * 100;
+    ? Math.max(260, (showCards ? 460 : 300) * fontScale)
+    : Math.max(170, 215 * fontScale);
+  const measuredStackHeight = stackHeight > 0 ? stackHeight : estimatedCardHeight;
+  const stackTop = clampNumber(
+    effective.superChatBottom - measuredStackHeight,
+    0,
+    Math.max(0, PLAY_HEIGHT - measuredStackHeight)
+  );
   const canAdjust = sideStream || showCards;
 
+  useEffect(() => {
+    const element = previewRef.current;
+    if (!element) return;
+    const updateScale = () => {
+      const rect = element.getBoundingClientRect();
+      const nextScale = Math.max(0.01, Math.min(rect.width / PLAY_WIDTH, rect.height / PLAY_HEIGHT));
+      setCanvasScale((current) => (Math.abs(current - nextScale) > 0.0001 ? nextScale : current));
+    };
+    updateScale();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(updateScale);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const element = stackRef.current;
+    if (!element) {
+      setStackHeight(0);
+      return;
+    }
+    const updateHeight = () => {
+      const nextHeight = Math.max(0, element.offsetHeight);
+      setStackHeight((current) => (Math.abs(current - nextHeight) > 0.5 ? nextHeight : current));
+    };
+    updateHeight();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [effective.boxFontSize, effective.superChatWidth, overlayMode, preset]);
+
+  useEffect(() => {
+    const updateFullscreen = () => {
+      setIsFullscreen(document.fullscreenElement === previewRef.current?.parentElement);
+    };
+    updateFullscreen();
+    document.addEventListener('fullscreenchange', updateFullscreen);
+    return () => document.removeEventListener('fullscreenchange', updateFullscreen);
+  }, []);
+
   function canvasPoint(clientX: number, clientY: number) {
-    const rect = previewRef.current?.getBoundingClientRect();
+    const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0 || rect.height <= 0) return null;
     return {
-      x: ((clientX - rect.left) / rect.width) * PLAY_WIDTH,
-      y: ((clientY - rect.top) / rect.height) * PLAY_HEIGHT,
-      scaleX: PLAY_WIDTH / rect.width,
-      scaleY: PLAY_HEIGHT / rect.height
+      x: clampNumber(((clientX - rect.left) / rect.width) * PLAY_WIDTH, 0, PLAY_WIDTH),
+      y: clampNumber(((clientY - rect.top) / rect.height) * PLAY_HEIGHT, 0, PLAY_HEIGHT)
     };
   }
 
@@ -158,12 +209,7 @@ export function DanmakuStylePreview({
     if (!point) return;
     event.preventDefault();
     event.stopPropagation();
-    const previewRect = previewRef.current?.getBoundingClientRect();
-    const stackRect = stackRef.current?.getBoundingClientRect();
-    const measuredHeight =
-      previewRect && stackRect && previewRect.height > 0
-        ? (stackRect.height / previewRect.height) * PLAY_HEIGHT
-        : estimatedCardHeight;
+    const measuredHeight = Math.max(1, stackRef.current?.offsetHeight || measuredStackHeight);
     stackRef.current?.setPointerCapture(event.pointerId);
     const nextInteraction = {
       kind,
@@ -171,7 +217,7 @@ export function DanmakuStylePreview({
       startClientX: event.clientX,
       startClientY: event.clientY,
       startLeft: effective.panelLeft,
-      startTop: clampNumber(effective.superChatBottom - measuredHeight, 0, PLAY_HEIGHT - measuredHeight),
+      startTop: stackTop,
       startWidth: effective.superChatWidth,
       startFontSize: effective.boxFontSize,
       cardHeight: measuredHeight
@@ -185,14 +231,13 @@ export function DanmakuStylePreview({
     if (!activeInteraction || activeInteraction.pointerId !== event.pointerId) return;
     event.preventDefault();
     const point = canvasPoint(event.clientX, event.clientY);
-    if (!point) return;
     const startPoint = canvasPoint(activeInteraction.startClientX, activeInteraction.startClientY);
-    if (!startPoint) return;
+    if (!point || !startPoint) return;
     const dx = point.x - startPoint.x;
     const dy = point.y - startPoint.y;
     if (activeInteraction.kind === 'move') {
       const panelLeft = clampNumber(activeInteraction.startLeft + dx, 0, PLAY_WIDTH - activeInteraction.startWidth);
-      const top = clampNumber(activeInteraction.startTop + dy, 0, PLAY_HEIGHT - activeInteraction.cardHeight);
+      const top = clampNumber(activeInteraction.startTop + dy, 0, Math.max(0, PLAY_HEIGHT - activeInteraction.cardHeight));
       onLayoutChange({
         ...layout,
         panelLeft: Math.round(panelLeft),
@@ -218,106 +263,141 @@ export function DanmakuStylePreview({
     setInteraction(null);
   }
 
+  async function toggleFullscreen() {
+    const host = previewRef.current?.parentElement;
+    if (!host) return;
+    try {
+      if (document.fullscreenElement === host) {
+        await document.exitFullscreen();
+      } else {
+        await host.requestFullscreen();
+      }
+    } catch {
+      // Some embedded webviews may not expose the Fullscreen API. The preview
+      // remains fully usable at its normal size in that case.
+    }
+  }
+
+  const stackStyle = {
+    left: `${effective.panelLeft}px`,
+    top: `${stackTop}px`,
+    width: `${effective.superChatWidth}px`,
+    '--preview-font-size': `${effective.boxFontSize}px`,
+    '--preview-avatar-size': `${Math.max(28, Math.round(effective.boxFontSize * 1.42))}px`
+  } as CSSProperties;
+
   return (
     <div className={`danmaku-style-preview preset-${preset}`} ref={previewRef}>
-      {!sideStream ? (
-        <>
-          <span
-            className="preview-rolling-danmaku first"
-            style={{
-              top: `${(effective.danmakuTop / PLAY_HEIGHT) * 100}%`,
-              fontSize: `${Math.max(11, effective.danmakuFontSize * 0.34)}px`
-            }}
-          >
-            这个样式很适合录播！
-          </span>
-          <span
-            className="preview-rolling-danmaku second"
-            style={{
-              top: `${((effective.danmakuTop + effective.danmakuLineHeight * 1.2) / PLAY_HEIGHT) * 100}%`,
-              fontSize: `${Math.max(10, effective.danmakuFontSize * 0.31)}px`
-            }}
-          >
-            弹幕预览 ✨
-          </span>
-        </>
-      ) : null}
-
-      {sideStream ? (
-        <div
-          ref={stackRef}
-          className={`preview-message-stack preview-side-stream ${interaction ? 'is-adjusting' : ''}`}
-          style={{ left: `${stackLeftPercent}%`, top: `${stackTopPercent}%`, width: `${stackWidthPercent}%` }}
-          onPointerMove={moveInteraction}
-          onPointerUp={endInteraction}
-          onPointerCancel={endInteraction}
-        >
-          <div
-            className="preview-side-stream-content"
-            onPointerDown={(event) => beginInteraction(event, 'move')}
-            title="拖动调整侧边互动流的位置"
-          >
-            <SideChatPreviewRow user="加勒比海没有香" badge="加油比海没有香" text="开播吧，胖胖小紫！" tone="blue" />
-            <SideChatPreviewRow user="千里当甘甘" badge="千里当甘甘" text="点赞了直播间 30 次" tone="cyan" />
-            {showCards ? <SideEventPreview user="影帝紫定能行" text="投喂 足迹 x1" price="CNY0.1" kind="gift" /> : null}
-            <SideChatPreviewRow user="小紫的贤鱼" badge="小紫的贤鱼" text="感谢你的足迹，啾咪～" tone="mint" />
-            {showCards ? <SideEventPreview user="影帝紫定能行" text="投喂 粉丝团灯牌 x1" price="CNY0.1" kind="superchat" /> : null}
-          </div>
-          <button
-            className="preview-card-resize"
-            type="button"
-            aria-label="拖动调整侧边互动流大小"
-            title="拖动调整侧边互动流的宽度和字号"
-            onPointerDown={(event) => beginInteraction(event, 'resize')}
-          >
-            <Maximize2 size={13} />
-          </button>
-        </div>
-      ) : showCards ? (
-        <div
-          ref={stackRef}
-          className={`preview-message-stack ${interaction ? 'is-adjusting' : ''}`}
-          style={{ left: `${stackLeftPercent}%`, top: `${stackTopPercent}%`, width: `${stackWidthPercent}%` }}
-          onPointerMove={moveInteraction}
-          onPointerUp={endInteraction}
-          onPointerCancel={endInteraction}
-        >
-          <div
-            className="preview-card preview-superchat"
-            onPointerDown={(event) => beginInteraction(event, 'move')}
-            title="拖动调整互动卡片的位置"
-          >
-            <span className="preview-card-grab" aria-hidden="true">
-              <Move size={14} />
+      <div
+        className="danmaku-style-preview-canvas"
+        ref={canvasRef}
+        style={{ transform: `translate(-50%, -50%) scale(${canvasScale})` }}
+      >
+        {!sideStream ? (
+          <>
+            <span
+              className="preview-rolling-danmaku first"
+              style={{
+                top: `${effective.danmakuTop}px`,
+                fontSize: `${effective.danmakuFontSize}px`,
+                animationDuration: `${effective.danmakuDuration}s`
+              }}
+            >
+              示例弹幕：录播顺利！
             </span>
-            <strong>小电视同学</strong>
-            <small>SuperChat CNY 30</small>
-            <p>直播顺利！</p>
-          </div>
-          <div className="preview-card preview-gift" onPointerDown={(event) => beginInteraction(event, 'move')}>
-            <strong>录播观众</strong>
-            <small>赠送 小花花 x3</small>
-          </div>
-          <button
-            className="preview-card-resize"
-            type="button"
-            aria-label="拖动调整互动卡片大小"
-            title="拖动调整互动卡片的宽度和字号"
-            onPointerDown={(event) => beginInteraction(event, 'resize')}
+            <span
+              className="preview-rolling-danmaku second"
+              style={{
+                top: `${effective.danmakuTop + effective.danmakuLineHeight * 1.2}px`,
+                fontSize: `${Math.max(12, effective.danmakuFontSize * 0.9)}px`,
+                animationDuration: `${Math.min(20, effective.danmakuDuration * 1.08)}s`
+              }}
+            >
+              第二条示例弹幕
+            </span>
+          </>
+        ) : null}
+
+        {sideStream ? (
+          <div
+            ref={stackRef}
+            className={`preview-message-stack preview-side-stream ${interaction ? 'is-adjusting' : ''}`}
+            style={stackStyle}
+            onPointerMove={moveInteraction}
+            onPointerUp={endInteraction}
+            onPointerCancel={endInteraction}
           >
-            <Maximize2 size={13} />
-          </button>
-        </div>
-      ) : null}
+            <div
+              className="preview-side-stream-content"
+              onPointerDown={(event) => beginInteraction(event, 'move')}
+              title="拖动调整侧栏位置"
+            >
+              <SideChatPreviewRow user="观众 A" badge="LV.18" text="这是一条示例互动" tone="blue" />
+              <SideChatPreviewRow user="观众 B" badge="LV.25" text="点赞了直播间" tone="cyan" />
+              {showCards ? <SideEventPreview user="观众 C" text="赠送 小礼物 x1" price="CNY 0.1" kind="gift" /> : null}
+              <SideChatPreviewRow user="观众 D" badge="LV.12" text="感谢你的支持～" tone="mint" />
+              {showCards ? <SideEventPreview user="观众 E" text="加入了粉丝团" price="CNY 0.1" kind="superchat" /> : null}
+            </div>
+            <button
+              className="preview-card-resize"
+              type="button"
+              aria-label="拖动调整侧栏大小"
+              title="拖动调整侧栏宽度和字号"
+              onPointerDown={(event) => beginInteraction(event, 'resize')}
+            >
+              <Maximize2 size={32} />
+            </button>
+          </div>
+        ) : showCards ? (
+          <div
+            ref={stackRef}
+            className={`preview-message-stack ${interaction ? 'is-adjusting' : ''}`}
+            style={stackStyle}
+            onPointerMove={moveInteraction}
+            onPointerUp={endInteraction}
+            onPointerCancel={endInteraction}
+          >
+            <div
+              className="preview-card preview-superchat"
+              onPointerDown={(event) => beginInteraction(event, 'move')}
+              title="拖动调整互动卡片位置"
+            >
+              <span className="preview-card-grab" aria-hidden="true">
+                <Move size={30} />
+              </span>
+              <strong>示例用户</strong>
+              <small>SuperChat CNY 30</small>
+              <p>直播顺利！</p>
+            </div>
+            <div className="preview-card preview-gift" onPointerDown={(event) => beginInteraction(event, 'move')}>
+              <strong>示例观众</strong>
+              <small>赠送 小花花 x3</small>
+            </div>
+            <button
+              className="preview-card-resize"
+              type="button"
+              aria-label="拖动调整互动卡片大小"
+              title="拖动调整互动卡片宽度和字号"
+              onPointerDown={(event) => beginInteraction(event, 'resize')}
+            >
+              <Maximize2 size={32} />
+            </button>
+          </div>
+        ) : null}
+      </div>
 
       <div className="danmaku-preview-toolbar">
         <span>
-          {sideStream ? '侧栏' : '卡片'}：x {Math.round(effective.panelLeft)} · y {Math.round(effective.superChatBottom)} · 宽{' '}
+          {sideStream ? '侧栏' : '卡片'} x{Math.round(effective.panelLeft)} · y{Math.round(effective.superChatBottom)} · 宽
           {Math.round(effective.superChatWidth)}
         </span>
+        <button type="button" onClick={() => void toggleFullscreen()} title="全屏查看画面和弹幕">
+          <Maximize2 size={14} />
+          {isFullscreen ? '退出全屏' : '全屏预览'}
+        </button>
         <button type="button" onClick={() => onLayoutChange({})}>
           <RotateCcw size={14} />
-          恢复预设位置
+          恢复预设
         </button>
       </div>
     </div>
