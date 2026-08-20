@@ -788,16 +788,74 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
       stdio: ['ignore', 'ignore', 'pipe']
     });
     options.onChild?.(child);
+    const progressStallTimeoutMs = Math.max(0, Number(options.progressStallTimeoutMs || 0));
+    const progressValueFromText =
+      progressStallTimeoutMs > 0 && typeof options.progressValueFromText === 'function'
+        ? options.progressValueFromText
+        : null;
     let stderr = '';
+    let settled = false;
+    let stalledError = null;
+    let lastProgressValue = Number.NEGATIVE_INFINITY;
+    let lastProgressAt = Date.now();
+    let stallTimer = null;
+
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (stallTimer) clearInterval(stallTimer);
+      callback(value);
+    };
+
+    const triggerProgressStall = () => {
+      if (settled || stalledError || !progressValueFromText || child.exitCode !== null || child.signalCode) return;
+      const elapsedMs = Date.now() - lastProgressAt;
+      if (elapsedMs < progressStallTimeoutMs) return;
+      stalledError = new Error(
+        `FFmpeg 已连续 ${Math.ceil(progressStallTimeoutMs / 1000)} 秒没有输出媒体进度，已终止该处理进程。`
+      );
+      stalledError.code = 'FFMPEG_NO_PROGRESS';
+      stalledError.ffmpegNoProgress = true;
+      stalledError.ffmpegStallTimeoutMs = progressStallTimeoutMs;
+      stalledError.ffmpegLastProgressValue = Number.isFinite(lastProgressValue) ? lastProgressValue : null;
+      stalledError.ffmpegStderr = compactLogLine(stderr);
+      try {
+        options.onNoProgress?.(stalledError, child);
+      } catch {}
+      requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+    };
+
+    if (progressValueFromText) {
+      const intervalMs = Math.max(500, Math.min(5000, Math.floor(progressStallTimeoutMs / 4) || 1000));
+      stallTimer = setInterval(triggerProgressStall, intervalMs);
+      stallTimer.unref?.();
+    }
+
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString('utf8');
       stderr = `${stderr}${text}`.slice(-8000);
+      if (progressValueFromText) {
+        try {
+          const progressValue = Number(progressValueFromText(text));
+          if (Number.isFinite(progressValue) && progressValue > lastProgressValue + 0.0001) {
+            lastProgressValue = progressValue;
+            lastProgressAt = Date.now();
+          }
+        } catch {}
+      }
       onStderr?.(text);
     });
-    child.on('error', reject);
+    child.on('error', (error) => finish(reject, stalledError || error));
     child.on('close', (code, signal) => {
+      if (stalledError) {
+        stalledError.ffmpegExitCode = code;
+        stalledError.ffmpegSignal = signal || '';
+        stalledError.ffmpegStderr = compactLogLine(stderr);
+        finish(reject, stalledError);
+        return;
+      }
       if (code === 0) {
-        resolve();
+        finish(resolve);
         return;
       }
       const error = new Error(`ffmpeg 退出码 ${code}，信号 ${signal || '-'}：${compactLogLine(stderr)}`);
@@ -807,7 +865,7 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
       error.ffmpegExitCode = code;
       error.ffmpegSignal = signal || '';
       error.ffmpegStderr = compactLogLine(stderr);
-      reject(error);
+      finish(reject, error);
     });
   });
 }
@@ -859,10 +917,12 @@ function updateFfmpegJobProgress(progress, text) {
   progress.estimatedRemainingSec =
     duration > 0 && processedSec >= 1 && elapsedSec >= 1 ? remainingSec / Math.max(processedSec / elapsedSec, 0.001) : null;
   progress.updatedAt = now;
-  progress.message =
+  const progressText =
     duration > 0
       ? `${formatDurationSeconds(currentTimeSec)} / ${formatDurationSeconds(duration)}`
       : `已处理 ${formatDurationSeconds(currentTimeSec)}`;
+  const stageLabel = String(progress.stageLabel || '').trim();
+  progress.message = stageLabel ? `${stageLabel} · ${progressText}` : progressText;
   return true;
 }
 
@@ -1066,11 +1126,13 @@ async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, opti
   const fps = Number(mediaInfo.videoInfo?.fps || 0);
   const videoReorderAllowanceSec = fps > 0 ? Math.min(0.15, 3 / fps) : 0.12;
   const avDeltaSec = measuredAvDeltaSec > 0 ? Math.max(0, measuredAvDeltaSec - videoReorderAllowanceSec) : measuredAvDeltaSec;
+  const videoPresentationDurationSec = videoDurationSec > 0 ? videoDurationSec + videoReorderAllowanceSec : 0;
   const containerDurationSec = Number(mediaInfo.durationSec || 0);
   const streamDurationSec = Math.max(videoDurationSec, audioDurationSec);
   return {
     containerDurationSec,
     videoDurationSec,
+    videoPresentationDurationSec,
     audioDurationSec,
     avDeltaSec,
     measuredAvDeltaSec,
@@ -1286,8 +1348,21 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
         decodeErrorCount: Number(audioStart.decodeErrorCount || 0) + Number(audioEnd?.decodeErrorCount || 0)
       }
     : null;
+  const firstVideoPts = video.firstPts;
+  const lastVideoPts = video.lastPts;
+  const firstAudioPts = audio?.firstPts ?? null;
+  const lastAudioPts = audio?.lastPts ?? null;
+  const avStartDeltaSec =
+    Number.isFinite(firstAudioPts) && Number.isFinite(firstVideoPts) ? Number(firstAudioPts) - Number(firstVideoPts) : null;
+  const avEndDeltaSec =
+    Number.isFinite(lastAudioPts) && Number.isFinite(lastVideoPts) ? Number(lastAudioPts) - Number(lastVideoPts) : null;
+  // AAC priming and a few reordered video frames can legitimately move a
+  // boundary by a handful of milliseconds.  Larger offsets mean a copy-concat
+  // would preserve a visibly out-of-sync source segment.
+  const avBoundaryToleranceSec = Math.max(0.12, Number(timingInfo.videoReorderAllowanceSec || 0) + 0.08);
   const warnings = [];
   if (!video.packetCount) warnings.push('没有检测到视频包');
+  if (mediaInfo.audioInfo && !audio?.packetCount) warnings.push('没有检测到音频包');
   if (video.ptsMaxBackwardSec > 0.75) warnings.push(`视频 PTS 大幅回退 ${video.ptsBackwardCount} 次`);
   if (video.dtsBackwardCount) warnings.push(`视频 DTS 回退 ${video.dtsBackwardCount} 次`);
   if (video.decodeErrorCount) warnings.push(`视频损坏/解析警告 ${video.decodeErrorCount} 次`);
@@ -1297,21 +1372,38 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
   if (copyWarnings.nonMonotonicCount) warnings.push(`完整流扫描发现时间戳异常 ${copyWarnings.nonMonotonicCount} 次`);
   if (copyWarnings.corruptPacketCount) warnings.push(`完整流扫描发现损坏包警告 ${copyWarnings.corruptPacketCount} 次`);
   if (Math.abs(Number(timingInfo.avDeltaSec || 0)) > 0.08) warnings.push(`A/V 时长差 ${timingInfo.avDeltaSec.toFixed(3)}s`);
+  if (avStartDeltaSec !== null && Math.abs(avStartDeltaSec) > avBoundaryToleranceSec) {
+    warnings.push(`A/V 起始偏差 ${avStartDeltaSec.toFixed(3)}s`);
+  }
+  if (avEndDeltaSec !== null && Math.abs(avEndDeltaSec) > avBoundaryToleranceSec) {
+    warnings.push(`A/V 末尾偏差 ${avEndDeltaSec.toFixed(3)}s`);
+  }
   const broken =
     !video.packetCount ||
+    (mediaInfo.audioInfo && !audio?.packetCount) ||
     video.dtsBackwardCount > 0 ||
     (audio && audio.dtsBackwardCount > 0) ||
     copyWarnings.nonMonotonicCount > 0;
+  const timingSafeForCopy =
+    Boolean(timingInfo.timingSafeForCopy) &&
+    (!mediaInfo.audioInfo ||
+      (avStartDeltaSec !== null &&
+        avEndDeltaSec !== null &&
+        Math.abs(avStartDeltaSec) <= avBoundaryToleranceSec &&
+        Math.abs(avEndDeltaSec) <= avBoundaryToleranceSec));
   return {
     ...timingInfo,
-    firstVideoPts: video.firstPts,
+    firstVideoPts,
     firstVideoDts: video.firstDts,
-    lastVideoPts: video.lastPts,
+    lastVideoPts,
     lastVideoDts: video.lastDts,
-    firstAudioPts: audio?.firstPts ?? null,
+    firstAudioPts,
     firstAudioDts: audio?.firstDts ?? null,
-    lastAudioPts: audio?.lastPts ?? null,
+    lastAudioPts,
     lastAudioDts: audio?.lastDts ?? null,
+    avStartDeltaSec,
+    avEndDeltaSec,
+    avBoundaryToleranceSec,
     videoPtsMonotonic: video.ptsMonotonic,
     videoDtsMonotonic: video.dtsMonotonic,
     audioPtsMonotonic: audio?.ptsMonotonic ?? true,
@@ -1319,6 +1411,7 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
     corruptPacketCount:
       Number(video.decodeErrorCount || 0) + Number(audio?.decodeErrorCount || 0) + Number(copyWarnings.corruptPacketCount || 0),
     packetAuditMode: 'leading-and-trailing-sample-plus-full-copy-scan',
+    timingSafeForCopy,
     timelineHealth: broken ? 'broken' : warnings.length ? 'warning' : 'healthy',
     warnings
   };
@@ -1905,7 +1998,10 @@ async function discoverRecordingFiles(outputDir, options = {}) {
       }
       recordings[index] = {
         id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
-        startedAt: stat.mtimeMs,
+        roomId: String(metadata?.roomId || ''),
+        roomTitle: String(metadata?.roomTitle || ''),
+        anchor: String(metadata?.anchor || ''),
+        startedAt: Number(metadata?.startedAt || stat.mtimeMs),
         cleanPath,
         danmakuPath,
         cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),

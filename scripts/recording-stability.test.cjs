@@ -13,7 +13,7 @@ const {
   createAss
 } = require('../src/server/danmaku/ass.cjs');
 const { createRecordingArgs, mergeDanmakuFiles } = require('../src/server/recording/ffmpeg.cjs');
-const { LiveRecordService } = require('../src/server/app/service.cjs');
+const { LiveRecordService, getMonitorPollDelayMs } = require('../src/server/app/service.cjs');
 const { runCapturedProcess } = require('../src/server/shared/helpers.cjs');
 const ffmpegPath = require('ffmpeg-static');
 
@@ -201,6 +201,13 @@ test('media clock uses first FFmpeg progress rather than FFmpeg spawn wall time'
   assert.equal(service.resolveSessionVideoTime(session, 8000), 3, 'post-first-frame event does not include 5s startup wait or source PTS offset');
 });
 
+test('offline rooms poll for live start at most every three seconds while live rooms retain the configured interval', () => {
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 15 }), 3000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 1 }, { pollIntervalSec: 15 }), 15000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0, lastError: 'timeout' }, { pollIntervalSec: 15 }), 15000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 2 }), 2000);
+});
+
 test('FFmpeg timeline regressions rotate the current segment and recording args disable hidden reconnects', () => {
   const args = createRecordingArgs({
     streamUrl: 'https://cdn.example/live.flv',
@@ -210,6 +217,7 @@ test('FFmpeg timeline regressions rotate the current segment and recording args 
   assert.ok(args.includes('-progress'));
   assert.ok(!args.includes('-reconnect'));
   assert.ok(!args.includes('+genpts+discardcorrupt'));
+  assert.ok(!args.includes('ignore_err'), 'live capture must not silently keep damaged startup packets');
 
   const service = new LiveRecordService();
   service.log = () => {};
@@ -235,6 +243,34 @@ test('FFmpeg timeline regressions rotate the current segment and recording args 
 
   assert.equal(session.rotating, true);
   assert.equal(session.segmentReason, 'pts-discontinuity');
+});
+
+test('startup decode errors discard the short segment and rotate before it reaches the merged output', () => {
+  const service = new LiveRecordService();
+  service.log = () => {};
+  service.emitState = () => {};
+  const room = { id: 'startup-corruption', currentRecording: { startedAt: 1, cleanPath: 'startup.clean.mkv' } };
+  const session = {
+    roomId: room.id,
+    liveSessionId: 'live-startup-corruption',
+    stream: { host: 'https://bad-cdn.example' },
+    startedAt: 1,
+    cleanPath: 'startup.clean.mkv',
+    ffmpegSpawnAt: Date.now(),
+    state: 'recording',
+    mediaClock: { originMono: 1 },
+    finished: false,
+    stopping: false,
+    rotating: false,
+    ffmpeg: { exitCode: null, signalCode: null, kill: () => {} }
+  };
+  service.recordingSessions.set(room.id, session);
+
+  service.processRecordingFfmpegOutput(room, session, '[hevc] Invalid NAL unit #0.');
+
+  assert.equal(session.rotating, true);
+  assert.equal(session.segmentReason, 'startup-corruption');
+  assert.equal(session.discardStartupSegment, true);
 });
 
 test('a large FFmpeg output-time jump also rotates instead of appending a torn timeline', () => {

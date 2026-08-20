@@ -148,6 +148,8 @@ export function RoomCard({
   const danmakuCommandSummary = commandCountsSummary(room.currentRecording?.danmakuCommandCounts);
   const roomNumber = room.realRoomId || room.id;
   const roomSubtitle = room.anchor ? `${room.anchor} · 房间号 ${roomNumber}` : `房间号 ${roomNumber}`;
+  const mergeActive = room.mergeProgress?.status === 'running' || room.mergeProgress?.status === 'retrying';
+  const mergeRetrying = room.mergeProgress?.status === 'retrying';
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
@@ -174,6 +176,7 @@ export function RoomCard({
           <span className={room.monitoring ? 'badge on' : 'badge'}>{room.monitoring ? '已监听' : '未监听'}</span>
           <span className={room.recording ? 'badge hot' : 'badge'}>{room.recording ? '录制中' : '未录制'}</span>
           {room.mergeProgress?.status === 'running' ? <span className="badge work">合并分段中</span> : null}
+          {room.mergeProgress?.status === 'retrying' ? <span className="badge work">合并等待重试</span> : null}
           {room.burning ? <span className="badge work">生成弹幕视频中</span> : null}
         </div>
 
@@ -192,11 +195,27 @@ export function RoomCard({
         ) : null}
 
         {room.mergeProgress ? <JobProgress progress={room.mergeProgress} /> : null}
-        {room.mergeProgress?.status === 'running' ? (
-          <div className="warning-line">
-            <CircleAlert size={16} />
-            <span>正在生成合并后的 merged 文件。合并完成前先不要烧录小分段，建议等合并产物完成后再烧录，或使用自动烧录。</span>
-          </div>
+        {mergeActive ? (
+          <button
+            className="wide-button danger fill"
+            type="button"
+            disabled={busy === `cancel-merge-${roomKey}`}
+            onClick={() => run(`cancel-merge-${roomKey}`, () => recorder.cancelMerge(room.id))}
+          >
+            <Square size={17} />
+            {mergeRetrying ? '取消自动合并重试' : '中断合并'}
+          </button>
+        ) : null}
+        {room.mergeProgress?.status === 'error' ? (
+          <button
+            className="wide-button fill"
+            type="button"
+            disabled={busy === `retry-merge-${roomKey}`}
+            onClick={() => run(`retry-merge-${roomKey}`, () => recorder.retryMerge(room.id))}
+          >
+            <RefreshCw size={17} />
+            重新尝试合并
+          </button>
         ) : null}
 
         {room.burnProgress ? <JobProgress progress={room.burnProgress} /> : null}

@@ -99,6 +99,8 @@ export type DanmakuStyleLayout = {
   danmakuTop?: number;
   danmakuFontSize?: number;
   danmakuLineHeight?: number;
+  /** The time, in seconds, a normal rolling danmaku crosses the canvas. */
+  danmakuDuration?: number;
 };
 
 export type AppSettings = {
@@ -261,7 +263,7 @@ export type FfmpegCapabilities = {
 export type FfmpegJobProgress = {
   id: string;
   kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
-  status: 'running' | 'completed' | 'error' | 'cancelled';
+  status: 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
   label: string;
   outputPath?: string;
   roomId?: string;
@@ -272,6 +274,8 @@ export type FfmpegJobProgress = {
   currentTimeSec?: number;
   durationSec?: number;
   estimatedRemainingSec?: number | null;
+  stageLabel?: string;
+  stageStartedAt?: number;
   percent?: number | null;
   message?: string;
 };
@@ -394,6 +398,8 @@ export type RecorderApi = {
   setAutoRecord: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
+  cancelMerge: (roomId: string) => Promise<AppState>;
+  retryMerge: (roomId: string) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
   startExportPreview: (request: { cleanPath: string }) => Promise<ExportPreviewResult>;
   cancelExportPreview: () => Promise<AppState>;

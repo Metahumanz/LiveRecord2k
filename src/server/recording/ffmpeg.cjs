@@ -33,8 +33,6 @@ function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec, s
     '-y',
     '-fflags',
     '+discardcorrupt',
-    '-err_detect',
-    'ignore_err',
     '-rw_timeout',
     '30000000'
   ];
@@ -297,8 +295,6 @@ function createNormalizeSegmentArgs({
     '2',
     '-fflags',
     '+genpts+discardcorrupt',
-    '-err_detect',
-    'ignore_err',
     '-i',
     inputPath
   ];
@@ -340,7 +336,7 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     throw new Error('统一规格合并缺少有效的目标分辨率。');
   }
 
-  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt'];
   for (const segment of segments) {
     args.push('-i', segment.filePath);
   }
