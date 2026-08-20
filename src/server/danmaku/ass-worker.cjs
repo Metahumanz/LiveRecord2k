@@ -33,14 +33,13 @@ async function runAssWorker() {
     throw new Error('字幕任务缺少输入或输出路径。');
   }
   const [events, baseStyle] = await Promise.all([readDanmakuEvents(danmakuPath), readDanmakuStyle(cssPath)]);
-  const style = adaptDanmakuStyleToVideo(
-    resolveDanmakuStyle(baseStyle, request.stylePreset, request.styleLayout),
-    request.videoInfo
-  );
+  const baseResolvedStyle = resolveDanmakuStyle(baseStyle, request.stylePreset, request.styleLayout);
+  const style = adaptDanmakuStyleToVideo(baseResolvedStyle, request.videoInfo);
   const ass = createAss(events, {
     overlayMode: request.overlayMode,
     danmakuArea: request.danmakuArea,
-    style,
+    style: baseResolvedStyle,
+    videoInfo: request.videoInfo,
     startTime: request.startTime,
     endTime: request.endTime,
     shiftTime: request.shiftTime

@@ -419,7 +419,8 @@ test('burn filter waits for the first decodable keyframe and still produces vali
 test('portrait burn keeps the source canvas and renders its adaptive ASS overlay', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-portrait-burn-'));
   const inputPath = path.join(tempDir, 'portrait-input.mp4');
-  const assPath = path.join(tempDir, 'portrait-overlay.ass');
+  const danmakuPath = path.join(tempDir, 'portrait-input.danmaku.jsonl');
+  const cssPath = path.join(tempDir, 'portrait-input.danmaku.css');
   const outputPath = path.join(tempDir, 'portrait-output.mp4');
   try {
     const generated = await runCapturedProcess(
@@ -448,18 +449,36 @@ test('portrait burn keeps the source canvas and renders its adaptive ASS overlay
       { timeoutMs: 20_000 }
     );
     assert.equal(generated.status, 0, generated.stderr);
-    const ass = createAss([{ type: 'danmaku', time: 0.1, user: '观众', text: '竖屏烧录' }], {
-      stylePreset: 'h5-card',
-      videoInfo: { width: 540, height: 960 }
+    await fsp.writeFile(
+      danmakuPath,
+      `${JSON.stringify({ type: 'danmaku', time: 0.1, user: '观众', text: '竖屏烧录' })}\n`,
+      'utf8'
+    );
+    const service = new LiveRecordService();
+    service.ffmpegPath = ffmpegPath;
+    service.ensurePlatformCjkFont = async () => {};
+    const recording = {
+      cleanPath: inputPath,
+      danmakuPath,
+      cssPath,
+      // A stale library entry must never determine the ASS canvas.
+      videoInfo: { width: 1920, height: 1080 }
+    };
+    const assets = await service.generateSubtitleAssets(recording, {
+      stylePreset: 'h5-card'
     });
+    const ass = await fsp.readFile(assets.assPath, 'utf8');
     assert.match(ass, /PlayResX: 540/);
     assert.match(ass, /PlayResY: 960/);
-    await fsp.writeFile(assPath, ass, 'utf8');
+    assert.equal(assets.playWidth, 540);
+    assert.equal(assets.playHeight, 960);
+    assert.equal(recording.videoInfo.width, 540);
+    assert.equal(recording.videoInfo.height, 960);
     const burned = await runCapturedProcess(
       ffmpegPath,
       createBurnArgs({
         cleanPath: inputPath,
-        assPath,
+        assPath: assets.assPath,
         burnedPath: outputPath,
         codec: 'libx264',
         crf: 24,

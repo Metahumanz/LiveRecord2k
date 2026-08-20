@@ -257,6 +257,11 @@
   background: #090d10;
 }
 
+.clip-preview.is-portrait {
+  width: min(100%, 440px);
+  margin-inline: auto;
+}
+
 .clip-preview video {
   width: 100%;
   height: 100%;
