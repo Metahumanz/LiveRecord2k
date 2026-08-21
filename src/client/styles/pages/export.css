@@ -414,6 +414,13 @@
   line-height: 1;
 }
 
+.preview-side-avatar svg {
+  width: 68%;
+  height: 68%;
+  overflow: visible;
+  color: rgba(255, 255, 255, 0.9);
+}
+
 .preview-side-chat-content {
   display: grid;
   justify-items: start;
@@ -576,6 +583,8 @@
 }
 
 .preview-gift {
+  align-self: start;
+  box-sizing: border-box;
   border-left: 4px solid #c46cff;
   background: rgba(247, 243, 255, 0.9);
   color: #502980;
@@ -756,6 +765,10 @@
   color: transparent;
   background: rgba(232, 241, 240, 0.86);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.32);
+}
+
+.preset-minimal .preview-side-avatar svg {
+  display: none;
 }
 
 .preset-minimal .preview-side-event {

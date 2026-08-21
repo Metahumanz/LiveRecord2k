@@ -78,7 +78,17 @@ test('guard protocol variants collapse to one session event and USER_TOAST_MSG_V
 test('SEND_GIFT is captured once while COMBO_SEND is deliberately ignored without count inflation', () => {
   const sendGift = {
     cmd: 'SEND_GIFT',
-    data: { uid: 7, uname: '连击用户', gift_name: '小花', gift_id: 100, num: 3, price: 1000, tid: 'gift-1', timestamp: 1_786_432_100 }
+    data: {
+      uid: 7,
+      uname: '连击用户',
+      face: '//i0.hdslb.com/bfs/face/combination-user.jpg',
+      gift_name: '小花',
+      gift_id: 100,
+      num: 3,
+      price: 1000,
+      tid: 'gift-1',
+      timestamp: 1_786_432_100
+    }
   };
   const combo = {
     cmd: 'COMBO_SEND',
@@ -88,6 +98,7 @@ test('SEND_GIFT is captured once while COMBO_SEND is deliberately ignored withou
 
   assert.equal(event.type, 'gift');
   assert.equal(event.count, 3);
+  assert.equal(event.avatarUrl, 'https://i0.hdslb.com/bfs/face/combination-user.jpg');
   assert.equal(normalizeDanmakuEvent(combo, timing(4.1)), null);
   assert.equal(classifyDanmakuEventIgnore(combo, null), 'deliberatelyIgnored');
 });
