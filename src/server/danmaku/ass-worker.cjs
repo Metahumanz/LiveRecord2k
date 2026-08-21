@@ -5,6 +5,7 @@ const {
   readDanmakuStyle,
   resolveDanmakuStyle,
   adaptDanmakuStyleToVideo,
+  createAvatarOverlayPlan,
   createAss
 } = require('./ass.cjs');
 
@@ -44,6 +45,19 @@ async function runAssWorker() {
     endTime: request.endTime,
     shiftTime: request.shiftTime
   });
+  const avatarPlan = ['h5-card', 'bubble'].includes(String(style.visualPreset || ''))
+    ? createAvatarOverlayPlan(events, {
+        overlayMode: request.overlayMode,
+        danmakuArea: request.danmakuArea,
+        style: baseResolvedStyle,
+        videoInfo: request.videoInfo,
+        startTime: request.startTime,
+        endTime: request.endTime,
+        shiftTime: request.shiftTime,
+        maxEntries: request.avatarOverlayMaxEntries,
+        maxSegmentsPerEntry: request.avatarOverlayMaxSegmentsPerEntry
+      })
+    : undefined;
   await fsp.writeFile(assPath, ass, 'utf8');
   process.stdout.write(
     JSON.stringify({
@@ -51,7 +65,8 @@ async function runAssWorker() {
       eventCount: events.length,
       playWidth: style.playWidth,
       playHeight: style.playHeight,
-      portrait: style.playHeight > style.playWidth
+      portrait: style.playHeight > style.playWidth,
+      avatarPlan
     })
   );
 }

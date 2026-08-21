@@ -103,22 +103,29 @@ function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLa
   };
 }
 
+function AvatarPlaceholder() {
+  return (
+    <span className="preview-side-avatar" aria-hidden="true">
+      <svg viewBox="0 0 32 32" focusable="false">
+        <circle cx="16" cy="10.5" r="5.1" fill="currentColor" fillOpacity="0.78" />
+        <path d="M6.9 27c0-5.15 4.08-8.7 9.1-8.7s9.1 3.55 9.1 8.7" fill="currentColor" fillOpacity="0.78" />
+      </svg>
+    </span>
+  );
+}
+
 function SideChatPreviewRow({
-  user,
   badge,
   text,
   tone
 }: {
-  user: string;
   badge: string;
   text: string;
   tone: 'cyan' | 'blue' | 'mint';
 }) {
   return (
     <div className={`preview-side-chat-row tone-${tone}`}>
-      <span className="preview-side-avatar" aria-hidden="true">
-        {user.slice(0, 1)}
-      </span>
+      <AvatarPlaceholder />
       <div className="preview-side-chat-content">
         <small>{badge}</small>
         <strong>{text}</strong>
@@ -140,9 +147,7 @@ function SideEventPreview({
 }) {
   return (
     <div className={`preview-side-event preview-side-${kind}`}>
-      <span className="preview-side-avatar" aria-hidden="true">
-        {user.slice(0, 1)}
-      </span>
+      <AvatarPlaceholder />
       <div>
         <strong>{user}</strong>
         <small>{text}</small>
@@ -191,6 +196,10 @@ export function DanmakuStylePreview({
     Math.max(0, previewCanvas.height - measuredStackHeight)
   );
   const canAdjust = sideStream || showCards;
+  const previewGiftWidth = Math.min(
+    Math.max(1, effective.superChatWidth * 0.88),
+    Math.max(effective.boxFontSize * 8.8, effective.superChatWidth * 0.62)
+  );
 
   useEffect(() => {
     const element = previewRef.current;
@@ -399,10 +408,10 @@ export function DanmakuStylePreview({
               onPointerDown={(event) => beginInteraction(event, 'move')}
               title="拖动调整侧栏位置"
             >
-              <SideChatPreviewRow user="观众 A" badge="LV.18" text="这是一条示例互动" tone="blue" />
-              <SideChatPreviewRow user="观众 B" badge="LV.25" text="点赞了直播间" tone="cyan" />
+              <SideChatPreviewRow badge="LV.18" text="这是一条示例互动" tone="blue" />
+              <SideChatPreviewRow badge="LV.25" text="点赞了直播间" tone="cyan" />
               {showCards ? <SideEventPreview user="观众 C" text="赠送 小礼物 x1" price="CNY 0.1" kind="gift" /> : null}
-              <SideChatPreviewRow user="观众 D" badge="LV.12" text="感谢你的支持～" tone="mint" />
+              <SideChatPreviewRow badge="LV.12" text="感谢你的支持～" tone="mint" />
               {showCards ? <SideEventPreview user="观众 E" text="加入了粉丝团" price="CNY 0.1" kind="superchat" /> : null}
             </div>
             <button
@@ -436,7 +445,11 @@ export function DanmakuStylePreview({
               <small>SuperChat CNY 30</small>
               <p>直播顺利！</p>
             </div>
-            <div className="preview-card preview-gift" onPointerDown={(event) => beginInteraction(event, 'move')}>
+            <div
+              className="preview-card preview-gift"
+              style={{ width: `${previewGiftWidth}px` }}
+              onPointerDown={(event) => beginInteraction(event, 'move')}
+            >
               <strong>示例观众</strong>
               <small>赠送 小花花 x3</small>
             </div>

@@ -77,22 +77,68 @@ function commandData(command) {
   return raw && typeof raw === 'object' ? raw : {};
 }
 
+function normalizeAvatarUrl(...candidates) {
+  for (const candidate of candidates) {
+    const raw = typeof candidate === 'string' ? candidate.trim() : '';
+    if (!raw || raw.length > 2048) continue;
+    const source = raw.startsWith('//') ? `https:${raw}` : raw;
+    try {
+      const parsed = new URL(source);
+      const host = parsed.hostname.toLowerCase();
+      const isBilibiliImageHost =
+        host === 'hdslb.com' ||
+        host.endsWith('.hdslb.com') ||
+        host === 'biliimg.com' ||
+        host.endsWith('.biliimg.com');
+      if (['http:', 'https:'].includes(parsed.protocol) && isBilibiliImageHost) {
+        return parsed.toString();
+      }
+    } catch {
+      // A malformed avatar field must never prevent the interaction itself
+      // from being captured and burned.
+    }
+  }
+  return '';
+}
+
+function eventAvatarUrl(data = {}, extra = {}) {
+  return normalizeAvatarUrl(
+    data.face,
+    data.face_url,
+    data.faceUrl,
+    data.avatar,
+    data.avatar_url,
+    data.avatarUrl,
+    data.user_info?.face,
+    data.user_info?.face_url,
+    data.user_info?.avatar,
+    data.user_show_info?.face,
+    data.user_show_info?.avatar,
+    extra.face,
+    extra.face_url,
+    extra.avatar
+  );
+}
+
 function normalizeDanmakuEvent(command, timing) {
   const type = danmakuCommandType(command);
   const normalizedTiming = normalizeEventTiming(timing);
 
   if (type === 'DANMU_MSG') {
     const info = command.info || [];
+    const data = commandData(command);
     const text = String(info[1] || '');
     if (!text.trim()) return null;
     const uid = Number(info[2]?.[0] || 0);
+    const avatarUrl = eventAvatarUrl(data, info[2] || {});
     return {
       ...normalizeSourceMeta(command, commandData(command), normalizedTiming),
       type: 'danmaku',
       uid,
       text,
       user: String(info[2]?.[1] || ''),
-      color: Number(info[0]?.[3] || 0xffffff)
+      color: Number(info[0]?.[3] || 0xffffff),
+      ...(avatarUrl ? { avatarUrl } : {})
     };
   }
 
@@ -104,6 +150,7 @@ function normalizeDanmakuEvent(command, timing) {
     const count = Number(data.num || data.combo_num || data.combo_count || 1);
     const unitPrice = Number(data.price || data.discount_price || 0) / 1000;
     const totalPrice = Number(data.total_coin || data.total_price || 0) / 1000 || unitPrice * count;
+    const avatarUrl = eventAvatarUrl(data);
     return {
       ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'gift',
@@ -114,12 +161,14 @@ function normalizeDanmakuEvent(command, timing) {
       count,
       unitPrice,
       totalPrice,
-      price: unitPrice
+      price: unitPrice,
+      ...(avatarUrl ? { avatarUrl } : {})
     };
   }
 
   if (type === 'SUPER_CHAT_MESSAGE' || type === 'SUPER_CHAT_MESSAGE_JPN') {
     const data = commandData(command);
+    const avatarUrl = eventAvatarUrl(data);
     return {
       ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'superchat',
@@ -127,7 +176,8 @@ function normalizeDanmakuEvent(command, timing) {
       user: String(data.user_info?.uname || data.uname || ''),
       text: String(data.message || ''),
       price: Number(data.price || 0),
-      duration: Number(data.time || data.duration || 60)
+      duration: Number(data.time || data.duration || 60),
+      ...(avatarUrl ? { avatarUrl } : {})
     };
   }
 
@@ -135,6 +185,7 @@ function normalizeDanmakuEvent(command, timing) {
     const data = commandData(command);
     const count = Number(data.num || 1);
     const unitPrice = Number(data.price || 0) / 1000;
+    const avatarUrl = eventAvatarUrl(data);
     return {
       ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'guard',
@@ -145,7 +196,8 @@ function normalizeDanmakuEvent(command, timing) {
       guardLevel: Number(data.guard_level || 0),
       unitPrice,
       totalPrice: unitPrice * count,
-      price: unitPrice
+      price: unitPrice,
+      ...(avatarUrl ? { avatarUrl } : {})
     };
   }
 
@@ -183,7 +235,7 @@ const DEFAULT_DANMAKU_STYLE = {
   messageDuration: 5,
   giftLanes: 4,
   giftBottom: 922,
-  giftWidth: 540,
+  giftWidth: 360,
   giftHeight: 58,
   giftAreaHeight: 260,
   giftGap: 10,
@@ -377,7 +429,7 @@ function createDefaultDanmakuCss() {
   --message-duration: 5;
   --gift-lanes: 4;
   --gift-bottom: 922;
-  --gift-width: 540;
+  --gift-width: 360;
   --gift-height: 58;
   --gift-area-height: 260;
   --gift-gap: 10;
@@ -597,7 +649,7 @@ function resolveGiftTotalPrice(event) {
   return Number.isFinite(unit) && unit > 0 ? unit * Math.max(1, count) : 0;
 }
 
-function createAss(events, options = {}) {
+function resolveAssRenderContext(events, options = {}) {
   const overlayMode = normalizeBurnOverlayMode(options.overlayMode);
   const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea);
   const baseStyle =
@@ -613,6 +665,11 @@ function createAss(events, options = {}) {
     messageDuration: style.messageDuration,
     danmakuDuration: style.danmakuDuration
   });
+  return { overlayMode, danmakuArea, style, sorted };
+}
+
+function createAss(events, options = {}) {
+  const { overlayMode, danmakuArea, style, sorted } = resolveAssRenderContext(events, options);
   const lines = [
     '[Script Info]',
     'ScriptType: v4.00+',
@@ -668,6 +725,91 @@ function createAss(events, options = {}) {
   }
 
   return `${lines.join('\n')}\n`;
+}
+
+// Raster headshots cannot be embedded in ASS.  Keep the placement calculation
+// beside the ASS renderer so the optional FFmpeg alpha layer can use the exact
+// same queue motion, source canvas and circular avatar bounds.
+function createAvatarOverlayPlan(events, options = {}) {
+  const { style, sorted } = resolveAssRenderContext(events, options);
+  const visualPreset = visualPresetFromStyle(style);
+  const maxEntries = Math.floor(clamp(options.maxEntries ?? 24, 0, 96));
+  const maxSegmentsPerEntry = Math.floor(clamp(options.maxSegmentsPerEntry ?? 32, 1, 128));
+  const panelLeft = Math.max(0, Number(style.panelLeft) || 0);
+  const panelWidth = Math.max(1, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const panelHeight = Math.max(1, Number(style.superChatBottom) || DEFAULT_DANMAKU_STYLE.superChatBottom);
+  const plan = {
+    visualPreset,
+    panel: { left: panelLeft, width: panelWidth, height: panelHeight },
+    eventCount: sorted.length,
+    candidateCount: 0,
+    truncated: false,
+    entries: []
+  };
+
+  // The minimal preset intentionally has a small status dot rather than an
+  // avatar frame, and the legacy preset is plain rolling danmaku.
+  if (!['h5-card', 'bubble'].includes(visualPreset) || maxEntries < 1) {
+    return plan;
+  }
+
+  const timeline = createMessageTimeline(sorted, style, { includeDanmaku: true, sideStream: true });
+  const candidates = [];
+  for (const item of timeline.items) {
+    const entriesByAvatar = new Map();
+    for (const segment of item.segments || []) {
+      const event = segment.event || item.event || {};
+      const avatarUrl = normalizeAvatarUrl(event.avatarUrl, item.event?.avatarUrl);
+      const uid = Math.floor(Number(event.uid || item.event?.uid || 0));
+      const placement = getSideAvatarPlacement(event, style, segment);
+      if (!placement || (!avatarUrl && (!Number.isSafeInteger(uid) || uid <= 0))) {
+        continue;
+      }
+      const sourceKey = avatarUrl || `uid:${uid}`;
+      const key = `${sourceKey}|${Math.round(placement.innerSize * 100)}`;
+      if (!entriesByAvatar.has(key)) {
+        const entry = {
+          id: `avatar-${candidates.length + 1}`,
+          avatarUrl,
+          uid: Number.isSafeInteger(uid) && uid > 0 ? uid : 0,
+          size: placement.innerSize,
+          start: segment.start,
+          segments: []
+        };
+        entriesByAvatar.set(key, entry);
+        candidates.push(entry);
+      }
+      const entry = entriesByAvatar.get(key);
+      if (!entry) continue;
+      if (entry.segments.length >= maxSegmentsPerEntry) {
+        plan.truncated = true;
+        continue;
+      }
+      entry.segments.push({
+        start: segment.start,
+        end: segment.end,
+        x1: placement.innerX1,
+        x2: placement.innerX2,
+        y1: placement.innerY1,
+        y2: placement.innerY2
+      });
+    }
+  }
+  plan.candidateCount = candidates.length;
+  if (candidates.length <= maxEntries) {
+    plan.entries = candidates;
+    return plan;
+  }
+  // A whole stream can contain thousands of side cards. Selecting across the
+  // timeline instead of keeping only the first few gives the transparent
+  // layer useful coverage from the beginning through the end of a recording.
+  plan.truncated = true;
+  for (let index = 0; index < maxEntries; index += 1) {
+    const sourceIndex =
+      maxEntries === 1 ? 0 : Math.round((index * (candidates.length - 1)) / (maxEntries - 1));
+    plan.entries.push(candidates[sourceIndex]);
+  }
+  return plan;
 }
 
 function renderRollingDanmaku(event, style, start, y, duration) {
@@ -769,6 +911,9 @@ function createMessageItems(events, style, options = {}) {
         }
         previous.event = versionEvent;
         previous.end = Math.max(previous.end, time + duration);
+        const versionMetrics = getMessageItemMetrics(versionEvent, style, options);
+        previous.height = Math.max(Number(previous.height) || 0, versionMetrics.height);
+        previous.width = Math.max(Number(previous.width) || 0, versionMetrics.width);
         continue;
       }
     }
@@ -780,13 +925,15 @@ function createMessageItems(events, style, options = {}) {
       comboCount: 1,
       totalPrice: resolveGiftTotalPrice(sourceEvent)
     };
+    const metrics = getMessageItemMetrics(event, style, options);
     const item = {
       id: `message-${items.length}`,
       order: items.length,
       type: event.type,
       start: time,
       end: time + duration,
-      height: getMessageItemHeight(event, style),
+      height: metrics.height,
+      width: metrics.width,
       event,
       versions: [{ time, event }]
     };
@@ -800,23 +947,27 @@ function createMessageItems(events, style, options = {}) {
   return items;
 }
 
-function getMessageItemHeight(event, style) {
-  if (event.type === 'danmaku') {
-    if (visualPresetFromStyle(style) === 'minimal') {
-      return getMinimalSideChatMetrics(style, event.text).height;
+function getMessageItemMetrics(event, style, options = {}) {
+  if (options.sideStream === true) {
+    if (event.type === 'danmaku') {
+      return visualPresetFromStyle(style) === 'minimal'
+        ? getMinimalSideChatMetrics(style, event.text)
+        : getSideChatMetrics(style, event.text);
     }
-    return getSideChatMetrics(style, event.text).height;
-  }
-  if (visualPresetFromStyle(style) === 'minimal') {
-    return getMinimalSideInteractionMetrics(style).height;
+    return visualPresetFromStyle(style) === 'minimal'
+      ? getMinimalSideInteractionMetrics(style)
+      : getSideInteractionCardMetrics(style);
   }
   if (event.type === 'superchat') {
-    return getMessageCardMetrics(style, event.text).height;
+    return getMessageCardMetrics(style, event.text);
   }
   if (event.type === 'guard') {
-    return getGuardCardMetrics(style).height;
+    return getGuardCardMetrics(style);
   }
-  return getGuardCardMetrics(style).height;
+  if (event.type === 'gift') {
+    return getGiftCardMetrics(style, event);
+  }
+  return getSideChatMetrics(style, event.text);
 }
 
 function createMessageTimeline(events, styleValues = {}, options = {}) {
@@ -1019,7 +1170,7 @@ function buildMessageMotionSegments(item, changes, style, options = {}) {
   const splitSegments = splitMotionSegments(ySegments, splitTimes);
   const exitStart = Math.max(item.start, item.end - animationDuration);
   const panelLeft = Number(style.panelLeft) || 0;
-  const exitWidth = Math.max(1, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const exitWidth = Math.max(1, Number(item.width) || Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
   const xAt = (time) => {
     if (options.sideStream === true) return panelLeft;
     if (time <= exitStart) return panelLeft;
@@ -1307,8 +1458,96 @@ function sideAvatarColor(event) {
   return assColorFromRgbWithAlpha(palette[hash % palette.length], 0x03);
 }
 
-function sideUserInitial(event) {
-  return Array.from(String(event.user || '观众').trim())[0] || '观';
+function getSideAvatarPlacement(event, style, segment) {
+  if (visualPresetFromStyle(style) === 'minimal' || !segment) {
+    return null;
+  }
+  const metrics = event.type === 'danmaku' ? getSideChatMetrics(style, event.text) : getSideInteractionCardMetrics(style);
+  const offsetX = event.type === 'danmaku' ? 0 : metrics.padding;
+  const offsetY = event.type === 'danmaku' ? Math.max(0, (metrics.height - metrics.avatarSize) / 2) : metrics.padding;
+  const size = Math.max(8, Number(metrics.avatarSize) || 0);
+  const ringInset = Math.max(1, size * 0.055);
+  const innerSize = Math.max(1, size - ringInset * 2);
+  return {
+    offsetX,
+    offsetY,
+    size,
+    ringInset,
+    innerSize,
+    outerX1: segment.x1 + offsetX,
+    outerX2: segment.x2 + offsetX,
+    outerY1: segment.y1 + offsetY,
+    outerY2: segment.y2 + offsetY,
+    innerX1: segment.x1 + offsetX + ringInset,
+    innerX2: segment.x2 + offsetX + ringInset,
+    innerY1: segment.y1 + offsetY + ringInset,
+    innerY2: segment.y2 + offsetY + ringInset
+  };
+}
+
+function renderSideAvatar(event, segment, clip, placement) {
+  if (!placement) return [];
+  const { offsetX, offsetY, size: safeSize, ringInset, innerSize } = placement;
+  const headSize = Math.max(4, safeSize * 0.29);
+  const headX = offsetX + (safeSize - headSize) / 2;
+  const headY = offsetY + safeSize * 0.21;
+  const shouldersWidth = Math.max(6, safeSize * 0.64);
+  const shouldersHeight = Math.max(4, safeSize * 0.3);
+  const shouldersX = offsetX + (safeSize - shouldersWidth) / 2;
+  const shouldersY = offsetY + safeSize * 0.58;
+  const softWhite = assColorFromRgbWithAlpha(0xffffff, 0x40);
+  return [
+    // This remains under the optional raster layer as a safe fallback when a
+    // recorded or public Bilibili avatar cannot be fetched during export.
+    drawRoundedRect(
+      5,
+      segment.start,
+      segment.end,
+      segment.x1 + offsetX,
+      segment.y1 + offsetY,
+      safeSize,
+      safeSize,
+      safeSize / 2,
+      assColorFromRgbWithAlpha(0xffffff, 0x88),
+      segmentShapeOptions(segment, clip, offsetX, offsetY)
+    ),
+    drawRoundedRect(
+      6,
+      segment.start,
+      segment.end,
+      segment.x1 + offsetX + ringInset,
+      segment.y1 + offsetY + ringInset,
+      innerSize,
+      innerSize,
+      innerSize / 2,
+      sideAvatarColor(event),
+      segmentShapeOptions(segment, clip, offsetX + ringInset, offsetY + ringInset)
+    ),
+    drawRoundedRect(
+      7,
+      segment.start,
+      segment.end,
+      segment.x1 + headX,
+      segment.y1 + headY,
+      headSize,
+      headSize,
+      headSize / 2,
+      softWhite,
+      segmentShapeOptions(segment, clip, headX, headY)
+    ),
+    drawRoundedRect(
+      7,
+      segment.start,
+      segment.end,
+      segment.x1 + shouldersX,
+      segment.y1 + shouldersY,
+      shouldersWidth,
+      shouldersHeight,
+      shouldersHeight / 2,
+      softWhite,
+      segmentShapeOptions(segment, clip, shouldersX, shouldersY)
+    )
+  ];
 }
 
 function sideInteractionText(event) {
@@ -1339,31 +1578,10 @@ function renderSideChatSegment(event, style, segment, clip) {
     Math.max(metrics.metaFontSize * 2.3, estimateTextWidth(username, metrics.metaFontSize) + metrics.metaFontSize)
   );
   const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
-  const avatarY = Math.max(0, (metrics.height - metrics.avatarSize) / 2);
   const bubbleX = metrics.contentX;
   const bubbleY = metrics.bubbleTop;
   return [
-    drawRoundedRect(
-      5,
-      segment.start,
-      segment.end,
-      segment.x1,
-      segment.y1 + avatarY,
-      metrics.avatarSize,
-      metrics.avatarSize,
-      metrics.avatarSize / 2,
-      sideAvatarColor(event),
-      segmentShapeOptions(segment, clip, 0, avatarY)
-    ),
-    dialogue(
-      6,
-      segment.start,
-      segment.end,
-      'BoxText',
-      `{${textTag}${segmentPositionTag(segment, metrics.avatarSize / 2, avatarY + metrics.avatarSize / 2)}\\an5\\fs${assNumber(
-        metrics.avatarSize * 0.44
-      )}\\1c${palette.avatarText}\\b1}${assEscape(sideUserInitial(event))}`
-    ),
+    ...renderSideAvatar(event, segment, clip, getSideAvatarPlacement(event, style, segment)),
     ...(metrics.metaHeight > 0
       ? [
           drawRoundedRect(
@@ -1455,7 +1673,6 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
   const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
   const detail = truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
   const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
-  const avatarY = metrics.padding;
   const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
   const priceWidth = price ? Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2) : 0;
   const priceX = metrics.width - metrics.padding - priceWidth;
@@ -1472,27 +1689,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
       palette.background,
       segmentShapeOptions(segment, clip)
     ),
-    drawRoundedRect(
-      7,
-      segment.start,
-      segment.end,
-      segment.x1 + metrics.padding,
-      segment.y1 + avatarY,
-      metrics.avatarSize,
-      metrics.avatarSize,
-      metrics.avatarSize / 2,
-      sideAvatarColor(event),
-      segmentShapeOptions(segment, clip, metrics.padding, avatarY)
-    ),
-    dialogue(
-      8,
-      segment.start,
-      segment.end,
-      'BoxText',
-      `{${textTag}${segmentPositionTag(segment, metrics.padding + metrics.avatarSize / 2, avatarY + metrics.avatarSize / 2)}\\an5\\fs${assNumber(
-        metrics.avatarSize * 0.44
-      )}\\1c${palette.avatarText}\\b1}${assEscape(sideUserInitial(event))}`
-    ),
+    ...renderSideAvatar(event, segment, clip, getSideAvatarPlacement(event, style, segment)),
     dialogue(
       8,
       segment.start,
@@ -1719,7 +1916,7 @@ function renderGuardCardSegment(event, style, segment, clip) {
 }
 
 function renderGiftCardSegment(event, style, segment, clip) {
-  const metrics = getGuardCardMetrics(style);
+  const metrics = getGiftCardMetrics(style, event);
   const palette = giftCardPalette(resolveGiftTotalPrice(event), style);
   const username = truncateTextToWidth(event.user || '用户', metrics.textWidth, metrics.fontSize);
   const count = Math.max(1, Number(event.count) || 1);
@@ -1812,6 +2009,47 @@ function getGuardCardMetrics(style) {
     fontSize,
     metaFontSize,
     textWidth: width - radius
+  };
+}
+
+function getGiftCardMetrics(style, event = {}) {
+  const panelWidth = Math.max(160, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const configuredWidth = Math.max(160, Number(style.giftWidth) || DEFAULT_DANMAKU_STYLE.giftWidth);
+  // Gifts should read as a compact ticker, not as a full-width SuperChat card.
+  // Keep enough room for ordinary names while reserving the wide card only for
+  // unusually long names or gift titles.
+  const maxWidth = Math.max(160, Math.min(configuredWidth, panelWidth * 0.88));
+  const fontSize = Math.max(
+    12,
+    Math.min(
+      Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize,
+      Number(style.giftFontSize) || DEFAULT_DANMAKU_STYLE.giftFontSize
+    )
+  );
+  const metaFontSize = Math.max(12, Math.floor(fontSize * MESSAGE_CARD.metaFontScale));
+  const nominalHeight = fontSize + metaFontSize + fontSize / 2;
+  const radius = getCardRadius(style, fontSize, maxWidth, nominalHeight);
+  const insetX = Math.max(radius / 2, Math.round(fontSize * 0.58));
+  const username = String(event.user || '用户');
+  const count = Math.max(1, Number(event.count) || 1);
+  const giftText = `赠送 ${event.giftName || '礼物'} x${count}`;
+  const maximumTextWidth = Math.max(1, maxWidth - insetX * 2);
+  const minimumTextWidth = Math.min(maximumTextWidth, Math.max(156, fontSize * 8.8));
+  const desiredTextWidth = Math.max(
+    estimateTextWidth(username, fontSize),
+    estimateTextWidth(giftText, metaFontSize)
+  );
+  const textWidth = clamp(Math.ceil(desiredTextWidth + fontSize * 0.55), minimumTextWidth, maximumTextWidth);
+  const width = Math.max(1, textWidth + insetX * 2);
+  const height = Math.max(fontSize + metaFontSize + radius, Number(style.giftHeight) || 0);
+  return {
+    width,
+    height,
+    radius,
+    insetX,
+    fontSize,
+    metaFontSize,
+    textWidth
   };
 }
 
@@ -2293,6 +2531,7 @@ module.exports = {
   getRollingDanmakuDuration,
   chooseRollingDanmakuLane,
   createMessageTimeline,
+  createAvatarOverlayPlan,
   createAss,
   drawRect,
   drawRoundedRect,

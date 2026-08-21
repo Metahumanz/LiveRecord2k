@@ -9,6 +9,7 @@ const { LiveRecordService, isFfmpegMemoryPressureError } = require('../src/serve
 const { createAss } = require('../src/server/danmaku/ass.cjs');
 const {
   createBurnArgs,
+  createAvatarOverlayFilterScript,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
@@ -416,6 +417,85 @@ test('burn filter waits for the first decodable keyframe and still produces vali
   }
 });
 
+test('photo avatars are composed through a separate transparent side layer and keep an MP4-compatible output', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-burn-'));
+  const inputPath = path.join(tempDir, 'input.mp4');
+  const sourceAvatarPath = path.join(tempDir, 'source.png');
+  const avatarPath = path.join(tempDir, 'avatar.png');
+  const assPath = path.join(tempDir, 'overlay.ass');
+  const filterScriptPath = path.join(tempDir, 'avatar-layer.ffscript');
+  const outputPath = path.join(tempDir, 'output.mp4');
+  try {
+    const input = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=1.2',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1.2',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', inputPath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(input.status, 0, input.stderr);
+    const source = await runCapturedProcess(
+      ffmpegPath,
+      ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=80x80:rate=1:duration=1', '-frames:v', '1', sourceAvatarPath],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(source.status, 0, source.stderr);
+    const cropped = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y', '-i', sourceAvatarPath, '-frames:v', '1', '-vf',
+        "scale=32:32:force_original_aspect_ratio=increase,crop=32:32,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2),(W/2)*(W/2)),255,0)'",
+        '-pix_fmt', 'rgba', avatarPath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(cropped.status, 0, cropped.stderr);
+    await fsp.writeFile(assPath, createAss([]), 'utf8');
+    const avatarOverlay = {
+      panel: { left: 10, width: 120, height: 180 },
+      filterScriptPath,
+      entries: [
+        {
+          imagePath: avatarPath,
+          segments: [
+            { start: 0.1, end: 0.6, x1: 18, x2: 18, y1: 28, y2: 56 },
+            { start: 0.6, end: 1, x1: 18, x2: 18, y1: 56, y2: 56 }
+          ]
+        }
+      ]
+    };
+    const script = createAvatarOverlayFilterScript({ assPath, fps: 30, avatarOverlay });
+    assert.match(script, /color=c=black@0\.0:s=120x180:r=30,format=rgba/);
+    assert.match(script, /\[avatar_layer_0\]\[avatar_image_0\]overlay=/);
+    assert.match(script, /format=yuv420p\[vout\]/);
+    await fsp.writeFile(filterScriptPath, script, 'utf8');
+    const args = createBurnArgs({
+      cleanPath: inputPath,
+      assPath,
+      burnedPath: outputPath,
+      codec: 'libx264',
+      crf: 24,
+      container: 'mp4',
+      fps: 30,
+      avatarOverlay
+    });
+    assert.ok(args.includes('-filter_complex_script'));
+    assert.equal(args.includes('-vf'), false);
+    assert.equal(args.filter((arg) => arg === '-i').length, 2, 'source video plus the alpha avatar input');
+    const burned = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
+    assert.equal(burned.status, 0, burned.stderr);
+    const info = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.ok(info.videoInfo);
+    assert.ok(info.audioInfo);
+    assert.equal(info.videoInfo.pixelFormat, 'yuv420p');
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('portrait burn keeps the source canvas and renders its adaptive ASS overlay', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-portrait-burn-'));
   const inputPath = path.join(tempDir, 'portrait-input.mp4');
@@ -451,7 +531,7 @@ test('portrait burn keeps the source canvas and renders its adaptive ASS overlay
     assert.equal(generated.status, 0, generated.stderr);
     await fsp.writeFile(
       danmakuPath,
-      `${JSON.stringify({ type: 'danmaku', time: 0.1, user: '观众', text: '竖屏烧录' })}\n`,
+      `${JSON.stringify({ type: 'danmaku', time: 0.1, uid: 42, user: '观众', text: '竖屏烧录' })}\n`,
       'utf8'
     );
     const service = new LiveRecordService();
@@ -472,6 +552,7 @@ test('portrait burn keeps the source canvas and renders its adaptive ASS overlay
     assert.match(ass, /PlayResY: 960/);
     assert.equal(assets.playWidth, 540);
     assert.equal(assets.playHeight, 960);
+    assert.equal(assets.avatarPlan?.entries?.[0]?.uid, 42, 'worker returns the matching photo-layer motion plan');
     assert.equal(recording.videoInfo.width, 540);
     assert.equal(recording.videoInfo.height, 960);
     const burned = await runCapturedProcess(

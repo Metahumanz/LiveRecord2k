@@ -24,6 +24,113 @@ function escapeFilterPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 }
 
+function formatFilterNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '0';
+  return number.toFixed(3).replace(/\.?0+$/, '') || '0';
+}
+
+function normalizeAvatarOverlayEntries(avatarOverlay) {
+  const entries = Array.isArray(avatarOverlay?.entries) ? avatarOverlay.entries : [];
+  return entries
+    .map((entry) => {
+      const imagePath = String(entry?.imagePath || '').trim();
+      const segments = Array.isArray(entry?.segments)
+        ? entry.segments
+            .map((segment) => ({
+              start: Number(segment?.start),
+              end: Number(segment?.end),
+              x1: Number(segment?.x1),
+              x2: Number(segment?.x2),
+              y1: Number(segment?.y1),
+              y2: Number(segment?.y2)
+            }))
+            .filter(
+              (segment) =>
+                Number.isFinite(segment.start) &&
+                Number.isFinite(segment.end) &&
+                segment.end > segment.start &&
+                [segment.x1, segment.x2, segment.y1, segment.y2].every(Number.isFinite)
+            )
+        : [];
+      return { imagePath, segments };
+    })
+    .filter((entry) => entry.imagePath && entry.segments.length);
+}
+
+function avatarMotionExpression(segments, axis, offset = 0) {
+  const coordinateOne = axis === 'x' ? 'x1' : 'y1';
+  const coordinateTwo = axis === 'x' ? 'x2' : 'y2';
+  const ordered = [...segments].sort((left, right) => left.start - right.start || left.end - right.end);
+  const motionAt = (segment) => {
+    const from = Number(segment[coordinateOne]) - offset;
+    const to = Number(segment[coordinateTwo]) - offset;
+    if (Math.abs(to - from) < 0.001 || segment.end - segment.start < 0.001) {
+      return formatFilterNumber(from);
+    }
+    return `${formatFilterNumber(from)}+(${formatFilterNumber(to)}-${formatFilterNumber(from)})*(t-${formatFilterNumber(
+      segment.start
+    )})/${formatFilterNumber(segment.end - segment.start)}`;
+  };
+  let expression = motionAt(ordered[ordered.length - 1]);
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const segment = ordered[index];
+    expression = `if(between(t\\,${formatFilterNumber(segment.start)}\\,${formatFilterNumber(segment.end)})\\,${motionAt(
+      segment
+    )}\\,${expression})`;
+  }
+  return expression;
+}
+
+function createBurnVideoFilter(assPath, fps) {
+  const targetFps = normalizeMergeFps(fps);
+  const fpsFilter = targetFps ? `,fps=${targetFps}:start_time=0` : '';
+  return (
+    `settb=AVTB,setpts=PTS-STARTPTS,select='if(isnan(prev_selected_t)\\,key\\,1)'${fpsFilter},` +
+    `ass='${escapeFilterPath(assPath)}'`
+  );
+}
+
+// The avatar artwork is built as its own transparent side-panel stream and
+// composited once above the ASS result.  This avoids a full-frame overlay pass
+// for every headshot while preserving the ASS vector portrait underneath as a
+// failure fallback.
+function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay } = {}) {
+  const entries = normalizeAvatarOverlayEntries(avatarOverlay);
+  if (!entries.length) return '';
+  const panel = avatarOverlay?.panel || {};
+  const panelLeft = Math.max(0, Number(panel.left) || 0);
+  const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
+  const panelHeight = Math.max(1, Math.ceil(Number(panel.height) || 1));
+  const layerFps = normalizeMergeFps(fps) || 30;
+  const filters = [`[0:v]${createBurnVideoFilter(assPath, fps)}[burn_base]`];
+  filters.push(
+    `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,settb=AVTB,setpts=PTS-STARTPTS[avatar_layer_0]`
+  );
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    const imageLabel = `avatar_image_${index}`;
+    const previousLayer = `avatar_layer_${index}`;
+    const nextLayer = `avatar_layer_${index + 1}`;
+    const start = Math.min(...entry.segments.map((segment) => segment.start));
+    const end = Math.max(...entry.segments.map((segment) => segment.end));
+    filters.push(`[${index + 1}:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba[${imageLabel}]`);
+    filters.push(
+      `[${previousLayer}][${imageLabel}]overlay=` +
+        `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
+        `y='${avatarMotionExpression(entry.segments, 'y')}':` +
+        `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
+        `eof_action=pass:repeatlast=0:format=auto[${nextLayer}]`
+    );
+  }
+  filters.push(
+    `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
+      'eof_action=pass:repeatlast=0:format=auto,format=yuv420p[vout]'
+  );
+  return `${filters.join(';\n')}\n`;
+}
+
 function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec, streamProtocol, streamFormat }) {
   const args = [
     '-hide_banner',
@@ -89,23 +196,28 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
   return args;
 }
 
-function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration, fps }) {
+function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration, fps, avatarOverlay }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   args.push('-i', cleanPath);
+  const avatarEntries = avatarOverlay?.filterScriptPath ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
+  const avatarFps = normalizeMergeFps(fps) || 30;
+  for (const entry of avatarEntries) {
+    args.push('-loop', '1', '-framerate', String(avatarFps), '-i', entry.imagePath);
+  }
   if (hasStart) {
     args.push('-ss', formatFfmpegSeconds(startTime));
   }
   if (hasDuration) {
     args.push('-t', formatFfmpegSeconds(duration));
   }
-  const targetFps = normalizeMergeFps(fps);
-  const fpsFilter = targetFps ? `,fps=${targetFps}:start_time=0` : '';
-  const videoFilter =
-    `settb=AVTB,setpts=PTS-STARTPTS,select='if(isnan(prev_selected_t)\\,key\\,1)'${fpsFilter},` +
-    `ass='${escapeFilterPath(assPath)}'`;
-  args.push('-map', '0:v:0', '-map', '0:a?', '-vf', videoFilter, '-c:v', codec || 'libx265');
+  if (avatarEntries.length) {
+    args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]', '-map', '0:a?');
+  } else {
+    args.push('-map', '0:v:0', '-map', '0:a?', '-vf', createBurnVideoFilter(assPath, fps));
+  }
+  args.push('-c:v', codec || 'libx265');
 
   if ((codec || '').includes('nvenc')) {
     args.push('-preset', 'p5', '-cq', String(crf), '-b:v', '0');
@@ -573,6 +685,7 @@ module.exports = {
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
+  createAvatarOverlayFilterScript,
   createPreviewHlsArgs,
   createClipCopyArgs,
   createConcatCopyArgs,

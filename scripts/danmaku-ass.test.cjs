@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   createAss,
   createMessageTimeline,
+  createAvatarOverlayPlan,
   createDefaultDanmakuCss,
   getDanmakuEventDuration,
   getRollingDanmakuDuration,
@@ -23,6 +24,7 @@ test('default message card style matches the compact lower-left reference scale'
   assert.match(css, /--panel-left: 5;/);
   assert.match(css, /--superchat-bottom: 1070;/);
   assert.match(css, /--superchat-width: 375;/);
+  assert.match(css, /--gift-width: 360;/);
   assert.match(css, /--message-duration: 5;/);
 
   const migrated = normalizeDanmakuStyle({
@@ -114,6 +116,8 @@ test('non-default presets turn ordinary danmaku into a fixed side conversation s
   assert.match(h5Card, /\\move\(28,/);
   assert.match(h5Card, /预览用户/);
   assert.match(h5Card, /\\1c&HD7CF59&\\1a&H04&/);
+  assert.match(h5Card, /\\1c&HFFFFFF&\\1a&H40&/);
+  assert.doesNotMatch(h5Card, /\\an5/);
   assert.match(bubble, /\\clip\(54,0,474,1018\)/);
   assert.match(bubble, /\\1c&H2F2230&\\1a&H12&/);
   assert.match(minimal, /\\clip\(24,0,384,1052\)/);
@@ -214,18 +218,77 @@ test('guard events render as a membership card instead of the generic gift ticke
 });
 
 test('ordinary gifts share the message stack and use the compact two-line card requested for burn-in', () => {
-  const ass = createAss([
+  const events = [
     { type: 'gift', time: 1, user: '观众A', giftName: '小花花', count: 2 },
     { type: 'superchat', time: 2, duration: 4, user: '观众B', price: 30, text: '测试消息' }
-  ]);
+  ];
+  const ass = createAss(events);
+  const [gift] = createMessageTimeline(events).items;
 
   assert.match(ass, /\\1c&HF7F3FF&\\1a&H18&/);
   assert.match(ass, /\\1c&HC46CFF&\\1a&H00&/);
   assert.match(ass, /\\1c&H00502980&\\b1}观众A/);
   assert.match(ass, /\\1c&H0054434B&\\b0}赠送 小花花 x2/);
   assert.match(ass, /\\clip\(5,0,380,1070\)/);
-  assert.match(ass, /\\move\(5,1003\.5,5,903\)/);
+  assert.ok(gift.width < 300, 'short gifts should not occupy the full interaction-card width');
+  assert.equal(gift.segments.at(-1).x2, 5 - gift.width, 'the exit animation follows the compact gift width');
   assert.doesNotMatch(ass, /观众A:|礼物互动|COMBO|￥/);
+});
+
+test('photo-avatar overlay plan reuses the side queue coordinates and keeps a safe fallback scope', () => {
+  const events = [
+    {
+      type: 'danmaku',
+      time: 1,
+      uid: 101,
+      user: '头像用户',
+      text: '头像需要随队列一起移动',
+      avatarUrl: 'https://i0.hdslb.com/bfs/face/avatar-a.jpg'
+    },
+    { type: 'gift', time: 2, uid: 202, user: '礼物用户', giftName: '小花', count: 1 }
+  ];
+  const plan = createAvatarOverlayPlan(events, { stylePreset: 'h5-card', maxEntries: 8 });
+
+  assert.equal(plan.visualPreset, 'h5-card');
+  assert.deepEqual(plan.panel, { left: 28, width: 450, height: 1040 });
+  assert.equal(plan.entries.length, 2);
+  assert.equal(plan.entries[0].avatarUrl, 'https://i0.hdslb.com/bfs/face/avatar-a.jpg');
+  assert.equal(plan.entries[1].uid, 202, 'a missing recorded URL can be resolved from the public UID card later');
+  assert.equal(plan.entries[1].avatarUrl, '');
+  assert.ok(plan.entries[0].size > 20);
+  assert.ok(plan.entries[0].segments.some((segment) => segment.y1 !== segment.y2), 'avatar follows the push animation');
+  assert.ok(plan.entries[0].segments.every((segment) => segment.x1 >= plan.panel.left));
+  assert.equal(createAvatarOverlayPlan(events, { stylePreset: 'current' }).entries.length, 0);
+  assert.equal(createAvatarOverlayPlan(events, { stylePreset: 'minimal' }).entries.length, 0);
+});
+
+test('photo-avatar overlay samples a long side stream across its full duration rather than only at the start', () => {
+  const events = Array.from({ length: 7 }, (_unused, index) => ({
+    type: 'danmaku',
+    time: index * 60,
+    uid: index + 1,
+    user: `用户${index + 1}`,
+    text: `第 ${index + 1} 条`,
+    avatarUrl: `https://i0.hdslb.com/bfs/face/${index + 1}.jpg`
+  }));
+  const plan = createAvatarOverlayPlan(events, { stylePreset: 'bubble', maxEntries: 3 });
+
+  assert.equal(plan.candidateCount, 7);
+  assert.equal(plan.entries.length, 3);
+  assert.equal(plan.truncated, true);
+  assert.equal(plan.entries[0].start, 0);
+  assert.equal(plan.entries.at(-1).start, 360);
+});
+
+test('gift ticker width grows only for content and stays inside its configured cap', () => {
+  const [shortGift] = createMessageTimeline([{ type: 'gift', time: 1, user: '观众A', giftName: '小花', count: 1 }]).items;
+  const [longGift] = createMessageTimeline([
+    { type: 'gift', time: 1, user: '这是一个很长很长的昵称', giftName: '这是一个很长很长的礼物名称', count: 9999 }
+  ]).items;
+
+  assert.ok(longGift.width > shortGift.width, 'long names may use more room than a normal short gift');
+  assert.ok(shortGift.width < 375, 'the ordinary ticker must be shorter than the SuperChat card');
+  assert.ok(longGift.width <= 330, 'the ticker must never grow past the compact 88% card cap');
 });
 
 test('large message stacks append ASS lines without overflowing the V8 call stack', () => {
@@ -260,7 +323,7 @@ test('gift, superchat, and guard use one push/reflow lifecycle', () => {
   assert.ok(gift.changes[1].toY < gift.changes[1].fromY);
   assert.ok(gift.changes.at(-1).toY > gift.changes.at(-1).fromY);
   assert.equal(gift.segments.at(-1).x1, 5);
-  assert.equal(gift.segments.at(-1).x2, -370);
+  assert.equal(gift.segments.at(-1).x2, 5 - gift.width);
 });
 
 test('same-user same-gift combos update in place and extend the five-second lifetime', () => {
