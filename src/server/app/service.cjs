@@ -31,6 +31,7 @@ const {
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
+  createAvatarOverlayFilterScript,
   createPreviewHlsArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
@@ -241,6 +242,10 @@ const WEBHOOK_MAX_QUEUE_SIZE = 100;
 const WEBHOOK_RETRY_DELAYS_MS = [0, 1000, 3000];
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
+const MAX_AVATAR_OVERLAY_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_AVATAR_OVERLAY_ENTRIES = 24;
+const MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY = 32;
+const MAX_AVATAR_OVERLAY_CONCURRENCY = 3;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
@@ -262,6 +267,60 @@ const MERGE_AV_DURATION_TOLERANCE_SEC = 0.08;
 const MERGE_AV_BOUNDARY_TOLERANCE_SEC = 0.12;
 const CLEANUP_METADATA_SCAN_MAX_DEPTH = 4;
 const CLEANUP_METADATA_SCAN_LIMIT = 2000;
+
+function normalizeBiliAvatarUrl(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw || raw.length > 2048) return '';
+  try {
+    const target = new URL(raw.startsWith('//') ? `https:${raw}` : raw);
+    const host = target.hostname.toLowerCase();
+    const isAvatarHost =
+      host === 'hdslb.com' || host.endsWith('.hdslb.com') || host === 'biliimg.com' || host.endsWith('.biliimg.com');
+    if (!['http:', 'https:'].includes(target.protocol) || !isAvatarHost) return '';
+    target.protocol = 'https:';
+    return target.toString();
+  } catch {
+    return '';
+  }
+}
+
+function avatarImageExtension(contentType) {
+  const type = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+  return (
+    {
+      'image/jpeg': '.jpg',
+      'image/jpg': '.jpg',
+      'image/png': '.png',
+      'image/webp': '.webp',
+      'image/gif': '.gif'
+    }[type] || ''
+  );
+}
+
+function createAvatarCircleFilter(size) {
+  const edge = Math.round(clamp(size, 8, 512));
+  return (
+    `scale=${edge}:${edge}:force_original_aspect_ratio=increase,crop=${edge}:${edge},format=rgba,` +
+    "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2),(W/2)*(W/2)),255,0)'"
+  );
+}
+
+async function mapWithConcurrency(values, concurrency, mapper) {
+  const output = Array(values.length).fill(null);
+  let nextIndex = 0;
+  const workerCount = Math.min(values.length, Math.max(1, Math.floor(Number(concurrency) || 1)));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        output[index] = await mapper(values[index], index);
+      }
+    })
+  );
+  return output;
+}
+
 const RECORDING_MEDIA_FILE_PATTERN =
   /(?:\.(?:clean|merged|danmaku|danmaku-only)|\.clip_[^.]+\.(?:clean|danmaku|danmaku-only))\.(?:mp4|mkv)$/i;
 const EXPORT_PREVIEW_EXTENSIONS = new Set(['.m3u8', '.ts']);
@@ -7028,6 +7087,159 @@ try {
     return this.getState();
   }
 
+  async lookupBiliAvatarForOverlay(uid) {
+    const safeUid = Math.floor(Number(uid || 0));
+    if (!Number.isSafeInteger(safeUid) || safeUid <= 0) return '';
+    const endpoint = `https://api.bilibili.com/x/web-interface/card?mid=${encodeURIComponent(String(safeUid))}`;
+    const response = await requestUrlBuffer(endpoint, {
+      headersForUrl: (target) => ({
+        ...createImageProxyHeaders(target, this.settings.cookie),
+        Accept: 'application/json, text/plain, */*'
+      }),
+      validateUrl: (target) => validateRemoteUrl(target, { allowHost: isBilibiliHost }),
+      allowProxy: false,
+      retries: 1,
+      timeoutMs: 10000,
+      maxRedirects: 2,
+      maxBytes: 256 * 1024
+    });
+    let payload;
+    try {
+      payload = JSON.parse(response.toString('utf8'));
+    } catch {
+      return '';
+    }
+    if (Number(payload?.code) !== 0) return '';
+    return normalizeBiliAvatarUrl(payload?.data?.card?.face || payload?.data?.face || '');
+  }
+
+  async prepareAvatarOverlayLayer(avatarPlan, options = {}) {
+    const requestedEntries = Array.isArray(avatarPlan?.entries)
+      ? avatarPlan.entries.slice(0, MAX_AVATAR_OVERLAY_ENTRIES)
+      : [];
+    if (!requestedEntries.length || !options.assPath) return null;
+
+    const label = String(options.label || '烧录');
+    const workingDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-'));
+    const avatarUrlsByUid = new Map();
+    const sourceFilesByUrl = new Map();
+    let failedCount = 0;
+    const resolveAvatarUrl = async (entry) => {
+      const direct = normalizeBiliAvatarUrl(entry?.avatarUrl);
+      if (direct) return direct;
+      const uid = Math.floor(Number(entry?.uid || 0));
+      if (!Number.isSafeInteger(uid) || uid <= 0) return '';
+      if (!avatarUrlsByUid.has(uid)) {
+        avatarUrlsByUid.set(uid, this.lookupBiliAvatarForOverlay(uid).catch(() => ''));
+      }
+      return avatarUrlsByUid.get(uid);
+    };
+    const fetchAvatarSource = async (avatarUrl) => {
+      if (!sourceFilesByUrl.has(avatarUrl)) {
+        sourceFilesByUrl.set(
+          avatarUrl,
+          (async () => {
+            const asset = await requestUrlBuffer(avatarUrl, {
+              headersForUrl: (target) => createImageProxyHeaders(target, this.settings.cookie),
+              validateUrl: (target) => validateRemoteUrl(target, { allowHost: isBilibiliHost }),
+              allowProxy: false,
+              retries: 1,
+              timeoutMs: 12000,
+              maxRedirects: 3,
+              maxBytes: MAX_AVATAR_OVERLAY_IMAGE_BYTES,
+              includeResponseMetadata: true
+            });
+            const contentType = String(asset.headers?.['content-type'] || '').toLowerCase();
+            if (!contentType.startsWith('image/')) {
+              throw new Error('头像服务没有返回图片。');
+            }
+            const extension = avatarImageExtension(contentType) || '.img';
+            const digest = crypto.createHash('sha256').update(avatarUrl).digest('hex').slice(0, 24);
+            const sourcePath = path.join(workingDir, `source-${digest}${extension}`);
+            await fsp.writeFile(sourcePath, asset.body);
+            return sourcePath;
+          })()
+        );
+      }
+      return sourceFilesByUrl.get(avatarUrl);
+    };
+
+    try {
+      this.log('info', `${label} 正在准备真实头像透明图层（最多 ${requestedEntries.length} 个）。`);
+      const prepared = await mapWithConcurrency(requestedEntries, MAX_AVATAR_OVERLAY_CONCURRENCY, async (entry, index) => {
+        try {
+          const avatarUrl = await resolveAvatarUrl(entry);
+          if (!avatarUrl) throw new Error('没有可用头像地址。');
+          const sourcePath = await fetchAvatarSource(avatarUrl);
+          const size = Math.round(clamp(Number(entry?.size || 0), 8, 512));
+          const imagePath = path.join(workingDir, `avatar-${String(index + 1).padStart(2, '0')}-${size}.png`);
+          const rendered = await runCapturedProcess(
+            this.ffmpegPath,
+            [
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              '-y',
+              '-i',
+              sourcePath,
+              '-frames:v',
+              '1',
+              '-vf',
+              createAvatarCircleFilter(size),
+              '-pix_fmt',
+              'rgba',
+              imagePath
+            ],
+            { timeoutMs: 15000, maxOutputBytes: 32 * 1024 }
+          );
+          if (rendered.timedOut || rendered.status !== 0 || (await getFileSize(imagePath)) < 128) {
+            throw new Error(compactLogLine(rendered.stderr || '头像圆形裁切失败。'));
+          }
+          return { ...entry, imagePath };
+        } catch {
+          failedCount += 1;
+          return null;
+        }
+      });
+      const entries = prepared.filter(Boolean);
+      if (!entries.length) {
+        await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
+        this.log('warn', `${label} 未能准备真实头像，继续使用通用头像图标。`);
+        return null;
+      }
+      const overlay = { panel: avatarPlan.panel, entries };
+      const filterScriptPath = path.join(workingDir, 'avatar-layer.ffscript');
+      const script = createAvatarOverlayFilterScript({
+        assPath: options.assPath,
+        fps: options.fps,
+        avatarOverlay: overlay
+      });
+      if (!script) {
+        await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
+        return null;
+      }
+      await fsp.writeFile(filterScriptPath, script, 'utf8');
+      this.log(
+        'info',
+        `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
+          avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
+        }${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}。`
+      );
+      return { ...overlay, filterScriptPath, temporaryDir: workingDir };
+    } catch (error) {
+      await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
+      this.log('warn', `${label} 真实头像图层准备失败，继续使用通用头像：${compactLogLine(error.message)}`);
+      return null;
+    }
+  }
+
+  async cleanupAvatarOverlayLayer(layer) {
+    const temporaryDir = String(layer?.temporaryDir || '').trim();
+    if (temporaryDir) {
+      await fsp.rm(temporaryDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
   async startBurnRecording(room, recording, options = {}) {
     if (this.isRoomBurning(room)) {
       this.log('warn', `${roomLabel(room)} 已有弹幕版正在生成，跳过 ${path.basename(recording.cleanPath)}。`);
@@ -7038,6 +7250,7 @@ try {
       return false;
     }
 
+    let avatarLayer = null;
     try {
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
       const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
@@ -7071,6 +7284,12 @@ try {
 
       await assertDiskSpace(burnedPath, { estimatedBytes: Number(recording.fileSize || 0) });
       await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+      const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
+      avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
+        assPath: assets.assPath,
+        fps: burnFps,
+        label: `${roomLabel(room)} 烧录`
+      });
       const args = createBurnArgs({
         cleanPath: burnSourcePath,
         assPath: assets.assPath,
@@ -7078,7 +7297,8 @@ try {
         codec: this.settings.burnCodec,
         crf: this.settings.burnCrf,
         container: getContainerFromPath(burnedPath),
-        fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps
+        fps: burnFps,
+        avatarOverlay: avatarLayer
       });
       const ffmpeg = spawn(this.ffmpegPath, args, {
         windowsHide: true,
@@ -7129,6 +7349,7 @@ try {
         }
         finishFfmpegJobProgress(room.burnProgress, 'error', `启动失败：${error.message}`);
         fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+        this.cleanupAvatarOverlayLayer(avatarLayer).catch(() => {});
         this.log('error', `${roomLabel(room)} 烧录进程启动失败：${error.message}`);
         this.emitState();
       });
@@ -7153,6 +7374,7 @@ try {
           room.burning = false;
           this.burnSessions.delete(room.id);
         }
+        await this.cleanupAvatarOverlayLayer(avatarLayer);
         if (cancelled) {
           finishFfmpegJobProgress(room.burnProgress, 'cancelled', '弹幕视频生成已取消');
           fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
@@ -7202,6 +7424,7 @@ try {
         this.scheduleQueuedUpdateCheck();
       });
     } catch (error) {
+      await this.cleanupAvatarOverlayLayer(avatarLayer);
       const cancelled = this.burnCancelRequests.delete(room.id);
       room.burning = false;
       this.burnSessions.delete(room.id);
@@ -7268,7 +7491,9 @@ try {
         : undefined,
       startTime: options.startTime,
       endTime: options.endTime,
-      shiftTime: options.shiftTime
+      shiftTime: options.shiftTime,
+      avatarOverlayMaxEntries: MAX_AVATAR_OVERLAY_ENTRIES,
+      avatarOverlayMaxSegmentsPerEntry: MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY
     });
     const generatedAss = await fsp.readFile(temporaryAssPath, 'utf8').catch(() => '');
     if (!generatedAss.includes('[Script Info]') || !generatedAss.includes('[Events]')) {
@@ -7286,7 +7511,8 @@ try {
       styleLayout,
       playWidth: Number(result.playWidth || 0),
       playHeight: Number(result.playHeight || 0),
-      portrait: result.portrait === true
+      portrait: result.portrait === true,
+      avatarPlan: result.avatarPlan || null
     };
   }
 
@@ -7519,6 +7745,7 @@ try {
     let cssPath = recording.cssPath;
     let assPath = recording.assPath;
     let temporaryAssDir = '';
+    let avatarLayer = null;
     let args;
     let codecInfo = null;
     if (mode === 'clean') {
@@ -7546,6 +7773,12 @@ try {
       cssPath = assets.cssPath;
       assPath = assets.assPath;
       codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
+      const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
+      avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
+        assPath,
+        fps: exportFps,
+        label: '烧录片段导出'
+      });
       args = createBurnArgs({
         cleanPath: recording.cleanPath,
         assPath,
@@ -7555,7 +7788,8 @@ try {
         container: outputContainer,
         startTime,
         duration,
-        fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps
+        fps: exportFps,
+        avatarOverlay: avatarLayer
       });
     }
 
@@ -7622,6 +7856,7 @@ try {
       }
     } finally {
       await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+      await this.cleanupAvatarOverlayLayer(avatarLayer);
       if (this.exportProgress?.id === progress.id) {
         this.exportProcess = null;
         this.exportCancelRequested = false;
