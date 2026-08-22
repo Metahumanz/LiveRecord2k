@@ -133,7 +133,7 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
 
 export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const hasPercent = typeof progress.percent === 'number' && Number.isFinite(progress.percent);
-  const indeterminate = progress.status === 'retrying' || !hasPercent;
+  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent;
   const percent = hasPercent ? clampNumber(progress.percent || 0, 0, 100) : 0;
   const hasEta =
     (progress.status === 'running' || progress.status === 'retrying') &&
@@ -151,7 +151,9 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         ? '失败'
         : progress.status === 'retrying'
           ? '等待重试'
-        : hasPercent
+          : progress.status === 'queued'
+            ? '等待资源'
+          : hasPercent
           ? `${Math.round(percent)}%`
           : '处理中';
   return (

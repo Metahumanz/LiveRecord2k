@@ -121,6 +121,41 @@ test('merge progress keeps the current segment stage after FFmpeg begins reporti
   assert.match(progress.message, /\d+秒/);
 });
 
+test('structured FFmpeg progress and merge resource waiting remain observable and cancellable', async () => {
+  assert.equal(parseFfmpegProgressTime('frame=42\nout_time_us=31500000\nprogress=continue'), 31.5);
+
+  const service = createMergeTestService();
+  const room = { id: 'merge-queue', title: 'Queue', anchor: 'test', recording: false };
+  const progress = createFfmpegJobProgress({ kind: 'merge', label: 'merge', durationSec: 120, roomId: room.id });
+  room.mergeProgress = progress;
+  service.rooms.set(room.id, room);
+  service.setMergeProgressStage(room, progress, '正在读取分段媒体信息');
+  assert.equal(progress.percent, null);
+  const releaseRecording = service.mediaJobs.registerExternal({
+    id: `recording:${room.id}:1`,
+    type: 'recording',
+    resource: 'recording'
+  });
+  try {
+    const waitForLease = service.acquireMergeMediaLease(room, progress, { preferred: 'libx264' }).then(
+      () => null,
+      (error) => error
+    );
+    await waitFor(() => room.mergeProgress?.status === 'queued');
+    assert.match(room.mergeProgress.message, /录制优先/);
+    assert.match(room.mergeProgress.message, /合并队列第 1 位/);
+
+    await service.cancelMerge(room.id);
+    const error = await waitForLease;
+    assert.equal(error?.code, 'MEDIA_JOB_CANCELLED');
+    assert.equal(room.mergeProgress?.status, 'cancelled');
+    assert.match(room.mergeProgress?.message || '', /取消排队合并/);
+    assert.equal(service.mediaJobs.snapshot().some((job) => job.id === progress.id), false);
+  } finally {
+    releaseRecording();
+  }
+});
+
 test('merge normalization drops corrupt packets instead of explicitly ignoring decoder errors', () => {
   const args = createNormalizeSegmentArgs({
     inputPath: 'source.clean.mp4',

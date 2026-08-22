@@ -263,13 +263,14 @@ export type FfmpegCapabilities = {
 export type FfmpegJobProgress = {
   id: string;
   kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
-  status: 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
+  status: 'queued' | 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
   label: string;
   outputPath?: string;
   roomId?: string;
   codec?: string;
   codecKind?: 'software' | 'hardware';
   startedAt: number;
+  workStartedAt?: number;
   updatedAt: number;
   currentTimeSec?: number;
   durationSec?: number;

@@ -132,6 +132,7 @@ test('mixed segment specifications select the highest resolution and require tra
   assert.match(normalizeFilter, /anullsrc=r=48000:cl=stereo/);
   assert.doesNotMatch(normalizeFilter, /concat=n=/);
   assert.equal(normalizeArgs[normalizeArgs.indexOf('-filter_threads') + 1], '1');
+  assert.deepEqual(normalizeArgs.slice(0, 5), ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y']);
 
   const copyArgs = createConcatCopyArgs({
     concatPath: 'normalized.concat.txt',
@@ -140,6 +141,7 @@ test('mixed segment specifications select the highest resolution and require tra
     streamCodec: 'hevc (Main)'
   });
   assert.ok(copyArgs.includes('hvc1'));
+  assert.deepEqual(copyArgs.slice(0, 5), ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y']);
 
   const realProfileTarget = selectHighestResolutionVideoInfo([
     { videoInfo: { codec: 'h264 (High)', width: 3840, height: 2160, fps: 30, pixelFormat: 'yuv420p10le', bitDepth: 10 } },
