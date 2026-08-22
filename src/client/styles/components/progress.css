@@ -173,11 +173,14 @@
   background: #d8c36e;
 }
 
+.job-progress.queued .job-progress-heading strong,
+.job-progress.queued .job-progress-message,
 .job-progress.retrying .job-progress-heading strong,
 .job-progress.retrying .job-progress-message {
   color: #f2d88d;
 }
 
+.job-progress.queued .job-progress-track span,
 .job-progress.retrying .job-progress-track span {
   background: linear-gradient(90deg, #d8c36e, #f2d88d);
 }

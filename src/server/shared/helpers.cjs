@@ -909,7 +909,7 @@ function updateFfmpegJobProgress(progress, text) {
   if (!percentChanged && now - Number(progress.updatedAt || 0) < 500) {
     return false;
   }
-  const elapsedSec = Math.max(0, (now - Number(progress.startedAt || now)) / 1000);
+  const elapsedSec = Math.max(0, (now - Number(progress.workStartedAt || progress.startedAt || now)) / 1000);
   const processedSec = Math.max(0, currentTimeSec);
   const remainingSec = duration > 0 ? Math.max(0, duration - processedSec) : 0;
   progress.currentTimeSec = Math.max(0, currentTimeSec);
@@ -952,7 +952,7 @@ function parseFfmpegProgressTime(text) {
   while ((match = timePattern.exec(value))) {
     latest = parseFfmpegTime(match[1]);
   }
-  const outTimePattern = /out_time(?:_ms)?=([0-9:.]+)/gi;
+  const outTimePattern = /out_time(?:(?:_(?:ms|us))?)=([0-9:.]+)/gi;
   while ((match = outTimePattern.exec(value))) {
     const raw = match[1];
     const parsed = raw.includes(':') ? parseFfmpegTime(raw) : Number(raw) / 1_000_000;

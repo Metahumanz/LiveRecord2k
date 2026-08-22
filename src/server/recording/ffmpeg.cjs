@@ -317,7 +317,7 @@ function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, contai
 }
 
 function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec }) {
-  const args = ['-hide_banner', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
+  const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
   if (container === 'mp4') {
     if (isHevcCodec(streamCodec)) {
       args.push('-tag:v', 'hvc1');
@@ -398,6 +398,9 @@ function createNormalizeSegmentArgs({
   // the uniform intermediates.
   const args = [
     '-hide_banner',
+    '-nostats',
+    '-progress',
+    'pipe:2',
     '-y',
     '-filter_threads',
     '1',
@@ -448,7 +451,7 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     throw new Error('统一规格合并缺少有效的目标分辨率。');
   }
 
-  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt'];
+  const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-fflags', '+genpts+discardcorrupt'];
   for (const segment of segments) {
     args.push('-i', segment.filePath);
   }
@@ -496,7 +499,7 @@ function createAudioAlignArgs({ inputPath, outputPath, container, videoDurationS
   const duration = Number(videoDurationSec || 0);
   if (!duration) throw new Error('音画对齐缺少有效的视频时长。');
   const args = [
-    '-hide_banner', '-y', '-i', inputPath,
+    '-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-i', inputPath,
     '-filter_complex', `[0:a:0]aresample=48000:async=1:first_pts=0,apad,atrim=duration=${formatFfmpegSeconds(duration)},asetpts=PTS-STARTPTS[aout]`,
     '-map', '0:v:0', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-ac', '2',
     '-dn', '-sn', '-avoid_negative_ts', 'make_zero'

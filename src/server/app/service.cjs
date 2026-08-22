@@ -5492,6 +5492,12 @@ try {
       throw error;
     }
     this.clearMergeRetryState(room.id, mergeGroup);
+    if (room.mergeProgress?.kind === 'merge' && room.mergeProgress.status === 'cancelled') {
+      // A cancellation deliberately leaves the reconnect group untouched. In
+      // particular, do not finalize the live-session diagnostics or enqueue a
+      // burn for only the last source segment.
+      return null;
+    }
     if (recording) {
       await this.finalizeLiveDiagnostics(room, recording, recording.mergedFrom?.length ? 'merged' : 'completed').catch((error) => {
         this.log('warn', `${roomLabel(room)} 写入最终 diagnostics 失败：${error.message}`);
@@ -5532,11 +5538,116 @@ try {
     const elapsedSec = Math.max(0, Math.floor((Date.now() - Number(startedAt || Date.now())) / 1000));
     progress.stageLabel = String(stageLabel || '').trim();
     progress.stageStartedAt = Number(startedAt || Date.now());
+    if (!progress.workStartedAt && progress.status === 'running') {
+      // Before a media lease is obtained this is preparation, not a measurable
+      // encoding percentage. Showing a static 0% made a queued merge look hung.
+      progress.percent = null;
+      progress.estimatedRemainingSec = null;
+    }
     progress.updatedAt = Date.now();
     progress.message =
       progress.stageLabel + (elapsedSec >= 2 ? '（已用' + formatDurationSeconds(elapsedSec) + '）' : '');
     this.emitState();
     return true;
+  }
+
+  getMediaJobRoomLabel(job) {
+    const match = /^recording:([^:]+):/.exec(String(job?.id || ''));
+    const room = match ? this.rooms.get(match[1]) : null;
+    return room ? roomLabel(room) : '其他直播录制';
+  }
+
+  getMergeMediaWaitDetails(resource, progressId) {
+    const jobs = this.mediaJobs.snapshot();
+    const queued = jobs.filter((job) => job.status === 'queued' && job.resource === resource);
+    const ownIndex = queued.findIndex((job) => job.id === progressId);
+    const recordingLabels =
+      resource === 'cpu' || resource === 'gpu'
+        ? [
+            ...new Set(
+              jobs
+                .filter((job) => job.status === 'running' && job.type === 'recording')
+                .map((job) => this.getMediaJobRoomLabel(job))
+            )
+          ]
+        : [];
+    const activeSameResource = jobs.filter(
+      (job) => job.status === 'running' && job.resource === resource && job.id !== progressId && job.type !== 'recording'
+    );
+    return {
+      queuePosition: ownIndex >= 0 ? ownIndex + 1 : 1,
+      recordingLabels,
+      activeSameResource
+    };
+  }
+
+  setMergeQueuedProgress(room, progress, resource, queuedAt) {
+    if (room.mergeProgress?.id !== progress?.id) {
+      return false;
+    }
+    const elapsedSec = Math.max(0, Math.floor((Date.now() - Number(queuedAt || Date.now())) / 1000));
+    const details = this.getMergeMediaWaitDetails(resource, progress.id);
+    const resourceLabel = resource === 'gpu' ? 'GPU' : resource === 'cpu' ? 'CPU' : resource.toUpperCase();
+    const waits = [];
+    if (details.recordingLabels.length) {
+      waits.push(`录制优先：${details.recordingLabels.join('、')}`);
+    }
+    if (details.activeSameResource.length) {
+      waits.push(`正在处理 ${details.activeSameResource.length} 个${resourceLabel}任务`);
+    }
+    waits.push(`合并队列第 ${details.queuePosition} 位`);
+    progress.status = 'queued';
+    progress.stageLabel = '正在等待可用媒体资源';
+    progress.stageStartedAt = Number(queuedAt || Date.now());
+    progress.updatedAt = Date.now();
+    progress.message =
+      `正在等待可用媒体资源（${waits.join('；')}）` +
+      (elapsedSec >= 2 ? `（已等${formatDurationSeconds(elapsedSec)}）` : '');
+    this.emitState();
+    return true;
+  }
+
+  async acquireMergeMediaLease(room, progress, mergeEncoderPlan) {
+    const resource = mergeEncoderPlan.preferred.includes('libx') ? 'cpu' : 'gpu';
+    const queuedAt = Date.now();
+    const leasePromise = this.mediaJobs.acquire({
+      id: progress.id,
+      type: 'merge',
+      resource,
+      cancel: () => {
+        this.mergeCancelRequests.add(room.id);
+        const child = this.mergeProcesses.get(room.id);
+        if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+      }
+    });
+    this.setMergeQueuedProgress(room, progress, resource, queuedAt);
+    const heartbeat = setInterval(() => {
+      this.setMergeQueuedProgress(room, progress, resource, queuedAt);
+    }, MERGE_STAGE_HEARTBEAT_MS);
+    heartbeat.unref?.();
+    try {
+      const lease = await leasePromise;
+      if (this.mergeCancelRequests.has(room.id)) {
+        lease.release();
+        return null;
+      }
+      if (room.mergeProgress?.id === progress.id) {
+        const workStartedAt = Date.now();
+        progress.status = 'running';
+        progress.workStartedAt = workStartedAt;
+        progress.currentTimeSec = 0;
+        progress.percent = progress.durationSec > 0 ? 0 : null;
+        progress.estimatedRemainingSec = null;
+        progress.stageLabel = '已取得媒体资源，准备开始合并';
+        progress.stageStartedAt = workStartedAt;
+        progress.message = '已取得媒体资源，正在启动合并';
+        progress.updatedAt = workStartedAt;
+        this.emitState();
+      }
+      return lease;
+    } finally {
+      clearInterval(heartbeat);
+    }
   }
 
   async runMergePreparationStage(room, progress, stageLabel, operation) {
@@ -5736,6 +5847,8 @@ try {
       .join('；');
     assertSafeMergeTargetProfile(segmentMediaInfos, targetVideoInfo, { requiresVideoTranscode: requiresTranscode });
     const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
+    progress.codec = mergeEncoderPlan.preferred;
+    progress.codecKind = mergeEncoderPlan.preferred.includes('libx') ? 'software' : 'hardware';
     const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
     const sourceBytes = segmentFileSizes.reduce((sum, fileSize) => sum + Number(fileSize || 0), 0);
     const targetPixels = Number(targetVideoInfo.width || 0) * Number(targetVideoInfo.height || 0);
@@ -5752,14 +5865,36 @@ try {
     await this.runMergePreparationStage(room, progress, '正在检查本次合并的磁盘空间', () =>
       assertDiskSpace(outputPath, { estimatedBytes: estimatedTemporaryBytes })
     );
-    const mergeLease = await this.runMergePreparationStage(room, progress, '正在等待可用媒体资源', () =>
-      this.mediaJobs.acquire({
-        id: progress.id,
-        type: 'merge',
-        resource: mergeEncoderPlan.preferred.includes('libx') ? 'cpu' : 'gpu',
-        cancel: () => this.cancelMerge(room.id).catch(() => {})
-      })
-    );
+    if (this.mergeCancelRequests.has(room.id)) {
+      if (room.mergeProgress?.id === progress.id) {
+        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
+      }
+      this.mergeCancelRequests.delete(room.id);
+      this.emitState();
+      return null;
+    }
+    let mergeLease;
+    try {
+      mergeLease = await this.acquireMergeMediaLease(room, progress, mergeEncoderPlan);
+    } catch (error) {
+      if (this.mergeCancelRequests.has(room.id) || error?.code === 'MEDIA_JOB_CANCELLED') {
+        if (room.mergeProgress?.id === progress.id) {
+          finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消排队合并，所有源分段均已保留');
+        }
+        this.mergeCancelRequests.delete(room.id);
+        this.emitState();
+        return null;
+      }
+      throw error;
+    }
+    if (!mergeLease) {
+      if (room.mergeProgress?.id === progress.id) {
+        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
+      }
+      this.mergeCancelRequests.delete(room.id);
+      this.emitState();
+      return null;
+    }
     this.mergeCancelRequests.delete(room.id);
 
     this.log(
@@ -5782,6 +5917,7 @@ try {
         const progressOffsetSec = Math.max(0, Number(options.progressOffsetSec || 0));
         const trackProgress = options.trackProgress !== false;
         const stageLabel = String(options.stageLabel || '合并处理');
+        const segmentDurationSec = Math.max(0, Number(options.segmentDurationSec || 0));
         const stageStartedAt = Date.now();
         let sawMediaProgress = false;
         let lastStageProgressEmitAt = 0;
@@ -5804,7 +5940,11 @@ try {
             const processedSec = parseFfmpegProgressTime(line);
             if (Number.isFinite(processedSec) && room.mergeProgress?.id === progress.id) {
               sawMediaProgress = true;
-              room.mergeProgress.stageLabel = stageLabel;
+              const localProgressLabel =
+                segmentDurationSec > 0
+                  ? `${stageLabel} · 本段 ${formatDurationSeconds(Math.min(segmentDurationSec, Math.max(0, processedSec)))} / ${formatDurationSeconds(segmentDurationSec)}`
+                  : stageLabel;
+              room.mergeProgress.stageLabel = localProgressLabel;
               room.mergeProgress.stageStartedAt = stageStartedAt;
             }
             if (trackProgress && room.mergeProgress?.id === progress.id) {
@@ -5818,7 +5958,10 @@ try {
               const now = Date.now();
               if (now - lastStageProgressEmitAt >= 500) {
                 lastStageProgressEmitAt = now;
-                room.mergeProgress.message = stageLabel + ' · 已处理 ' + formatDurationSeconds(processedSec);
+                room.mergeProgress.message =
+                  (segmentDurationSec > 0
+                    ? `${stageLabel} · 本段 ${formatDurationSeconds(Math.min(segmentDurationSec, Math.max(0, processedSec)))} / ${formatDurationSeconds(segmentDurationSec)}`
+                    : stageLabel) + ' · 已处理 ' + formatDurationSeconds(processedSec);
                 room.mergeProgress.updatedAt = now;
                 this.emitState();
               }
@@ -5856,6 +5999,12 @@ try {
       const runBoundedTranscode = async (videoCodec) => {
         await fsp.rm(normalizeTempDir, { recursive: true, force: true });
         await fsp.mkdir(normalizeTempDir, { recursive: true });
+        if (room.mergeProgress?.id === progress.id) {
+          room.mergeProgress.codec = videoCodec;
+          room.mergeProgress.codecKind = videoCodec.includes('libx') ? 'software' : 'hardware';
+          room.mergeProgress.updatedAt = Date.now();
+          this.emitState();
+        }
         const normalizedPaths = [];
         let progressOffsetSec = 0;
         for (let index = 0; index < segments.length; index += 1) {
@@ -5868,7 +6017,8 @@ try {
           );
           const normalizedPath = path.join(normalizeTempDir, `${String(index + 1).padStart(3, '0')}.normalized.mkv`);
           if (room.mergeProgress?.id === progress.id) {
-            room.mergeProgress.message = `正在规范化分段 ${index + 1}/${segments.length}`;
+            room.mergeProgress.stageLabel = `规范化分段 ${index + 1}/${segments.length}`;
+            room.mergeProgress.message = `正在规范化分段 ${index + 1}/${segments.length}（本段共 ${formatDurationSeconds(sourceDurationSec)}）`;
             room.mergeProgress.updatedAt = Date.now();
             this.emitState();
           }
@@ -5883,7 +6033,11 @@ try {
               videoCodec,
               softwareThreads: mergeSoftwareThreads
             }),
-            { progressOffsetSec, stageLabel: `规范化分段 ${index + 1}/${segments.length}` }
+            {
+              progressOffsetSec,
+              stageLabel: `规范化分段 ${index + 1}/${segments.length}`,
+              segmentDurationSec: sourceDurationSec
+            }
           );
           const normalizedInfo = await this.runMergePreparationStage(
             room,
@@ -6202,7 +6356,7 @@ try {
       }
       this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : failureMessage}；源分段未删除。`);
       this.emitState();
-      if (cancelled) return fallbackRecording;
+      if (cancelled) return null;
       throw error;
     } finally {
       mergeLease.release();
@@ -6540,10 +6694,22 @@ try {
     const room = this.getRoom(roomId);
     const child = this.mergeProcesses.get(room.id);
     const running = room.mergeProgress?.status === 'running';
+    const queued = room.mergeProgress?.status === 'queued';
     const retrying = room.mergeProgress?.status === 'retrying';
+    const queuedProgressId = queued ? room.mergeProgress?.id : '';
+    if (queued) this.mergeCancelRequests.add(room.id);
+    const cancelledQueuedJob = queuedProgressId ? this.mediaJobs.cancel(queuedProgressId) : false;
     const cancelledRetryCount = this.clearMergeRetryStatesForRoom(room.id);
-    if (!child && !running && !retrying && !cancelledRetryCount) return this.getState();
-    if (!child && !running) {
+    if (cancelledQueuedJob) {
+      if (room.mergeProgress?.kind === 'merge') {
+        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消排队合并，所有源分段均已保留');
+      }
+      this.log('info', `${roomLabel(room)} 已取消排队合并；源分段未删除。`);
+      this.emitState();
+      return this.getState();
+    }
+    if (!child && !running && !queued && !retrying && !cancelledRetryCount) return this.getState();
+    if (!child && !running && !queued) {
       if (room.mergeProgress?.kind === 'merge') {
         finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消自动合并重试，所有源分段均已保留');
       }
@@ -6553,7 +6719,7 @@ try {
     }
     this.mergeCancelRequests.add(room.id);
     if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
-    if (running) room.mergeProgress.message = '正在取消合并，源分段会全部保留';
+    if (running || queued) room.mergeProgress.message = queued ? '正在取消排队合并，源分段会全部保留' : '正在取消合并，源分段会全部保留';
     this.emitState();
     return this.getState();
   }

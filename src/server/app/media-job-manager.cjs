@@ -98,7 +98,9 @@ class MediaJobManager extends EventEmitter {
     const queueIndex = this.queue.findIndex((job) => job.id === key);
     if (queueIndex >= 0) {
       const [job] = this.queue.splice(queueIndex, 1);
-      job.reject(new Error('媒体任务已取消。'));
+      const error = new Error('媒体任务已取消。');
+      error.code = 'MEDIA_JOB_CANCELLED';
+      job.reject(error);
       this.emit('change');
       return true;
     }

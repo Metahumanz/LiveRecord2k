@@ -148,8 +148,10 @@ export function RoomCard({
   const danmakuCommandSummary = commandCountsSummary(room.currentRecording?.danmakuCommandCounts);
   const roomNumber = room.realRoomId || room.id;
   const roomSubtitle = room.anchor ? `${room.anchor} · 房间号 ${roomNumber}` : `房间号 ${roomNumber}`;
-  const mergeActive = room.mergeProgress?.status === 'running' || room.mergeProgress?.status === 'retrying';
+  const mergeActive =
+    room.mergeProgress?.status === 'queued' || room.mergeProgress?.status === 'running' || room.mergeProgress?.status === 'retrying';
   const mergeRetrying = room.mergeProgress?.status === 'retrying';
+  const mergeQueued = room.mergeProgress?.status === 'queued';
 
   return (
     <article className={`room-card ${room.recording ? 'is-recording' : ''}`}>
@@ -175,6 +177,7 @@ export function RoomCard({
           <span className={room.liveStatus === 1 ? 'badge hot' : 'badge'}>{liveStatusLabel}</span>
           <span className={room.monitoring ? 'badge on' : 'badge'}>{room.monitoring ? '已监听' : '未监听'}</span>
           <span className={room.recording ? 'badge hot' : 'badge'}>{room.recording ? '录制中' : '未录制'}</span>
+          {room.mergeProgress?.status === 'queued' ? <span className="badge work">合并排队中</span> : null}
           {room.mergeProgress?.status === 'running' ? <span className="badge work">合并分段中</span> : null}
           {room.mergeProgress?.status === 'retrying' ? <span className="badge work">合并等待重试</span> : null}
           {room.burning ? <span className="badge work">生成弹幕视频中</span> : null}
@@ -203,7 +206,7 @@ export function RoomCard({
             onClick={() => run(`cancel-merge-${roomKey}`, () => recorder.cancelMerge(room.id))}
           >
             <Square size={17} />
-            {mergeRetrying ? '取消自动合并重试' : '中断合并'}
+            {mergeRetrying ? '取消自动合并重试' : mergeQueued ? '取消排队合并' : '中断合并'}
           </button>
         ) : null}
         {room.mergeProgress?.status === 'error' ? (
