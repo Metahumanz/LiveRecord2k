@@ -245,6 +245,53 @@ test('GitHub API asset fallback does not mistake Windows zip for a Linux package
   assert.equal(manifest.sha256, '3'.repeat(64));
 });
 
+test('GitHub API asset fallback on ARM picks arm64 deb and never treats update.json as a package', () => {
+  const armAssets = [
+    {
+      name: 'bili-record-2k_1.2.3_amd64.deb',
+      browser_download_url: 'https://example.test/bili-record-2k_1.2.3_amd64.deb',
+      digest: 'sha256:' + 'a'.repeat(64)
+    },
+    {
+      name: 'bili-record-2k_1.2.3_arm64.deb',
+      browser_download_url: 'https://example.test/bili-record-2k_1.2.3_arm64.deb',
+      digest: 'sha256:' + 'b'.repeat(64)
+    },
+    {
+      name: 'bili-record-2k_1.2.3_linux_x64.tar.gz',
+      browser_download_url: 'https://example.test/bili-record-2k_1.2.3_linux_x64.tar.gz',
+      digest: 'sha256:' + 'c'.repeat(64)
+    },
+    {
+      name: 'bili-record-2k_1.2.3_linux_arm64.tar.gz',
+      browser_download_url: 'https://example.test/bili-record-2k_1.2.3_linux_arm64.tar.gz',
+      digest: 'sha256:' + 'd'.repeat(64)
+    },
+    {
+      name: 'update.json',
+      browser_download_url: 'https://example.test/update.json',
+      digest: ''
+    }
+  ];
+  const manifest = normalizeUpdateManifest(
+    { tag_name: 'v1.2.3', assets: armAssets },
+    { platform: 'linux', arch: 'arm64', packageType: 'deb' }
+  );
+  assert.equal(manifest.packageType, 'deb');
+  assert.equal(manifest.packageName, 'bili-record-2k_1.2.3_arm64.deb');
+  assert.match(manifest.packageUrl, /_arm64\.deb$/);
+  assert.equal(manifest.sha256, 'b'.repeat(64));
+  assert.notEqual(manifest.packageName, 'update.json');
+});
+
+test('official update manifest can fall back to gh-proxy like release packages', () => {
+  const manifestUrl = 'https://github.com/Metahumanz/LiveRecord2k/releases/latest/download/update.json';
+  assert.deepEqual(createUpdateDownloadSources(manifestUrl, { officialSource: true }), [
+    { url: manifestUrl, label: 'GitHub 官方源' },
+    { url: `https://gh-proxy.com/${manifestUrl}`, label: 'GitHub 镜像' }
+  ]);
+});
+
 test('Linux update package filenames keep their complete package extension', () => {
   const debArch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
   assert.equal(
