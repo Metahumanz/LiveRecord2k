@@ -3243,7 +3243,7 @@ try {
       'Content-Length': String(stat.size),
       'Cache-Control': 'no-store'
     });
-    fs.createReadStream(filePath).pipe(response);
+    pipeLocalFileToResponse(filePath, request, response);
   }
 
   createFileCacheId(filePath, stat, version) {
@@ -3347,7 +3347,7 @@ try {
     };
     if (!range) {
       response.writeHead(200, { ...headers, 'Content-Length': String(total) });
-      fs.createReadStream(filePath).pipe(response);
+      pipeLocalFileToResponse(filePath, request, response);
       return;
     }
 
@@ -3369,7 +3369,7 @@ try {
       'Content-Length': String(end - start + 1),
       'Content-Range': `bytes ${start}-${end}/${total}`
     });
-    fs.createReadStream(filePath, { start, end }).pipe(response);
+    pipeLocalFileToResponse(filePath, request, response, { start, end });
   }
 
   isKnownMediaPath(filePath) {
@@ -9112,6 +9112,75 @@ function writeText(response, statusCode, text, contentType = 'text/plain; charse
   response.end(text);
 }
 
+// 统一的“本地文件 → HTTP 响应”文件流生命周期管理。
+// 跨平台（Windows NTFS/SMB/UNC、Linux ext4/CIFS/NFS、macOS）共用同一条释放路径：
+// 只要客户端断开（request.aborted / request.close / response.close），
+// 立即 destroy ReadStream，并移除本方法注册的全部监听器；
+// 正常播放完成（response.writableFinished/writableEnded）不会提前 destroy。
+function pipeLocalFileToResponse(filePath, request, response, options = {}) {
+  const start = Number(options.start);
+  const end = Number(options.end);
+  const hasRange = Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start;
+  const stream = hasRange ? fs.createReadStream(filePath, { start, end }) : fs.createReadStream(filePath);
+  let cleaned = false;
+
+  const isResponseFinished = () =>
+    Boolean(response && (response.writableFinished || response.writableEnded));
+
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (request && typeof request.removeListener === 'function') {
+      request.removeListener('aborted', onAborted);
+      request.removeListener('close', onRequestClose);
+    }
+    if (response && typeof response.removeListener === 'function') {
+      response.removeListener('close', onResponseClose);
+    }
+    stream.removeListener('error', onStreamError);
+    stream.removeListener('close', onStreamClose);
+  };
+
+  const destroy = () => {
+    if (cleaned) return;
+    try {
+      stream.unpipe(response);
+    } catch {}
+    if (!stream.destroyed) {
+      stream.destroy();
+    }
+    cleanup();
+  };
+
+  const onAborted = () => destroy();
+  const onRequestClose = () => {
+    // request.close 在正常请求完成后也会触发；只有响应尚未写完才视为断开。
+    if (!isResponseFinished()) destroy();
+  };
+  const onResponseClose = () => {
+    if (!isResponseFinished()) destroy();
+  };
+  const onStreamError = () => {
+    if (!isResponseFinished() && response && !response.destroyed) {
+      response.destroy();
+    }
+    destroy();
+  };
+  const onStreamClose = () => cleanup();
+
+  stream.on('error', onStreamError);
+  stream.on('close', onStreamClose);
+  if (request && typeof request.on === 'function') {
+    request.on('aborted', onAborted);
+    request.on('close', onRequestClose);
+  }
+  if (response && typeof response.on === 'function') {
+    response.on('close', onResponseClose);
+  }
+  stream.pipe(response);
+  return stream;
+}
+
 function isHlsPreviewCandidate(stream) {
   const protocol = String(stream?.protocol || '').toLowerCase();
   const format = String(stream?.format || '').toLowerCase();
@@ -9185,6 +9254,7 @@ module.exports = {
   DIST_ROOT,
   writeJson,
   writeText,
+  pipeLocalFileToResponse,
   mimeType,
   getRuntimePort,
   getRuntimeHost,

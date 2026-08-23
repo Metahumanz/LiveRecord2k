@@ -135,6 +135,17 @@ export function ExportPage({
     : undefined;
   const previewIsPortrait = hasPreviewCanvas && previewHeight > previewWidth;
 
+  const releasePreviewVideo = () => {
+    hlsRef.current?.destroy();
+    hlsRef.current = null;
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    }
+  };
+
   useEffect(() => {
     setMediaDuration(0);
     setPlaybackTime(0);
@@ -142,8 +153,7 @@ export function ExportPage({
     setPreviewError('');
     setPreviewNeedsProxy(false);
     setPreviewDeclined(false);
-    hlsRef.current?.destroy();
-    hlsRef.current = null;
+    releasePreviewVideo();
   }, [draft.cleanPath]);
 
   useEffect(() => {
@@ -151,11 +161,7 @@ export function ExportPage({
     if (!video || !draft.cleanPath) {
       return;
     }
-    hlsRef.current?.destroy();
-    hlsRef.current = null;
-    video.pause();
-    video.removeAttribute('src');
-    video.load();
+    releasePreviewVideo();
 
     if (activeProxy) {
       setPreviewError('');
@@ -176,16 +182,14 @@ export function ExportPage({
         setPreviewError('当前浏览器无法播放 HLS 兼容预览。');
       }
       return () => {
-        hlsRef.current?.destroy();
-        hlsRef.current = null;
+        releasePreviewVideo();
       };
     }
 
     video.src = mediaSource;
     video.load();
     return () => {
-      hlsRef.current?.destroy();
-      hlsRef.current = null;
+      releasePreviewVideo();
     };
   }, [activeProxy?.id, activeProxy?.previewUrl, draft.cleanPath, mediaSource]);
 
