@@ -487,6 +487,7 @@ test('photo avatars are composed through a separate transparent side layer and k
     assert.ok(args.includes('-filter_complex_script'));
     assert.equal(args.includes('-vf'), false);
     assert.equal(args.filter((arg) => arg === '-i').length, 2, 'source video plus the alpha avatar input');
+    assert.equal(args[args.indexOf('-framerate') + 1], '1', 'static avatar artwork is not decoded at output FPS');
     const burned = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
     assert.equal(burned.status, 0, burned.stderr);
     const info = await probeMediaFileInfo(ffmpegPath, outputPath);
@@ -497,6 +498,123 @@ test('photo avatars are composed through a separate transparent side layer and k
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('NVIDIA avatar composite keeps the full visual timeline on CUDA', () => {
+  const avatarOverlay = {
+    panel: { left: 10, width: 120, height: 180 },
+    filterScriptPath: 'C:/temp/avatar-layer.ffscript',
+    gpuComposite: true,
+    entries: [
+      {
+        imagePath: 'C:/temp/avatar.png',
+        segments: [{ start: 0.1, end: 1, x1: 18, x2: 18, y1: 28, y2: 56 }]
+      }
+    ]
+  };
+  const script = createAvatarOverlayFilterScript({
+    assPath: 'C:/temp/overlay.ass',
+    fps: 60,
+    avatarOverlay,
+    gpuComposite: true
+  });
+  const args = createBurnArgs({
+    cleanPath: 'C:/temp/input.mp4',
+    assPath: 'C:/temp/overlay.ass',
+    burnedPath: 'C:/temp/output.mp4',
+    codec: 'hevc_nvenc',
+    crf: 24,
+    container: 'mp4',
+    fps: 60,
+    avatarOverlay
+  });
+
+  assert.match(script, /ass='C\\:\/temp\/overlay\.ass',hwupload_cuda\[avatar_layer_0\]/);
+  assert.match(script, /overlay_cuda=/);
+  assert.match(script, /overlay_cuda=x='[^']*\\,18\\,18\)/, 'CUDA uses full-canvas avatar coordinates');
+  assert.match(script, /scale_cuda=format=yuv420p\[vout\]/);
+  assert.doesNotMatch(script, /enable='between/);
+  assert.equal(args[args.indexOf('-init_hw_device') + 1], 'cuda=br2k_avatar:0');
+  assert.equal(args[args.indexOf('-filter_hw_device') + 1], 'br2k_avatar');
+  assert.equal(args[args.indexOf('-framerate') + 1], '1');
+});
+
+test(
+  'NVIDIA avatar composite renders a real 2K/60 ASS-plus-avatar export',
+  { skip: process.env.BR2K_TEST_CUDA !== '1' },
+  async () => {
+    const width = 2560;
+    const height = 1440;
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cuda-avatar-burn-'));
+    const inputPath = path.join(tempDir, 'input.mp4');
+    const avatarPath = path.join(tempDir, 'avatar.png');
+    const assPath = path.join(tempDir, 'overlay.ass');
+    const filterScriptPath = path.join(tempDir, 'avatar-layer.ffscript');
+    const outputPath = path.join(tempDir, 'output.mp4');
+    try {
+      const input = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=60:duration=0.5`,
+          '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=0.5',
+          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', inputPath
+        ],
+        { timeoutMs: 20_000 }
+      );
+      assert.equal(input.status, 0, input.stderr);
+      const avatar = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-f', 'lavfi', '-i', 'color=c=red@0.5:s=32x32:r=1:d=1,format=rgba',
+          '-frames:v', '1', '-pix_fmt', 'rgba', avatarPath
+        ],
+        { timeoutMs: 20_000 }
+      );
+      assert.equal(avatar.status, 0, avatar.stderr);
+      await fsp.writeFile(assPath, createAss([{ type: 'danmaku', time: 0.1, text: 'CUDA 头像' }]), 'utf8');
+      const avatarOverlay = {
+        panel: { left: 10, width: 120, height: 180 },
+        filterScriptPath,
+        gpuComposite: true,
+        entries: [
+          {
+            imagePath: avatarPath,
+          segments: [{ start: 0.1, end: 0.4, x1: 18, x2: 18, y1: 28, y2: 56 }]
+          }
+        ]
+      };
+      await fsp.writeFile(
+        filterScriptPath,
+        createAvatarOverlayFilterScript({ assPath, fps: 60, avatarOverlay, gpuComposite: true }),
+        'utf8'
+      );
+      const burned = await runCapturedProcess(
+        ffmpegPath,
+        createBurnArgs({
+          cleanPath: inputPath,
+          assPath,
+          burnedPath: outputPath,
+          codec: 'hevc_nvenc',
+          crf: 24,
+          container: 'mp4',
+          fps: 60,
+          avatarOverlay
+        }),
+        { timeoutMs: 30_000 }
+      );
+      assert.equal(burned.status, 0, burned.stderr);
+      const info = await probeMediaFileInfo(ffmpegPath, outputPath);
+      assert.ok(info.videoInfo);
+      assert.ok(info.audioInfo);
+      assert.equal(info.videoInfo.width, width);
+      assert.equal(info.videoInfo.height, height);
+      assert.equal(Math.round(Number(info.videoInfo.fps || 0)), 60, 'static avatar artwork keeps the 60fps output timeline');
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
 
 test('portrait burn keeps the source canvas and renders its adaptive ASS overlay', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-portrait-burn-'));

@@ -1,5 +1,5 @@
 import danmakuStylePresetData from '../../shared/danmaku-style-presets.json';
-import type { AppSettings, DanmakuStylePreset, FfmpegCodecOption } from '../types';
+import type { AppSettings, BurnAvatarMode, DanmakuStylePreset, FfmpegCodecOption } from '../types';
 
 type DanmakuStylePresetDefinition = {
   label: string;
@@ -43,6 +43,7 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'burnDanmakuArea',
   'burnDanmakuStylePreset',
   'burnDanmakuStyleLayout',
+  'burnAvatarMode',
   'burnCodec',
   'burnCrf',
   'notifyLiveStarted',
@@ -81,6 +82,12 @@ export const danmakuAreaOptions = [
 export const danmakuStylePresetOptions = (Object.entries(danmakuStylePresets) as Array<
   [DanmakuStylePreset, DanmakuStylePresetDefinition]
 >).map(([value, definition]) => ({ value, ...definition }));
+
+export const burnAvatarModeOptions: Array<{ value: BurnAvatarMode; label: string }> = [
+  { value: 'off', label: '关闭（通用头像）' },
+  { value: 'limited', label: '少量（最多 6 个）' },
+  { value: 'high', label: '高质量（最多 24 个）' }
+];
 
 export const exportModeOptions = [
   { label: '纯净片段', value: 'clean' },

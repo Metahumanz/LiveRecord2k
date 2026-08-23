@@ -17,7 +17,13 @@ import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
-import { danmakuAreaOptions, danmakuStylePresetOptions, exportModeOptions, overlayModeOptions } from '../ui/options';
+import {
+  burnAvatarModeOptions,
+  danmakuAreaOptions,
+  danmakuStylePresetOptions,
+  exportModeOptions,
+  overlayModeOptions
+} from '../ui/options';
 import {
   clampNumber,
   filename,
@@ -773,6 +779,19 @@ export function ExportPage({
                 </button>
               ))}
             </div>
+            <label className="danmaku-style-speed">
+              <span>真实头像</span>
+              <select
+                value={draft.avatarMode}
+                onChange={(event) => setDraft({ ...draft, avatarMode: event.target.value as AppSettings['burnAvatarMode'] })}
+              >
+                {burnAvatarModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
             {draft.stylePreset === 'current' ? (
               <label className="danmaku-style-speed">
                 <span>滚动速度</span>

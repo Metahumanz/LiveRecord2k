@@ -36,6 +36,7 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
       danmakuArea: current.danmakuArea || state.settings.burnDanmakuArea,
       stylePreset: current.stylePreset || state.settings.burnDanmakuStylePreset,
       styleLayout: current.styleLayout || { ...state.settings.burnDanmakuStyleLayout },
+      avatarMode: current.avatarMode || state.settings.burnAvatarMode,
       outputDir: current.outputDir || state.settings.outputDir
     };
   }
@@ -49,6 +50,7 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
     danmakuArea: state.settings.burnDanmakuArea,
     stylePreset: state.settings.burnDanmakuStylePreset,
     styleLayout: { ...state.settings.burnDanmakuStyleLayout },
+    avatarMode: state.settings.burnAvatarMode,
     outputDir: current.outputDir || state.settings.outputDir
   };
 }

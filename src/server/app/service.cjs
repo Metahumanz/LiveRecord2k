@@ -87,6 +87,7 @@ const {
   normalizeBurnCodec,
   normalizeRoomImageMode,
   normalizeBurnOverlayMode,
+  normalizeBurnAvatarMode,
   normalizeExportMode,
   overlayModeLabel,
   basenameWithoutExt,
@@ -244,6 +245,7 @@ const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_AVATAR_OVERLAY_IMAGE_BYTES = 2 * 1024 * 1024;
 const MAX_AVATAR_OVERLAY_ENTRIES = 24;
+const LIMITED_AVATAR_OVERLAY_ENTRIES = 6;
 const MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY = 32;
 const MAX_AVATAR_OVERLAY_CONCURRENCY = 3;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
@@ -267,6 +269,28 @@ const MERGE_AV_DURATION_TOLERANCE_SEC = 0.08;
 const MERGE_AV_BOUNDARY_TOLERANCE_SEC = 0.12;
 const CLEANUP_METADATA_SCAN_MAX_DEPTH = 4;
 const CLEANUP_METADATA_SCAN_LIMIT = 2000;
+
+function avatarOverlayEntryLimit(mode) {
+  switch (normalizeBurnAvatarMode(mode)) {
+    case 'off':
+      return 0;
+    case 'limited':
+      return LIMITED_AVATAR_OVERLAY_ENTRIES;
+    default:
+      return MAX_AVATAR_OVERLAY_ENTRIES;
+  }
+}
+
+function burnAvatarModeLabel(mode) {
+  switch (normalizeBurnAvatarMode(mode)) {
+    case 'off':
+      return '关闭';
+    case 'limited':
+      return `少量（最多 ${LIMITED_AVATAR_OVERLAY_ENTRIES} 个）`;
+    default:
+      return `高质量（最多 ${MAX_AVATAR_OVERLAY_ENTRIES} 个）`;
+  }
+}
 
 function normalizeBiliAvatarUrl(value) {
   const raw = typeof value === 'string' ? value.trim() : '';
@@ -666,6 +690,8 @@ class LiveRecordService {
       unavailableBurnCodecs: [],
       hwaccels: [],
       videoAdapters: [],
+      cudaAvatarComposite: false,
+      cudaAvatarCompositeReason: '',
       probedAt: 0,
       probeError: ''
     };
@@ -688,6 +714,7 @@ class LiveRecordService {
       burnDanmakuArea: 'half',
       burnDanmakuStylePreset: 'current',
       burnDanmakuStyleLayout: {},
+      burnAvatarMode: 'high',
       burnCodec: 'libx265',
       burnCrf: 24,
       notifyLiveStarted: true,
@@ -875,6 +902,14 @@ class LiveRecordService {
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     this.log('info', `当前弹幕版编码：${this.getBurnCodecInfo(this.settings.burnCodec).label}（${this.settings.burnCodec}）`);
+    this.log(
+      this.ffmpegCapabilities.cudaAvatarComposite ? 'info' : 'warn',
+      this.ffmpegCapabilities.cudaAvatarComposite
+        ? '真实头像透明图层将使用 NVIDIA CUDA 合成。'
+        : `真实头像透明图层将使用 CPU 合成${
+            this.ffmpegCapabilities.cudaAvatarCompositeReason ? `：${this.ffmpegCapabilities.cudaAvatarCompositeReason}` : ''
+          }`
+    );
     this.emitState();
   }
 
@@ -1058,6 +1093,7 @@ class LiveRecordService {
       burnDanmakuArea: normalizeDanmakuDisplayArea(settings.burnDanmakuArea),
       burnDanmakuStylePreset: normalizeDanmakuStylePreset(settings.burnDanmakuStylePreset),
       burnDanmakuStyleLayout: normalizeDanmakuStyleLayout(settings.burnDanmakuStyleLayout),
+      burnAvatarMode: normalizeBurnAvatarMode(settings.burnAvatarMode),
       notifyLiveStarted: settings.notifyLiveStarted !== false,
       notifyLiveEnded: settings.notifyLiveEnded !== false,
       notifyRecordingStarted: settings.notifyRecordingStarted !== false,
@@ -1116,6 +1152,15 @@ class LiveRecordService {
       (this.ffmpegCapabilities?.unavailableBurnCodecs || []).find((option) => option.value === value) ||
       BURN_CODEC_CANDIDATES.find((option) => option.value === value) ||
       { value, label: value || '未知编码', kind: 'software' }
+    );
+  }
+
+  shouldUseCudaAvatarComposite(codec, avatarPlan) {
+    return Boolean(
+      Array.isArray(avatarPlan?.entries) &&
+        avatarPlan.entries.length > 0 &&
+        String(codec || '').includes('nvenc') &&
+        this.ffmpegCapabilities?.cudaAvatarComposite
     );
   }
 
@@ -7246,7 +7291,8 @@ try {
       overlayMode: options.overlayMode || this.settings.burnOverlayMode,
       danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea,
       stylePreset: options.stylePreset,
-      styleLayout: options.styleLayout
+      styleLayout: options.styleLayout,
+      avatarMode: options.avatarMode ?? this.settings.burnAvatarMode
     });
     this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
     this.emitState();
@@ -7375,10 +7421,12 @@ try {
       }
       const overlay = { panel: avatarPlan.panel, entries };
       const filterScriptPath = path.join(workingDir, 'avatar-layer.ffscript');
+      const gpuComposite = Boolean(options.gpuComposite);
       const script = createAvatarOverlayFilterScript({
         assPath: options.assPath,
         fps: options.fps,
-        avatarOverlay: overlay
+        avatarOverlay: overlay,
+        gpuComposite
       });
       if (!script) {
         await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
@@ -7389,9 +7437,9 @@ try {
         'info',
         `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
           avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
-        }${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}。`
+        }${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? '，NVIDIA CUDA 合成。' : '。'}`
       );
-      return { ...overlay, filterScriptPath, temporaryDir: workingDir };
+      return { ...overlay, filterScriptPath, temporaryDir: workingDir, gpuComposite };
     } catch (error) {
       await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
       this.log('warn', `${label} 真实头像图层准备失败，继续使用通用头像：${compactLogLine(error.message)}`);
@@ -7422,6 +7470,7 @@ try {
       const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
       const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
       const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
+      const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
       this.burnCancelRequests.delete(room.id);
       const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
       const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
@@ -7431,7 +7480,7 @@ try {
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
       }
-      const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout });
+      const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout, avatarMode });
       if (options.prepareOnly) {
         this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
         return true;
@@ -7451,10 +7500,12 @@ try {
       await assertDiskSpace(burnedPath, { estimatedBytes: Number(recording.fileSize || 0) });
       await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
       const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
+      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         assPath: assets.assPath,
         fps: burnFps,
-        label: `${roomLabel(room)} 烧录`
+        label: `${roomLabel(room)} 烧录`,
+        gpuComposite: gpuAvatarComposite
       });
       const args = createBurnArgs({
         cleanPath: burnSourcePath,
@@ -7488,6 +7539,8 @@ try {
           overlayMode
         )}，${danmakuDisplayAreaLabel(danmakuArea)}，样式 ${stylePreset}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
           codecInfo.label
+        }，真实头像 ${burnAvatarModeLabel(avatarMode)}${
+          avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''
         }${assets.playWidth > 0 && assets.playHeight > 0 ? `，${assets.playWidth}x${assets.playHeight}${assets.portrait ? ' 竖屏适配' : ''}` : ''}）`
       );
       if (this.settings.notifyBurnStarted) {
@@ -7630,6 +7683,7 @@ try {
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
+    const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
     let videoInfo = options.videoInfo || recording.videoInfo;
     if (recording.cleanPath) {
       const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath).catch(() => null);
@@ -7658,7 +7712,7 @@ try {
       startTime: options.startTime,
       endTime: options.endTime,
       shiftTime: options.shiftTime,
-      avatarOverlayMaxEntries: MAX_AVATAR_OVERLAY_ENTRIES,
+      avatarOverlayMaxEntries: avatarOverlayEntryLimit(avatarMode),
       avatarOverlayMaxSegmentsPerEntry: MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY
     });
     const generatedAss = await fsp.readFile(temporaryAssPath, 'utf8').catch(() => '');
@@ -7675,6 +7729,7 @@ try {
       eventCount: result.eventCount,
       stylePreset,
       styleLayout,
+      avatarMode,
       playWidth: Number(result.playWidth || 0),
       playHeight: Number(result.playHeight || 0),
       portrait: result.portrait === true,
@@ -7714,12 +7769,14 @@ try {
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
+    const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
     const suffix = createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea);
     const assets = await this.generateSubtitleAssets(recording, {
       overlayMode,
       danmakuArea,
       stylePreset,
       styleLayout,
+      avatarMode,
       startTime,
       endTime,
       shiftTime: Number.isFinite(startTime),
@@ -7754,6 +7811,7 @@ try {
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
+    const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const durationSec = await this.resolveRecordingDuration(recording, {}, Number(recording.durationSec || 0));
@@ -7798,6 +7856,7 @@ try {
         danmakuArea,
         stylePreset,
         styleLayout,
+        avatarMode,
         outputDir,
         outputPath
       }
@@ -7877,6 +7936,7 @@ try {
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
+    const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
     const startTime = parseTimeInput(options.startTime ?? options.start);
     let endTime = parseTimeInput(options.endTime ?? options.end);
     const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
@@ -7930,6 +7990,7 @@ try {
         danmakuArea,
         stylePreset,
         styleLayout,
+        avatarMode,
         startTime,
         endTime,
         shiftTime: true,
@@ -7940,10 +8001,12 @@ try {
       assPath = assets.assPath;
       codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
       const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
+      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         assPath,
         fps: exportFps,
-        label: '烧录片段导出'
+        label: '烧录片段导出',
+        gpuComposite: gpuAvatarComposite
       });
       args = createBurnArgs({
         cleanPath: recording.cleanPath,
@@ -7977,6 +8040,10 @@ try {
       'info',
       `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}${
         codecInfo ? `（${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${codecInfo.label}）` : ''
+      }${
+        mode === 'burn'
+          ? `，真实头像 ${burnAvatarModeLabel(avatarMode)}${avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''}`
+          : ''
       }`
     );
     let cancelled = false;

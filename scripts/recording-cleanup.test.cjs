@@ -310,6 +310,15 @@ test('source deletion setting is disabled whenever automatic burn is disabled', 
   assert.equal(enabled.deleteSourceAfterBurn, true);
 });
 
+test('real-avatar mode preserves legacy high quality by default and normalizes all three choices', () => {
+  const service = new LiveRecordService();
+  assert.equal(service.settings.burnAvatarMode, 'high');
+  assert.equal(service.normalizeSettings({ ...service.settings, burnAvatarMode: 'off' }).burnAvatarMode, 'off');
+  assert.equal(service.normalizeSettings({ ...service.settings, burnAvatarMode: 'limited' }).burnAvatarMode, 'limited');
+  assert.equal(service.normalizeSettings({ ...service.settings, burnAvatarMode: 'high' }).burnAvatarMode, 'high');
+  assert.equal(service.normalizeSettings({ ...service.settings, burnAvatarMode: 'unknown' }).burnAvatarMode, 'high');
+});
+
 test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-delete-source-after-burn-'));
   const sourcePath = path.join(outputDir, 'session.clean.mp4');

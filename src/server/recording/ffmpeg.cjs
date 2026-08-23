@@ -82,6 +82,21 @@ function avatarMotionExpression(segments, axis, offset = 0) {
   return expression;
 }
 
+function avatarGpuMotionExpression(segments, axis, offset = 0) {
+  const ordered = [...segments].sort((left, right) => left.start - right.start || left.end - right.end);
+  const start = Math.min(...ordered.map((segment) => segment.start));
+  const end = Math.max(...ordered.map((segment) => segment.end));
+  // overlay_cuda does not expose FFmpeg's timeline `enable` switch. Keep the
+  // source texture off-canvas outside its own queue lifetime instead; x/y are
+  // still evaluated on the 60fps main timeline, so motion remains identical.
+  const hidden = axis === 'x' ? '-overlay_w' : '-overlay_h';
+  return `if(between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})\\,${avatarMotionExpression(
+    ordered,
+    axis,
+    offset
+  )}\\,${hidden})`;
+}
+
 function createBurnVideoFilter(assPath, fps) {
   const targetFps = normalizeMergeFps(fps);
   const fpsFilter = targetFps ? `,fps=${targetFps}:start_time=0` : '';
@@ -91,11 +106,12 @@ function createBurnVideoFilter(assPath, fps) {
   );
 }
 
-// The avatar artwork is built as its own transparent side-panel stream and
-// composited once above the ASS result.  This avoids a full-frame overlay pass
-// for every headshot while preserving the ASS vector portrait underneath as a
-// failure fallback.
-function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay } = {}) {
+// CPU rendering builds avatar artwork in a transparent side-panel stream and
+// composites it once above ASS. CUDA's overlay filter cannot chain a
+// transparent alpha main input, so its path composites the same circles
+// directly onto the already-rendered ASS video. The vector portrait beneath
+// remains the failure fallback in both cases.
+function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, gpuComposite = false } = {}) {
   const entries = normalizeAvatarOverlayEntries(avatarOverlay);
   if (!entries.length) return '';
   const panel = avatarOverlay?.panel || {};
@@ -103,10 +119,16 @@ function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay } = {}) {
   const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
   const panelHeight = Math.max(1, Math.ceil(Number(panel.height) || 1));
   const layerFps = normalizeMergeFps(fps) || 30;
-  const filters = [`[0:v]${createBurnVideoFilter(assPath, fps)}[burn_base]`];
-  filters.push(
-    `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,settb=AVTB,setpts=PTS-STARTPTS[avatar_layer_0]`
-  );
+  const filters = [
+    gpuComposite
+      ? `[0:v]${createBurnVideoFilter(assPath, fps)},hwupload_cuda[avatar_layer_0]`
+      : `[0:v]${createBurnVideoFilter(assPath, fps)}[burn_base]`
+  ];
+  if (!gpuComposite) {
+    filters.push(
+      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,settb=AVTB,setpts=PTS-STARTPTS[avatar_layer_0]`
+    );
+  }
 
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index];
@@ -115,18 +137,31 @@ function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay } = {}) {
     const nextLayer = `avatar_layer_${index + 1}`;
     const start = Math.min(...entry.segments.map((segment) => segment.start));
     const end = Math.max(...entry.segments.map((segment) => segment.end));
-    filters.push(`[${index + 1}:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba[${imageLabel}]`);
     filters.push(
-      `[${previousLayer}][${imageLabel}]overlay=` +
-        `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
-        `y='${avatarMotionExpression(entry.segments, 'y')}':` +
-        `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
-        `eof_action=pass:repeatlast=0:format=auto[${nextLayer}]`
+      `[${index + 1}:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba${gpuComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
     );
+    if (gpuComposite) {
+      filters.push(
+        `[${previousLayer}][${imageLabel}]overlay_cuda=` +
+          `x='${avatarGpuMotionExpression(entry.segments, 'x')}':` +
+          `y='${avatarGpuMotionExpression(entry.segments, 'y')}':` +
+          `eof_action=pass:repeatlast=0[${nextLayer}]`
+      );
+    } else {
+      filters.push(
+        `[${previousLayer}][${imageLabel}]overlay=` +
+          `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
+          `y='${avatarMotionExpression(entry.segments, 'y')}':` +
+          `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
+          `eof_action=pass:repeatlast=0:format=auto[${nextLayer}]`
+      );
+    }
   }
   filters.push(
-    `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
-      'eof_action=pass:repeatlast=0:format=auto,format=yuv420p[vout]'
+    gpuComposite
+      ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p[vout]`
+      : `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
+          'eof_action=pass:repeatlast=0:format=auto,format=yuv420p[vout]'
   );
   return `${filters.join(';\n')}\n`;
 }
@@ -199,12 +234,18 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
 function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration, fps, avatarOverlay }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
-  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
-  args.push('-i', cleanPath);
   const avatarEntries = avatarOverlay?.filterScriptPath ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
-  const avatarFps = normalizeMergeFps(fps) || 30;
+  const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite && String(codec || '').includes('nvenc'));
+  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  if (gpuAvatarComposite) {
+    args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
+  }
+  args.push('-i', cleanPath);
   for (const entry of avatarEntries) {
-    args.push('-loop', '1', '-framerate', String(avatarFps), '-i', entry.imagePath);
+    // Avatar artwork is static. Motion is driven by the main video timestamp
+    // in the filter graph, so one source frame per second is sufficient and
+    // avoids decoding/uploading a duplicate PNG for every output frame.
+    args.push('-loop', '1', '-framerate', '1', '-i', entry.imagePath);
   }
   if (hasStart) {
     args.push('-ss', formatFfmpegSeconds(startTime));
