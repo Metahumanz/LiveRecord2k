@@ -91,6 +91,8 @@ export type DanmakuArea = 'quarter' | 'half' | 'three-quarter' | 'no-overlap' | 
 
 export type DanmakuStylePreset = 'current' | 'h5-card' | 'bubble' | 'minimal';
 
+export type BurnAvatarMode = 'off' | 'limited' | 'high';
+
 export type DanmakuStyleLayout = {
   panelLeft?: number;
   superChatBottom?: number;
@@ -118,6 +120,7 @@ export type AppSettings = {
   burnDanmakuArea: DanmakuArea;
   burnDanmakuStylePreset: DanmakuStylePreset;
   burnDanmakuStyleLayout: DanmakuStyleLayout;
+  burnAvatarMode: BurnAvatarMode;
   burnCodec: string;
   burnCrf: number;
   notifyLiveStarted: boolean;
@@ -322,6 +325,7 @@ export type ExportClipRequest = {
   danmakuArea?: DanmakuArea;
   stylePreset?: DanmakuStylePreset;
   styleLayout?: DanmakuStyleLayout;
+  avatarMode?: BurnAvatarMode;
   outputDir?: string;
   outputPath?: string;
 };
@@ -411,6 +415,7 @@ export type RecorderApi = {
       danmakuArea?: DanmakuArea;
       stylePreset?: DanmakuStylePreset;
       styleLayout?: DanmakuStyleLayout;
+      avatarMode?: BurnAvatarMode;
       prepareOnly?: boolean;
     }
   ) => Promise<AppState>;
@@ -422,6 +427,7 @@ export type RecorderApi = {
       danmakuArea?: DanmakuArea;
       stylePreset?: DanmakuStylePreset;
       styleLayout?: DanmakuStyleLayout;
+      avatarMode?: BurnAvatarMode;
     }
   ) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
@@ -457,5 +463,6 @@ export type ExportDraft = {
   danmakuArea: DanmakuArea;
   stylePreset: DanmakuStylePreset;
   styleLayout: DanmakuStyleLayout;
+  avatarMode: BurnAvatarMode;
   outputDir: string;
 };

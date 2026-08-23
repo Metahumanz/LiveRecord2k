@@ -375,13 +375,15 @@ function mergeCommandCounts(items) {
 }
 
 async function detectFfmpegCapabilities(ffmpegPath) {
-  const [encoderProbe, hwaccelProbe, videoAdapters] = await Promise.all([
+  const [encoderProbe, hwaccelProbe, filterProbe, videoAdapters] = await Promise.all([
     runFfmpegProbe(ffmpegPath, ['-hide_banner', '-encoders']),
     runFfmpegProbe(ffmpegPath, ['-hide_banner', '-hwaccels']),
+    runFfmpegProbe(ffmpegPath, ['-hide_banner', '-filters']),
     detectVideoAdapters()
   ]);
   const encoderNames = parseFfmpegEncoderNames(encoderProbe.output);
   const hwaccels = parseFfmpegHwaccels(hwaccelProbe.output);
+  const filterNames = parseFfmpegFilterNames(filterProbe.output);
   const burnCodecs = [];
   const unavailableBurnCodecs = [];
 
@@ -404,11 +406,19 @@ async function detectFfmpegCapabilities(ffmpegPath) {
     burnCodecs.push(candidate);
   }
 
+  const cudaAvatarComposite =
+    hwaccels.includes('cuda') &&
+    ['hwupload_cuda', 'overlay_cuda', 'scale_cuda'].every((filter) => filterNames.has(filter))
+      ? await testFfmpegCudaAvatarComposite(ffmpegPath)
+      : { ok: false, reason: '未检测到可用的 CUDA 透明图层合成链路' };
+
   return {
     burnCodecs,
     unavailableBurnCodecs,
     hwaccels,
     videoAdapters,
+    cudaAvatarComposite: cudaAvatarComposite.ok,
+    cudaAvatarCompositeReason: cudaAvatarComposite.reason || '',
     probedAt: Date.now(),
     probeError: encoderProbe.ok ? '' : encoderProbe.error
   };
@@ -512,6 +522,17 @@ function parseFfmpegHwaccels(output) {
     .map((line) => line.trim())
     .filter((line) => line && !line.includes(':'))
     .filter((line) => /^[a-z0-9_]+$/i.test(line));
+}
+
+function parseFfmpegFilterNames(output) {
+  const names = new Set();
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const match = /^\s*[A-Z.]{3}\s+([^\s]+)/i.exec(line);
+    if (match) {
+      names.add(match[1]);
+    }
+  }
+  return names;
 }
 
 async function detectVideoAdapters() {
@@ -638,6 +659,51 @@ async function testFfmpegEncoder(ffmpegPath, codec) {
   }
 }
 
+async function testFfmpegCudaAvatarComposite(ffmpegPath) {
+  try {
+    const result = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-init_hw_device',
+        'cuda=br2k_avatar_probe:0',
+        '-filter_hw_device',
+        'br2k_avatar_probe',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=black:s=64x64:r=1:d=1',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=white@0.5:s=16x16:r=1:d=1,format=rgba',
+        '-filter_complex',
+        '[0:v]hwupload_cuda[base];[1:v]hwupload_cuda[avatar];[base][avatar]overlay_cuda=x=8:y=8,scale_cuda=format=yuv420p[out]',
+        '-map',
+        '[out]',
+        '-frames:v',
+        '1',
+        '-f',
+        'null',
+        '-'
+      ],
+      { timeoutMs: 10000, maxOutputBytes: 128 * 1024 }
+    );
+    if (result.status === 0 && !result.error) {
+      return { ok: true, reason: '' };
+    }
+    const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+    return {
+      ok: false,
+      reason: result.timedOut ? 'CUDA 透明图层测试超时' : output || result.error?.message || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+}
+
 function normalizeBurnCodec(value) {
   const codec = String(value || '').trim();
   return BURN_CODEC_VALUES.has(codec) ? codec : 'libx265';
@@ -649,6 +715,10 @@ function normalizeRoomImageMode(value) {
 
 function normalizeBurnOverlayMode(value) {
   return value === 'danmaku' ? 'danmaku' : 'danmaku-gift';
+}
+
+function normalizeBurnAvatarMode(value) {
+  return ['off', 'limited', 'high'].includes(String(value || '').trim()) ? String(value).trim() : 'high';
 }
 
 function normalizeExportMode(value) {
@@ -2971,14 +3041,17 @@ module.exports = {
   runFfmpegProbe,
   parseFfmpegEncoderNames,
   parseFfmpegHwaccels,
+  parseFfmpegFilterNames,
   detectVideoAdapters,
   detectVideoAdapterVendor,
   hasVideoAdapterVendor,
   shouldTestHardwareEncoder,
   testFfmpegEncoder,
+  testFfmpegCudaAvatarComposite,
   normalizeBurnCodec,
   normalizeRoomImageMode,
   normalizeBurnOverlayMode,
+  normalizeBurnAvatarMode,
   normalizeExportMode,
   overlayModeLabel,
   basenameWithoutExt,

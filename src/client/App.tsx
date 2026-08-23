@@ -57,6 +57,7 @@ export default function App() {
     danmakuArea: 'half',
     stylePreset: 'current',
     styleLayout: {},
+    avatarMode: 'high',
     outputDir: ''
   });
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
@@ -236,6 +237,7 @@ export default function App() {
       danmakuArea: state?.settings.burnDanmakuArea || current.danmakuArea,
       stylePreset: state?.settings.burnDanmakuStylePreset || current.stylePreset,
       styleLayout: { ...(state?.settings.burnDanmakuStyleLayout || current.styleLayout) },
+      avatarMode: state?.settings.burnAvatarMode || current.avatarMode,
       outputDir: current.outputDir || state?.settings.outputDir || ''
     }));
   }
@@ -253,6 +255,7 @@ export default function App() {
         danmakuArea: exportDraft.danmakuArea,
         stylePreset: exportDraft.stylePreset,
         styleLayout: exportDraft.styleLayout,
+        avatarMode: exportDraft.avatarMode,
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
@@ -281,6 +284,7 @@ export default function App() {
         danmakuArea: exportDraft.danmakuArea,
         stylePreset: exportDraft.stylePreset,
         styleLayout: exportDraft.styleLayout,
+        avatarMode: exportDraft.avatarMode,
         outputDir: exportDraft.outputDir
       });
       setExportResult(result);
@@ -299,7 +303,8 @@ export default function App() {
     await saveSettingsWithToast(
       {
         burnDanmakuStylePreset: exportDraft.stylePreset,
-        burnDanmakuStyleLayout: exportDraft.styleLayout
+        burnDanmakuStyleLayout: exportDraft.styleLayout,
+        burnAvatarMode: exportDraft.avatarMode
       },
       '已设为默认烧录样式；自动烧录和下次导出会使用这组参数'
     );

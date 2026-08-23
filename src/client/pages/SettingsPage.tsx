@@ -3,7 +3,14 @@ import { Bell, FileCode2, FolderOpen, HardDrive, LogIn, QrCode, Save, Video } fr
 import { recorder } from '../recorderClient';
 import { PageHeader, SettingPanel, Toggle } from '../components/common';
 import type { AppSettings, AppState, DiskSpaceState } from '../types';
-import { containerOptions, danmakuAreaOptions, danmakuStylePresetOptions, overlayModeOptions, qnOptions } from '../ui/options';
+import {
+  burnAvatarModeOptions,
+  containerOptions,
+  danmakuAreaOptions,
+  danmakuStylePresetOptions,
+  overlayModeOptions,
+  qnOptions
+} from '../ui/options';
 import { burnCodecOptions, burnCodecSummary, formatFileSize, isBilibiliLoggedIn } from '../utils';
 
 export function SettingsPage({
@@ -332,6 +339,25 @@ export function SettingsPage({
                   </option>
                 ))}
               </select>
+            </label>
+
+            <label className="field">
+              <span>真实头像</span>
+              <select
+                value={settingsDraft.burnAvatarMode}
+                onChange={(event) =>
+                  updateSetting({ burnAvatarMode: event.target.value as AppSettings['burnAvatarMode'] })
+                }
+              >
+                {burnAvatarModeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="field-help">
+                仅“侧边互动流”和“侧边气泡流”使用。高质量保持现有 24 个真实头像；NVIDIA 硬编会自动用 CUDA 合成。
+              </p>
             </label>
 
             <label className="field">
