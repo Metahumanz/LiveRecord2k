@@ -163,6 +163,7 @@ const {
   normalizeProxyUrl,
   proxyAuthorizationHeader,
   readTextSource,
+  createUpdateDownloadSources,
   isDefaultUpdateSource,
   normalizeUpdateManifest,
   normalizeVersion,
@@ -8449,25 +8450,38 @@ try {
 
   async fetchUpdateManifest(onStatus) {
     const source = this.settings.updateManifestUrl || DEFAULT_UPDATE_MANIFEST_URL;
-    let raw;
-    try {
-      raw = await readTextSource(source, {
-        timeoutMs: UPDATE_CHECK_TIMEOUT_MS,
-        retries: 3,
-        onRetry: ({ attempt, maxAttempts, error }) => {
-          onStatus?.(
-            `检查更新连接中断，正在重试 ${attempt}/${Math.max(1, Number(maxAttempts || 1) - 1)}：${
-              error.message || error
-            }`
-          );
+    const isOfficial = isDefaultUpdateSource(source, DEFAULT_UPDATE_MANIFEST_URL);
+    const manifestAttempts = createUpdateDownloadSources(source, { officialSource: isOfficial });
+    let raw = '';
+    let lastError = null;
+    for (let index = 0; index < manifestAttempts.length; index += 1) {
+      const attempt = manifestAttempts[index];
+      try {
+        raw = await readTextSource(attempt.url, {
+          timeoutMs: UPDATE_CHECK_TIMEOUT_MS,
+          retries: 3,
+          onRetry: ({ attempt: retryAttempt, maxAttempts, error }) => {
+            onStatus?.(
+              `${attempt.label}连接中断，正在重试 ${retryAttempt}/${Math.max(1, Number(maxAttempts || 1) - 1)}：${
+                error.message || error
+              }`
+            );
+          }
+        });
+        break;
+      } catch (error) {
+        lastError = error;
+        if (index + 1 < manifestAttempts.length) {
+          onStatus?.(`${attempt.label}连接失败，改用${manifestAttempts[index + 1].label}...`);
         }
-      });
-    } catch (error) {
-      if (!isDefaultUpdateSource(source, DEFAULT_UPDATE_MANIFEST_URL)) {
-        throw error;
+      }
+    }
+    if (!raw) {
+      if (!isOfficial) {
+        throw lastError || new Error('更新清单获取失败。');
       }
       onStatus?.('默认更新清单连接失败，正在改用 GitHub Release API...');
-      this.log('warn', `默认更新清单失败，改用 GitHub Release API：${error.message}`);
+      this.log('warn', `默认更新清单失败，改用 GitHub Release API：${lastError?.message || ''}`);
       raw = await readTextSource(GITHUB_LATEST_RELEASE_API, {
         timeoutMs: UPDATE_CHECK_TIMEOUT_MS,
         retries: 3,
@@ -8480,9 +8494,48 @@ try {
         }
       });
     }
-    const payload = JSON.parse(raw);
+    let payload = JSON.parse(raw);
+    // GitHub Release API 没有本项目的 Ed25519 签名；资产中通常带有 update.json，
+    // 优先下载官方签名清单，恢复 Linux 受控自动安装，同时确保按真实架构选择安装包。
+    if (Array.isArray(payload.assets) && !Array.isArray(payload.files)) {
+      const updateAsset = (payload.assets || []).find((asset) => {
+        const name = String(asset?.name || packageFileNameFromUrl(asset?.browser_download_url || asset?.url || ''));
+        return /^update\.json$/i.test(name) || /\/update\.json$/i.test(name);
+      });
+      const updateAssetUrl = String(updateAsset?.browser_download_url || updateAsset?.url || '');
+      if (updateAssetUrl) {
+        const signedAttempts = createUpdateDownloadSources(updateAssetUrl, { officialSource: true });
+        for (let signedIndex = 0; signedIndex < signedAttempts.length; signedIndex += 1) {
+          const attempt = signedAttempts[signedIndex];
+          try {
+            const signedRaw = await readTextSource(attempt.url, {
+              timeoutMs: UPDATE_CHECK_TIMEOUT_MS,
+              retries: 2,
+              onRetry: ({ attempt: retryAttempt, maxAttempts, error: retryError }) => {
+                onStatus?.(
+                  `${attempt.label}更新清单连接中断，正在重试 ${retryAttempt}/${Math.max(1, Number(maxAttempts || 1) - 1)}：${
+                    retryError.message || retryError
+                  }`
+                );
+              }
+            });
+            const signedPayload = JSON.parse(signedRaw);
+            if (Array.isArray(signedPayload.files) && signedPayload.signed) {
+              payload = signedPayload;
+              break;
+            }
+            throw new Error('更新清单资产缺少 files/signed。');
+          } catch (error) {
+            lastError = error;
+            if (signedIndex + 1 < signedAttempts.length) {
+              this.log('warn', `${attempt.label}更新清单获取失败，改用${signedAttempts[signedIndex + 1].label}：${error.message}`);
+            }
+          }
+        }
+      }
+    }
     const manifest = normalizeUpdateManifest(payload);
-    manifest.officialSource = isDefaultUpdateSource(source, DEFAULT_UPDATE_MANIFEST_URL);
+    manifest.officialSource = isOfficial;
     if (!manifest.version || !manifest.packageUrl) {
       throw new Error('更新源缺少 version 或 packageUrl。');
     }

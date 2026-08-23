@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.5.4 - 2026-08-24
+
+- 修复树莓派等国内网络环境下 Linux 自动更新失效的问题：官方 update.json 清单现在和安装包一样支持 GitHub 镜像回退；直连失败后切换到 GitHub Release API 时，会优先下载发布资产中的官方签名清单，恢复 systemd root 更新服务的自动安装能力。
+- 修复 GitHub Release API 兜底清单不识别 CPU 架构的问题：现在按文件名区分 amd64/arm64 并过滤 update.json 本身，ARM 设备不会再误选 x86_64 的 deb 包，也不会把清单当成安装包。
+- 树莓派等 ARM 设备从本版本起可正常获取 bili-record-2k_*_arm64.deb 并自动升级；已误下载的 amd64 包不会被采用。
+
 ## 0.5.3 - 2026-08-24
 
 - 统一所有本地文件 HTTP 输出（完整文件、Range 请求、剪辑兼容预览 `.m3u8`/`.ts`）的文件流生命周期：客户端一断开就立即销毁 ReadStream 并清理监听器，不再依赖浏览器先结束请求；修复源 MP4 连续 Range 请求中断后残留文件句柄的问题。该逻辑与文件系统无关，Windows NTFS/SMB/UNC、Linux ext4/CIFS/NFS 与 macOS 共用同一释放路径。

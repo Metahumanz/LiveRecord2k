@@ -37,7 +37,8 @@ const BURN_CODEC_CANDIDATES = [
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 const APP_ROOT = getAppRoot();
 const APP_VERSION = getAppVersion();
-const OFFICIAL_RELEASE_DOWNLOAD_PREFIX = 'https://github.com/Metahumanz/LiveRecord2k/releases/download/';
+// 官方更新清单（releases/latest/download/update.json）与下载包共用镜像回退。
+const OFFICIAL_RELEASE_DOWNLOAD_PREFIX = 'https://github.com/Metahumanz/LiveRecord2k/releases/';
 const UPDATE_DOWNLOAD_MIRROR_PREFIX = 'https://gh-proxy.com/';
 const UPDATE_DOWNLOAD_LOW_SPEED_BYTES_PER_SECOND = 64 * 1024;
 const UPDATE_DOWNLOAD_LOW_SPEED_WINDOW_MS = 20 * 1000;
@@ -2398,11 +2399,22 @@ function normalizeUpdateManifest(payload, options = {}) {
     platform
   );
   if (Array.isArray(payload.assets)) {
-    const files = payload.assets.map((asset) => ({
-      name: asset.name || packageFileNameFromUrl(asset.browser_download_url || asset.url || ''),
-      url: asset.browser_download_url || asset.url || '',
-      sha256: String(asset.digest || '').replace(/^sha256:/i, '')
-    }));
+    // GitHub Release API 的 assets 没有 kind/platform/arch 字段，必须从文件名推断；
+    // 同时过滤 update.json 等非安装包资产，避免把清单当成 deb 候选。
+    const files = payload.assets
+      .map((asset) => {
+        const name = asset.name || packageFileNameFromUrl(asset.browser_download_url || asset.url || '');
+        const packageKind = inferUpdatePackageKindFromName(name);
+        return {
+          name,
+          url: asset.browser_download_url || asset.url || '',
+          sha256: String(asset.digest || '').replace(/^sha256:/i, ''),
+          kind: packageKind,
+          platform: packageKind ? inferUpdatePlatform(name, packageKind) : '',
+          arch: packageKind ? inferUpdateArchFromName(name) : ''
+        };
+      })
+      .filter((file) => file.url && file.kind);
     const packageAsset = selectUpdatePackageFile(files, { platform, arch, preferredPackageType });
     return {
       version: normalizeVersion(payload.version || payload.tag_name || ''),
@@ -2412,7 +2424,11 @@ function normalizeUpdateManifest(payload, options = {}) {
       sha256: packageAsset?.sha256 || payload.sha256 || '',
       releaseUrl: payload.html_url || '',
       notes: payload.body || '',
-      packageName: packageAsset?.name || packageFileNameFromUrl(packageAsset?.url || '')
+      packageName: packageAsset?.name || packageFileNameFromUrl(packageAsset?.url || ''),
+      packageArch: packageAsset?.arch || '',
+      signed: payload.signed || null,
+      signatureAlgorithm: String(payload.signatureAlgorithm || ''),
+      signature: String(payload.signature || '')
     };
   }
   const files = Array.isArray(payload.files) ? payload.files : [];
@@ -2498,6 +2514,25 @@ function inferUpdatePlatform(value, packageType = '') {
   const text = String(value || '').toLowerCase();
   if (packageType === 'deb' || packageType === 'tarball' || /\.(?:deb|tar\.gz|tgz)(?:$|[?#])/i.test(text)) return 'linux';
   if (packageType === 'installer' || packageType === 'portable' || packageType === 'msix' || /\.(?:exe|msi|msix|zip)(?:$|[?#])/i.test(text)) return 'win32';
+  return '';
+}
+
+function inferUpdatePackageKindFromName(value) {
+  const text = String(value || '').toLowerCase();
+  if (text.endsWith('.deb')) return 'deb';
+  if (/.(?:tar\.gz|tgz)$/.test(text)) return 'tarball';
+  if (/.(?:msix|appinstaller)$/.test(text)) return 'msix';
+  if (/.(?:exe|msi)$/.test(text) && /(?:setup|install|installer)/.test(text)) return 'installer';
+  if (/.zip$/.test(text)) return 'portable';
+  return '';
+}
+
+function inferUpdateArchFromName(value) {
+  const text = String(value || '').toLowerCase();
+  if (/(?:^|[_-])(?:amd64|x86_64)(?:[._-]|$)/.test(text)) return 'x64';
+  if (/(?:^|[_-])(?:arm64|aarch64)(?:[._-]|$)/.test(text)) return 'arm64';
+  if (/(?:^|[_-])(?:i386|i686)(?:[._-]|$)/.test(text)) return 'ia32';
+  if (/.(?:exe|msi|msix|zip)$/.test(text)) return 'x64';
   return '';
 }
 
