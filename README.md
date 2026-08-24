@@ -100,12 +100,16 @@ https://live.bilibili.com/22625025
 ```text
 123456_anchor_title_20260627_142000.clean.mp4
 123456_anchor_title_20260627_142000.danmaku.jsonl
+123456_anchor_title_20260627_142000.danmaku.avatars.json
+123456_anchor_title_20260627_142000.danmaku.avatars/
 123456_anchor_title_20260627_142000.danmaku.ass
 123456_anchor_title_20260627_142000.danmaku.mp4
 ```
 
 - `.clean.mp4`：无弹幕原始录像，默认最终文件。
 - `.danmaku.jsonl`：弹幕和互动事件记录。
+- `.danmaku.avatars.json`：录制期间捕获到的头像清单；烧录优先从这里读取，不再等到烧录时才按 UID 查询。
+- `.danmaku.avatars/`：与清单配套的本地头像图片，文件名包含 UID 和内容摘要；清单和目录按同一录像分段生成，续录合并时会合并到最终录像旁边。
 - `.danmaku.ass`：根据弹幕记录生成的字幕文件。
 - `.danmaku.mp4`：烧录弹幕后生成的视频。
 - `.recording.mkv`：MP4 模式录制中的临时文件，正常停止并封装成功后会自动删除。

@@ -95,6 +95,8 @@ const {
   createQnProbeList,
   getContainerFromPath,
   deriveSiblingPath,
+  deriveAvatarManifestPath,
+  deriveAvatarDirectory,
   deriveBurnedPath,
   deriveClipPath,
   replaceExtension,
@@ -245,10 +247,13 @@ const WEBHOOK_RETRY_DELAYS_MS = [0, 1000, 3000];
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_AVATAR_OVERLAY_IMAGE_BYTES = 2 * 1024 * 1024;
-const MAX_AVATAR_OVERLAY_ENTRIES = 24;
 const LIMITED_AVATAR_OVERLAY_ENTRIES = 6;
+const UNLIMITED_AVATAR_OVERLAY_ENTRIES = Number.MAX_SAFE_INTEGER;
 const MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY = 32;
 const MAX_AVATAR_OVERLAY_CONCURRENCY = 3;
+const RECORDED_AVATAR_MANIFEST_SCHEMA_VERSION = 1;
+const RECORDED_AVATAR_CAPTURE_CONCURRENCY = 3;
+const RECORDED_AVATAR_FLUSH_TIMEOUT_MS = 12 * 1000;
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const SEGMENT_ROTATION_GRACE_MS = 10 * 1000;
 const PREVIEW_SESSION_TTL_MS = 10 * 60 * 1000;
@@ -278,7 +283,7 @@ function avatarOverlayEntryLimit(mode) {
     case 'limited':
       return LIMITED_AVATAR_OVERLAY_ENTRIES;
     default:
-      return MAX_AVATAR_OVERLAY_ENTRIES;
+      return UNLIMITED_AVATAR_OVERLAY_ENTRIES;
   }
 }
 
@@ -289,7 +294,7 @@ function burnAvatarModeLabel(mode) {
     case 'limited':
       return `少量（最多 ${LIMITED_AVATAR_OVERLAY_ENTRIES} 个）`;
     default:
-      return `高质量（最多 ${MAX_AVATAR_OVERLAY_ENTRIES} 个）`;
+      return '高质量（全部真实头像）';
   }
 }
 
@@ -1206,6 +1211,7 @@ class LiveRecordService {
       startedAt: Number(recording.startedAt || Date.now()),
       cleanPath,
       danmakuPath: String(recording.danmakuPath || deriveSiblingPath(cleanPath, 'danmaku', 'jsonl')),
+      avatarManifestPath: String(recording.avatarManifestPath || deriveAvatarManifestPath(cleanPath)),
       cssPath: String(recording.cssPath || deriveSiblingPath(cleanPath, 'danmaku', 'css')),
       assPath: String(recording.assPath || deriveSiblingPath(cleanPath, 'danmaku', 'ass')),
       burnedPath: String(recording.burnedPath || deriveBurnedPath(cleanPath, 'danmaku-gift')),
@@ -3892,6 +3898,8 @@ try {
       const cleanPath = path.join(outputDir, `${baseName}.clean.${container}`);
       const capturePath = container === 'mp4' ? path.join(outputDir, `${baseName}.recording.mkv`) : cleanPath;
       const danmakuPath = path.join(outputDir, `${baseName}.danmaku.jsonl`);
+      const avatarManifestPath = deriveAvatarManifestPath(cleanPath);
+      const avatarDirectory = deriveAvatarDirectory(cleanPath);
       const cssPath = path.join(outputDir, `${baseName}.danmaku.css`);
       const assPath = path.join(outputDir, `${baseName}.danmaku.ass`);
       const burnedPath = path.join(outputDir, `${baseName}.danmaku.${container}`);
@@ -3963,6 +3971,8 @@ try {
         cleanPath,
         capturePath,
         danmakuPath,
+        avatarManifestPath,
+        avatarDirectory,
         cssPath,
         assPath,
         burnedPath,
@@ -3993,6 +4003,20 @@ try {
           malformedEvent: 0,
           writeDropped: 0,
           filteredEvent: 0
+        },
+        avatarCapture: {
+          manifestPath: avatarManifestPath,
+          directory: avatarDirectory,
+          entries: new Map(),
+          knownKeys: new Set(),
+          queue: [],
+          pending: new Set(),
+          active: 0,
+          totalBytes: 0,
+          truncated: false,
+          failures: 0,
+          manifestWriteChain: Promise.resolve(),
+          idleWaiters: new Set()
         },
         deduper: this.getLiveDanmakuDeduper(liveSessionId),
         danmakuQueueMetrics: {
@@ -4047,6 +4071,7 @@ try {
         liveSessionId,
         cleanPath,
         danmakuPath,
+        avatarManifestPath,
         cssPath,
         assPath,
         burnedPath,
@@ -4092,6 +4117,9 @@ try {
       }
       this.writeActiveSegmentMetadata(room, session).catch((error) => {
         this.log('warn', `${roomLabel(room)} 写入断电恢复标记失败：${error.message}`);
+      });
+      this.scheduleAvatarManifestWrite(session, 'recording').catch((error) => {
+        this.log('warn', `${roomLabel(room)} 写入头像记录清单失败：${error.message}`);
       });
       this.armRecordingRotation(room, session);
       this.armNoMediaWatch(room, session);
@@ -4415,6 +4443,364 @@ try {
     }
   }
 
+  ensureAvatarCaptureState(session) {
+    if (session?.avatarCapture) return session.avatarCapture;
+    if (!session) return null;
+    const manifestPath = String(session.avatarManifestPath || deriveAvatarManifestPath(session.cleanPath || '')).trim();
+    const directory = String(session.avatarDirectory || deriveAvatarDirectory(session.cleanPath || '')).trim();
+    session.avatarManifestPath = manifestPath;
+    session.avatarDirectory = directory;
+    session.avatarCapture = {
+      manifestPath,
+      directory,
+      entries: new Map(),
+      knownKeys: new Set(),
+      queue: [],
+      pending: new Set(),
+      active: 0,
+      totalBytes: 0,
+      truncated: false,
+      failures: 0,
+      manifestWriteChain: Promise.resolve(),
+      idleWaiters: new Set()
+    };
+    return session.avatarCapture;
+  }
+
+  async fetchAvatarImageAsset(avatarUrl) {
+    const asset = await requestUrlBuffer(avatarUrl, {
+      headersForUrl: (target) => createImageProxyHeaders(target, this.settings.cookie),
+      validateUrl: (target) => validateRemoteUrl(target, { allowHost: isBilibiliHost }),
+      allowProxy: false,
+      retries: 1,
+      timeoutMs: 10000,
+      maxRedirects: 3,
+      maxBytes: MAX_AVATAR_OVERLAY_IMAGE_BYTES,
+      includeResponseMetadata: true
+    });
+    const contentType = String(asset.headers?.['content-type'] || '').toLowerCase();
+    if (!contentType.startsWith('image/')) {
+      throw new Error('头像服务没有返回图片。');
+    }
+    if (!asset.body?.length || asset.body.length > MAX_AVATAR_OVERLAY_IMAGE_BYTES) {
+      throw new Error('头像图片为空或过大。');
+    }
+    return { body: asset.body, contentType };
+  }
+
+  createAvatarManifestPayload(session, status = 'recording') {
+    const capture = this.ensureAvatarCaptureState(session);
+    const manifestDirectory = path.dirname(capture.manifestPath);
+    const entries = Array.from(capture.entries.values()).map((entry) => {
+      const filePath = String(entry.filePath || '').trim();
+      const relativeFile = filePath
+        ? path.relative(manifestDirectory, filePath).split(path.sep).join('/')
+        : '';
+      return {
+        uid: Number(entry.uid || 0),
+        avatarUrl: normalizeBiliAvatarUrl(entry.avatarUrl),
+        file: relativeFile,
+        status: String(entry.status || (relativeFile ? 'captured' : 'unavailable')),
+        capturedAt: Number(entry.capturedAt || Date.now())
+      };
+    });
+    return {
+      schemaVersion: RECORDED_AVATAR_MANIFEST_SCHEMA_VERSION,
+      createdByVersion: APP_VERSION,
+      status: status === 'completed' ? 'completed' : 'recording',
+      captureComplete: status === 'completed' && !capture.truncated,
+      truncated: Boolean(capture.truncated),
+      entryCount: entries.length,
+      totalBytes: Number(capture.totalBytes || 0),
+      entries,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  scheduleAvatarManifestWrite(session, status = 'recording') {
+    const capture = this.ensureAvatarCaptureState(session);
+    const operation = capture.manifestWriteChain.then(async () => {
+      const manifestPath = capture.manifestPath;
+      const temporaryPath = `${manifestPath}.${process.pid}.${Date.now()}.tmp`;
+      await fsp.mkdir(path.dirname(manifestPath), { recursive: true, mode: 0o770 });
+      await fsp.writeFile(
+        temporaryPath,
+        `${JSON.stringify(this.createAvatarManifestPayload(session, status), null, 2)}\n`,
+        { encoding: 'utf8', mode: 0o660 }
+      );
+      try {
+        await atomicReplaceFile(temporaryPath, manifestPath);
+      } finally {
+        await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+      }
+      return manifestPath;
+    });
+    capture.manifestWriteChain = operation.catch(() => {});
+    return operation;
+  }
+
+  notifyAvatarCaptureIdle(capture) {
+    if (!capture || capture.active || capture.queue.length || capture.pending.size) return;
+    const waiters = Array.from(capture.idleWaiters || []);
+    capture.idleWaiters?.clear();
+    for (const resolve of waiters) resolve(true);
+  }
+
+  pumpAvatarCaptureQueue(session) {
+    const capture = this.ensureAvatarCaptureState(session);
+    if (!capture) return;
+    while (capture.active < RECORDED_AVATAR_CAPTURE_CONCURRENCY && capture.queue.length) {
+      const request = capture.queue.shift();
+      capture.active += 1;
+      let taskPromise;
+      taskPromise = Promise.resolve()
+        .then(() => this.captureAvatarSnapshot(session, request))
+        .catch(() => {
+          capture.failures += 1;
+        })
+        .finally(() => {
+          capture.active = Math.max(0, capture.active - 1);
+          capture.pending.delete(taskPromise);
+          this.pumpAvatarCaptureQueue(session);
+          this.notifyAvatarCaptureIdle(capture);
+        });
+      capture.pending.add(taskPromise);
+    }
+    this.notifyAvatarCaptureIdle(capture);
+  }
+
+  queueRecordingAvatarCapture(session, event) {
+    const capture = this.ensureAvatarCaptureState(session);
+    if (!capture || !event) return;
+    const uid = Math.floor(Number(event.uid || 0));
+    const avatarUrl = normalizeBiliAvatarUrl(event.avatarUrl);
+    if (!avatarUrl && (!Number.isSafeInteger(uid) || uid <= 0)) return;
+    const requestKey = avatarUrl || `uid:${uid}`;
+    if (capture.knownKeys.has(requestKey)) return;
+    capture.knownKeys.add(requestKey);
+    capture.queue.push({ uid, avatarUrl, requestKey });
+    this.pumpAvatarCaptureQueue(session);
+  }
+
+  async captureAvatarSnapshot(session, request) {
+    const capture = this.ensureAvatarCaptureState(session);
+    if (!capture) return;
+    const uid = Math.floor(Number(request?.uid || 0));
+    let avatarUrl = normalizeBiliAvatarUrl(request?.avatarUrl);
+    if (!avatarUrl && Number.isSafeInteger(uid) && uid > 0) {
+      avatarUrl = await this.lookupBiliAvatarForOverlay(uid).catch(() => '');
+    }
+
+    const existing = Array.from(capture.entries.values()).find((entry) =>
+      avatarUrl
+        ? normalizeBiliAvatarUrl(entry.avatarUrl) === avatarUrl
+        : !normalizeBiliAvatarUrl(entry.avatarUrl) && Number(entry.uid || 0) === uid
+    );
+    if (existing) return;
+
+    const entry = {
+      uid,
+      avatarUrl,
+      filePath: '',
+      status: avatarUrl ? 'url-only' : 'unavailable',
+      capturedAt: Date.now()
+    };
+    if (avatarUrl) {
+      try {
+        const asset = await this.fetchAvatarImageAsset(avatarUrl);
+        await fsp.mkdir(capture.directory, { recursive: true, mode: 0o770 });
+        const extension = avatarImageExtension(asset.contentType) || '.img';
+        const digest = crypto
+          .createHash('sha256')
+          .update(`${uid}|${avatarUrl}`)
+          .digest('hex')
+          .slice(0, 24);
+        const fileName = `uid-${uid > 0 ? uid : 'unknown'}-${digest}${extension}`;
+        const filePath = path.join(capture.directory, fileName);
+        const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+        await fsp.writeFile(temporaryPath, asset.body, { mode: 0o660 });
+        try {
+          await atomicReplaceFile(temporaryPath, filePath);
+        } finally {
+          await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+        }
+        entry.filePath = filePath;
+        entry.status = 'captured';
+        capture.totalBytes += asset.body.length;
+      } catch {
+        capture.failures += 1;
+      }
+    }
+    capture.entries.set(avatarUrl || request.requestKey, entry);
+    await this.scheduleAvatarManifestWrite(session, session.finished ? 'completed' : 'recording');
+  }
+
+  async flushAvatarCapture(session) {
+    const capture = this.ensureAvatarCaptureState(session);
+    if (!capture) return true;
+    this.pumpAvatarCaptureQueue(session);
+    let drained = capture.active === 0 && capture.queue.length === 0 && capture.pending.size === 0;
+    if (!drained) {
+      drained = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          capture.idleWaiters.delete(waiter);
+          resolve(false);
+        }, RECORDED_AVATAR_FLUSH_TIMEOUT_MS);
+        const waiter = (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        };
+        capture.idleWaiters.add(waiter);
+      });
+    }
+    await capture.manifestWriteChain.catch(() => {});
+    return drained;
+  }
+
+  async readAvatarManifestFile(manifestPath) {
+    const resolvedPath = path.resolve(String(manifestPath || '').trim());
+    if (!resolvedPath) return { present: false, entries: [], captureComplete: false };
+    let payload;
+    try {
+      payload = JSON.parse(await fsp.readFile(resolvedPath, 'utf8'));
+    } catch {
+      return { present: false, entries: [], captureComplete: false };
+    }
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.entries)) {
+      return { present: false, entries: [], captureComplete: false };
+    }
+    const manifestDirectory = path.dirname(resolvedPath);
+    const avatarDirectory = replaceExtension(resolvedPath, '');
+    const entries = payload.entries
+      .map((entry) => {
+        const uid = Math.floor(Number(entry?.uid || 0));
+        const avatarUrl = normalizeBiliAvatarUrl(entry?.avatarUrl);
+        const file = String(entry?.file || '').trim();
+        let filePath = '';
+        if (file) {
+          const candidate = path.resolve(manifestDirectory, file);
+          if (isPathInsideDirectory(candidate, avatarDirectory)) filePath = candidate;
+        }
+        return {
+          uid,
+          avatarUrl,
+          filePath,
+          status: String(entry?.status || ''),
+          capturedAt: Number(entry?.capturedAt || 0)
+        };
+      })
+      .filter((entry) => entry.uid > 0 || entry.avatarUrl || entry.filePath);
+    const byUrl = new Map();
+    const byUid = new Map();
+    for (const entry of entries) {
+      if (entry.avatarUrl && !byUrl.has(entry.avatarUrl)) byUrl.set(entry.avatarUrl, entry);
+      if (entry.uid > 0) {
+        const previous = byUid.get(entry.uid);
+        if (!previous || (!previous.filePath && entry.filePath) || entry.capturedAt >= previous.capturedAt) {
+          byUid.set(entry.uid, entry);
+        }
+      }
+    }
+    return {
+      present: true,
+      entries,
+      byUrl,
+      byUid,
+      captureComplete: payload.captureComplete === true,
+      truncated: payload.truncated === true,
+      manifestPath: resolvedPath
+    };
+  }
+
+  async loadAvatarManifestForRecording(recording) {
+    const manifestPath = String(recording?.avatarManifestPath || deriveAvatarManifestPath(recording?.cleanPath || '')).trim();
+    return this.readAvatarManifestFile(manifestPath);
+  }
+
+  async mergeAvatarManifests(segments, targetManifestPath) {
+    const sourceManifests = [];
+    for (const segment of segments || []) {
+      const manifestPath = String(segment?.avatarManifestPath || deriveAvatarManifestPath(segment?.cleanPath || '')).trim();
+      const manifest = await this.readAvatarManifestFile(manifestPath);
+      if (manifest.present) sourceManifests.push(manifest);
+    }
+    if (!sourceManifests.length) return false;
+
+    const targetPath = path.resolve(String(targetManifestPath || '').trim());
+    const targetDirectory = replaceExtension(targetPath, '');
+    const targetManifestDirectory = path.dirname(targetPath);
+    const mergedByKey = new Map();
+    let captureComplete = true;
+    let totalBytes = 0;
+    await fsp.rm(targetDirectory, { recursive: true, force: true });
+    await fsp.mkdir(targetDirectory, { recursive: true, mode: 0o770 });
+    try {
+      for (const manifest of sourceManifests) {
+        captureComplete = captureComplete && manifest.captureComplete === true;
+        for (const sourceEntry of manifest.entries) {
+          const key = sourceEntry.avatarUrl || `uid:${sourceEntry.uid}`;
+          const existing = mergedByKey.get(key);
+          if (existing?.filePath && !sourceEntry.filePath) continue;
+          const mergedEntry = {
+            uid: sourceEntry.uid,
+            avatarUrl: sourceEntry.avatarUrl,
+            filePath: '',
+            status: sourceEntry.status,
+            capturedAt: sourceEntry.capturedAt
+          };
+          if (sourceEntry.filePath && (await isExistingFile(sourceEntry.filePath))) {
+            const sourceBytes = await getFileSize(sourceEntry.filePath);
+            const digest = crypto
+              .createHash('sha256')
+              .update(`${sourceEntry.uid}|${sourceEntry.avatarUrl}|${sourceEntry.filePath}`)
+              .digest('hex')
+              .slice(0, 24);
+            const extension = path.extname(sourceEntry.filePath).toLowerCase() || '.img';
+            const targetFile = path.join(
+              targetDirectory,
+              `uid-${sourceEntry.uid > 0 ? sourceEntry.uid : 'unknown'}-${digest}${extension}`
+            );
+            if (!(await isExistingFile(targetFile))) await fsp.copyFile(sourceEntry.filePath, targetFile);
+            mergedEntry.filePath = targetFile;
+            mergedEntry.status = 'captured';
+            totalBytes += sourceBytes;
+          }
+          if (!existing || (!existing.filePath && mergedEntry.filePath)) mergedByKey.set(key, mergedEntry);
+        }
+      }
+      const entries = Array.from(mergedByKey.values()).map((entry) => ({
+        uid: Number(entry.uid || 0),
+        avatarUrl: normalizeBiliAvatarUrl(entry.avatarUrl),
+        file: entry.filePath ? path.relative(targetManifestDirectory, entry.filePath).split(path.sep).join('/') : '',
+        status: entry.status || (entry.filePath ? 'captured' : 'unavailable'),
+        capturedAt: Number(entry.capturedAt || Date.now())
+      }));
+      const payload = {
+        schemaVersion: RECORDED_AVATAR_MANIFEST_SCHEMA_VERSION,
+        createdByVersion: APP_VERSION,
+        status: 'completed',
+        captureComplete,
+        truncated: !captureComplete,
+        entryCount: entries.length,
+        totalBytes,
+        entries,
+        updatedAt: new Date().toISOString()
+      };
+      const temporaryPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+      await fsp.writeFile(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o660 });
+      try {
+        await atomicReplaceFile(temporaryPath, targetPath);
+      } finally {
+        await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+      }
+      return true;
+    } catch (error) {
+      await fsp.rm(targetDirectory, { recursive: true, force: true }).catch(() => {});
+      await fsp.rm(targetPath, { force: true }).catch(() => {});
+      throw error;
+    }
+  }
+
   async startDanmakuCapture(room, session) {
     clearTimeout(session.danmakuReconnectTimer);
     session.danmakuReconnectTimer = null;
@@ -4556,6 +4942,7 @@ try {
           this.updateLiveDiagnosticsFromSession(room, session);
           return;
         }
+        this.queueRecordingAvatarCapture(session, event);
         const writeDroppedBefore = Number(session.danmakuDropCounts?.writeDropped || 0);
         const written = session.eventStream.write(`${JSON.stringify(event)}\n`);
         if (!written) {
@@ -4846,6 +5233,13 @@ try {
     this.transitionRecordingState(room, session, 'finalizing');
     session.danmakuClient?.close('录制结束');
     await new Promise((resolve) => session.eventStream.end(resolve));
+    const avatarsDrained = await this.flushAvatarCapture(session);
+    await this.scheduleAvatarManifestWrite(session, 'completed').catch((error) => {
+      this.log('warn', `${roomLabel(room)} 写入最终头像记录清单失败：${error.message}`);
+    });
+    if (!avatarsDrained) {
+      this.log('warn', `${roomLabel(room)} 头像记录仍有任务未完成，已保存已抓取的头像；未完成项将在烧录时使用回退图标。`);
+    }
     if (wasActiveSession) {
       room.recording = false;
     }
@@ -4970,6 +5364,7 @@ try {
       liveSessionId: session.liveSessionId,
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
+      avatarManifestPath: session.avatarManifestPath,
       cssPath: session.cssPath,
       assPath: session.assPath,
       burnedPath: session.burnedPath,
@@ -5759,6 +6154,7 @@ try {
     const syncTmpPath = replaceExtension(outputPath, `.sync.tmp.${container}`);
     const concatPath = replaceExtension(outputPath, '.concat.txt');
     const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
+    const avatarManifestPath = deriveAvatarManifestPath(outputPath);
     const cssPath = deriveSiblingPath(outputPath, 'danmaku', 'css');
     const danmakuTmpPath = `${danmakuPath}.${process.pid}.tmp`;
     const cssTmpPath = `${cssPath}.${process.pid}.tmp`;
@@ -6276,6 +6672,9 @@ try {
           cssTmpPath,
           createDefaultDanmakuCss()
         );
+        await this.mergeAvatarManifests(segments, avatarManifestPath).catch((error) => {
+          this.log('warn', `${roomLabel(room)} 合并头像记录失败，后续烧录将使用兼容回退：${error.message}`);
+        });
         await Promise.all([fsp.stat(danmakuTmpPath), fsp.stat(cssTmpPath)]);
       });
       await atomicReplaceFile(tmpPath, outputPath);
@@ -6293,6 +6692,7 @@ try {
         liveSessionId: segments[0].liveSessionId || '',
         cleanPath: outputPath,
         danmakuPath,
+        avatarManifestPath,
         cssPath,
         assPath,
         burnedPath,
@@ -6453,6 +6853,9 @@ try {
       mergeGroup: String(recording.mergeGroup || ''),
       mergeSequence: Number(recording.mergeSequence || 0),
       mergeOutputPath: toMetadataRelativePath(recording.mergeOutputPath),
+      avatarManifestPath: toMetadataRelativePath(
+        recording.avatarManifestPath || deriveAvatarManifestPath(cleanPath)
+      ),
       mergedFrom,
       cleanupId: String(recording.cleanupId || ''),
       segmentReason: String(recording.segmentReason || 'initial'),
@@ -6491,6 +6894,7 @@ try {
       mergeOutputPath: path.basename(session.mergeOutputPath || ''),
       segmentReason: session.segmentReason || 'initial',
       danmakuPath: path.basename(session.danmakuPath || ''),
+      avatarManifestPath: path.basename(session.avatarManifestPath || deriveAvatarManifestPath(session.cleanPath)),
       diagnosticsPath: path.basename(session.diagnosticsPath || ''),
       streamMetadata: session.streamMetadata || null,
       updatedAt: new Date().toISOString()
@@ -6531,6 +6935,8 @@ try {
           normalizedCapturePath,
           normalizedCleanPath,
           `${normalizedCleanPath}.metadata.json`,
+          String(session?.avatarManifestPath || deriveAvatarManifestPath(normalizedCleanPath)),
+          String(session?.avatarDirectory || deriveAvatarDirectory(normalizedCleanPath)),
           String(session?.danmakuPath || deriveSiblingPath(normalizedCleanPath, 'danmaku', 'jsonl')),
           String(session?.cssPath || deriveSiblingPath(normalizedCleanPath, 'danmaku', 'css')),
           String(session?.assPath || deriveSiblingPath(normalizedCleanPath, 'danmaku', 'ass')),
@@ -6551,9 +6957,9 @@ try {
     for (const filePath of uniquePaths) {
       if (!isPathInsideDirectory(filePath, outputDir)) continue;
       const stat = await fsp.stat(filePath).catch(() => null);
-      if (!stat?.isFile()) continue;
+      if (!stat?.isFile() && !stat?.isDirectory()) continue;
       try {
-        await fsp.rm(filePath, { force: true });
+        await fsp.rm(filePath, { recursive: stat.isDirectory(), force: true });
         deletedCount += 1;
       } catch {
         failedCount += 1;
@@ -6613,6 +7019,9 @@ try {
           cleanPath,
           capturePath,
           danmakuPath,
+          avatarManifestPath: metadata?.avatarManifestPath
+            ? path.resolve(directory, path.basename(metadata.avatarManifestPath))
+            : deriveAvatarManifestPath(cleanPath),
           cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
           assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
           burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
@@ -6677,6 +7086,9 @@ try {
           cleanPath,
           capturePath,
           danmakuPath,
+          avatarManifestPath: metadata?.avatarManifestPath
+            ? path.resolve(directory, path.basename(metadata.avatarManifestPath))
+            : deriveAvatarManifestPath(cleanPath),
           cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
           assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
           burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
@@ -6840,6 +7252,8 @@ try {
         const base = parsed.name.replace(/\.(?:clean|recording|finalizing)$/i, '');
         const siblingNames = [
           `${base}.danmaku.jsonl`,
+          `${base}.danmaku.avatars.json`,
+          `${base}.danmaku.avatars`,
           `${base}.danmaku.css`,
           `${base}.danmaku.ass`,
           `${base}.danmaku-only.ass`,
@@ -6858,6 +7272,8 @@ try {
       add(`${recording.cleanPath}.metadata.json`);
       add(recording.capturePath);
       add(recording.danmakuPath);
+      add(recording.avatarManifestPath || deriveAvatarManifestPath(recording.cleanPath));
+      add(deriveAvatarDirectory(recording.cleanPath));
       add(recording.cssPath);
       add(recording.assPath);
       add(recording.burnedPath);
@@ -6889,6 +7305,11 @@ try {
       const directory = path.dirname(cleanPath);
       const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
       for (const entry of entries) {
+        const avatarDirectoryName = path.basename(deriveAvatarDirectory(cleanPath));
+        if (entry.isDirectory() && entry.name === avatarDirectoryName) {
+          addCleanupPath(path.join(directory, entry.name));
+          continue;
+        }
         if (!entry.isFile() || !isGeneratedSegmentArtifactName(entry.name, cleanPath)) continue;
         addCleanupPath(path.join(directory, entry.name));
       }
@@ -6906,11 +7327,11 @@ try {
         continue;
       }
       const stat = await fsp.stat(filePath).catch(() => null);
-      if (!stat?.isFile()) {
+      if (!stat?.isFile() && !stat?.isDirectory()) {
         continue;
       }
       try {
-        await fsp.rm(filePath, { force: true });
+        await fsp.rm(filePath, { recursive: stat.isDirectory(), force: true });
         deletedCount += 1;
       } catch (error) {
         failedCount += 1;
@@ -7327,46 +7748,45 @@ try {
   }
 
   async prepareAvatarOverlayLayer(avatarPlan, options = {}) {
-    const requestedEntries = Array.isArray(avatarPlan?.entries)
-      ? avatarPlan.entries.slice(0, MAX_AVATAR_OVERLAY_ENTRIES)
-      : [];
+    const requestedEntries = Array.isArray(avatarPlan?.entries) ? avatarPlan.entries : [];
     if (!requestedEntries.length || !options.assPath) return null;
 
     const label = String(options.label || '烧录');
     const workingDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-'));
+    const avatarManifest = await this.loadAvatarManifestForRecording(options.recording);
     const avatarUrlsByUid = new Map();
     const sourceFilesByUrl = new Map();
     let failedCount = 0;
-    const resolveAvatarUrl = async (entry) => {
+    let recordedCount = 0;
+    const resolveAvatarSource = async (entry) => {
       const direct = normalizeBiliAvatarUrl(entry?.avatarUrl);
-      if (direct) return direct;
       const uid = Math.floor(Number(entry?.uid || 0));
-      if (!Number.isSafeInteger(uid) || uid <= 0) return '';
+      const snapshot = direct
+        ? avatarManifest.byUrl?.get(direct)
+        : Number.isSafeInteger(uid) && uid > 0
+          ? avatarManifest.byUid?.get(uid)
+          : null;
+      if (snapshot?.filePath && (await isExistingFile(snapshot.filePath))) {
+        recordedCount += 1;
+        return { kind: 'file', path: snapshot.filePath };
+      }
+      if (snapshot?.avatarUrl) return { kind: 'url', url: snapshot.avatarUrl };
+      if (direct) return { kind: 'url', url: direct };
+      if (avatarManifest.present && avatarManifest.captureComplete) return null;
+      if (!Number.isSafeInteger(uid) || uid <= 0) return null;
       if (!avatarUrlsByUid.has(uid)) {
         avatarUrlsByUid.set(uid, this.lookupBiliAvatarForOverlay(uid).catch(() => ''));
       }
-      return avatarUrlsByUid.get(uid);
+      const avatarUrl = await avatarUrlsByUid.get(uid);
+      return avatarUrl ? { kind: 'url', url: avatarUrl } : null;
     };
     const fetchAvatarSource = async (avatarUrl) => {
       if (!sourceFilesByUrl.has(avatarUrl)) {
         sourceFilesByUrl.set(
           avatarUrl,
           (async () => {
-            const asset = await requestUrlBuffer(avatarUrl, {
-              headersForUrl: (target) => createImageProxyHeaders(target, this.settings.cookie),
-              validateUrl: (target) => validateRemoteUrl(target, { allowHost: isBilibiliHost }),
-              allowProxy: false,
-              retries: 1,
-              timeoutMs: 12000,
-              maxRedirects: 3,
-              maxBytes: MAX_AVATAR_OVERLAY_IMAGE_BYTES,
-              includeResponseMetadata: true
-            });
-            const contentType = String(asset.headers?.['content-type'] || '').toLowerCase();
-            if (!contentType.startsWith('image/')) {
-              throw new Error('头像服务没有返回图片。');
-            }
-            const extension = avatarImageExtension(contentType) || '.img';
+            const asset = await this.fetchAvatarImageAsset(avatarUrl);
+            const extension = avatarImageExtension(asset.contentType) || '.img';
             const digest = crypto.createHash('sha256').update(avatarUrl).digest('hex').slice(0, 24);
             const sourcePath = path.join(workingDir, `source-${digest}${extension}`);
             await fsp.writeFile(sourcePath, asset.body);
@@ -7378,12 +7798,12 @@ try {
     };
 
     try {
-      this.log('info', `${label} 正在准备真实头像透明图层（最多 ${requestedEntries.length} 个）。`);
+      this.log('info', `${label} 正在准备真实头像透明图层（${requestedEntries.length} 个）。`);
       const prepared = await mapWithConcurrency(requestedEntries, MAX_AVATAR_OVERLAY_CONCURRENCY, async (entry, index) => {
         try {
-          const avatarUrl = await resolveAvatarUrl(entry);
-          if (!avatarUrl) throw new Error('没有可用头像地址。');
-          const sourcePath = await fetchAvatarSource(avatarUrl);
+          const source = await resolveAvatarSource(entry);
+          if (!source) throw new Error('没有可用头像地址。');
+          const sourcePath = source.kind === 'file' ? source.path : await fetchAvatarSource(source.url);
           const size = Math.round(clamp(Number(entry?.size || 0), 8, 512));
           const imagePath = path.join(workingDir, `avatar-${String(index + 1).padStart(2, '0')}-${size}.png`);
           const rendered = await runCapturedProcess(
@@ -7438,7 +7858,7 @@ try {
         'info',
         `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
           avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
-        }${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? '，NVIDIA CUDA 合成。' : '。'}`
+        }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? '，NVIDIA CUDA 合成。' : '。'}`
       );
       return { ...overlay, filterScriptPath, temporaryDir: workingDir, gpuComposite };
     } catch (error) {
@@ -7503,6 +7923,7 @@ try {
       const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
       const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
+        recording,
         assPath: assets.assPath,
         fps: burnFps,
         label: `${roomLabel(room)} 烧录`,
@@ -8004,6 +8425,7 @@ try {
       const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
       const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
+        recording,
         assPath,
         fps: exportFps,
         label: '烧录片段导出',
