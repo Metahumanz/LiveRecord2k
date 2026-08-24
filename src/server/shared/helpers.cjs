@@ -769,6 +769,14 @@ function deriveSiblingPath(filePath, suffix, extension) {
   return path.join(parsed.dir, `${fitOutputBaseName(parsed.dir, base, tail)}${tail}`);
 }
 
+function deriveAvatarManifestPath(filePath) {
+  return deriveSiblingPath(filePath, 'danmaku.avatars', 'json');
+}
+
+function deriveAvatarDirectory(filePath) {
+  return replaceExtension(deriveAvatarManifestPath(filePath), '');
+}
+
 function deriveBurnedPath(filePath, overlayMode) {
   return deriveSiblingPath(filePath, normalizeBurnOverlayMode(overlayMode) === 'danmaku' ? 'danmaku-only' : 'danmaku');
 }
@@ -2075,6 +2083,8 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         startedAt: Number(metadata?.startedAt || stat.mtimeMs),
         cleanPath,
         danmakuPath,
+        avatarManifestPath:
+          resolveMetadataRelativePath(metadata?.avatarManifestPath) || deriveAvatarManifestPath(cleanPath),
         cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
         assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
         burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
@@ -3094,6 +3104,8 @@ module.exports = {
   createQnProbeList,
   getContainerFromPath,
   deriveSiblingPath,
+  deriveAvatarManifestPath,
+  deriveAvatarDirectory,
   deriveBurnedPath,
   deriveClipPath,
   replaceExtension,

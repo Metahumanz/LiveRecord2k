@@ -247,7 +247,10 @@ const DEFAULT_DANMAKU_STYLE = {
 const DEFAULT_DANMAKU_STYLE_PRESET = 'current';
 const DANMAKU_STYLE_LAYOUT_LIMITS = {
   panelLeft: [0, 2000],
-  superChatBottom: [0, 4000],
+  // Negative reference values are valid for portrait layouts: the extra
+  // vertical canvas above the 1080p reference needs room to move a card stack
+  // all the way to the top while keeping the default bottom anchoring intact.
+  superChatBottom: [-4000, 4000],
   superChatWidth: [220, 1200],
   boxFontSize: [12, 80],
   danmakuTop: [0, 2000],
@@ -486,7 +489,7 @@ function normalizeDanmakuStyle(values = {}) {
       upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.panelLeft
     }),
     superChatLanes: Math.round(pickNumber('superchat-lanes', DEFAULT_DANMAKU_STYLE.superChatLanes, 1, 10)),
-    superChatBottom: pickNumber('superchat-bottom', DEFAULT_DANMAKU_STYLE.superChatBottom, 0, 4000, {
+    superChatBottom: pickNumber('superchat-bottom', DEFAULT_DANMAKU_STYLE.superChatBottom, -4000, 4000, {
       upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.superChatBottom
     }),
     superChatWidth: pickNumber('superchat-width', DEFAULT_DANMAKU_STYLE.superChatWidth, 220, 1200),
@@ -556,7 +559,7 @@ function adaptDanmakuStyleToVideo(styleValue = {}, videoInfo) {
     maximumPanelWidth
   );
   const anchorFromBottom = (value) =>
-    clamp(canvas.height - Math.max(0, baseHeight - (Number(value) || 0)) * scale, 0, canvas.height);
+    clamp(canvas.height - (baseHeight - (Number(value) || 0)) * scale, 0, canvas.height);
   const giftWidth = clamp(scaleDanmakuMetric(style.giftWidth, scale), 1, maximumPanelWidth);
 
   return {
@@ -733,7 +736,10 @@ function createAss(events, options = {}) {
 function createAvatarOverlayPlan(events, options = {}) {
   const { style, sorted } = resolveAssRenderContext(events, options);
   const visualPreset = visualPresetFromStyle(style);
-  const maxEntries = Math.floor(clamp(options.maxEntries ?? 24, 0, 96));
+  const configuredMaxEntries = Number(options.maxEntries);
+  const maxEntries = Number.isFinite(configuredMaxEntries)
+    ? Math.max(0, Math.floor(configuredMaxEntries))
+    : Number.MAX_SAFE_INTEGER;
   const maxSegmentsPerEntry = Math.floor(clamp(options.maxSegmentsPerEntry ?? 32, 1, 128));
   const panelLeft = Math.max(0, Number(style.panelLeft) || 0);
   const panelWidth = Math.max(1, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
@@ -955,8 +961,8 @@ function getMessageItemMetrics(event, style, options = {}) {
         : getSideChatMetrics(style, event.text);
     }
     return visualPresetFromStyle(style) === 'minimal'
-      ? getMinimalSideInteractionMetrics(style)
-      : getSideInteractionCardMetrics(style);
+      ? getMinimalSideInteractionMetrics(style, event)
+      : getSideInteractionCardMetrics(style, event);
   }
   if (event.type === 'superchat') {
     return getMessageCardMetrics(style, event.text);
@@ -1337,9 +1343,9 @@ function getMinimalSideChatMetrics(style, text) {
   };
 }
 
-function getSideInteractionCardMetrics(style) {
+function getSideInteractionCardMetrics(style, event = {}) {
   const fontSize = Math.max(16, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.86));
-  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const width = getSideInteractionCardWidth(style, event);
   const padding = Math.max(8, Math.round(fontSize * 0.42));
   const avatarSize = Math.max(28, Math.round(fontSize * 1.36));
   const avatarGap = Math.max(6, Math.round(fontSize * 0.3));
@@ -1361,9 +1367,9 @@ function getSideInteractionCardMetrics(style) {
   };
 }
 
-function getMinimalSideInteractionMetrics(style) {
+function getMinimalSideInteractionMetrics(style, event = {}) {
   const fontSize = Math.max(13, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.62));
-  const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
+  const width = getSideInteractionCardWidth(style, event);
   const dotSize = Math.max(8, Math.round(fontSize * 0.62));
   const gap = Math.max(5, Math.round(fontSize * 0.35));
   const paddingY = Math.max(4, Math.round(fontSize * 0.32));
@@ -1379,6 +1385,13 @@ function getMinimalSideInteractionMetrics(style) {
     textWidth: Math.max(fontSize * 4, width - dotSize - gap),
     textWidthWithPrice: Math.max(fontSize * 4, width - dotSize - gap - priceReserve)
   };
+}
+
+function getSideInteractionCardWidth(style, event = {}) {
+  const isGift = event?.type === 'gift';
+  const configuredWidth = Number(isGift ? style.giftWidth : style.superChatWidth);
+  const fallbackWidth = isGift ? DEFAULT_DANMAKU_STYLE.giftWidth : DEFAULT_DANMAKU_STYLE.superChatWidth;
+  return Math.max(220, configuredWidth || fallbackWidth);
 }
 
 function sideChatPalette(style) {
@@ -1462,7 +1475,7 @@ function getSideAvatarPlacement(event, style, segment) {
   if (visualPresetFromStyle(style) === 'minimal' || !segment) {
     return null;
   }
-  const metrics = event.type === 'danmaku' ? getSideChatMetrics(style, event.text) : getSideInteractionCardMetrics(style);
+  const metrics = event.type === 'danmaku' ? getSideChatMetrics(style, event.text) : getSideInteractionCardMetrics(style, event);
   const offsetX = event.type === 'danmaku' ? 0 : metrics.padding;
   const offsetY = event.type === 'danmaku' ? Math.max(0, (metrics.height - metrics.avatarSize) / 2) : metrics.padding;
   const size = Math.max(8, Number(metrics.avatarSize) || 0);
@@ -1666,7 +1679,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
   if (visualPresetFromStyle(style) === 'minimal') {
     return renderMinimalSideInteractionCardSegment(event, style, segment, clip);
   }
-  const metrics = getSideInteractionCardMetrics(style);
+  const metrics = getSideInteractionCardMetrics(style, event);
   const palette = sideInteractionPalette(style, event);
   const price = sideInteractionPrice(event);
   const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
@@ -1737,7 +1750,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
 }
 
 function renderMinimalSideInteractionCardSegment(event, style, segment, clip) {
-  const metrics = getMinimalSideInteractionMetrics(style);
+  const metrics = getMinimalSideInteractionMetrics(style, event);
   const price = sideInteractionPrice(event);
   const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
   const username = truncateTextToWidth(event.user || '观众', textWidth * 0.35, metrics.fontSize);
