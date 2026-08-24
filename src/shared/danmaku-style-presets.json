@@ -19,6 +19,7 @@
       "superChatBottom": 1040,
       "superChatWidth": 450,
       "superChatGap": 12,
+      "giftWidth": 360,
       "giftRadius": 18,
       "giftFontSize": 23
     }
@@ -38,6 +39,7 @@
       "superChatBottom": 1018,
       "superChatWidth": 420,
       "superChatGap": 10,
+      "giftWidth": 330,
       "giftRadius": 28,
       "giftFontSize": 22
     }
@@ -57,6 +59,7 @@
       "superChatBottom": 1052,
       "superChatWidth": 360,
       "superChatGap": 6,
+      "giftWidth": 280,
       "giftRadius": 8,
       "giftFontSize": 18
     }

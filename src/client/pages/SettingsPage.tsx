@@ -356,7 +356,7 @@ export function SettingsPage({
                 ))}
               </select>
               <p className="field-help">
-                仅“侧边互动流”和“侧边气泡流”使用。高质量保持现有 24 个真实头像；NVIDIA 硬编会自动用 CUDA 合成。
+                仅“侧边互动流”和“侧边气泡流”使用。高质量使用整场录制到的全部真实头像，少量最多 6 个；NVIDIA 硬编会自动用 CUDA 合成。
               </p>
             </label>
 

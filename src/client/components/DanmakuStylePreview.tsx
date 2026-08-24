@@ -11,6 +11,7 @@ const DEFAULT_LAYOUT = {
   panelLeft: 5,
   superChatBottom: 1070,
   superChatWidth: 375,
+  giftWidth: 360,
   boxFontSize: 29,
   danmakuTop: 36,
   danmakuFontSize: 38,
@@ -24,6 +25,13 @@ type PreviewCanvas = {
   height: number;
   scale: number;
   portrait: boolean;
+};
+type PreviewFrame = {
+  centerX: number;
+  centerY: number;
+  width: number;
+  height: number;
+  scale: number;
 };
 type Interaction = {
   kind: 'move' | 'resize';
@@ -56,13 +64,34 @@ function buildPreviewCanvas(videoInfo?: { width?: number; height?: number } | nu
   };
 }
 
+// The video element itself fills the preview box and uses object-fit: contain.
+// Compute the actual painted video rectangle so the overlay follows the video
+// rather than the black bars around it, especially when a portrait source is
+// shown in a landscape fullscreen viewport.
+function buildContainedPreviewFrame(hostWidth: number, hostHeight: number, canvas: PreviewCanvas): PreviewFrame {
+  const safeHostWidth = Math.max(1, Number(hostWidth) || 1);
+  const safeHostHeight = Math.max(1, Number(hostHeight) || 1);
+  const aspect = Math.max(0.01, canvas.width / Math.max(1, canvas.height));
+  const hostAspect = safeHostWidth / safeHostHeight;
+  const width =
+    hostAspect >= aspect ? safeHostHeight * aspect : safeHostWidth;
+  const height = width / aspect;
+  return {
+    centerX: safeHostWidth / 2,
+    centerY: safeHostHeight / 2,
+    width,
+    height,
+    scale: Math.min(width / canvas.width, height / canvas.height)
+  };
+}
+
 function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLayout, canvas: PreviewCanvas): EffectiveLayout {
   const style = danmakuStylePresets[preset]?.style || {};
   const base = {
     panelLeft: clampNumber(numberValue(layout.panelLeft ?? style.panelLeft, DEFAULT_LAYOUT.panelLeft), 0, 2000),
     superChatBottom: clampNumber(
       numberValue(layout.superChatBottom ?? style.superChatBottom, DEFAULT_LAYOUT.superChatBottom),
-      0,
+      -4000,
       4000
     ),
     superChatWidth: clampNumber(
@@ -70,6 +99,7 @@ function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLa
       220,
       1200
     ),
+    giftWidth: clampNumber(numberValue(style.giftWidth, DEFAULT_LAYOUT.giftWidth), 160, 1200),
     boxFontSize: clampNumber(numberValue(layout.boxFontSize ?? style.boxFontSize, DEFAULT_LAYOUT.boxFontSize), 12, 80),
     danmakuTop: clampNumber(numberValue(layout.danmakuTop ?? style.danmakuTop, DEFAULT_LAYOUT.danmakuTop), 0, 2000),
     danmakuFontSize: clampNumber(
@@ -93,8 +123,9 @@ function buildEffectiveLayout(preset: DanmakuStylePreset, layout: DanmakuStyleLa
   const maximumPanelWidth = Math.max(1, canvas.width - panelLeft - Math.max(8, metric(12)));
   return {
     panelLeft,
-    superChatBottom: clampNumber(canvas.height - Math.max(0, PLAY_HEIGHT - base.superChatBottom) * canvas.scale, 0, canvas.height),
+    superChatBottom: clampNumber(canvas.height - (PLAY_HEIGHT - base.superChatBottom) * canvas.scale, 0, canvas.height),
     superChatWidth: clampNumber(Math.max(Math.min(220, maximumPanelWidth), metric(base.superChatWidth)), 1, maximumPanelWidth),
+    giftWidth: clampNumber(metric(base.giftWidth), 1, maximumPanelWidth),
     boxFontSize: metric(base.boxFontSize),
     danmakuTop: metric(base.danmakuTop),
     danmakuFontSize: metric(base.danmakuFontSize),
@@ -138,15 +169,20 @@ function SideEventPreview({
   user,
   text,
   price,
-  kind
+  kind,
+  width
 }: {
   user: string;
   text: string;
   price?: string;
   kind: 'gift' | 'superchat';
+  width?: number;
 }) {
   return (
-    <div className={`preview-side-event preview-side-${kind}`}>
+    <div
+      className={`preview-side-event preview-side-${kind}`}
+      style={width ? { width: `${width}px` } : undefined}
+    >
       <AvatarPlaceholder />
       <div>
         <strong>{user}</strong>
@@ -175,10 +211,16 @@ export function DanmakuStylePreview({
   const stackRef = useRef<HTMLDivElement | null>(null);
   const interactionRef = useRef<Interaction | null>(null);
   const [interaction, setInteraction] = useState<Interaction | null>(null);
-  const [canvasScale, setCanvasScale] = useState(1);
   const [stackHeight, setStackHeight] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const previewCanvas = useMemo(() => buildPreviewCanvas(videoInfo), [videoInfo?.height, videoInfo?.width]);
+  const [previewFrame, setPreviewFrame] = useState<PreviewFrame>(() => ({
+    centerX: PLAY_WIDTH / 2,
+    centerY: PLAY_HEIGHT / 2,
+    width: PLAY_WIDTH,
+    height: PLAY_HEIGHT,
+    scale: 1
+  }));
   const effective = useMemo(
     () => buildEffectiveLayout(preset, layout, previewCanvas),
     [layout, preset, previewCanvas]
@@ -204,16 +246,38 @@ export function DanmakuStylePreview({
   useEffect(() => {
     const element = previewRef.current;
     if (!element) return;
-    const updateScale = () => {
+    let animationFrame = 0;
+    const measureFrame = () => {
+      animationFrame = 0;
       const rect = element.getBoundingClientRect();
-      const nextScale = Math.max(0.01, Math.min(rect.width / previewCanvas.width, rect.height / previewCanvas.height));
-      setCanvasScale((current) => (Math.abs(current - nextScale) > 0.0001 ? nextScale : current));
+      const contained = buildContainedPreviewFrame(rect.width, rect.height, previewCanvas);
+      setPreviewFrame((current) => {
+        if (
+          Math.abs(current.centerX - contained.centerX) < 0.1 &&
+          Math.abs(current.centerY - contained.centerY) < 0.1 &&
+          Math.abs(current.width - contained.width) < 0.1 &&
+          Math.abs(current.height - contained.height) < 0.1
+        ) {
+          return current;
+        }
+        return contained;
+      });
     };
-    updateScale();
-    if (typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(updateScale);
-    observer.observe(element);
-    return () => observer.disconnect();
+    const scheduleMeasure = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(measureFrame);
+    };
+    scheduleMeasure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scheduleMeasure);
+    observer?.observe(element);
+    window.addEventListener('resize', scheduleMeasure);
+    document.addEventListener('fullscreenchange', scheduleMeasure);
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      observer?.disconnect();
+      window.removeEventListener('resize', scheduleMeasure);
+      document.removeEventListener('fullscreenchange', scheduleMeasure);
+    };
   }, [previewCanvas.height, previewCanvas.width]);
 
   useEffect(() => {
@@ -231,7 +295,7 @@ export function DanmakuStylePreview({
     const observer = new ResizeObserver(updateHeight);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [effective.boxFontSize, effective.superChatWidth, overlayMode, preset]);
+  }, [effective.boxFontSize, effective.giftWidth, effective.superChatWidth, overlayMode, preset]);
 
   useEffect(() => {
     const updateFullscreen = () => {
@@ -259,7 +323,7 @@ export function DanmakuStylePreview({
     }
     if (next.superChatBottom !== undefined) {
       updated.superChatBottom = Math.round(
-        clampNumber(PLAY_HEIGHT - (previewCanvas.height - next.superChatBottom) / scale, 0, 4000)
+        clampNumber(PLAY_HEIGHT - (previewCanvas.height - next.superChatBottom) / scale, -4000, 4000)
       );
     }
     if (next.superChatWidth !== undefined) {
@@ -357,7 +421,9 @@ export function DanmakuStylePreview({
     '--preview-avatar-size': `${Math.max(28, Math.round(effective.boxFontSize * 1.42))}px`
   } as CSSProperties;
   const canvasStyle = {
-    transform: `translate(-50%, -50%) scale(${canvasScale})`,
+    left: `${previewFrame.centerX}px`,
+    top: `${previewFrame.centerY}px`,
+    transform: `translate(-50%, -50%) scale(${previewFrame.scale})`,
     '--preview-stage-width': `${previewCanvas.width}px`,
     '--preview-stage-height': `${previewCanvas.height}px`
   } as CSSProperties;
@@ -410,7 +476,15 @@ export function DanmakuStylePreview({
             >
               <SideChatPreviewRow badge="LV.18" text="这是一条示例互动" tone="blue" />
               <SideChatPreviewRow badge="LV.25" text="点赞了直播间" tone="cyan" />
-              {showCards ? <SideEventPreview user="观众 C" text="赠送 小礼物 x1" price="CNY 0.1" kind="gift" /> : null}
+              {showCards ? (
+                <SideEventPreview
+                  user="观众 C"
+                  text="赠送 小礼物 x1"
+                  price="CNY 0.1"
+                  kind="gift"
+                  width={effective.giftWidth}
+                />
+              ) : null}
               <SideChatPreviewRow badge="LV.12" text="感谢你的支持～" tone="mint" />
               {showCards ? <SideEventPreview user="观众 E" text="加入了粉丝团" price="CNY 0.1" kind="superchat" /> : null}
             </div>

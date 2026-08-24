@@ -86,7 +86,7 @@ export const danmakuStylePresetOptions = (Object.entries(danmakuStylePresets) as
 export const burnAvatarModeOptions: Array<{ value: BurnAvatarMode; label: string }> = [
   { value: 'off', label: '关闭（通用头像）' },
   { value: 'limited', label: '少量（最多 6 个）' },
-  { value: 'high', label: '高质量（最多 24 个）' }
+  { value: 'high', label: '高质量（全部真实头像）' }
 ];
 
 export const exportModeOptions = [

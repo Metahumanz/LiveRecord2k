@@ -65,6 +65,7 @@ test('style presets keep the existing CSS untouched by default and apply preview
   assert.equal(styled.panelLeft, 90);
   assert.equal(styled.superChatBottom, 1000);
   assert.equal(styled.superChatWidth, 500);
+  assert.equal(normalizeDanmakuStyleLayout({ superChatBottom: -200 }).superChatBottom, -200);
   const event = { type: 'superchat', time: 1, user: '预览用户', price: 30, text: '样式预览应与烧录一致' };
   const legacyAss = createAss([event], { style: resolveDanmakuStyle(existingCssStyle, 'current', {}) });
   const currentAss = createAss([event], { stylePreset: 'current', style: existingCssStyle, styleLayout: {} });
@@ -89,6 +90,12 @@ test('portrait source videos use their real ASS canvas and keep overlays inside 
   assert.ok(Math.abs(smallPortrait.panelLeft - 18.67) < 0.01);
   assert.ok(Math.abs(smallPortrait.superChatWidth - 300) < 0.01);
   assert.ok(Math.abs(smallPortrait.superChatBottom - 1253.33) < 0.01);
+
+  const topPortrait = adaptDanmakuStyleToVideo(
+    resolveDanmakuStyle({}, 'h5-card', { superChatBottom: -200 }),
+    { width: 720, height: 1280 }
+  );
+  assert.ok(topPortrait.superChatBottom < 500, 'portrait layout can move the interaction stack near the top');
 
   const sideAss = createAss([{ type: 'danmaku', time: 1, user: '竖屏用户', text: '侧栏需要贴在竖屏内' }], {
     stylePreset: 'h5-card',
@@ -278,6 +285,28 @@ test('photo-avatar overlay samples a long side stream across its full duration r
   assert.equal(plan.truncated, true);
   assert.equal(plan.entries[0].start, 0);
   assert.equal(plan.entries.at(-1).start, 360);
+
+  const fullPlan = createAvatarOverlayPlan(events, { stylePreset: 'bubble' });
+  assert.equal(fullPlan.entries.length, 7, 'the default high-quality plan keeps every recorded avatar');
+  assert.equal(fullPlan.truncated, false);
+});
+
+test('side presets shorten gift bars without shortening ordinary danmaku bars', () => {
+  const gift = { type: 'gift', time: 1, uid: 11, user: '礼物用户', giftName: '小花', count: 1 };
+  const chat = { type: 'danmaku', time: 1, uid: 12, user: '弹幕用户', text: '普通弹幕仍使用侧栏宽度' };
+  const expected = {
+    'h5-card': { gift: 360, chat: 450 },
+    bubble: { gift: 330, chat: 420 },
+    minimal: { gift: 280, chat: 360 }
+  };
+
+  for (const [preset, widths] of Object.entries(expected)) {
+    const style = resolveDanmakuStyle({}, preset);
+    const giftItem = createMessageTimeline([gift], style, { sideStream: true, includeDanmaku: true }).items[0];
+    const chatItem = createMessageTimeline([chat], style, { sideStream: true, includeDanmaku: true }).items[0];
+    assert.equal(giftItem.width, widths.gift, `${preset} gift bar uses its compact width`);
+    assert.equal(chatItem.width, widths.chat, `${preset} ordinary danmaku keeps its panel width`);
+  }
 });
 
 test('gift ticker width grows only for content and stays inside its configured cap', () => {
