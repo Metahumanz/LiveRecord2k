@@ -31,7 +31,10 @@ const {
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
+  createBurnAudioMuxArgs,
   createAvatarOverlayFilterScript,
+  createAvatarOverlayChunkFilterScript,
+  clipAvatarOverlayEntries,
   createPreviewHlsArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
@@ -249,7 +252,20 @@ const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_AVATAR_OVERLAY_IMAGE_BYTES = 2 * 1024 * 1024;
 const LIMITED_AVATAR_OVERLAY_ENTRIES = 6;
 const UNLIMITED_AVATAR_OVERLAY_ENTRIES = Number.MAX_SAFE_INTEGER;
+// FFmpeg's expression evaluator has a practical nesting limit.  Keep each
+// motion expression small; this is an internal layer split and does not limit
+// the number of avatars retained by high-quality mode.
 const MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY = 32;
+// overlay_cuda allocates a full filter surface for every chained layer.  Keep
+// the fast path bounded; high-quality mode still keeps every avatar, but large
+// recordings use the CPU compositor instead of failing halfway through with
+// CUDA_ERROR_OUT_OF_MEMORY.
+const MAX_CUDA_AVATAR_OVERLAY_ENTRIES = 48;
+const AVATAR_OVERLAY_CHUNK_SECONDS = 60;
+// Seek a little before each independent avatar chunk, then discard accurately
+// to its true source-time boundary.  This prevents a long-GOP keyframe before
+// the requested position from leaking into the next concatenated chunk.
+const AVATAR_CHUNK_SEEK_PREROLL_SECONDS = 2;
 const MAX_AVATAR_OVERLAY_CONCURRENCY = 3;
 const RECORDED_AVATAR_MANIFEST_SCHEMA_VERSION = 1;
 const RECORDED_AVATAR_CAPTURE_CONCURRENCY = 3;
@@ -519,6 +535,44 @@ function deriveTimelineBoundaryDelta(timeline, boundary) {
   const audio = finiteTimelineValue(boundary === 'Start' ? timeline?.firstAudioPts : timeline?.lastAudioPts);
   const video = finiteTimelineValue(boundary === 'Start' ? timeline?.firstVideoPts : timeline?.lastVideoPts);
   return audio !== null && video !== null ? audio - video : null;
+}
+
+// A live fMP4/HLS segment can legitimately carry audio from t=0 while its
+// first decodable video keyframe is later.  A burn filter resets video PTS so
+// it can render ASS, therefore it must explicitly restore that leading gap or
+// the video content is pulled forward against the audio (and repeated at the
+// first chunk boundary).  The persisted timeline audit supplies these values
+// without adding another full-file scan at export time.
+function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
+  const clipStart = Math.max(0, Number(startTime) || 0);
+  const clipDuration = Math.max(0, Number(duration) || 0);
+  const candidates = [recording?.timelineHealth, recording?.timingInfo, recording?.streamMetadata].filter(
+    (value) => value && typeof value === 'object'
+  );
+  const firstFinite = (field) => {
+    for (const candidate of candidates) {
+      const value = finiteTimelineValue(candidate?.[field]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const firstVideoPts = firstFinite('firstVideoPts');
+  const firstAudioPts = firstFinite('firstAudioPts');
+  const capPadding = (value) => {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return clipDuration > 0 ? Math.min(value, clipDuration) : value;
+  };
+  // Do not manufacture a lead-in for video-only sources.  With both streams,
+  // each track keeps any real source-side initial silence after clipping.
+  const videoPaddingSec = firstAudioPts !== null ? capPadding(Number(firstVideoPts) - clipStart) : 0;
+  const audioPaddingSec = firstVideoPts !== null ? capPadding(Number(firstAudioPts) - clipStart) : 0;
+  return {
+    videoPaddingSec,
+    audioPaddingSec,
+    videoClockStartSec: clipStart + videoPaddingSec,
+    firstVideoPts,
+    firstAudioPts
+  };
 }
 
 // Deciding whether copy-concat is safe must use timing as well as codec,
@@ -1162,9 +1216,10 @@ class LiveRecordService {
   }
 
   shouldUseCudaAvatarComposite(codec, avatarPlan) {
+    const entryCount = Array.isArray(avatarPlan?.entries) ? avatarPlan.entries.length : 0;
     return Boolean(
-      Array.isArray(avatarPlan?.entries) &&
-        avatarPlan.entries.length > 0 &&
+      entryCount > 0 &&
+        entryCount <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
         String(codec || '').includes('nvenc') &&
         this.ffmpegCapabilities?.cudaAvatarComposite
     );
@@ -1244,6 +1299,36 @@ class LiveRecordService {
       streamMetadata: recording.streamMetadata || null,
       recordingState: String(recording.recordingState || ''),
       recovery: recording.recovery || null
+    };
+  }
+
+  // The export page intentionally submits a compact request (paths plus
+  // options), while the recording library owns the expensive packet audit.
+  // Reattach those canonical timing fields before queueing so a browser cannot
+  // accidentally turn a known source A/V boundary offset into an uncorrected
+  // burn job.
+  hydrateRecordingFromLibrary(recording) {
+    if (!recording?.cleanPath) return recording;
+    const targetPath = path.resolve(recording.cleanPath).toLowerCase();
+    const saved = this.recordings.find((candidate) => {
+      try {
+        return candidate?.cleanPath && path.resolve(candidate.cleanPath).toLowerCase() === targetPath;
+      } catch {
+        return false;
+      }
+    });
+    if (!saved) return recording;
+    return {
+      ...recording,
+      durationSec: Number(recording.durationSec || 0) > 0 ? recording.durationSec : Number(saved.durationSec || 0),
+      fileSize: Number(recording.fileSize || 0) > 0 ? recording.fileSize : Number(saved.fileSize || 0),
+      valid: saved.valid === false ? false : recording.valid,
+      validReason: recording.validReason || saved.validReason || '',
+      videoInfo: recording.videoInfo || saved.videoInfo || null,
+      timingInfo: recording.timingInfo || saved.timingInfo || null,
+      timelineHealth: recording.timelineHealth || saved.timelineHealth || null,
+      timelineHealthStatus: recording.timelineHealthStatus || saved.timelineHealthStatus || '',
+      streamMetadata: recording.streamMetadata || saved.streamMetadata || null
     };
   }
 
@@ -7752,10 +7837,22 @@ try {
     if (!requestedEntries.length || !options.assPath) return null;
 
     const label = String(options.label || '烧录');
+    const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
+    const cancellationError = () => {
+      const error = new Error('媒体处理已取消。');
+      error.code = 'BR2K_MEDIA_CANCELLED';
+      return error;
+    };
+    const throwIfCancelled = () => {
+      if (isCancelled()) throw cancellationError();
+    };
+    throwIfCancelled();
     const workingDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-'));
     const avatarManifest = await this.loadAvatarManifestForRecording(options.recording);
     const avatarUrlsByUid = new Map();
     const sourceFilesByUrl = new Map();
+    const renderedAvatarBySource = new Map();
+    const recordedSnapshotPaths = new Set();
     let failedCount = 0;
     let recordedCount = 0;
     const resolveAvatarSource = async (entry) => {
@@ -7767,7 +7864,10 @@ try {
           ? avatarManifest.byUid?.get(uid)
           : null;
       if (snapshot?.filePath && (await isExistingFile(snapshot.filePath))) {
-        recordedCount += 1;
+        if (!recordedSnapshotPaths.has(snapshot.filePath)) {
+          recordedSnapshotPaths.add(snapshot.filePath);
+          recordedCount += 1;
+        }
         return { kind: 'file', path: snapshot.filePath };
       }
       if (snapshot?.avatarUrl) return { kind: 'url', url: snapshot.avatarUrl };
@@ -7796,44 +7896,62 @@ try {
       }
       return sourceFilesByUrl.get(avatarUrl);
     };
+    const renderAvatar = (sourcePath, size) => {
+      const renderKey = `${sourcePath}\u0000${size}`;
+      if (!renderedAvatarBySource.has(renderKey)) {
+        const digest = crypto.createHash('sha256').update(renderKey).digest('hex').slice(0, 24);
+        const imagePath = path.join(workingDir, `avatar-${digest}-${size}.png`);
+        renderedAvatarBySource.set(
+          renderKey,
+          (async () => {
+            const rendered = await runCapturedProcess(
+              this.ffmpegPath,
+              [
+                '-hide_banner',
+                '-loglevel',
+                'error',
+                '-y',
+                '-i',
+                sourcePath,
+                '-frames:v',
+                '1',
+                '-vf',
+                createAvatarCircleFilter(size),
+                '-pix_fmt',
+                'rgba',
+                imagePath
+              ],
+              { timeoutMs: 15000, maxOutputBytes: 32 * 1024 }
+            );
+            if (rendered.timedOut || rendered.status !== 0 || (await getFileSize(imagePath)) < 128) {
+              throw new Error(compactLogLine(rendered.stderr || '头像圆形裁切失败。'));
+            }
+            return imagePath;
+          })()
+        );
+      }
+      return renderedAvatarBySource.get(renderKey);
+    };
 
     try {
       this.log('info', `${label} 正在准备真实头像透明图层（${requestedEntries.length} 个）。`);
       const prepared = await mapWithConcurrency(requestedEntries, MAX_AVATAR_OVERLAY_CONCURRENCY, async (entry, index) => {
         try {
+          throwIfCancelled();
           const source = await resolveAvatarSource(entry);
           if (!source) throw new Error('没有可用头像地址。');
           const sourcePath = source.kind === 'file' ? source.path : await fetchAvatarSource(source.url);
           const size = Math.round(clamp(Number(entry?.size || 0), 8, 512));
-          const imagePath = path.join(workingDir, `avatar-${String(index + 1).padStart(2, '0')}-${size}.png`);
-          const rendered = await runCapturedProcess(
-            this.ffmpegPath,
-            [
-              '-hide_banner',
-              '-loglevel',
-              'error',
-              '-y',
-              '-i',
-              sourcePath,
-              '-frames:v',
-              '1',
-              '-vf',
-              createAvatarCircleFilter(size),
-              '-pix_fmt',
-              'rgba',
-              imagePath
-            ],
-            { timeoutMs: 15000, maxOutputBytes: 32 * 1024 }
-          );
-          if (rendered.timedOut || rendered.status !== 0 || (await getFileSize(imagePath)) < 128) {
-            throw new Error(compactLogLine(rendered.stderr || '头像圆形裁切失败。'));
-          }
+          const imagePath = await renderAvatar(sourcePath, size);
+          throwIfCancelled();
           return { ...entry, imagePath };
-        } catch {
+        } catch (error) {
+          if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
           failedCount += 1;
           return null;
         }
       });
+      throwIfCancelled();
       const entries = prepared.filter(Boolean);
       if (!entries.length) {
         await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
@@ -7843,26 +7961,42 @@ try {
       const overlay = { panel: avatarPlan.panel, entries };
       const filterScriptPath = path.join(workingDir, 'avatar-layer.ffscript');
       const gpuComposite = Boolean(options.gpuComposite);
-      const script = createAvatarOverlayFilterScript({
-        assPath: options.assPath,
-        fps: options.fps,
-        avatarOverlay: overlay,
-        gpuComposite
-      });
-      if (!script) {
-        await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
-        return null;
+      const chunkDuration = !gpuComposite && entries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES ? AVATAR_OVERLAY_CHUNK_SECONDS : 0;
+      if (!chunkDuration) {
+        const script = createAvatarOverlayFilterScript({
+          assPath: options.assPath,
+          fps: options.fps,
+          avatarOverlay: overlay,
+          gpuComposite,
+          duration: options.duration,
+          timelineOffset: options.timelineOffset,
+          leadingVideoPaddingSec: options.leadingVideoPaddingSec,
+          outputDuration: options.outputDuration,
+          skipInitialKeyframeGuard: options.skipInitialKeyframeGuard
+        });
+        if (!script) {
+          await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
+          return null;
+        }
+        await fsp.writeFile(filterScriptPath, script, 'utf8');
       }
-      await fsp.writeFile(filterScriptPath, script, 'utf8');
       this.log(
         'info',
         `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
           avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
-        }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? '，NVIDIA CUDA 合成。' : '。'}`
+          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? '，NVIDIA CUDA 合成。' : chunkDuration ? '，按时间分段合成（按段选择 CUDA/CPU）。' : '。'}`
       );
-      return { ...overlay, filterScriptPath, temporaryDir: workingDir, gpuComposite };
+      return {
+        ...overlay,
+        filterScriptPath: chunkDuration ? '' : filterScriptPath,
+        temporaryDir: workingDir,
+        gpuComposite,
+        chunked: Boolean(chunkDuration),
+        chunkDuration
+      };
     } catch (error) {
       await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
+      if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
       this.log('warn', `${label} 真实头像图层准备失败，继续使用通用头像：${compactLogLine(error.message)}`);
       return null;
     }
@@ -7872,6 +8006,172 @@ try {
     const temporaryDir = String(layer?.temporaryDir || '').trim();
     if (temporaryDir) {
       await fsp.rm(temporaryDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  async runChunkedAvatarBurn({
+    cleanPath,
+    assPath,
+    burnedPath,
+    codec,
+    crf,
+    startTime = 0,
+    duration,
+    fps,
+    avatarLayer,
+    includeAudio = true,
+    timelineAlignment,
+    onChild,
+    onStderr,
+    onProgress,
+    onStage,
+    isCancelled
+  } = {}) {
+    const chunkDuration = Math.max(1, Number(avatarLayer?.chunkDuration || AVATAR_OVERLAY_CHUNK_SECONDS));
+    const sourceStart = Math.max(0, Number(startTime) || 0);
+    const totalDuration = Number(duration);
+    const leadingVideoPaddingSec = Math.max(0, Number(timelineAlignment?.videoPaddingSec) || 0);
+    const leadingAudioPaddingSec = Math.max(0, Number(timelineAlignment?.audioPaddingSec) || 0);
+    if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+      throw new Error('分段烧录时长无效。');
+    }
+    const temporaryDir = String(avatarLayer?.temporaryDir || '').trim();
+    if (!temporaryDir) {
+      throw new Error('分段烧录缺少头像临时目录。');
+    }
+    const chunkPaths = [];
+    const chunkDurations = [];
+    const scriptPaths = [];
+    const concatPath = path.join(temporaryDir, 'avatar-chunks.ffconcat');
+    let completedDuration = 0;
+    const cancellationError = () => {
+      const error = new Error('媒体处理已取消。');
+      error.code = 'BR2K_MEDIA_CANCELLED';
+      return error;
+    };
+    const reportStderr = (text) => {
+      onStderr?.(text);
+      const localTime = parseFfmpegProgressTime(text);
+      if (Number.isFinite(localTime)) {
+        onProgress?.(Math.min(totalDuration, completedDuration + Math.max(0, localTime)));
+      }
+    };
+
+    try {
+      let chunkIndex = 0;
+      while (completedDuration < totalDuration - 0.001) {
+        if (isCancelled?.()) throw cancellationError();
+        const chunkStart = sourceStart + completedDuration;
+        const chunkLength = Math.min(chunkDuration, totalDuration - completedDuration);
+        const chunkEnd = chunkStart + chunkLength;
+        const initialChunk = chunkIndex === 0;
+        const chunkVideoPaddingSec = initialChunk ? Math.min(leadingVideoPaddingSec, chunkLength) : 0;
+        const chunkTimelineOffset = initialChunk ? chunkStart + chunkVideoPaddingSec : chunkStart;
+        const chunkSeekPrerollSec = Math.min(AVATAR_CHUNK_SEEK_PREROLL_SECONDS, chunkStart);
+        const chunkInputTrimEndSec = chunkSeekPrerollSec + chunkLength;
+        onStage?.(`正在烧录头像分段 ${chunkIndex + 1}`);
+        const scriptPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.ffscript`);
+        const chunkPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.mkv`);
+        const activeEntries = clipAvatarOverlayEntries(avatarLayer, chunkStart, chunkEnd);
+        const useCudaForChunk = Boolean(
+          activeEntries.length > 0 &&
+            activeEntries.length <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
+            String(codec || '').includes('nvenc') &&
+            this.ffmpegCapabilities?.cudaAvatarComposite
+        );
+        const script = createAvatarOverlayChunkFilterScript({
+          assPath,
+          fps,
+          avatarOverlay: avatarLayer,
+          chunkStart,
+          chunkEnd,
+          timelineOffset: chunkTimelineOffset,
+          leadingVideoPaddingSec: chunkVideoPaddingSec,
+          outputDuration: chunkLength,
+          inputTrimStartSec: chunkSeekPrerollSec,
+          inputTrimEndSec: chunkInputTrimEndSec,
+          preserveSourceFrameTiming: true,
+          gpuComposite: useCudaForChunk
+        });
+        if (!script) throw new Error(`头像分段 ${chunkIndex + 1} 没有生成有效滤镜。`);
+        await fsp.writeFile(scriptPath, script, 'utf8');
+        await fsp.rm(chunkPath, { force: true }).catch(() => {});
+        scriptPaths.push(scriptPath);
+        const chunkAvatarLayer = {
+          ...avatarLayer,
+          entries: activeEntries,
+          filterScriptPath: scriptPath,
+          gpuComposite: useCudaForChunk
+        };
+        const args = createBurnArgs({
+          cleanPath,
+          assPath,
+          burnedPath: chunkPath,
+          codec,
+          crf,
+          container: 'mkv',
+          startTime: chunkStart,
+          duration: chunkLength,
+          fps,
+          avatarOverlay: chunkAvatarLayer,
+          inputSeek: true,
+          inputSeekPrerollSec: chunkSeekPrerollSec,
+          inputTrimStartSec: chunkSeekPrerollSec,
+          inputTrimEndSec: chunkInputTrimEndSec,
+          timelineOffset: chunkTimelineOffset,
+          leadingVideoPaddingSec: chunkVideoPaddingSec,
+          includeAudio: false
+        });
+        await runFfmpegJob(this.ffmpegPath, args, reportStderr, { onChild });
+        // A short, static chunk can legitimately be smaller than the final
+        // output-size sanity threshold.  Only reject a missing/nearly-empty
+        // intermediate container here; the final output gets the full media
+        // stream and size validation below.
+        if ((await getFileSize(chunkPath)) < 1024) {
+          throw new Error(`头像分段 ${chunkIndex + 1} 输出未通过文件大小验证。`);
+        }
+        chunkPaths.push(chunkPath);
+        chunkDurations.push(chunkLength);
+        completedDuration += chunkLength;
+        onProgress?.(Math.min(totalDuration, completedDuration));
+        chunkIndex += 1;
+      }
+
+      if (isCancelled?.()) throw cancellationError();
+      // Explicit source-time windows prevent the concat demuxer from using
+      // each H.26x chunk's trailing DTS (typically a few B-frames early) as
+      // the start of the next chunk. Without this, a long burn slowly pulls
+      // video behind the separately muxed source audio.
+      await writeConcatFile(concatPath, chunkPaths, { durations: chunkDurations });
+      onStage?.('正在封装连续视频和源音频');
+      await runFfmpegJob(
+        this.ffmpegPath,
+        includeAudio
+          ? createBurnAudioMuxArgs({
+              concatPath,
+              cleanPath,
+              outputPath: burnedPath,
+              codec,
+              startTime: sourceStart,
+              duration: totalDuration,
+              container: getContainerFromPath(burnedPath),
+              leadingAudioPaddingSec,
+              includeAudio: true
+            })
+          : createConcatCopyArgs({
+              concatPath,
+              outputPath: burnedPath,
+              container: getContainerFromPath(burnedPath),
+              streamCodec: codec
+            }),
+        reportStderr,
+        { onChild }
+      );
+      onProgress?.(totalDuration);
+    } finally {
+      await Promise.all(
+        [...chunkPaths, concatPath, ...scriptPaths].map((filePath) => fsp.rm(filePath, { force: true }).catch(() => {}))
+      );
     }
   }
 
@@ -7901,6 +8201,7 @@ try {
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
       }
+      const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
       const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout, avatarMode });
       if (options.prepareOnly) {
         this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
@@ -7926,22 +8227,13 @@ try {
         recording,
         assPath: assets.assPath,
         fps: burnFps,
+        duration: durationSec,
+        timelineOffset: burnTimeline.videoClockStartSec,
+        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+        outputDuration: durationSec,
         label: `${roomLabel(room)} 烧录`,
-        gpuComposite: gpuAvatarComposite
-      });
-      const args = createBurnArgs({
-        cleanPath: burnSourcePath,
-        assPath: assets.assPath,
-        burnedPath: burnedTmpPath,
-        codec: this.settings.burnCodec,
-        crf: this.settings.burnCrf,
-        container: getContainerFromPath(burnedPath),
-        fps: burnFps,
-        avatarOverlay: avatarLayer
-      });
-      const ffmpeg = spawn(this.ffmpegPath, args, {
-        windowsHide: true,
-        stdio: ['ignore', 'ignore', 'pipe']
+        gpuComposite: gpuAvatarComposite,
+        isCancelled: () => this.burnCancelRequests.has(room.id)
       });
       const progress = createFfmpegJobProgress({
         kind: 'burn',
@@ -7954,7 +8246,10 @@ try {
       });
       room.burning = true;
       room.burnProgress = progress;
-      this.burnSessions.set(room.id, ffmpeg);
+      // A chunked burn has several short-lived FFmpeg children.  Keep a map
+      // entry during the gaps between children so queue/cancel state remains
+      // stable; onChild below replaces null with the current process.
+      this.burnSessions.set(room.id, null);
       this.log(
         'info',
         `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(
@@ -7974,32 +8269,34 @@ try {
         });
       }
 
-      ffmpeg.stderr.on('data', (chunk) => {
-        const text = chunk.toString('utf8');
-        if (updateFfmpegJobProgress(room.burnProgress, text)) {
+      const handleBurnStderr = (text) => {
+        if (updateFfmpegJobProgress(progress, text)) {
           this.emitState();
         }
+        handleBurnLog(text);
+      };
+      const handleBurnLog = (text) => {
         if (/error|failed|invalid/i.test(text)) {
           this.log('warn', `${roomLabel(room)} 烧录：${compactLogLine(text)}`);
         }
-      });
-      ffmpeg.on('error', (error) => {
-        if (this.burnSessions.get(room.id) === ffmpeg) {
-          this.burnSessions.delete(room.id);
-          room.burning = false;
+      };
+      const handleBurnProgress = (currentTimeSec) => {
+        const value = Math.max(0, Number(currentTimeSec) || 0);
+        if (updateFfmpegJobProgress(progress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
+          this.emitState();
         }
-        finishFfmpegJobProgress(room.burnProgress, 'error', `启动失败：${error.message}`);
-        fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
-        this.cleanupAvatarOverlayLayer(avatarLayer).catch(() => {});
-        this.log('error', `${roomLabel(room)} 烧录进程启动失败：${error.message}`);
-        this.emitState();
-      });
-      ffmpeg.on('close', async (code, signal) => {
-        const progressId = room.burnProgress?.id;
-        const cancelled = this.burnCancelRequests.delete(room.id);
-        let validationError = null;
+      };
+      const finishBurn = async (processingError = null) => {
+        const cancelled = this.burnCancelRequests.delete(room.id) || processingError?.code === 'BR2K_MEDIA_CANCELLED';
+        let validationError = processingError;
+        let exitCode = Number.isFinite(Number(processingError?.ffmpegExitCode))
+          ? Number(processingError.ffmpegExitCode)
+          : processingError
+            ? -1
+            : 0;
+        const signal = processingError?.ffmpegSignal || '';
         let burnedSuccessfully = false;
-        if (!cancelled && code === 0) {
+        if (!cancelled && !processingError && exitCode === 0) {
           try {
             const result = await probeMediaFileInfo(this.ffmpegPath, burnedTmpPath, { timeoutMs: 15000 });
             if (!result.videoInfo || (await getFileSize(burnedTmpPath)) < 32 * 1024) {
@@ -8008,21 +8305,19 @@ try {
             await atomicReplaceFile(burnedTmpPath, burnedPath);
           } catch (error) {
             validationError = error;
-            code = -1;
+            exitCode = -1;
           }
         }
-        if (this.burnSessions.get(room.id) === ffmpeg) {
-          room.burning = false;
-          this.burnSessions.delete(room.id);
-        }
+        room.burning = false;
+        this.burnSessions.delete(room.id);
         await this.cleanupAvatarOverlayLayer(avatarLayer);
         if (cancelled) {
-          finishFfmpegJobProgress(room.burnProgress, 'cancelled', '弹幕视频生成已取消');
-          fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+          finishFfmpegJobProgress(progress, 'cancelled', '弹幕视频生成已取消');
+          await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
           this.log('info', `${roomLabel(room)} 已取消生成弹幕视频：${path.basename(burnedPath)}`);
-        } else if (code === 0) {
+        } else if (exitCode === 0 && !validationError) {
           burnedSuccessfully = true;
-          finishFfmpegJobProgress(room.burnProgress, 'completed', '弹幕版已生成');
+          finishFfmpegJobProgress(progress, 'completed', '弹幕版已生成');
           this.log('success', `${roomLabel(room)} 有弹幕版已生成：${path.basename(burnedPath)}`);
           if (this.settings.notifyBurnEnded) {
             this.notify('弹幕版已生成', `${roomLabel(room)} ${path.basename(burnedPath)}`, 'burn.completed', {
@@ -8034,16 +8329,16 @@ try {
           }
         } else {
           await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
-          const failureDetail = validationError?.message || `退出码 ${code}`;
-          finishFfmpegJobProgress(room.burnProgress, 'error', `烧录失败：${failureDetail}`);
+          const failureDetail = validationError?.message || `退出码 ${exitCode}`;
+          finishFfmpegJobProgress(progress, 'error', `烧录失败：${failureDetail}`);
           this.log('error', `${roomLabel(room)} 烧录失败：${failureDetail}，信号 ${signal || '-'}`);
           if (this.settings.notifyBurnEnded) {
-            this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${code}`, 'burn.failed', {
+            this.notify('弹幕版烧录失败', `${roomLabel(room)} 退出码 ${exitCode}`, 'burn.failed', {
               roomId: room.id,
               roomTitle: room.title || '',
               anchor: room.anchor || '',
               fileName: path.basename(burnedPath),
-              exitCode: code
+              exitCode
             });
           }
         }
@@ -8057,13 +8352,68 @@ try {
         }
         this.emitState();
         setTimeout(() => {
-          if (room.burnProgress?.id === progressId) {
+          if (room.burnProgress?.id === progress.id) {
             delete room.burnProgress;
             this.emitState();
           }
         }, 5000).unref?.();
         this.scheduleQueuedUpdateCheck();
-      });
+      };
+      void (async () => {
+        let processingError = null;
+        try {
+          if (avatarLayer?.chunked) {
+            await this.runChunkedAvatarBurn({
+              cleanPath: burnSourcePath,
+              assPath: assets.assPath,
+              burnedPath: burnedTmpPath,
+              codec: this.settings.burnCodec,
+              crf: this.settings.burnCrf,
+              duration: durationSec,
+              fps: burnFps,
+              avatarLayer,
+              includeAudio: Boolean(mediaInfo.audioInfo),
+              timelineAlignment: burnTimeline,
+              onChild: (child) => this.burnSessions.set(room.id, child),
+              onStderr: handleBurnLog,
+              onProgress: handleBurnProgress,
+              isCancelled: () => this.burnCancelRequests.has(room.id)
+            });
+          } else {
+            const args = createBurnArgs({
+              cleanPath: burnSourcePath,
+              assPath: assets.assPath,
+              burnedPath: burnedTmpPath,
+              codec: this.settings.burnCodec,
+              crf: this.settings.burnCrf,
+              container: getContainerFromPath(burnedPath),
+              startTime: 0,
+              duration: durationSec,
+              fps: burnFps,
+              avatarOverlay: avatarLayer,
+              timelineOffset: burnTimeline.videoClockStartSec,
+              leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+              leadingAudioPaddingSec: burnTimeline.audioPaddingSec
+            });
+            await runFfmpegJob(this.ffmpegPath, args, handleBurnStderr, {
+              onChild: (child) => this.burnSessions.set(room.id, child)
+            });
+          }
+        } catch (error) {
+          processingError = error;
+        }
+        try {
+          await finishBurn(processingError);
+        } catch (error) {
+          room.burning = false;
+          this.burnSessions.delete(room.id);
+          await this.cleanupAvatarOverlayLayer(avatarLayer);
+          this.log('error', `${roomLabel(room)} 烧录收尾失败：${error.message}`);
+          this.emitState();
+        }
+      })();
+      this.emitState();
+      return true;
     } catch (error) {
       await this.cleanupAvatarOverlayLayer(avatarLayer);
       const cancelled = this.burnCancelRequests.delete(room.id);
@@ -8084,11 +8434,15 @@ try {
 
   async cancelBurnDanmaku(roomId) {
     const room = this.getRoom(roomId);
+    this.burnCancelRequests.add(room.id);
     const ffmpeg = this.burnSessions.get(room.id);
     if (!ffmpeg) {
+      if (room.burning) {
+        this.log('info', `${roomLabel(room)} 已标记取消，当前分段结束后停止弹幕视频生成。`);
+        this.emitState();
+      }
       return this.getState();
     }
-    this.burnCancelRequests.add(room.id);
     if (room.burnProgress?.status === 'running') {
       room.burnProgress.message = '正在中断弹幕视频生成';
       room.burnProgress.updatedAt = Date.now();
@@ -8120,10 +8474,12 @@ try {
       options.assPath ||
       deriveSiblingPath(recording.cleanPath, createDanmakuAssSuffix(overlayMode, danmakuArea), 'ass');
     const temporaryAssPath = `${assPath}.${process.pid}.${Date.now()}.tmp`;
+    const avatarPlanPath = `${temporaryAssPath}.avatar-plan.json`;
     const result = await runAssWorkerJob({
       danmakuPath: recording.danmakuPath,
       cssPath,
       assPath: temporaryAssPath,
+      avatarPlanPath,
       overlayMode,
       danmakuArea,
       stylePreset,
@@ -8160,10 +8516,11 @@ try {
   }
 
   async prepareSubtitleExport(options = {}) {
-    const recording = this.normalizeRecording(options.recording || options);
+    let recording = this.normalizeRecording(options.recording || options);
     if (!recording) {
       throw new Error('请选择录像文件。');
     }
+    recording = this.hydrateRecordingFromLibrary(recording);
     if (recording.valid === false) {
       throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
@@ -8217,10 +8574,11 @@ try {
   }
 
   async createExportQueueItem(options = {}) {
-    const recording = this.normalizeRecording(options.recording || options);
+    let recording = this.normalizeRecording(options.recording || options);
     if (!recording) {
       throw new Error('请选择录像文件。');
     }
+    recording = this.hydrateRecordingFromLibrary(recording);
     if (recording.valid === false) {
       throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
@@ -8267,6 +8625,10 @@ try {
       createdAt: Date.now(),
       request: {
         ...options,
+        // Keep the canonical packet audit with queued work.  The UI normally
+        // only posts file paths, but this data is needed much later when the
+        // task is finally dequeued and rendered.
+        recording,
         mode,
         cleanPath: recording.cleanPath,
         danmakuPath: options.danmakuPath || recording.danmakuPath,
@@ -8342,10 +8704,11 @@ try {
   }
 
   async runExportClipNow(options = {}) {
-    const recording = this.normalizeRecording(options.recording || options);
+    let recording = this.normalizeRecording(options.recording || options);
     if (!recording) {
       throw new Error('请选择录像文件。');
     }
+    recording = this.hydrateRecordingFromLibrary(recording);
     if (recording.valid === false) {
       throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
@@ -8386,16 +8749,47 @@ try {
       deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime);
     const outputContainer = getContainerFromPath(outputPath);
     const temporaryOutputPath = replaceExtension(outputPath, `.tmp.${outputContainer}`);
-    await assertDiskSpace(outputPath, { estimatedBytes: Math.ceil(Number(recording.fileSize || 0) * Math.min(1, duration / Math.max(1, durationSec || duration))) });
-    await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+    const codecInfo = mode === 'burn' ? this.getBurnCodecInfo(this.settings.burnCodec) : null;
+    const progress = createFfmpegJobProgress({
+      kind: 'export',
+      label: `导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`,
+      outputPath,
+      durationSec: duration,
+      codec: codecInfo?.value,
+      codecKind: codecInfo?.kind
+    });
+    const setExportStage = (stage) => {
+      if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
+      progress.stageLabel = stage;
+      progress.message = stage;
+      progress.updatedAt = Date.now();
+      this.emitState();
+    };
+    const throwIfExportCancelled = () => {
+      if (!this.exportCancelRequested) return;
+      const error = new Error('导出已取消。');
+      error.code = 'BR2K_MEDIA_CANCELLED';
+      throw error;
+    };
+    clearTimeout(this.exportProgressClearTimer);
+    this.exportProgress = progress;
+    this.exportProcess = null;
     this.exportCancelRequested = false;
+    setExportStage(mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段');
 
     let cssPath = recording.cssPath;
     let assPath = recording.assPath;
     let temporaryAssDir = '';
     let avatarLayer = null;
     let args;
-    let codecInfo = null;
+    let burnTimeline = null;
+    let cancelled = false;
+    try {
+      await assertDiskSpace(outputPath, {
+        estimatedBytes: Math.ceil(Number(recording.fileSize || 0) * Math.min(1, duration / Math.max(1, durationSec || duration)))
+      });
+      await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+      throwIfExportCancelled();
     if (mode === 'clean') {
       args = createClipCopyArgs({
         cleanPath: recording.cleanPath,
@@ -8407,6 +8801,7 @@ try {
     } else {
       temporaryAssDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-ass-'));
       const temporaryAssPath = path.join(temporaryAssDir, 'subtitle.ass');
+      setExportStage('正在生成字幕');
       const assets = await this.generateSubtitleAssets(recording, {
         overlayMode,
         danmakuArea,
@@ -8415,50 +8810,60 @@ try {
         avatarMode,
         startTime,
         endTime,
-        shiftTime: true,
+        // Keep ASS/avatar timings on the source recording clock. The burn
+        // command seeks at input time, then shifts the decoded chunk back to
+        // this clock before applying the overlays.
+        shiftTime: false,
         cssPath: options.cssPath || recording.cssPath,
         assPath: temporaryAssPath
       });
+      throwIfExportCancelled();
       cssPath = assets.cssPath;
       assPath = assets.assPath;
-      codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
       const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
       const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
+      burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      setExportStage('正在准备真实头像');
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         recording,
         assPath,
         fps: exportFps,
+        duration: startTime + duration,
+        timelineOffset: burnTimeline.videoClockStartSec,
+        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+        outputDuration: duration,
+        skipInitialKeyframeGuard: true,
         label: '烧录片段导出',
-        gpuComposite: gpuAvatarComposite
+        gpuComposite: gpuAvatarComposite,
+        isCancelled: () => this.exportCancelRequested
       });
-      args = createBurnArgs({
-        cleanPath: recording.cleanPath,
-        assPath,
-        burnedPath: temporaryOutputPath,
-        codec: this.settings.burnCodec,
-        crf: this.settings.burnCrf,
-        container: outputContainer,
-        startTime,
-        duration,
-        fps: exportFps,
-        avatarOverlay: avatarLayer
-      });
+      throwIfExportCancelled();
+      if (!avatarLayer?.chunked) {
+        args = createBurnArgs({
+          cleanPath: recording.cleanPath,
+          assPath,
+          burnedPath: temporaryOutputPath,
+          codec: this.settings.burnCodec,
+          crf: this.settings.burnCrf,
+          container: outputContainer,
+          startTime,
+          duration,
+          fps: exportFps,
+          avatarOverlay: avatarLayer,
+          inputSeek: true,
+          timelineOffset: burnTimeline.videoClockStartSec,
+          leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+          leadingAudioPaddingSec: burnTimeline.audioPaddingSec
+        });
+      }
+      if (burnTimeline.videoPaddingSec > 0.05 || burnTimeline.audioPaddingSec > 0.05) {
+        this.log(
+          'info',
+          `烧录片段导出 将保留源录像起始时间轴：视频前置 ${burnTimeline.videoPaddingSec.toFixed(3)} 秒，音频前置 ${burnTimeline.audioPaddingSec.toFixed(3)} 秒。`
+        );
+      }
     }
-
-    const progress = createFfmpegJobProgress({
-      kind: 'export',
-      label: `导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`,
-      outputPath,
-      durationSec: duration,
-      codec: codecInfo?.value,
-      codecKind: codecInfo?.kind
-    });
-    clearTimeout(this.exportProgressClearTimer);
-    this.exportProgress = progress;
-    this.exportProcess = null;
-    this.exportCancelRequested = false;
-    this.emitState();
-
+    setExportStage(mode === 'burn' ? '正在烧录片段' : '正在导出纯净片段');
     this.log(
       'info',
       `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}${
@@ -8469,20 +8874,53 @@ try {
           : ''
       }`
     );
-    let cancelled = false;
-    try {
-      await runFfmpegJob(this.ffmpegPath, args, (line) => {
+      const handleExportStderr = (line) => {
         if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
           this.emitState();
         }
+        handleExportLog(line);
+      };
+      const handleExportLog = (line) => {
         if (/error|failed|invalid/i.test(line)) {
           this.log('warn', `剪辑导出：${compactLogLine(line)}`);
         }
-      }, {
-        onChild: (child) => {
-          this.exportProcess = child;
+      };
+      const handleExportProgress = (currentTimeSec) => {
+        const value = Math.max(0, Number(currentTimeSec) || 0);
+        if (
+          this.exportProgress?.id === progress.id &&
+          updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)
+        ) {
+          this.emitState();
         }
-      });
+      };
+      const onChild = (child) => {
+        this.exportProcess = child;
+      };
+      if (avatarLayer?.chunked) {
+        await this.runChunkedAvatarBurn({
+          cleanPath: recording.cleanPath,
+          assPath,
+          burnedPath: temporaryOutputPath,
+          codec: this.settings.burnCodec,
+          crf: this.settings.burnCrf,
+          startTime,
+          duration,
+          fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
+          avatarLayer,
+          includeAudio: Boolean(mediaInfo.audioInfo),
+          timelineAlignment: burnTimeline,
+          onChild,
+          onStderr: handleExportLog,
+          onProgress: handleExportProgress,
+          onStage: setExportStage,
+          isCancelled: () => this.exportCancelRequested
+        });
+      } else {
+        await runFfmpegJob(this.ffmpegPath, args, handleExportStderr, { onChild });
+      }
+      throwIfExportCancelled();
+      setExportStage('正在验证并完成导出');
       const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
         throw new Error('导出临时输出未通过视频流与文件大小验证。');
@@ -8548,17 +8986,17 @@ try {
   }
 
   async cancelExportClip() {
-    if (!this.exportProcess) {
-      return this.getState();
-    }
     this.exportCancelRequested = true;
     if (this.exportProgress?.status === 'running') {
-      this.exportProgress.message = '正在中断导出';
+      this.exportProgress.message = this.exportProcess ? '正在中断导出' : '正在取消准备中的导出';
       this.exportProgress.updatedAt = Date.now();
     }
     this.log('info', '正在取消当前导出任务。');
-    requestFfmpegStop(this.exportProcess, { graceful: false, timeoutMs: 1500 });
     this.emitState();
+    if (!this.exportProcess) {
+      return this.getState();
+    }
+    requestFfmpegStop(this.exportProcess, { graceful: false, timeoutMs: 1500 });
     return this.getState();
   }
 
@@ -9680,32 +10118,45 @@ function hasUsableVideoCanvas(videoInfo) {
 }
 
 async function runAssWorkerJob(payload) {
+  const avatarPlanPath = String(payload.avatarPlanPath || '').trim();
   const managedServerEntry = String(process.env.BILI_RECORD_SERVER_ENTRY || '').trim();
-  const args = isSingleExecutableRuntime()
-    ? ['--ass-worker']
-    : [managedServerEntry || path.join(APP_ROOT, 'src', 'server', 'index.cjs'), '--ass-worker'];
-  const result = await runCapturedProcess(process.execPath, args, {
-    input: JSON.stringify(payload),
-    timeoutMs: 180000,
-    maxOutputBytes: 256 * 1024
-  });
-  if (result.timedOut) {
-    throw new Error('字幕生成超时，已终止后台字幕任务。');
-  }
-  if (result.error) {
-    throw new Error(`字幕任务启动失败：${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    throw new Error(`字幕生成失败：${compactLogLine(result.stderr || result.stdout) || `退出码 ${result.status}`}`);
-  }
   try {
-    const response = JSON.parse(String(result.stdout || '').trim());
-    if (!response.ok) {
-      throw new Error(response.message || '字幕任务未成功完成。');
+    const args = isSingleExecutableRuntime()
+      ? ['--ass-worker']
+      : [managedServerEntry || path.join(APP_ROOT, 'src', 'server', 'index.cjs'), '--ass-worker'];
+    const result = await runCapturedProcess(process.execPath, args, {
+      input: JSON.stringify(payload),
+      timeoutMs: 180000,
+      maxOutputBytes: 256 * 1024
+    });
+    if (result.timedOut) {
+      throw new Error('字幕生成超时，已终止后台字幕任务。');
     }
-    return response;
-  } catch (error) {
-    throw new Error(`字幕任务返回无效：${error.message}`);
+    if (result.error) {
+      throw new Error(`字幕任务启动失败：${result.error.message}`);
+    }
+    if (result.status !== 0) {
+      throw new Error(`字幕生成失败：${compactLogLine(result.stderr || result.stdout) || `退出码 ${result.status}`}`);
+    }
+    try {
+      const response = JSON.parse(String(result.stdout || '').trim());
+      if (!response.ok) {
+        throw new Error(response.message || '字幕任务未成功完成。');
+      }
+      if (response.avatarPlanStored) {
+        if (!avatarPlanPath) {
+          throw new Error('字幕任务返回了头像计划标记，但没有提供计划文件。');
+        }
+        response.avatarPlan = JSON.parse(await fsp.readFile(avatarPlanPath, 'utf8'));
+      }
+      return response;
+    } catch (error) {
+      throw new Error(`字幕任务返回无效：${error.message}`);
+    }
+  } finally {
+    if (avatarPlanPath) {
+      await fsp.rm(avatarPlanPath, { force: true }).catch(() => {});
+    }
   }
 }
 

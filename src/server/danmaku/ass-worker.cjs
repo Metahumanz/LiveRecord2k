@@ -11,6 +11,26 @@ const {
 
 const MAX_REQUEST_BYTES = 256 * 1024;
 
+async function writeAvatarPlan(avatarPlanPath, avatarPlan) {
+  const targetPath = String(avatarPlanPath || '').trim();
+  if (!targetPath) {
+    return false;
+  }
+  if (!avatarPlan) {
+    await fsp.rm(targetPath, { force: true }).catch(() => {});
+    return false;
+  }
+  const temporaryPath = `${targetPath}.${process.pid}.tmp`;
+  try {
+    await fsp.writeFile(temporaryPath, JSON.stringify(avatarPlan), 'utf8');
+    await fsp.rm(targetPath, { force: true });
+    await fsp.rename(temporaryPath, targetPath);
+    return true;
+  } finally {
+    await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
 async function readWorkerRequest() {
   const chunks = [];
   let size = 0;
@@ -30,6 +50,7 @@ async function runAssWorker() {
   const danmakuPath = String(request.danmakuPath || '').trim();
   const cssPath = String(request.cssPath || '').trim();
   const assPath = String(request.assPath || '').trim();
+  const avatarPlanPath = String(request.avatarPlanPath || '').trim();
   if (!danmakuPath || !cssPath || !assPath) {
     throw new Error('字幕任务缺少输入或输出路径。');
   }
@@ -58,17 +79,19 @@ async function runAssWorker() {
         maxSegmentsPerEntry: request.avatarOverlayMaxSegmentsPerEntry
       })
     : undefined;
+  const avatarPlanStored = await writeAvatarPlan(avatarPlanPath, avatarPlan);
   await fsp.writeFile(assPath, ass, 'utf8');
-  process.stdout.write(
-    JSON.stringify({
-      ok: true,
-      eventCount: events.length,
-      playWidth: style.playWidth,
-      playHeight: style.playHeight,
-      portrait: style.playHeight > style.playWidth,
-      avatarPlan
-    })
-  );
+  const response = {
+    ok: true,
+    eventCount: events.length,
+    playWidth: style.playWidth,
+    playHeight: style.playHeight,
+    portrait: style.playHeight > style.playWidth
+  };
+  if (avatarPlanStored) {
+    response.avatarPlanStored = true;
+  }
+  process.stdout.write(JSON.stringify(response));
 }
 
 module.exports = { runAssWorker };

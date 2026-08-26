@@ -97,13 +97,166 @@ function avatarGpuMotionExpression(segments, axis, offset = 0) {
   )}\\,${hidden})`;
 }
 
-function createBurnVideoFilter(assPath, fps) {
-  const targetFps = normalizeMergeFps(fps);
+function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration) {
+  const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  if (padding <= 0.0005) return '';
+  const filters = [
+    `tpad=start_duration=${formatFilterNumber(padding)}:start_mode=add:color=black`
+  ];
+  const duration = Math.max(0, Number(outputDuration) || 0);
+  // The source can begin with audio while its first decodable video frame is
+  // later.  Once the black lead-in is added, trim back to the requested clip
+  // length so the next independently-rendered chunk still starts on time.
+  if (duration > 0) {
+    filters.push(`trim=duration=${formatFilterNumber(duration)}`, 'setpts=PTS-STARTPTS');
+  }
+  return `,${filters.join(',')}`;
+}
+
+function createBurnVideoFilter(assPath, fps, options = {}) {
+  // Independently rendered chunks already carry the source's frame cadence.
+  // Re-applying fps=... per chunk can round the last presentation timestamps
+  // differently in every encoder process, which then becomes cumulative A/V
+  // drift when the chunks are joined. Keep the original frame clock for that
+  // path and only normalize FPS for a single, whole-file render.
+  const targetFps = options.preserveSourceFrameTiming ? 0 : normalizeMergeFps(fps);
   const fpsFilter = targetFps ? `,fps=${targetFps}:start_time=0` : '';
+  const timelineOffset = Math.max(0, Number(options.timelineOffset) || 0);
+  const leadingVideoPaddingSec = Math.max(0, Number(options.leadingVideoPaddingSec) || 0);
+  const inputTrimStartSec = Math.max(0, Number(options.inputTrimStartSec) || 0);
+  const rawInputTrimEndSec = Number(options.inputTrimEndSec);
+  const inputTrimEndSec = Number.isFinite(rawInputTrimEndSec) && rawInputTrimEndSec > inputTrimStartSec ? rawInputTrimEndSec : 0;
+  const inputTrimFilter =
+    inputTrimStartSec > 0.0005 || inputTrimEndSec > 0.0005
+      ? `,trim=start=${formatFilterNumber(inputTrimStartSec)}${
+          inputTrimEndSec > 0.0005 ? `:end=${formatFilterNumber(inputTrimEndSec)}` : ''
+        },setpts=PTS-STARTPTS`
+      : '';
+  const selectFilter = options.skipInitialKeyframeGuard
+    ? "select='1'"
+    : "select='if(isnan(prev_selected_t)\\,key\\,1)'";
+  const sourceClockFilter = timelineOffset
+    ? `,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(timelineOffset)}/TB`
+    : '';
+  const outputClockFilter = options.resetOutputTimestamps || leadingVideoPaddingSec > 0 ? ',setpts=PTS-STARTPTS' : '';
+  const leadingPaddingFilter = createLeadingVideoPaddingFilter(leadingVideoPaddingSec, options.outputDuration);
   return (
-    `settb=AVTB,setpts=PTS-STARTPTS,select='if(isnan(prev_selected_t)\\,key\\,1)'${fpsFilter},` +
-    `ass='${escapeFilterPath(assPath)}'`
+    `settb=AVTB,setpts=PTS-STARTPTS${inputTrimFilter},${selectFilter}${fpsFilter}${sourceClockFilter},` +
+    `ass='${escapeFilterPath(assPath)}'${outputClockFilter}${leadingPaddingFilter}`
   );
+}
+
+function avatarSegmentAt(segment, time, coordinateOne, coordinateTwo) {
+  const start = Number(segment?.start);
+  const end = Number(segment?.end);
+  const from = Number(segment?.[coordinateOne]);
+  const to = Number(segment?.[coordinateTwo]);
+  if (![start, end, from, to].every(Number.isFinite) || end <= start) {
+    return Number.isFinite(from) ? from : 0;
+  }
+  const ratio = Math.max(0, Math.min(1, (time - start) / (end - start)));
+  return from + (to - from) * ratio;
+}
+
+function clipAvatarSegments(segments, start, end) {
+  return segments
+    .map((segment) => {
+      const segmentStart = Number(segment.start);
+      const segmentEnd = Number(segment.end);
+      const clippedStart = Math.max(start, segmentStart);
+      const clippedEnd = Math.min(end, segmentEnd);
+      if (!Number.isFinite(clippedStart) || !Number.isFinite(clippedEnd) || clippedEnd <= clippedStart) {
+        return null;
+      }
+      return {
+        start: clippedStart,
+        end: clippedEnd,
+        x1: avatarSegmentAt(segment, clippedStart, 'x1', 'x2'),
+        x2: avatarSegmentAt(segment, clippedEnd, 'x1', 'x2'),
+        y1: avatarSegmentAt(segment, clippedStart, 'y1', 'y2'),
+        y2: avatarSegmentAt(segment, clippedEnd, 'y1', 'y2')
+      };
+    })
+    .filter(Boolean);
+}
+
+function clipAvatarOverlayEntries(avatarOverlay, start, end) {
+  return normalizeAvatarOverlayEntries(avatarOverlay)
+    .map((entry) => ({ ...entry, segments: clipAvatarSegments(entry.segments, start, end) }))
+    .filter((entry) => entry.segments.length);
+}
+
+function createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, entries, duration, chunkDuration }) {
+  const safeChunkDuration = Math.max(1, Number(chunkDuration) || 0);
+  if (!safeChunkDuration) return '';
+  const maxSegmentEnd = Math.max(
+    0,
+    ...entries.flatMap((entry) => entry.segments.map((segment) => Number(segment.end)).filter(Number.isFinite))
+  );
+  const timelineDuration = Number.isFinite(Number(duration)) && Number(duration) > 0 ? Number(duration) : maxSegmentEnd;
+  const chunkCount = Math.max(1, Math.ceil(timelineDuration / safeChunkDuration));
+  const panel = avatarOverlay?.panel || {};
+  const panelLeft = Math.max(0, Number(panel.left) || 0);
+  const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
+  const panelHeight = Math.max(1, Math.ceil(Number(panel.height) || 1));
+  const layerFps = normalizeMergeFps(fps) || 30;
+  const filters = [];
+  const splitLabels = Array.from({ length: chunkCount }, (_unused, index) => `[avatar_chunk_input_${index}]`).join('');
+  filters.push(`[0:v]${createBurnVideoFilter(assPath, fps)},split=${chunkCount}${splitLabels}`);
+  const outputLabels = [];
+
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+    const chunkStart = chunkIndex * safeChunkDuration;
+    const chunkEnd = Math.min(timelineDuration, (chunkIndex + 1) * safeChunkDuration);
+    const chunkBase = `avatar_chunk_base_${chunkIndex}`;
+    const chunkOutput = `avatar_chunk_output_${chunkIndex}`;
+    outputLabels.push(`[${chunkOutput}]`);
+    filters.push(
+      `[avatar_chunk_input_${chunkIndex}]trim=start=${formatFilterNumber(chunkStart)}:end=${formatFilterNumber(chunkEnd)}[${chunkBase}]`
+    );
+    const chunkEntries = entries
+      .map((entry) => ({ ...entry, segments: clipAvatarSegments(entry.segments, chunkStart, chunkEnd) }))
+      .filter((entry) => entry.segments.length);
+
+    if (!chunkEntries.length) {
+      filters.push(`[${chunkBase}]format=yuv420p,setpts=PTS-STARTPTS[${chunkOutput}]`);
+      continue;
+    }
+
+    const firstLayer = `avatar_chunk_layer_${chunkIndex}_0`;
+    filters.push(
+      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(
+        chunkStart
+      )}/TB[${firstLayer}]`
+    );
+    let previousLayer = firstLayer;
+    for (let entryIndex = 0; entryIndex < chunkEntries.length; entryIndex += 1) {
+      const entry = chunkEntries[entryIndex];
+      const imageLabel = `avatar_chunk_image_${chunkIndex}_${entryIndex}`;
+      const nextLayer = `avatar_chunk_layer_${chunkIndex}_${entryIndex + 1}`;
+      const start = Math.min(...entry.segments.map((segment) => segment.start));
+      const end = Math.max(...entry.segments.map((segment) => segment.end));
+      filters.push(
+        `movie='${escapeFilterPath(entry.imagePath)}',settb=AVTB,setpts=PTS-STARTPTS,format=rgba,loop=loop=-1:size=1:start=0[${imageLabel}]`
+      );
+      filters.push(
+        `[${previousLayer}][${imageLabel}]overlay=` +
+          `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
+          `y='${avatarMotionExpression(entry.segments, 'y')}':` +
+          `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
+          `eof_action=pass:repeatlast=1:format=auto[${nextLayer}]`
+      );
+      previousLayer = nextLayer;
+    }
+    filters.push(
+      `[${chunkBase}][${previousLayer}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
+        'eof_action=pass:repeatlast=0:format=auto,format=yuv420p,setpts=PTS-STARTPTS' +
+        `[${chunkOutput}]`
+    );
+  }
+
+  filters.push(`${outputLabels.join('')}concat=n=${chunkCount}:v=1:a=0,format=yuv420p[vout]`);
+  return `${filters.join(';\n')}\n`;
 }
 
 // CPU rendering builds avatar artwork in a transparent side-panel stream and
@@ -111,9 +264,37 @@ function createBurnVideoFilter(assPath, fps) {
 // transparent alpha main input, so its path composites the same circles
 // directly onto the already-rendered ASS video. The vector portrait beneath
 // remains the failure fallback in both cases.
-function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, gpuComposite = false } = {}) {
+function createAvatarOverlayFilterScript({
+  assPath,
+  fps,
+  avatarOverlay,
+  gpuComposite = false,
+  duration,
+  chunkDuration,
+  timelineOffset = 0,
+  resetOutputTimestamps = false,
+  leadingVideoPaddingSec = 0,
+  outputDuration = 0,
+  skipInitialKeyframeGuard = false,
+  inputTrimStartSec = 0,
+  inputTrimEndSec = 0,
+  preserveSourceFrameTiming = false
+} = {}) {
   const entries = normalizeAvatarOverlayEntries(avatarOverlay);
   if (!entries.length) return '';
+  if (!gpuComposite && Number(chunkDuration) > 0) {
+    return createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, entries, duration, chunkDuration });
+  }
+  const sourceClockOffset = Math.max(0, Number(timelineOffset) || 0);
+  const panelClockFilter = sourceClockOffset
+    ? `settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(sourceClockOffset)}/TB`
+    : 'settb=AVTB,setpts=PTS-STARTPTS';
+  const imageClockFilter = sourceClockOffset
+    ? `,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(sourceClockOffset)}/TB`
+    : '';
+  const leadingVideoPadding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  const outputClockFilter = resetOutputTimestamps || sourceClockOffset || leadingVideoPadding > 0 ? ',setpts=PTS-STARTPTS' : '';
+  const leadingPaddingFilter = createLeadingVideoPaddingFilter(leadingVideoPadding, outputDuration);
   const panel = avatarOverlay?.panel || {};
   const panelLeft = Math.max(0, Number(panel.left) || 0);
   const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
@@ -121,12 +302,24 @@ function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, gpuCompo
   const layerFps = normalizeMergeFps(fps) || 30;
   const filters = [
     gpuComposite
-      ? `[0:v]${createBurnVideoFilter(assPath, fps)},hwupload_cuda[avatar_layer_0]`
-      : `[0:v]${createBurnVideoFilter(assPath, fps)}[burn_base]`
+      ? `[0:v]${createBurnVideoFilter(assPath, fps, {
+        timelineOffset: sourceClockOffset,
+        skipInitialKeyframeGuard,
+        inputTrimStartSec,
+        inputTrimEndSec,
+        preserveSourceFrameTiming
+      })},hwupload_cuda[avatar_layer_0]`
+      : `[0:v]${createBurnVideoFilter(assPath, fps, {
+          timelineOffset: sourceClockOffset,
+          skipInitialKeyframeGuard,
+          inputTrimStartSec,
+          inputTrimEndSec,
+          preserveSourceFrameTiming
+        })}[burn_base]`
   ];
   if (!gpuComposite) {
     filters.push(
-      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,settb=AVTB,setpts=PTS-STARTPTS[avatar_layer_0]`
+      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,${panelClockFilter}[avatar_layer_0]`
     );
   }
 
@@ -138,14 +331,16 @@ function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, gpuCompo
     const start = Math.min(...entry.segments.map((segment) => segment.start));
     const end = Math.max(...entry.segments.map((segment) => segment.end));
     filters.push(
-      `[${index + 1}:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba${gpuComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
+      `movie='${escapeFilterPath(entry.imagePath)}',settb=AVTB,setpts=PTS-STARTPTS,format=rgba${
+        gpuComposite ? ',loop=loop=-1:size=1:start=0' : ',loop=loop=-1:size=1:start=0'
+      }${imageClockFilter}${gpuComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
     );
     if (gpuComposite) {
       filters.push(
         `[${previousLayer}][${imageLabel}]overlay_cuda=` +
           `x='${avatarGpuMotionExpression(entry.segments, 'x')}':` +
           `y='${avatarGpuMotionExpression(entry.segments, 'y')}':` +
-          `eof_action=pass:repeatlast=0[${nextLayer}]`
+          `eof_action=pass:repeatlast=1[${nextLayer}]`
       );
     } else {
       filters.push(
@@ -153,17 +348,70 @@ function createAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, gpuCompo
           `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
           `y='${avatarMotionExpression(entry.segments, 'y')}':` +
           `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
-          `eof_action=pass:repeatlast=0:format=auto[${nextLayer}]`
+          `eof_action=pass:repeatlast=1:format=auto[${nextLayer}]`
       );
     }
   }
   filters.push(
     gpuComposite
-      ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p[vout]`
+      ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
+          leadingPaddingFilter ? ',hwdownload,format=yuv420p' : ''
+        }${outputClockFilter}${leadingPaddingFilter}[vout]`
       : `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
-          'eof_action=pass:repeatlast=0:format=auto,format=yuv420p[vout]'
+          `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${leadingPaddingFilter}[vout]`
   );
   return `${filters.join(';\n')}\n`;
+}
+
+// Build only the filter graph needed for one source-time window.  This is
+// intentionally separate from the legacy all-in-one chunk graph above: long
+// recordings must not make FFmpeg parse thousands of windows in one process.
+function createAvatarOverlayChunkFilterScript({
+  assPath,
+  fps,
+  avatarOverlay,
+  chunkStart,
+  chunkEnd,
+  timelineOffset,
+  leadingVideoPaddingSec = 0,
+  outputDuration = 0,
+  inputTrimStartSec = 0,
+  inputTrimEndSec = 0,
+  preserveSourceFrameTiming = true,
+  gpuComposite = false
+} = {}) {
+  const start = Math.max(0, Number(chunkStart) || 0);
+  const end = Number(chunkEnd);
+  const entries = clipAvatarOverlayEntries(avatarOverlay, start, end);
+  const sourceClockOffset = Math.max(0, Number.isFinite(Number(timelineOffset)) ? Number(timelineOffset) : start);
+  if (!entries.length) {
+    return (
+      `[0:v]${createBurnVideoFilter(assPath, fps, {
+        timelineOffset: sourceClockOffset,
+        skipInitialKeyframeGuard: true,
+        resetOutputTimestamps: true,
+        leadingVideoPaddingSec,
+        outputDuration,
+        inputTrimStartSec,
+        inputTrimEndSec,
+        preserveSourceFrameTiming
+      })},format=yuv420p[vout]\n`
+    );
+  }
+  return createAvatarOverlayFilterScript({
+    assPath,
+    fps,
+    avatarOverlay: { ...(avatarOverlay || {}), entries },
+    gpuComposite,
+    timelineOffset: sourceClockOffset,
+    resetOutputTimestamps: true,
+    leadingVideoPaddingSec,
+    outputDuration,
+    skipInitialKeyframeGuard: true,
+    inputTrimStartSec,
+    inputTrimEndSec,
+    preserveSourceFrameTiming
+  });
 }
 
 function createRecordingArgs({ streamUrl, headers, outputPath, maxDurationSec, streamProtocol, streamFormat }) {
@@ -231,32 +479,70 @@ function createMp4FinalizeArgs({ inputPath, outputPath, streamCodec }) {
   return args;
 }
 
-function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container, startTime, duration, fps, avatarOverlay }) {
+function createBurnArgs({
+  cleanPath,
+  assPath,
+  burnedPath,
+  codec,
+  crf,
+  container,
+  startTime,
+  duration,
+  fps,
+  avatarOverlay,
+  inputSeek = false,
+  inputSeekPrerollSec = 0,
+  inputTrimStartSec = 0,
+  inputTrimEndSec = 0,
+  timelineOffset = 0,
+  leadingVideoPaddingSec = 0,
+  leadingAudioPaddingSec = 0,
+  includeAudio = true
+}) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
-  const avatarEntries = avatarOverlay?.filterScriptPath ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
+  // For independently rendered chunks, seek close to the boundary quickly.
+  // The generated filter graph trims this short preroll before assigning the
+  // source clock, so a preceding long-GOP keyframe cannot leak into a chunk.
+  const inputSeekPreroll = inputSeek && hasStart
+    ? Math.min(Number(startTime), Math.max(0, Number(inputSeekPrerollSec) || 0))
+    : 0;
+  const inputSeekStart = Math.max(0, Number(startTime) - inputSeekPreroll);
+  const hasFilterScript = Boolean(String(avatarOverlay?.filterScriptPath || '').trim());
+  const avatarEntries = hasFilterScript ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
   const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite && String(codec || '').includes('nvenc'));
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   if (gpuAvatarComposite) {
     args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
   }
-  args.push('-i', cleanPath);
-  for (const entry of avatarEntries) {
-    // Avatar artwork is static. Motion is driven by the main video timestamp
-    // in the filter graph, so one source frame per second is sufficient and
-    // avoids decoding/uploading a duplicate PNG for every output frame.
-    args.push('-loop', '1', '-framerate', '1', '-i', entry.imagePath);
+  if (inputSeek && hasStart) {
+    args.push('-ss', formatFfmpegSeconds(inputSeekStart));
   }
-  if (hasStart) {
+  args.push('-i', cleanPath);
+  if (!inputSeek && hasStart) {
     args.push('-ss', formatFfmpegSeconds(startTime));
   }
   if (hasDuration) {
     args.push('-t', formatFfmpegSeconds(duration));
   }
-  if (avatarEntries.length) {
-    args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]', '-map', '0:a?');
+  if (hasFilterScript) {
+    args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]');
+    if (includeAudio) args.push('-map', '0:a?');
   } else {
-    args.push('-map', '0:v:0', '-map', '0:a?', '-vf', createBurnVideoFilter(assPath, fps));
+    args.push('-map', '0:v:0');
+    if (includeAudio) args.push('-map', '0:a?');
+    args.push(
+      '-vf',
+      createBurnVideoFilter(assPath, fps, {
+        timelineOffset,
+        resetOutputTimestamps: Boolean(inputSeek) || Math.max(0, Number(leadingVideoPaddingSec) || 0) > 0,
+        leadingVideoPaddingSec,
+        outputDuration: duration,
+        skipInitialKeyframeGuard: Boolean(inputSeek),
+        inputTrimStartSec,
+        inputTrimEndSec
+      })
+    );
   }
   args.push('-c:v', codec || 'libx265');
 
@@ -279,7 +565,90 @@ function createBurnArgs({ cleanPath, assPath, burnedPath, codec, crf, container,
     args.push('-movflags', '+faststart');
   }
 
-  args.push('-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-b:a', '160k', '-ac', '2', burnedPath);
+  if (includeAudio) {
+    const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
+    const audioFilters = ['aresample=48000:async=1:first_pts=0', 'asetpts=PTS-STARTPTS'];
+    if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
+    audioFilters.push('asetpts=PTS-STARTPTS');
+    args.push(
+      '-af',
+      audioFilters.join(','),
+      '-c:a',
+      'aac',
+      '-b:a',
+      '160k',
+      '-ac',
+      '2'
+    );
+  } else {
+    args.push('-an');
+  }
+  args.push(burnedPath);
+  return args;
+}
+
+function createBurnAudioMuxArgs({
+  concatPath,
+  cleanPath,
+  outputPath,
+  codec,
+  crf,
+  startTime,
+  duration,
+  container,
+  leadingAudioPaddingSec = 0,
+  includeAudio = true
+}) {
+  const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
+  const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-f',
+    'concat',
+    '-safe',
+    '0',
+    '-i',
+    concatPath
+  ];
+  if (includeAudio) {
+    if (hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+    args.push('-i', cleanPath);
+  }
+  if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
+  args.push('-map', '0:v:0');
+  if (includeAudio) {
+    const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
+    const audioFilters = ['aresample=48000:async=1:first_pts=0', 'asetpts=PTS-STARTPTS'];
+    if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
+    if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
+    audioFilters.push('asetpts=PTS-STARTPTS');
+    args.push(
+      '-map',
+      '1:a?',
+      '-af',
+      audioFilters.join(','),
+      '-c:a',
+      'aac',
+      '-b:a',
+      '160k',
+      '-ac',
+      '2',
+      '-shortest'
+    );
+  } else {
+    args.push('-an');
+  }
+  args.push('-c:v', 'copy', '-dn', '-sn', '-avoid_negative_ts', 'make_zero');
+  if (container === 'mp4') {
+    if (isHevcCodec(codec)) args.push('-tag:v', 'hvc1');
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
   return args;
 }
 
@@ -671,8 +1040,23 @@ function normalizeMergeFps(value) {
   return Number(fps.toFixed(3));
 }
 
-async function writeConcatFile(concatPath, filePaths) {
-  const body = filePaths.map((filePath) => `file '${escapeConcatPath(filePath)}'`).join('\n');
+async function writeConcatFile(concatPath, filePaths, options = {}) {
+  const durations = Array.isArray(options?.durations) ? options.durations : [];
+  const body = filePaths
+    .map((filePath, index) => {
+      const duration = Number(durations[index]);
+      const lines = [`file '${escapeConcatPath(filePath)}'`];
+      // H.26x B-frames make a container's final decode timestamp earlier than
+      // its final presentation timestamp. The concat demuxer otherwise uses
+      // that shortened value as the next chunk's origin, advancing video a
+      // few frames at every boundary. The caller supplies the exact source
+      // time window when it is known.
+      if (Number.isFinite(duration) && duration > 0) {
+        lines.push(`duration ${formatFfmpegSeconds(duration)}`);
+      }
+      return lines.join('\n');
+    })
+    .join('\n');
   await fsp.writeFile(concatPath, `${body}\n`, 'utf8');
 }
 
@@ -729,7 +1113,10 @@ module.exports = {
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
+  createBurnAudioMuxArgs,
   createAvatarOverlayFilterScript,
+  createAvatarOverlayChunkFilterScript,
+  clipAvatarOverlayEntries,
   createPreviewHlsArgs,
   createClipCopyArgs,
   createConcatCopyArgs,
