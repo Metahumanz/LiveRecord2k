@@ -10,9 +10,11 @@ const { createAss } = require('../src/server/danmaku/ass.cjs');
 const {
   createBurnArgs,
   createAvatarOverlayFilterScript,
+  createAvatarOverlayChunkFilterScript,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
+  writeConcatFile,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
   assertSafeMergeTargetProfile
@@ -419,6 +421,53 @@ test('burn filter waits for the first decodable keyframe and still produces vali
   }
 });
 
+test('independent avatar chunks trim a bounded preroll before their exact source boundary', () => {
+  const args = createBurnArgs({
+    cleanPath: 'C:/temp/input.mp4',
+    assPath: 'C:/temp/overlay.ass',
+    burnedPath: 'C:/temp/chunk.mkv',
+    codec: 'libx264',
+    crf: 20,
+    container: 'mkv',
+    startTime: 60,
+    duration: 60,
+    fps: 60,
+    avatarOverlay: { filterScriptPath: 'C:/temp/avatar-layer.ffscript', entries: [] },
+    inputSeek: true,
+    inputSeekPrerollSec: 2,
+    includeAudio: false
+  });
+  const inputIndex = args.indexOf('-i');
+  assert.deepEqual(args.slice(inputIndex - 2, inputIndex + 3), ['-ss', '58', '-i', 'C:/temp/input.mp4', '-t']);
+  const script = createAvatarOverlayChunkFilterScript({
+    assPath: 'C:/temp/overlay.ass',
+    fps: 60,
+    avatarOverlay: { entries: [] },
+    chunkStart: 60,
+    chunkEnd: 120,
+    timelineOffset: 60,
+    inputTrimStartSec: 2,
+    inputTrimEndSec: 62
+  });
+  assert.match(script, /trim=start=2:end=62,setpts=PTS-STARTPTS/);
+  assert.doesNotMatch(script, /fps=60:start_time=0/, 'independent chunks must preserve the source frame clock');
+});
+
+test('chunk concat directives retain the caller supplied source-time windows', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-concat-duration-'));
+  const concatPath = path.join(tempDir, 'chunks.ffconcat');
+  try {
+    await writeConcatFile(concatPath, ['C:/temp/first.mkv', 'C:/temp/second.mkv'], { durations: [60, 12.34567] });
+    const content = await fsp.readFile(concatPath, 'utf8');
+    assert.equal(
+      content,
+      "file 'C:/temp/first.mkv'\nduration 60\nfile 'C:/temp/second.mkv'\nduration 12.346\n"
+    );
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('photo avatars are composed through a separate transparent side layer and keep an MP4-compatible output', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-burn-'));
   const inputPath = path.join(tempDir, 'input.mp4');
@@ -472,6 +521,7 @@ test('photo avatars are composed through a separate transparent side layer and k
     const script = createAvatarOverlayFilterScript({ assPath, fps: 30, avatarOverlay });
     assert.match(script, /color=c=black@0\.0:s=120x180:r=30,format=rgba/);
     assert.match(script, /\[avatar_layer_0\]\[avatar_image_0\]overlay=/);
+    assert.match(script, /movie='[^']+',settb=AVTB,setpts=PTS-STARTPTS,format=rgba,loop=loop=-1:size=1:start=0/);
     assert.match(script, /format=yuv420p\[vout\]/);
     await fsp.writeFile(filterScriptPath, script, 'utf8');
     const args = createBurnArgs({
@@ -486,14 +536,265 @@ test('photo avatars are composed through a separate transparent side layer and k
     });
     assert.ok(args.includes('-filter_complex_script'));
     assert.equal(args.includes('-vf'), false);
-    assert.equal(args.filter((arg) => arg === '-i').length, 2, 'source video plus the alpha avatar input');
-    assert.equal(args[args.indexOf('-framerate') + 1], '1', 'static avatar artwork is not decoded at output FPS');
+    assert.equal(args.filter((arg) => arg === '-i').length, 1, 'avatar images are loaded from the filter script');
+    assert.equal(args.includes('-framerate'), false, 'avatar artwork is not added as a separate live input');
     const burned = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
     assert.equal(burned.status, 0, burned.stderr);
     const info = await probeMediaFileInfo(ffmpegPath, outputPath);
     assert.ok(info.videoInfo);
     assert.ok(info.audioInfo);
     assert.equal(info.videoInfo.pixelFormat, 'yuv420p');
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('multiple recorded avatars remain visible in separate chunked time windows', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-multi-burn-'));
+  const inputPath = path.join(tempDir, 'input.mp4');
+  const redPath = path.join(tempDir, 'red.png');
+  const bluePath = path.join(tempDir, 'blue.png');
+  const assPath = path.join(tempDir, 'overlay.ass');
+  const filterScriptPath = path.join(tempDir, 'avatar-layer.ffscript');
+  const outputPath = path.join(tempDir, 'output.mp4');
+  try {
+    for (const [color, imagePath] of [['black', inputPath], ['red', redPath], ['blue', bluePath]]) {
+      const args = color === 'black'
+        ? [
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=30:d=2',
+            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
+            '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', imagePath
+          ]
+        : [
+            '-hide_banner', '-loglevel', 'error', '-y',
+            '-f', 'lavfi', '-i', `color=c=${color}:s=32x32:r=1:d=1`,
+            '-frames:v', '1', '-pix_fmt', 'rgba', imagePath
+          ];
+      const generated = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
+      assert.equal(generated.status, 0, generated.stderr);
+    }
+    await fsp.writeFile(assPath, createAss([]), 'utf8');
+    const avatarOverlay = {
+      panel: { left: 10, width: 120, height: 180 },
+      filterScriptPath,
+      entries: [
+        {
+          imagePath: redPath,
+          segments: [{ start: 1.1, end: 1.55, x1: 18, x2: 18, y1: 28, y2: 28 }]
+        },
+        {
+          imagePath: bluePath,
+          segments: [{ start: 1.6, end: 1.95, x1: 18, x2: 18, y1: 68, y2: 68 }]
+        }
+      ]
+    };
+    await fsp.writeFile(
+      filterScriptPath,
+      createAvatarOverlayFilterScript({ assPath, fps: 30, avatarOverlay, duration: 2, chunkDuration: 0.5 }),
+      'utf8'
+    );
+    const burned = await runCapturedProcess(
+      ffmpegPath,
+      createBurnArgs({
+        cleanPath: inputPath,
+        assPath,
+        burnedPath: outputPath,
+        codec: 'libx264',
+        crf: 20,
+        container: 'mp4',
+        fps: 30,
+        startTime: 1,
+        duration: 1,
+        avatarOverlay
+      }),
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(burned.status, 0, burned.stderr);
+    const outputInfo = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.ok(outputInfo.audioInfo, 'chunked avatar compositing must keep the source audio stream');
+
+    const samplePixel = async (time, x, y, label) => {
+      const rawPath = path.join(tempDir, `${label}.raw`);
+      const sampled = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(time), '-i', outputPath,
+          '-frames:v', '1', '-vf', `crop=1:1:${x}:${y},format=rgb24`, '-f', 'rawvideo', rawPath
+        ],
+        { timeoutMs: 20_000 }
+      );
+      assert.equal(sampled.status, 0, sampled.stderr);
+      return [...(await fsp.readFile(rawPath)).subarray(0, 3)];
+    };
+
+    assert.deepEqual(await samplePixel(0.2, 34, 44, 'red'), [252, 0, 0]);
+    assert.deepEqual(await samplePixel(0.8, 34, 84, 'blue'), [0, 0, 252]);
+    assert.deepEqual(await samplePixel(0.2, 34, 84, 'empty'), [0, 0, 0]);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('long avatar burns process each source-time chunk independently and keep A/V aligned', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-real-chunks-'));
+  const inputPath = path.join(tempDir, 'input.mp4');
+  const redPath = path.join(tempDir, 'red.png');
+  const bluePath = path.join(tempDir, 'blue.png');
+  const assPath = path.join(tempDir, 'overlay.ass');
+  const outputPath = path.join(tempDir, 'output.mp4');
+  try {
+    for (const [color, output] of [['red', redPath], ['blue', bluePath]]) {
+      const avatar = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner', '-loglevel', 'error', '-y',
+          '-f', 'lavfi', '-i', `color=c=${color}:s=32x32:r=1:d=1`,
+          '-frames:v', '1', '-pix_fmt', 'rgba', output
+        ],
+        { timeoutMs: 20_000 }
+      );
+      assert.equal(avatar.status, 0, avatar.stderr);
+    }
+    const input = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=30:d=3',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=3',
+        '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', inputPath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(input.status, 0, input.stderr);
+    await fsp.writeFile(assPath, createAss([]), 'utf8');
+    const service = new LiveRecordService();
+    service.ffmpegPath = ffmpegPath;
+    service.log = () => {};
+    const temporaryDir = await fsp.mkdtemp(path.join(tempDir, 'avatar-layer-'));
+    await service.runChunkedAvatarBurn({
+      cleanPath: inputPath,
+      assPath,
+      burnedPath: outputPath,
+      codec: 'libx264',
+      crf: 20,
+      startTime: 1,
+      duration: 2,
+      fps: 30,
+      avatarLayer: {
+        panel: { left: 10, width: 120, height: 180 },
+        temporaryDir,
+        chunkDuration: 0.5,
+        entries: [
+          { imagePath: redPath, segments: [{ start: 1.1, end: 1.5, x1: 18, x2: 18, y1: 28, y2: 28 }] },
+          { imagePath: bluePath, segments: [{ start: 2.1, end: 2.5, x1: 18, x2: 18, y1: 68, y2: 68 }] }
+        ]
+      },
+      onStderr: () => {}
+    });
+    const outputInfo = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.ok(outputInfo.videoInfo);
+    assert.ok(outputInfo.audioInfo);
+    assert.ok(Math.abs(outputInfo.durationSec - 2) < 0.15, JSON.stringify(outputInfo));
+    const timeline = await probeMediaTimelineInfo(ffmpegPath, outputPath, outputInfo);
+    assert.ok(Math.abs(timeline.avDeltaSec) < 0.08, JSON.stringify(timeline));
+
+    const samplePixel = async (time, x, y, label) => {
+      const rawPath = path.join(tempDir, `${label}.raw`);
+      const sampled = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(time), '-i', outputPath,
+          '-frames:v', '1', '-vf', `crop=1:1:${x}:${y},format=rgb24`, '-f', 'rawvideo', rawPath
+        ],
+        { timeoutMs: 20_000 }
+      );
+      assert.equal(sampled.status, 0, sampled.stderr);
+      return [...(await fsp.readFile(rawPath)).subarray(0, 3)];
+    };
+    assert.deepEqual(await samplePixel(0.2, 34, 44, 'red'), [252, 0, 0]);
+    assert.deepEqual(await samplePixel(1.2, 34, 84, 'blue'), [0, 0, 252]);
+    assert.deepEqual(await samplePixel(0.2, 34, 84, 'empty'), [0, 0, 0]);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('chunked burns preserve a source video lead-in instead of pulling video ahead of audio', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-av-lead-in-'));
+  const inputPath = path.join(tempDir, 'input.mp4');
+  const assPath = path.join(tempDir, 'overlay.ass');
+  const outputPath = path.join(tempDir, 'output.mp4');
+  try {
+    // Deliberately model a real fMP4/HLS capture: audio begins at t=0 while
+    // the first decodable video frame appears one second later.
+    const input = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'color=c=red:s=320x180:r=30:d=1',
+        '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=30:d=1',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=3',
+        '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0,setpts=PTS+1/TB[v]',
+        '-map', '[v]', '-map', '2:a', '-t', '3',
+        '-c:v', 'libx264', '-bf', '0', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-avoid_negative_ts', 'disabled', inputPath
+      ],
+      { timeoutMs: 20_000 }
+    );
+    assert.equal(input.status, 0, input.stderr);
+    await fsp.writeFile(assPath, createAss([]), 'utf8');
+
+    const service = new LiveRecordService();
+    service.ffmpegPath = ffmpegPath;
+    service.log = () => {};
+    const temporaryDir = await fsp.mkdtemp(path.join(tempDir, 'avatar-layer-'));
+    await service.runChunkedAvatarBurn({
+      cleanPath: inputPath,
+      assPath,
+      burnedPath: outputPath,
+      codec: 'libx264',
+      crf: 20,
+      startTime: 0,
+      duration: 3,
+      fps: 30,
+      avatarLayer: {
+        panel: { left: 10, width: 120, height: 180 },
+        temporaryDir,
+        chunkDuration: 1.5,
+        entries: []
+      },
+      timelineAlignment: { videoPaddingSec: 1, audioPaddingSec: 0 },
+      onStderr: () => {}
+    });
+
+    const outputInfo = await probeMediaFileInfo(ffmpegPath, outputPath);
+    assert.ok(outputInfo.videoInfo);
+    assert.ok(outputInfo.audioInfo);
+    assert.ok(Math.abs(outputInfo.durationSec - 3) < 0.15, JSON.stringify(outputInfo));
+    const timeline = await probeMediaTimelineInfo(ffmpegPath, outputPath, outputInfo);
+    assert.ok(Math.abs(timeline.avDeltaSec) < 0.12, JSON.stringify(timeline));
+
+    const samplePixel = async (time, label) => {
+      const rawPath = path.join(tempDir, `${label}.raw`);
+      const sampled = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(time), '-i', outputPath,
+          '-frames:v', '1', '-vf', 'crop=1:1:160:90,format=rgb24', '-f', 'rawvideo', rawPath
+        ],
+        { timeoutMs: 20_000 }
+      );
+      assert.equal(sampled.status, 0, sampled.stderr);
+      return [...(await fsp.readFile(rawPath)).subarray(0, 3)];
+    };
+    const isBlack = ([red, green, blue]) => red < 20 && green < 20 && blue < 20;
+    const isRed = ([red, green, blue]) => red > 180 && green < 70 && blue < 70;
+    const isBlue = ([red, green, blue]) => blue > 180 && red < 70 && green < 70;
+
+    assert.ok(isBlack(await samplePixel(0.5, 'lead-in')), 'the original video lead-in must remain black');
+    assert.ok(isRed(await samplePixel(1.2, 'red')), 'red source video must begin after the one-second lead-in');
+    assert.ok(isBlue(await samplePixel(2.2, 'blue')), 'later chunks must remain on the same source clock');
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
@@ -535,7 +836,66 @@ test('NVIDIA avatar composite keeps the full visual timeline on CUDA', () => {
   assert.doesNotMatch(script, /enable='between/);
   assert.equal(args[args.indexOf('-init_hw_device') + 1], 'cuda=br2k_avatar:0');
   assert.equal(args[args.indexOf('-filter_hw_device') + 1], 'br2k_avatar');
-  assert.equal(args[args.indexOf('-framerate') + 1], '1');
+  assert.equal(args.filter((arg) => arg === '-i').length, 1);
+  assert.match(script, /movie='C\\:\/temp\/avatar\.png'/);
+});
+
+test('CUDA avatar chunks download once before applying a CPU-only video lead-in', () => {
+  const script = createAvatarOverlayChunkFilterScript({
+    assPath: 'C:/temp/overlay.ass',
+    fps: 60,
+    avatarOverlay: {
+      panel: { left: 10, width: 120, height: 180 },
+      entries: [
+        {
+          imagePath: 'C:/temp/avatar.png',
+          segments: [{ start: 0.1, end: 1, x1: 18, x2: 18, y1: 28, y2: 56 }]
+        }
+      ]
+    },
+    chunkStart: 0,
+    chunkEnd: 2,
+    timelineOffset: 1,
+    leadingVideoPaddingSec: 1,
+    outputDuration: 2,
+    gpuComposite: true
+  });
+  assert.match(
+    script,
+    /scale_cuda=format=yuv420p,hwdownload,format=yuv420p,setpts=PTS-STARTPTS,tpad=start_duration=1:start_mode=add:color=black/
+  );
+});
+
+test('multiple static avatar inputs hold their first frame until their queue window', () => {
+  const entries = [
+    {
+      imagePath: 'C:/temp/avatar-first.png',
+      segments: [{ start: 0.1, end: 0.3, x1: 18, x2: 18, y1: 28, y2: 28 }]
+    },
+    {
+      imagePath: 'C:/temp/avatar-second.png',
+      segments: [{ start: 0.4, end: 0.6, x1: 18, x2: 18, y1: 68, y2: 68 }]
+    }
+  ];
+  for (const gpuComposite of [false, true]) {
+    const script = createAvatarOverlayFilterScript({
+      assPath: 'C:/temp/overlay.ass',
+      fps: 60,
+      avatarOverlay: {
+        panel: { left: 10, width: 120, height: 180 },
+        gpuComposite,
+        entries
+      }
+    });
+    const avatarOverlayLines = script
+      .split(/\r?\n/)
+      .filter((line) => /overlay(?:_cuda)?=/.test(line) && line.includes('[avatar_image_'));
+    assert.ok(avatarOverlayLines.length >= 2);
+    assert.ok(
+      avatarOverlayLines.every((line) => line.includes('eof_action=pass:repeatlast=1')),
+      `${gpuComposite ? 'CUDA' : 'CPU'} avatar layers must hold their static source frame`
+    );
+  }
 });
 
 test(

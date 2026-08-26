@@ -740,7 +740,10 @@ function createAvatarOverlayPlan(events, options = {}) {
   const maxEntries = Number.isFinite(configuredMaxEntries)
     ? Math.max(0, Math.floor(configuredMaxEntries))
     : Number.MAX_SAFE_INTEGER;
-  const maxSegmentsPerEntry = Math.floor(clamp(options.maxSegmentsPerEntry ?? 32, 1, 128));
+  // One FFmpeg overlay coordinate expression is a nested if-chain. Keep the
+  // public worker option bounded as well, so an older caller cannot recreate
+  // an expression that the FFmpeg evaluator rejects.
+  const maxSegmentsPerEntry = Math.floor(clamp(options.maxSegmentsPerEntry ?? 32, 1, 32));
   const panelLeft = Math.max(0, Number(style.panelLeft) || 0);
   const panelWidth = Math.max(1, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
   const panelHeight = Math.max(1, Number(style.superChatBottom) || DEFAULT_DANMAKU_STYLE.superChatBottom);
@@ -761,8 +764,14 @@ function createAvatarOverlayPlan(events, options = {}) {
 
   const timeline = createMessageTimeline(sorted, style, { includeDanmaku: true, sideStream: true });
   const candidates = [];
+  // A user can appear many times in one recording.  Collect all occurrences
+  // first, then pack only non-overlapping motion segments into the same
+  // FFmpeg layer.  The same bitmap may be visible in several cards at once;
+  // putting those overlapping occurrences in one layer would make one image
+  // try to occupy several positions and would also produce an enormous,
+  // invalid coordinate expression.
+  const segmentsByAvatar = new Map();
   for (const item of timeline.items) {
-    const entriesByAvatar = new Map();
     for (const segment of item.segments || []) {
       const event = segment.event || item.event || {};
       const avatarUrl = normalizeAvatarUrl(event.avatarUrl, item.event?.avatarUrl);
@@ -773,25 +782,15 @@ function createAvatarOverlayPlan(events, options = {}) {
       }
       const sourceKey = avatarUrl || `uid:${uid}`;
       const key = `${sourceKey}|${Math.round(placement.innerSize * 100)}`;
-      if (!entriesByAvatar.has(key)) {
-        const entry = {
-          id: `avatar-${candidates.length + 1}`,
+      if (!segmentsByAvatar.has(key)) {
+        segmentsByAvatar.set(key, {
           avatarUrl,
           uid: Number.isSafeInteger(uid) && uid > 0 ? uid : 0,
           size: placement.innerSize,
-          start: segment.start,
           segments: []
-        };
-        entriesByAvatar.set(key, entry);
-        candidates.push(entry);
+        });
       }
-      const entry = entriesByAvatar.get(key);
-      if (!entry) continue;
-      if (entry.segments.length >= maxSegmentsPerEntry) {
-        plan.truncated = true;
-        continue;
-      }
-      entry.segments.push({
+      segmentsByAvatar.get(key).segments.push({
         start: segment.start,
         end: segment.end,
         x1: placement.innerX1,
@@ -800,6 +799,39 @@ function createAvatarOverlayPlan(events, options = {}) {
         y2: placement.innerY2
       });
     }
+  }
+  for (const source of segmentsByAvatar.values()) {
+    const sourceEntries = [];
+    const orderedSegments = [...source.segments].sort(
+      (left, right) => left.start - right.start || left.end - right.end
+    );
+    for (const segment of orderedSegments) {
+      // Greedy interval packing keeps simultaneous cards on separate layers,
+      // while sequential appearances still share the already-rendered image.
+      let entry = sourceEntries.find(
+        (candidate) =>
+          candidate.segments.length < maxSegmentsPerEntry &&
+          segment.start >= candidate.lastEnd - 0.0001
+      );
+      if (!entry) {
+        entry = {
+          id: `avatar-${candidates.length + 1}`,
+          avatarUrl: source.avatarUrl,
+          uid: source.uid,
+          size: source.size,
+          start: segment.start,
+          lastEnd: Number.NEGATIVE_INFINITY,
+          segments: []
+        };
+        sourceEntries.push(entry);
+        candidates.push(entry);
+      }
+      entry.segments.push(segment);
+      entry.lastEnd = Math.max(entry.lastEnd, segment.end);
+    }
+  }
+  for (const entry of candidates) {
+    delete entry.lastEnd;
   }
   plan.candidateCount = candidates.length;
   if (candidates.length <= maxEntries) {

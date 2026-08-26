@@ -291,6 +291,36 @@ test('photo-avatar overlay samples a long side stream across its full duration r
   assert.equal(fullPlan.truncated, false);
 });
 
+test('photo-avatar overlay separates overlapping repeated sources without dropping later motion segments', () => {
+  const events = Array.from({ length: 5 }, (_unused, index) => ({
+    type: 'danmaku',
+    time: index * 100,
+    uid: 77,
+    user: '重复头像用户',
+    text: `第 ${index + 1} 条`,
+    avatarUrl: 'https://i0.hdslb.com/bfs/face/repeated.jpg'
+  }));
+  const fullPlan = createAvatarOverlayPlan(events, { stylePreset: 'bubble', maxSegmentsPerEntry: 128 });
+  assert.equal(fullPlan.candidateCount, 5, 'simultaneous side cards need independent image layers');
+  assert.equal(fullPlan.entries.length, 5);
+  assert.ok(fullPlan.entries[0].segments.some((segment) => segment.start >= 400));
+  assert.ok(
+    fullPlan.entries.every((entry) =>
+      entry.segments.every((segment, index) => index === 0 || segment.start >= entry.segments[index - 1].end - 0.0001)
+    ),
+    'one image layer must never contain overlapping card positions'
+  );
+
+  const chunkedPlan = createAvatarOverlayPlan(events, { stylePreset: 'bubble', maxSegmentsPerEntry: 2 });
+  assert.ok(chunkedPlan.candidateCount > 1, 'a full segment bucket starts a second layer for the same source');
+  assert.equal(
+    chunkedPlan.entries.reduce((count, entry) => count + entry.segments.length, 0),
+    fullPlan.entries.reduce((count, entry) => count + entry.segments.length, 0),
+    'splitting long source histories must preserve every segment'
+  );
+  assert.equal(chunkedPlan.truncated, false);
+});
+
 test('side presets shorten gift bars without shortening ordinary danmaku bars', () => {
   const gift = { type: 'gift', time: 1, uid: 11, user: '礼物用户', giftName: '小花', count: 1 };
   const chat = { type: 'danmaku', time: 1, uid: 12, user: '弹幕用户', text: '普通弹幕仍使用侧栏宽度' };

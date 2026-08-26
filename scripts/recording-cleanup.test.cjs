@@ -319,6 +319,17 @@ test('real-avatar mode preserves legacy high quality by default and normalizes a
   assert.equal(service.normalizeSettings({ ...service.settings, burnAvatarMode: 'unknown' }).burnAvatarMode, 'high');
 });
 
+test('large avatar plans fall back from CUDA compositing without reducing the high-quality plan', () => {
+  const service = new LiveRecordService();
+  service.ffmpegCapabilities = { cudaAvatarComposite: true };
+  service.settings.burnCodec = 'hevc_nvenc';
+  const entries = (count) => ({ entries: Array.from({ length: count }, () => ({})) });
+
+  assert.equal(service.shouldUseCudaAvatarComposite('hevc_nvenc', entries(48)), true);
+  assert.equal(service.shouldUseCudaAvatarComposite('hevc_nvenc', entries(49)), false);
+  assert.equal(service.shouldUseCudaAvatarComposite('libx265', entries(1)), false);
+});
+
 test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-delete-source-after-burn-'));
   const sourcePath = path.join(outputDir, 'session.clean.mp4');

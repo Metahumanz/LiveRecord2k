@@ -287,6 +287,62 @@ test('ASS generation runs successfully in the isolated worker process', async ()
   }
 });
 
+test('large avatar plans use a sidecar file instead of overflowing worker stdout', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-ass-avatar-plan-'));
+  const danmakuPath = path.join(tempDir, 'events.jsonl');
+  const cssPath = path.join(tempDir, 'style.css');
+  const assPath = path.join(tempDir, 'output.ass');
+  const avatarPlanPath = path.join(tempDir, 'avatar-plan.json');
+  const eventCount = 240;
+  try {
+    const events = Array.from({ length: eventCount }, (_, index) => ({
+      type: 'gift',
+      time: index * 2 + 1,
+      uid: index + 1,
+      user: `头像用户${index}`,
+      giftName: '礼物',
+      count: 1,
+      avatarUrl: `https://i0.hdslb.com/bfs/face/${String(index).padStart(4, '0')}-${'x'.repeat(1700)}.jpg`
+    }));
+    await Promise.all([
+      fsp.writeFile(danmakuPath, `${events.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8'),
+      fsp.writeFile(cssPath, createDefaultDanmakuCss(), 'utf8')
+    ]);
+    const result = await runCapturedProcess(
+      process.execPath,
+      [path.join(projectRoot, 'src/server/index.cjs'), '--ass-worker'],
+      {
+        input: JSON.stringify({
+          danmakuPath,
+          cssPath,
+          assPath,
+          avatarPlanPath,
+          overlayMode: 'danmaku-gift',
+          danmakuArea: 'half',
+          stylePreset: 'h5-card',
+          avatarOverlayMaxEntries: Number.MAX_SAFE_INTEGER,
+          avatarOverlayMaxSegmentsPerEntry: 128,
+          videoInfo: { width: 1920, height: 1080 }
+        }),
+        timeoutMs: 10000
+      }
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout);
+    assert.equal(response.ok, true);
+    assert.equal(response.avatarPlanStored, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(response, 'avatarPlan'), false);
+    assert.ok(Buffer.byteLength(result.stdout) < 4096);
+    const avatarPlan = JSON.parse(await fsp.readFile(avatarPlanPath, 'utf8'));
+    assert.ok(avatarPlan.entries.length >= eventCount, 'motion buckets may split one source into several safe layers');
+    assert.equal(new Set(avatarPlan.entries.map((entry) => entry.uid)).size, eventCount);
+    assert.ok(Buffer.byteLength(JSON.stringify(avatarPlan)) > 256 * 1024);
+    assert.ok((await fsp.stat(assPath)).isFile());
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test(
   'packaged Windows service can enter ASS worker mode',
   { skip: !fs.existsSync(path.join(projectRoot, 'release', 'webui', 'BiliRecord2K.Service.exe')) },
