@@ -38,7 +38,11 @@ jobs:
         run: npm ci
 
       - name: Run regression tests
-        run: npm test
+        # FFmpeg fixture tests are CPU-intensive. Running their files in
+        # parallel on a two-core hosted runner can make an individual media
+        # test exceed its own process timeout and leave the release blocked.
+        timeout-minutes: 15
+        run: npm run test:ci
 
       - name: Type-check and build frontend
         run: |
@@ -94,7 +98,8 @@ jobs:
         run: npm ci
 
       - name: Run Windows regression tests
-        run: npm test
+        timeout-minutes: 15
+        run: npm run test:ci
 
       - name: Build Windows packages
         env:
@@ -170,7 +175,8 @@ jobs:
         run: npm ci
 
       - name: Run Linux regression tests
-        run: npm test
+        timeout-minutes: 15
+        run: npm run test:ci
 
       - name: Build Linux packages
         run: npm run build:linux
