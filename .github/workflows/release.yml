@@ -42,7 +42,7 @@ jobs:
         # parallel on a two-core hosted runner can make an individual media
         # test exceed its own process timeout and leave the release blocked.
         timeout-minutes: 15
-        run: npm run test:ci
+        run: node --test --test-concurrency=1 --test-force-exit scripts/*.test.cjs
 
       - name: Type-check and build frontend
         run: |
@@ -99,7 +99,7 @@ jobs:
 
       - name: Run Windows regression tests
         timeout-minutes: 15
-        run: npm run test:ci
+        run: node --test --test-concurrency=1 --test-force-exit scripts/*.test.cjs
 
       - name: Build Windows packages
         env:
@@ -176,7 +176,7 @@ jobs:
 
       - name: Run Linux regression tests
         timeout-minutes: 15
-        run: npm run test:ci
+        run: node --test --test-concurrency=1 --test-force-exit scripts/*.test.cjs
 
       - name: Build Linux packages
         run: npm run build:linux
