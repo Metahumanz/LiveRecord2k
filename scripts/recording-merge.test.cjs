@@ -518,10 +518,10 @@ test('photo avatars are composed through a separate transparent side layer and k
         }
       ]
     };
-    const script = createAvatarOverlayFilterScript({ assPath, fps: 30, avatarOverlay });
-    assert.match(script, /color=c=black@0\.0:s=120x180:r=30,format=rgba/);
+    const script = createAvatarOverlayFilterScript({ assPath, fps: 30, avatarOverlay, duration: 1.2 });
+    assert.match(script, /color=c=black@0\.0:s=120x180:r=30:d=1\.2,format=rgba/);
     assert.match(script, /\[avatar_layer_0\]\[avatar_image_0\]overlay=/);
-    assert.match(script, /movie='[^']+',settb=AVTB,setpts=PTS-STARTPTS,format=rgba,loop=loop=-1:size=1:start=0/);
+    assert.match(script, /movie='[^']+',loop=loop=-1:size=1:start=0,trim=duration=1\.2,settb=AVTB,setpts=PTS-STARTPTS,format=rgba/);
     assert.match(script, /format=yuv420p\[vout\]/);
     await fsp.writeFile(filterScriptPath, script, 'utf8');
     const args = createBurnArgs({
@@ -532,6 +532,7 @@ test('photo avatars are composed through a separate transparent side layer and k
       crf: 24,
       container: 'mp4',
       fps: 30,
+      duration: 1.2,
       avatarOverlay
     });
     assert.ok(args.includes('-filter_complex_script'));
@@ -892,7 +893,7 @@ test('multiple static avatar inputs hold their first frame until their queue win
       .filter((line) => /overlay(?:_cuda)?=/.test(line) && line.includes('[avatar_image_'));
     assert.ok(avatarOverlayLines.length >= 2);
     assert.ok(
-      avatarOverlayLines.every((line) => line.includes('eof_action=pass:repeatlast=1')),
+      avatarOverlayLines.every((line) => line.includes('eof_action=repeat:repeatlast=1')),
       `${gpuComposite ? 'CUDA' : 'CPU'} avatar layers must hold their static source frame`
     );
   }

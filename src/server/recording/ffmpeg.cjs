@@ -58,6 +58,21 @@ function normalizeAvatarOverlayEntries(avatarOverlay) {
     .filter((entry) => entry.imagePath && entry.segments.length);
 }
 
+// `color` and a looped `movie` are infinite FFmpeg sources by default.  Keep
+// their lifetime bounded to the source-time range they can affect, otherwise
+// some FFmpeg builds keep waiting for the transparent side layer after the
+// real video has ended.
+function getAvatarLayerEnd(entries, duration, timelineOffset = 0, outputDuration = 0) {
+  const clockStart = Math.max(0, Number(timelineOffset) || 0);
+  const lastAvatarEnd = Math.max(
+    0,
+    ...entries.flatMap((entry) => entry.segments.map((segment) => Number(segment.end)).filter(Number.isFinite))
+  );
+  const requestedEnd = Math.max(0, Number(duration) || 0);
+  const outputEnd = clockStart + Math.max(0, Number(outputDuration) || 0);
+  return Math.max(clockStart + 0.001, lastAvatarEnd, requestedEnd, outputEnd);
+}
+
 function avatarMotionExpression(segments, axis, offset = 0) {
   const coordinateOne = axis === 'x' ? 'x1' : 'y1';
   const coordinateTwo = axis === 'x' ? 'x2' : 'y2';
@@ -208,6 +223,7 @@ function createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, e
   for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
     const chunkStart = chunkIndex * safeChunkDuration;
     const chunkEnd = Math.min(timelineDuration, (chunkIndex + 1) * safeChunkDuration);
+    const chunkLayerDuration = Math.max(0.001, chunkEnd - chunkStart);
     const chunkBase = `avatar_chunk_base_${chunkIndex}`;
     const chunkOutput = `avatar_chunk_output_${chunkIndex}`;
     outputLabels.push(`[${chunkOutput}]`);
@@ -225,7 +241,7 @@ function createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, e
 
     const firstLayer = `avatar_chunk_layer_${chunkIndex}_0`;
     filters.push(
-      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(
+      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps}:d=${formatFilterNumber(chunkLayerDuration)},format=rgba,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(
         chunkStart
       )}/TB[${firstLayer}]`
     );
@@ -237,14 +253,16 @@ function createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, e
       const start = Math.min(...entry.segments.map((segment) => segment.start));
       const end = Math.max(...entry.segments.map((segment) => segment.end));
       filters.push(
-        `movie='${escapeFilterPath(entry.imagePath)}',settb=AVTB,setpts=PTS-STARTPTS,format=rgba,loop=loop=-1:size=1:start=0[${imageLabel}]`
+        `movie='${escapeFilterPath(entry.imagePath)}',loop=loop=-1:size=1:start=0,trim=duration=${formatFilterNumber(
+          chunkLayerDuration
+        )},settb=AVTB,setpts=PTS-STARTPTS,format=rgba[${imageLabel}]`
       );
       filters.push(
         `[${previousLayer}][${imageLabel}]overlay=` +
           `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
           `y='${avatarMotionExpression(entry.segments, 'y')}':` +
           `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
-          `eof_action=pass:repeatlast=1:format=auto[${nextLayer}]`
+          `eof_action=repeat:repeatlast=1:format=auto[${nextLayer}]`
       );
       previousLayer = nextLayer;
     }
@@ -286,6 +304,8 @@ function createAvatarOverlayFilterScript({
     return createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, entries, duration, chunkDuration });
   }
   const sourceClockOffset = Math.max(0, Number(timelineOffset) || 0);
+  const layerEnd = getAvatarLayerEnd(entries, duration, sourceClockOffset, outputDuration);
+  const layerDuration = Math.max(0.001, layerEnd - sourceClockOffset);
   const panelClockFilter = sourceClockOffset
     ? `settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(sourceClockOffset)}/TB`
     : 'settb=AVTB,setpts=PTS-STARTPTS';
@@ -319,7 +339,9 @@ function createAvatarOverlayFilterScript({
   ];
   if (!gpuComposite) {
     filters.push(
-      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps},format=rgba,${panelClockFilter}[avatar_layer_0]`
+      `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps}:d=${formatFilterNumber(
+        layerDuration
+      )},format=rgba,${panelClockFilter}[avatar_layer_0]`
     );
   }
 
@@ -331,16 +353,16 @@ function createAvatarOverlayFilterScript({
     const start = Math.min(...entry.segments.map((segment) => segment.start));
     const end = Math.max(...entry.segments.map((segment) => segment.end));
     filters.push(
-      `movie='${escapeFilterPath(entry.imagePath)}',settb=AVTB,setpts=PTS-STARTPTS,format=rgba${
-        gpuComposite ? ',loop=loop=-1:size=1:start=0' : ',loop=loop=-1:size=1:start=0'
-      }${imageClockFilter}${gpuComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
+      `movie='${escapeFilterPath(entry.imagePath)}',loop=loop=-1:size=1:start=0,trim=duration=${formatFilterNumber(
+        layerDuration
+      )},settb=AVTB,setpts=PTS-STARTPTS,format=rgba${imageClockFilter}${gpuComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
     );
     if (gpuComposite) {
       filters.push(
         `[${previousLayer}][${imageLabel}]overlay_cuda=` +
           `x='${avatarGpuMotionExpression(entry.segments, 'x')}':` +
           `y='${avatarGpuMotionExpression(entry.segments, 'y')}':` +
-          `eof_action=pass:repeatlast=1[${nextLayer}]`
+          `eof_action=repeat:repeatlast=1[${nextLayer}]`
       );
     } else {
       filters.push(
@@ -348,7 +370,7 @@ function createAvatarOverlayFilterScript({
           `x='${avatarMotionExpression(entry.segments, 'x', panelLeft)}':` +
           `y='${avatarMotionExpression(entry.segments, 'y')}':` +
           `enable='between(t\\,${formatFilterNumber(start)}\\,${formatFilterNumber(end)})':` +
-          `eof_action=pass:repeatlast=1:format=auto[${nextLayer}]`
+          `eof_action=repeat:repeatlast=1:format=auto[${nextLayer}]`
       );
     }
   }
