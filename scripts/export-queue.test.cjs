@@ -67,6 +67,7 @@ test('a dequeued export remains visible while subtitles and avatars are being pr
       };
     };
 
+    service.settings.burnCodec = 'libx264';
     const queued = await service.exportClip({
       recording: { cleanPath: inputPath, danmakuPath },
       mode: 'burn',
@@ -74,12 +75,14 @@ test('a dequeued export remains visible while subtitles and avatars are being pr
       endTime: 1,
       outputPath
     });
+    service.settings.burnCodec = 'libx265';
     assert.equal(queued.queued, true);
     await waitFor(() => service.exportProgress?.status === 'running' && service.exportProgress?.message === '正在生成字幕');
     assert.equal(service.exportQueue.length, 0, 'the task has left the waiting list only because it is now visible as current');
     assert.match(service.exportProgress.label, /导出烧录片段/);
     assert.equal(queuedRequest?.recording?.timelineHealth?.firstVideoPts, 1.03);
     assert.equal(queuedRequest?.recording?.timelineHealth?.firstAudioPts, 0);
+    assert.equal(queuedRequest?.codec, 'libx264', 'queued export keeps the codec selected when it was enqueued');
 
     await service.cancelExportClip();
     assert.equal(service.exportProgress.message, '正在取消准备中的导出');

@@ -39,7 +39,6 @@ const {
   createClipCopyArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
-  createAudioAlignArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
   assertSafeMergeTargetProfile,
@@ -256,12 +255,13 @@ const UNLIMITED_AVATAR_OVERLAY_ENTRIES = Number.MAX_SAFE_INTEGER;
 // motion expression small; this is an internal layer split and does not limit
 // the number of avatars retained by high-quality mode.
 const MAX_AVATAR_OVERLAY_SEGMENTS_PER_ENTRY = 32;
-// overlay_cuda allocates a full filter surface for every chained layer.  Keep
-// the fast path bounded; high-quality mode still keeps every avatar, but large
-// recordings use the CPU compositor instead of failing halfway through with
-// CUDA_ERROR_OUT_OF_MEMORY.
+// overlay_cuda allocates a full filter surface for every chained layer. Keep
+// each CUDA chunk bounded and shorten dense chunks before falling back to CPU,
+// otherwise a busy minute can either exhaust VRAM or unnecessarily lose the
+// hardware path for the whole minute.
 const MAX_CUDA_AVATAR_OVERLAY_ENTRIES = 48;
 const AVATAR_OVERLAY_CHUNK_SECONDS = 60;
+const MIN_CUDA_AVATAR_CHUNK_SECONDS = 5;
 // Seek a little before each independent avatar chunk, then discard accurately
 // to its true source-time boundary.  This prevents a long-GOP keyframe before
 // the requested position from leaking into the next concatenated chunk.
@@ -284,6 +284,10 @@ const MEDIA_PROGRESS_BACKWARD_TOLERANCE_SEC = 0.75;
 // never advances its media clock.  Merge jobs are deliberately watched more
 // patiently than live recording, then retried from the preserved source files.
 const MERGE_PROGRESS_STALL_TIMEOUT_MS = 2 * 60 * 1000;
+const MERGE_FIRST_MEDIA_TIMEOUT_MS = 30 * 1000;
+const MERGE_REPEATED_DECODE_ERROR_GRACE_MS = 6 * 1000;
+const MERGE_REPEATED_DECODE_ERROR_LIMIT = 12;
+const MERGE_CORRUPT_PREFIX_RECOVERY_SEEK_SEC = 5;
 const MERGE_RETRY_DELAYS_MS = [30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000];
 const MERGE_STARTUP_RETRY_DELAY_MS = 15 * 1000;
 const MERGE_STAGE_HEARTBEAT_MS = 1000;
@@ -524,6 +528,36 @@ function isFfmpegMemoryPressureError(error) {
   );
 }
 
+function countRepeatedVideoDecodeErrors(text) {
+  return (
+    String(text || '').match(
+      /(?:duplicate poc in a sequence|error parsing nal unit|invalid nal unit|error submitting packet to decoder)/gi
+    ) || []
+  ).length;
+}
+
+function isFfmpegVideoDecodeError(error) {
+  if (error?.code === 'FFMPEG_DECODE_STALL' || error?.code === 'FFMPEG_NO_PROGRESS') return true;
+  const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
+  return /(?:duplicate poc in a sequence|error parsing nal unit|invalid nal unit|error submitting packet to decoder)/i.test(
+    detail
+  );
+}
+
+function isFfmpegHardwareDecodeError(error) {
+  const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
+  return /(?:hwaccel|hardware accelerator|hardware decoding|no device available for decoder|device setup failed|failed setup for format|failed to initialise|failed to initialize|error while decoding|failed to decode|decoder.*(?:failed|error)|cuvid|nvdec|d3d11va|dxva2|qsv.*(?:decode|device|session)|vaapi.*(?:decode|device|display)|cannot load nvcuda|cuda_error|unsupported.*(?:surface|pixel format))/i.test(
+    detail
+  );
+}
+
+function isFfmpegHardwareEncodeError(error) {
+  const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
+  return /(?:nvenc|qsv|amf|no capable devices|cannot load nvcuda|initializeencoder|initialiseencoder|error while opening encoder|failed to create.*(?:encoder|session)|hardware encoder)/i.test(
+    detail
+  );
+}
+
 function finiteTimelineValue(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
@@ -562,10 +596,22 @@ function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
     if (!Number.isFinite(value) || value <= 0) return 0;
     return clipDuration > 0 ? Math.min(value, clipDuration) : value;
   };
-  // Do not manufacture a lead-in for video-only sources.  With both streams,
-  // each track keeps any real source-side initial silence after clipping.
-  const videoPaddingSec = firstAudioPts !== null ? capPadding(Number(firstVideoPts) - clipStart) : 0;
-  const audioPaddingSec = firstVideoPts !== null ? capPadding(Number(firstAudioPts) - clipStart) : 0;
+  // Do not use absolute packet PTS as padding: some HLS/fMP4 inputs start at
+  // a non-zero timestamp.  Only the *relative* audio/video start offset is
+  // meaningful after filters reset each track to zero.  Preserve that offset
+  // with black video or silence so reconnect boundaries stay in sync.
+  const relativeVideoStart = firstVideoPts !== null ? Math.max(0, Number(firstVideoPts) - clipStart) : null;
+  const relativeAudioStart = firstAudioPts !== null ? Math.max(0, Number(firstAudioPts) - clipStart) : null;
+  const sharedStart =
+    relativeVideoStart !== null && relativeAudioStart !== null
+      ? Math.min(relativeVideoStart, relativeAudioStart)
+      : 0;
+  const videoPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null
+    ? capPadding(relativeVideoStart - sharedStart)
+    : 0;
+  const audioPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null
+    ? capPadding(relativeAudioStart - sharedStart)
+    : 0;
   return {
     videoPaddingSec,
     audioPaddingSec,
@@ -573,6 +619,27 @@ function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
     firstVideoPts,
     firstAudioPts
   };
+}
+
+// AAC is natively valid in both MP4 and MKV. For a whole-recording burn, keep
+// it packet-for-packet instead of decoding/re-encoding it: the source audio
+// clock is already known-good and this also saves a large CPU-only pass.
+function canCopyWholeSourceAudio(mediaInfo, startTime, duration, timelineAlignment) {
+  const sourceDuration = Math.max(0, Number(mediaInfo?.durationSec) || 0);
+  const audioCodec = String(mediaInfo?.audioInfo?.codec || '').toLowerCase();
+  const firstAudioPts = Number(timelineAlignment?.firstAudioPts);
+  const firstVideoPts = Number(timelineAlignment?.firstVideoPts);
+  return Boolean(
+    sourceDuration > 0 &&
+      /(?:^|\W)aac(?:\W|$)/.test(audioCodec) &&
+      Math.max(0, Number(startTime) || 0) <= 0.001 &&
+      Number(duration) >= sourceDuration - 0.1 &&
+      Number.isFinite(firstAudioPts) &&
+      Number.isFinite(firstVideoPts) &&
+      Math.abs(firstAudioPts) <= 0.001 &&
+      Math.abs(firstVideoPts) <= 0.001 &&
+      Math.max(0, Number(timelineAlignment?.audioPaddingSec) || 0) <= 0.0005
+  );
 }
 
 // Deciding whether copy-concat is safe must use timing as well as codec,
@@ -749,12 +816,14 @@ class LiveRecordService {
       burnCodecs: BURN_CODEC_CANDIDATES.filter((codec) => codec.kind === 'software'),
       unavailableBurnCodecs: [],
       hwaccels: [],
+      hardwareDecoders: [],
       videoAdapters: [],
       cudaAvatarComposite: false,
       cudaAvatarCompositeReason: '',
       probedAt: 0,
       probeError: ''
     };
+    this.runtimeCapabilitiesPromise = null;
     this.settings = this.normalizeSettings(this.settings);
   }
 
@@ -826,12 +895,7 @@ class LiveRecordService {
     });
     this.log('success', `WebUI 后端已启动，ffmpeg: ${this.ffmpegPath}`);
     this.log('info', '正在后台探测 ffmpeg、显卡能力和录像库。');
-    setImmediate(() => {
-      this.initializeRuntimeCapabilities().catch((error) => {
-        this.log('warn', `后台能力探测失败：${error.message}`);
-        this.emitState();
-      });
-    });
+    this.startRuntimeCapabilitiesProbe();
     setImmediate(() => {
       this.initializeRecordingLibrary().catch((error) => {
         this.log('warn', `后台扫描录像库失败：${error.message}`);
@@ -962,6 +1026,22 @@ class LiveRecordService {
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     this.log('info', `当前弹幕版编码：${this.getBurnCodecInfo(this.settings.burnCodec).label}（${this.settings.burnCodec}）`);
+    const hardwareDecoderSummary = ['h264', 'hevc']
+      .map((codec) => {
+        const labels = [
+          ...new Set(
+            (this.ffmpegCapabilities.hardwareDecoders || [])
+              .filter((decoder) => decoder.codec === codec)
+              .map((decoder) => decoder.label)
+          )
+        ];
+        return `${codec.toUpperCase()} ${labels.join('、') || '不可用'}`;
+      })
+      .join('；');
+    this.log(
+      (this.ffmpegCapabilities.hardwareDecoders || []).length ? 'info' : 'warn',
+      `可用硬件解码：${hardwareDecoderSummary}`
+    );
     this.log(
       this.ffmpegCapabilities.cudaAvatarComposite ? 'info' : 'warn',
       this.ffmpegCapabilities.cudaAvatarComposite
@@ -971,6 +1051,23 @@ class LiveRecordService {
           }`
     );
     this.emitState();
+  }
+
+  startRuntimeCapabilitiesProbe() {
+    if (this.runtimeCapabilitiesPromise) return this.runtimeCapabilitiesPromise;
+    this.runtimeCapabilitiesPromise = this.initializeRuntimeCapabilities().catch((error) => {
+      this.log('warn', `后台能力探测失败，将使用软件兼容路径：${error.message}`);
+      this.emitState();
+      return this.ffmpegCapabilities;
+    });
+    return this.runtimeCapabilitiesPromise;
+  }
+
+  async waitForRuntimeCapabilities() {
+    if (this.runtimeCapabilitiesPromise) {
+      await this.runtimeCapabilitiesPromise;
+    }
+    return this.ffmpegCapabilities;
   }
 
   async loadStore() {
@@ -1133,7 +1230,7 @@ class LiveRecordService {
   }
 
   normalizeSettings(settings) {
-    const burnCodec = this.ffmpegCapabilities
+    const burnCodec = Number(this.ffmpegCapabilities?.probedAt || 0) > 0
       ? this.chooseBurnCodec(settings.burnCodec)
       : normalizeBurnCodec(settings.burnCodec);
     return {
@@ -1213,6 +1310,60 @@ class LiveRecordService {
       BURN_CODEC_CANDIDATES.find((option) => option.value === value) ||
       { value, label: value || '未知编码', kind: 'software' }
     );
+  }
+
+  getPreviewCodec() {
+    const available = new Set(this.getAvailableBurnCodecs());
+    return ['h264_nvenc', 'h264_qsv', 'h264_amf', 'libx264'].find((codec) => available.has(codec)) || 'libx264';
+  }
+
+  getHardwareDecoder(videoInfo, encoderCodec = '') {
+    const sourceCodec = isHevcCodec(videoInfo?.codec)
+      ? 'hevc'
+      : /(?:^|[^a-z])(?:h264|avc)(?:[^a-z]|$)/i.test(String(videoInfo?.codec || ''))
+        ? 'h264'
+        : '';
+    const software = { value: 'software', label: 'CPU', kind: 'software', codec: sourceCodec };
+    if (!sourceCodec) return software;
+    const available = (this.ffmpegCapabilities?.hardwareDecoders || []).filter(
+      (decoder) => decoder.codec === sourceCodec
+    );
+    if (!available.length) return software;
+    const codec = String(encoderCodec || '');
+    const preference = codec.includes('nvenc')
+      ? ['cuda', 'd3d11va', 'dxva2', 'qsv', 'vaapi']
+      : codec.includes('qsv')
+        ? ['qsv', 'd3d11va', 'dxva2', 'vaapi', 'cuda']
+        : codec.includes('amf')
+          ? ['d3d11va', 'dxva2', 'vaapi', 'cuda', 'qsv']
+          : ['cuda', 'qsv', 'd3d11va', 'dxva2', 'vaapi'];
+    const selected = preference.map((value) => available.find((decoder) => decoder.value === value)).find(Boolean);
+    return selected ? { ...selected, kind: 'hardware' } : software;
+  }
+
+  getTranscodeResource(codec, videoInfo) {
+    const encoder = String(codec || '').trim();
+    const hardwareEncoder = Boolean(encoder) && !encoder.includes('libx');
+    const hasKnownVideoCodec = Boolean(String(videoInfo?.codec || '').trim());
+    const hardwareDecoder = hasKnownVideoCodec
+      ? this.getHardwareDecoder(videoInfo, codec).kind === 'hardware'
+      : (this.ffmpegCapabilities?.hardwareDecoders || []).length > 0;
+    return hardwareEncoder || hardwareDecoder ? 'hybrid' : 'cpu';
+  }
+
+  setProgressDecoder(progress, decoder, options = {}) {
+    if (!progress || !decoder) return;
+    progress.decoder = decoder.value;
+    progress.decoderKind = decoder.kind;
+    progress.decoderLabel = decoder.label;
+    if (options.reset) {
+      progress.workStartedAt = Date.now();
+      progress.currentTimeSec = 0;
+      progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
+      progress.estimatedRemainingSec = null;
+      if (options.message) progress.message = options.message;
+    }
+    progress.updatedAt = Date.now();
   }
 
   shouldUseCudaAvatarComposite(codec, avatarPlan) {
@@ -3181,11 +3332,20 @@ try {
 
     const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, sourcePath);
     const durationSec = await this.resolveRecordingDuration({ cleanPath: sourcePath }, mediaInfo).catch(() => mediaInfo.durationSec || 0);
+    await this.waitForRuntimeCapabilities();
+    const previewCodec = this.getPreviewCodec();
+    const previewCodecInfo = this.getBurnCodecInfo(previewCodec);
+    const previewDecoder = this.getHardwareDecoder(mediaInfo.videoInfo, previewCodec);
     const progress = createFfmpegJobProgress({
       kind: 'preview',
       label: `生成兼容预览：${path.basename(sourcePath)}`,
       outputPath: sourcePath,
-      durationSec
+      durationSec,
+      codec: previewCodec,
+      codecKind: previewCodecInfo.kind,
+      decoder: previewDecoder.value,
+      decoderKind: previewDecoder.kind,
+      decoderLabel: previewDecoder.label
     });
     clearTimeout(this.exportPreviewClearTimer);
     this.exportPreviewProgress = progress;
@@ -3199,35 +3359,84 @@ try {
       updatedAt: Date.now()
     };
     this.emitState();
-    this.log('info', `正在生成 H.264 兼容预览：${path.basename(sourcePath)}`);
+    this.log(
+      'info',
+      `正在生成 H.264 兼容预览：${path.basename(sourcePath)}（${
+        previewCodecInfo.kind === 'hardware' ? '硬件' : '软件'
+      }编码 ${previewCodec}，${previewDecoder.kind === 'hardware' ? `${previewDecoder.label} 硬件解码` : 'CPU 解码'}）`
+    );
     const previewLease = await this.mediaJobs.acquire({
       id: progress.id,
       type: 'preview',
-      resource: 'cpu',
+      resource: this.getTranscodeResource(previewCodec, mediaInfo.videoInfo),
       cancel: () => this.cancelExportPreview({ silent: true }).catch(() => {})
     });
 
-    runFfmpegJob(
-      this.ffmpegPath,
-      createPreviewHlsArgs({
-        inputPath: sourcePath,
-        playlistPath: workingPlaylistPath,
-        segmentPattern: path.join(workingPreviewDir, 'segment_%05d.ts')
-      }),
-      (line) => {
-        if (this.exportPreviewProgress?.id === progress.id && updateFfmpegJobProgress(this.exportPreviewProgress, line)) {
+    const handlePreviewStderr = (line) => {
+      if (this.exportPreviewProgress?.id === progress.id && updateFfmpegJobProgress(this.exportPreviewProgress, line)) {
+        this.emitState();
+      }
+      if (/error|failed|invalid/i.test(line)) {
+        this.log('warn', `兼容预览：${compactLogLine(line)}`);
+      }
+    };
+    const runPreviewWithFallback = async () => {
+      let activeCodec = previewCodec;
+      let activeDecoder = previewDecoder;
+      for (;;) {
+        try {
+          await runFfmpegJob(
+            this.ffmpegPath,
+            createPreviewHlsArgs({
+              inputPath: sourcePath,
+              playlistPath: workingPlaylistPath,
+              segmentPattern: path.join(workingPreviewDir, 'segment_%05d.ts'),
+              codec: activeCodec,
+              decoder: activeDecoder.value
+            }),
+            handlePreviewStderr,
+            {
+              onChild: (child) => {
+                this.exportPreviewProcess = child;
+              }
+            }
+          );
+          return;
+        } catch (error) {
+          if (this.exportPreviewProgress?.id !== progress.id || this.exportPreviewProgress.status !== 'running') {
+            throw error;
+          }
+          if (activeDecoder.kind === 'hardware' && isFfmpegHardwareDecodeError(error)) {
+            this.log(
+              'warn',
+              `兼容预览的 ${activeDecoder.label} 硬件解码不支持当前视频，立即改用 CPU 解码：${compactLogLine(error.message)}`
+            );
+            activeDecoder = { value: 'software', label: 'CPU', kind: 'software' };
+          } else if (!activeCodec.includes('libx') && isFfmpegHardwareEncodeError(error)) {
+            this.log(
+              'warn',
+              `兼容预览的硬件 H.264 编码不可用，立即改用 libx264：${compactLogLine(error.message)}`
+            );
+            activeCodec = 'libx264';
+            activeDecoder = { value: 'software', label: 'CPU', kind: 'software' };
+          } else {
+            throw error;
+          }
+          progress.codec = activeCodec;
+          progress.codecKind = activeCodec.includes('libx') ? 'software' : 'hardware';
+          this.setProgressDecoder(progress, activeDecoder);
+          progress.currentTimeSec = 0;
+          progress.percent = durationSec > 0 ? 0 : null;
+          progress.estimatedRemainingSec = null;
+          progress.message = '正在使用兼容路径重新生成预览';
           this.emitState();
-        }
-        if (/error|failed|invalid/i.test(line)) {
-          this.log('warn', `兼容预览：${compactLogLine(line)}`);
-        }
-      },
-      {
-        onChild: (child) => {
-          this.exportPreviewProcess = child;
+          await fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
+          await fsp.mkdir(workingPreviewDir, { recursive: true });
         }
       }
-    )
+    };
+
+    runPreviewWithFallback()
       .then(async () => {
         if (this.exportPreviewProgress?.id !== progress.id) {
           return;
@@ -3254,6 +3463,9 @@ try {
       })
       .catch((error) => {
         if (this.exportPreviewProgress?.id !== progress.id) {
+          return;
+        }
+        if (this.exportPreviewProgress.status === 'cancelled') {
           return;
         }
         if (this.exportPreviewProgress?.id === progress.id) {
@@ -5903,7 +6115,14 @@ try {
 
   scheduleMergeRetry(room, mergeGroup, fallbackRecording, error, options = {}) {
     const groupId = String(mergeGroup || '').trim();
-    if (!room?.id || !groupId || this.draining || this.mergeCancelRequests.has(room.id) || isFfmpegMemoryPressureError(error)) {
+    if (
+      !room?.id ||
+      !groupId ||
+      this.draining ||
+      this.mergeCancelRequests.has(room.id) ||
+      isFfmpegMemoryPressureError(error) ||
+      error?.code === 'MERGE_SEGMENT_UNDECODABLE'
+    ) {
       if (room?.id && groupId) this.clearMergeRetryState(room.id, groupId);
       return false;
     }
@@ -6085,10 +6304,12 @@ try {
 
   getMergeMediaWaitDetails(resource, progressId) {
     const jobs = this.mediaJobs.snapshot();
-    const queued = jobs.filter((job) => job.status === 'queued' && job.resource === resource);
+    const resourceSlots = (value) => (value === 'hybrid' ? ['cpu', 'gpu'] : [value]);
+    const overlaps = (left, right) => resourceSlots(left).some((slot) => resourceSlots(right).includes(slot));
+    const queued = jobs.filter((job) => job.status === 'queued' && overlaps(job.resource, resource));
     const ownIndex = queued.findIndex((job) => job.id === progressId);
     const recordingLabels =
-      resource === 'cpu' || resource === 'gpu'
+      resource === 'cpu' || resource === 'gpu' || resource === 'hybrid'
         ? [
             ...new Set(
               jobs
@@ -6098,7 +6319,8 @@ try {
           ]
         : [];
     const activeSameResource = jobs.filter(
-      (job) => job.status === 'running' && job.resource === resource && job.id !== progressId && job.type !== 'recording'
+      (job) =>
+        job.status === 'running' && overlaps(job.resource, resource) && job.id !== progressId && job.type !== 'recording'
     );
     return {
       queuePosition: ownIndex >= 0 ? ownIndex + 1 : 1,
@@ -6113,7 +6335,8 @@ try {
     }
     const elapsedSec = Math.max(0, Math.floor((Date.now() - Number(queuedAt || Date.now())) / 1000));
     const details = this.getMergeMediaWaitDetails(resource, progress.id);
-    const resourceLabel = resource === 'gpu' ? 'GPU' : resource === 'cpu' ? 'CPU' : resource.toUpperCase();
+    const resourceLabel =
+      resource === 'hybrid' ? 'CPU/GPU' : resource === 'gpu' ? 'GPU' : resource === 'cpu' ? 'CPU' : resource.toUpperCase();
     const waits = [];
     if (details.recordingLabels.length) {
       waits.push(`录制优先：${details.recordingLabels.join('、')}`);
@@ -6134,7 +6357,11 @@ try {
   }
 
   async acquireMergeMediaLease(room, progress, mergeEncoderPlan) {
-    const resource = mergeEncoderPlan.preferred.includes('libx') ? 'cpu' : 'gpu';
+    const resource = mergeEncoderPlan.requiresTranscode
+      ? mergeEncoderPlan.usesHardwareDecoder || !mergeEncoderPlan.preferred.includes('libx')
+        ? 'hybrid'
+        : 'cpu'
+      : 'cpu';
     const queuedAt = Date.now();
     const leasePromise = this.mediaJobs.acquire({
       id: progress.id,
@@ -6236,7 +6463,6 @@ try {
     const outputPath = segments[0].mergeOutputPath || deriveSiblingPath(segments[0].cleanPath, 'merged');
     const container = getContainerFromPath(outputPath);
     const tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
-    const syncTmpPath = replaceExtension(outputPath, `.sync.tmp.${container}`);
     const concatPath = replaceExtension(outputPath, '.concat.txt');
     const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
     const avatarManifestPath = deriveAvatarManifestPath(outputPath);
@@ -6366,6 +6592,10 @@ try {
       .map((assessment, index) => (assessment.requiresNormalization ? '#' + (index + 1) + ' ' + assessment.reason : ''))
       .filter(Boolean);
     const requiresTranscode = streamSpecsChanged || timingRequiresNormalization;
+    // Tracks whether this merge has already used the timestamp-preserving
+    // normalizer. A copy concat that fails final timing validation gets one
+    // safe retry; we never "fix" it later by warping the completed audio.
+    let usedTimelinePreservingNormalization = requiresTranscode;
     const mergePlanReason = [
       streamSpecsChanged ? '分辨率、帧率或编码规格变化' : '',
       timingRequiresNormalization ? '单段音画时间轴风险（' + timingIssueSummary.join('；') + '）' : ''
@@ -6373,7 +6603,14 @@ try {
       .filter(Boolean)
       .join('；');
     assertSafeMergeTargetProfile(segmentMediaInfos, targetVideoInfo, { requiresVideoTranscode: requiresTranscode });
+    await this.waitForRuntimeCapabilities();
     const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
+    mergeEncoderPlan.requiresTranscode = requiresTranscode;
+    mergeEncoderPlan.usesHardwareDecoder =
+      requiresTranscode &&
+      segmentMediaInfos.some(
+        (mediaInfo) => this.getHardwareDecoder(mediaInfo?.videoInfo, mergeEncoderPlan.preferred).kind === 'hardware'
+      );
     progress.codec = mergeEncoderPlan.preferred;
     progress.codecKind = mergeEncoderPlan.preferred.includes('libx') ? 'software' : 'hardware';
     const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
@@ -6435,7 +6672,6 @@ try {
     this.emitState();
     try {
       await fsp.rm(tmpPath, { force: true });
-      await fsp.rm(syncTmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
       await fsp.rm(cssTmpPath, { force: true });
       const mergeSoftwareThreads = Math.max(1, Math.min(2, Math.floor((os.cpus()?.length || 4) / 2)));
@@ -6446,14 +6682,57 @@ try {
         const stageLabel = String(options.stageLabel || '合并处理');
         const segmentDurationSec = Math.max(0, Number(options.segmentDurationSec || 0));
         const stageStartedAt = Date.now();
+        let child = null;
         let sawMediaProgress = false;
+        let lastMediaProgressSec = Number.NEGATIVE_INFINITY;
+        let lastMediaProgressAt = stageStartedAt;
+        let repeatedDecodeErrorCount = 0;
+        let firstRepeatedDecodeErrorAt = 0;
+        let lastDecodeWarningAt = 0;
+        let forcedFfmpegError = null;
         let lastStageProgressEmitAt = 0;
+        const stopStalledAttempt = (code, message) => {
+          if (forcedFfmpegError) return;
+          forcedFfmpegError = new Error(message);
+          forcedFfmpegError.code = code;
+          forcedFfmpegError.ffmpegNoProgress = true;
+          forcedFfmpegError.ffmpegLastProgressValue = Number.isFinite(lastMediaProgressSec)
+            ? lastMediaProgressSec
+            : null;
+          if (room.mergeProgress?.id === progress.id) {
+            room.mergeProgress.message = message;
+            room.mergeProgress.updatedAt = Date.now();
+          }
+          this.log('error', `${roomLabel(room)} ${message}`);
+          this.emitState();
+          requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+        };
         const updateWaitingForMedia = () => {
           if (sawMediaProgress || room.mergeProgress?.id !== progress.id) return;
-          const elapsedSec = Math.max(0, Math.floor((Date.now() - stageStartedAt) / 1000));
+          const now = Date.now();
+          const elapsedMs = Math.max(0, now - stageStartedAt);
+          const elapsedSec = Math.floor(elapsedMs / 1000);
+          if (
+            repeatedDecodeErrorCount >= MERGE_REPEATED_DECODE_ERROR_LIMIT &&
+            now - Math.max(lastMediaProgressAt, firstRepeatedDecodeErrorAt || 0) >= MERGE_REPEATED_DECODE_ERROR_GRACE_MS
+          ) {
+            stopStalledAttempt(
+              'FFMPEG_DECODE_STALL',
+              `${stageLabel}连续遇到 ${repeatedDecodeErrorCount} 次视频解码错误且没有生成画面，已终止当前尝试，正在切换兼容解码。`
+            );
+            return;
+          }
+          if (elapsedMs >= MERGE_FIRST_MEDIA_TIMEOUT_MS) {
+            stopStalledAttempt(
+              'FFMPEG_NO_PROGRESS',
+              `${stageLabel}等待 ${Math.ceil(MERGE_FIRST_MEDIA_TIMEOUT_MS / 1000)} 秒仍未生成首帧，已终止当前尝试。`
+            );
+            return;
+          }
+          if (forcedFfmpegError) return;
           room.mergeProgress.stageLabel = stageLabel;
           room.mergeProgress.stageStartedAt = stageStartedAt;
-          room.mergeProgress.updatedAt = Date.now();
+          room.mergeProgress.updatedAt = now;
           room.mergeProgress.message =
             stageLabel + '，等待首个媒体时间戳' + (elapsedSec >= 2 ? '（已用' + formatDurationSeconds(elapsedSec) + '）' : '');
           this.emitState();
@@ -6461,61 +6740,82 @@ try {
         updateWaitingForMedia();
         const firstProgressHeartbeat = setInterval(updateWaitingForMedia, MERGE_STAGE_HEARTBEAT_MS);
         firstProgressHeartbeat.unref?.();
-        let child = null;
         try {
-          await runFfmpegJob(this.ffmpegPath, args, (line) => {
-            const processedSec = parseFfmpegProgressTime(line);
-            if (Number.isFinite(processedSec) && room.mergeProgress?.id === progress.id) {
-              sawMediaProgress = true;
-              const localProgressLabel =
-                segmentDurationSec > 0
-                  ? `${stageLabel} · 本段 ${formatDurationSeconds(Math.min(segmentDurationSec, Math.max(0, processedSec)))} / ${formatDurationSeconds(segmentDurationSec)}`
-                  : stageLabel;
-              room.mergeProgress.stageLabel = localProgressLabel;
-              room.mergeProgress.stageStartedAt = stageStartedAt;
-            }
-            if (trackProgress && room.mergeProgress?.id === progress.id) {
-              const progressLine = Number.isFinite(processedSec)
-                ? `time=${formatFfmpegSeconds(progressOffsetSec + Math.max(0, processedSec))}`
-                : line;
-              if (updateFfmpegJobProgress(room.mergeProgress, progressLine)) {
-                this.emitState();
-              }
-            } else if (Number.isFinite(processedSec) && room.mergeProgress?.id === progress.id) {
+          try {
+            await runFfmpegJob(this.ffmpegPath, args, (line) => {
               const now = Date.now();
-              if (now - lastStageProgressEmitAt >= 500) {
-                lastStageProgressEmitAt = now;
-                room.mergeProgress.message =
-                  (segmentDurationSec > 0
+              const processedSec = parseFfmpegProgressTime(line);
+              if (Number.isFinite(processedSec) && processedSec > lastMediaProgressSec + 0.0001) {
+                lastMediaProgressSec = processedSec;
+                lastMediaProgressAt = now;
+                repeatedDecodeErrorCount = 0;
+                firstRepeatedDecodeErrorAt = 0;
+              }
+              if (Number.isFinite(processedSec) && processedSec > 0.0001 && room.mergeProgress?.id === progress.id) {
+                sawMediaProgress = true;
+                const localProgressLabel =
+                  segmentDurationSec > 0
                     ? `${stageLabel} · 本段 ${formatDurationSeconds(Math.min(segmentDurationSec, Math.max(0, processedSec)))} / ${formatDurationSeconds(segmentDurationSec)}`
-                    : stageLabel) + ' · 已处理 ' + formatDurationSeconds(processedSec);
-                room.mergeProgress.updatedAt = now;
+                    : stageLabel;
+                room.mergeProgress.stageLabel = localProgressLabel;
+                room.mergeProgress.stageStartedAt = stageStartedAt;
+              }
+              if (trackProgress && room.mergeProgress?.id === progress.id) {
+                const progressLine = Number.isFinite(processedSec)
+                  ? `time=${formatFfmpegSeconds(progressOffsetSec + Math.max(0, processedSec))}`
+                  : line;
+                if (updateFfmpegJobProgress(room.mergeProgress, progressLine)) {
+                  this.emitState();
+                }
+              } else if (Number.isFinite(processedSec) && room.mergeProgress?.id === progress.id) {
+                if (now - lastStageProgressEmitAt >= 500) {
+                  lastStageProgressEmitAt = now;
+                  room.mergeProgress.message =
+                    (segmentDurationSec > 0
+                      ? `${stageLabel} · 本段 ${formatDurationSeconds(Math.min(segmentDurationSec, Math.max(0, processedSec)))} / ${formatDurationSeconds(segmentDurationSec)}`
+                      : stageLabel) + ' · 已处理 ' + formatDurationSeconds(processedSec);
+                  room.mergeProgress.updatedAt = now;
+                  this.emitState();
+                }
+              }
+              const decodeErrorCount = countRepeatedVideoDecodeErrors(line);
+              if (decodeErrorCount > 0) {
+                repeatedDecodeErrorCount += decodeErrorCount;
+                firstRepeatedDecodeErrorAt ||= now;
+                if (now - lastDecodeWarningAt >= 5000) {
+                  lastDecodeWarningAt = now;
+                  this.log(
+                    'warn',
+                    `${roomLabel(room)} ${stageLabel} 视频解码异常（累计 ${repeatedDecodeErrorCount} 次）：${compactLogLine(line)}`
+                  );
+                }
+              } else if (/error|failed|invalid/i.test(line)) {
+                this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
+              }
+            }, {
+              onChild: (nextChild) => {
+                child = nextChild;
+                this.mergeProcesses.set(room.id, nextChild);
+              },
+              progressStallTimeoutMs: MERGE_PROGRESS_STALL_TIMEOUT_MS,
+              progressValueFromText: parseFfmpegProgressTime,
+              onNoProgress: (watchdogError) => {
+                const message = `${stageLabel}连续 ${Math.ceil(
+                  MERGE_PROGRESS_STALL_TIMEOUT_MS / 1000
+                )} 秒没有媒体进度，已终止；源分段会保留并自动重试。`;
+                watchdogError.message = message;
+                if (room.mergeProgress?.id === progress.id) {
+                  room.mergeProgress.message = message;
+                  room.mergeProgress.updatedAt = Date.now();
+                }
+                this.log('error', `${roomLabel(room)} ${message}`);
                 this.emitState();
               }
-            }
-            if (/error|failed|invalid/i.test(line)) {
-              this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
-            }
-          }, {
-            onChild: (nextChild) => {
-              child = nextChild;
-              this.mergeProcesses.set(room.id, nextChild);
-            },
-            progressStallTimeoutMs: MERGE_PROGRESS_STALL_TIMEOUT_MS,
-            progressValueFromText: parseFfmpegProgressTime,
-            onNoProgress: (watchdogError) => {
-              const message = `${stageLabel}连续 ${Math.ceil(
-                MERGE_PROGRESS_STALL_TIMEOUT_MS / 1000
-              )} 秒没有媒体进度，已终止；源分段会保留并自动重试。`;
-              watchdogError.message = message;
-              if (room.mergeProgress?.id === progress.id) {
-                room.mergeProgress.message = message;
-                room.mergeProgress.updatedAt = Date.now();
-              }
-              this.log('error', `${roomLabel(room)} ${message}`);
-              this.emitState();
-            }
-          });
+            });
+          } catch (error) {
+            throw forcedFfmpegError || error;
+          }
+          if (forcedFfmpegError) throw forcedFfmpegError;
         } finally {
           clearInterval(firstProgressHeartbeat);
           if (!child || this.mergeProcesses.get(room.id) === child) {
@@ -6533,6 +6833,7 @@ try {
           this.emitState();
         }
         const normalizedPaths = [];
+        const normalizedDurations = [];
         let progressOffsetSec = 0;
         for (let index = 0; index < segments.length; index += 1) {
           if (this.mergeCancelRequests.has(room.id)) throw new Error('合并已取消');
@@ -6542,30 +6843,137 @@ try {
             segments[index],
             segments[index + 1]
           );
+          const timelineAlignment = getBurnTimelineAlignment(segments[index], 0, sourceDurationSec);
           const normalizedPath = path.join(normalizeTempDir, `${String(index + 1).padStart(3, '0')}.normalized.mkv`);
-          if (room.mergeProgress?.id === progress.id) {
-            room.mergeProgress.stageLabel = `规范化分段 ${index + 1}/${segments.length}`;
-            room.mergeProgress.message = `正在规范化分段 ${index + 1}/${segments.length}（本段共 ${formatDurationSeconds(sourceDurationSec)}）`;
-            room.mergeProgress.updatedAt = Date.now();
-            this.emitState();
+          const baseStageLabel = `规范化分段 ${index + 1}/${segments.length}`;
+          if (timelineAlignment.videoPaddingSec > 0.05 || timelineAlignment.audioPaddingSec > 0.05) {
+            this.log(
+              'info',
+              `${roomLabel(room)} ${baseStageLabel} 保留源音画起始差：视频前置 ${timelineAlignment.videoPaddingSec.toFixed(
+                3
+              )} 秒，音频前置 ${timelineAlignment.audioPaddingSec.toFixed(3)} 秒。`
+            );
           }
-          await runMergeFfmpeg(
-            createNormalizeSegmentArgs({
-              inputPath: segments[index].cleanPath,
-              outputPath: normalizedPath,
-              container: 'mkv',
-              durationSec: sourceDurationSec,
-              hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
-              targetVideoInfo,
-              videoCodec,
-              softwareThreads: mergeSoftwareThreads
-            }),
-            {
-              progressOffsetSec,
-              stageLabel: `规范化分段 ${index + 1}/${segments.length}`,
-              segmentDurationSec: sourceDurationSec
+          const preferredDecoder = this.getHardwareDecoder(segmentMediaInfos[index]?.videoInfo, videoCodec);
+          const runNormalizeAttempt = async ({
+            stageLabel = baseStageLabel,
+            decoder = preferredDecoder.value,
+            decoderThreads = 2,
+            recoverySeekSec = 0
+          } = {}) => {
+            if (room.mergeProgress?.id === progress.id) {
+              const decoderInfo =
+                decoder === 'software'
+                  ? { value: 'software', label: 'CPU', kind: 'software' }
+                  : (this.ffmpegCapabilities?.hardwareDecoders || []).find(
+                      (candidate) => candidate.value === decoder && candidate.codec === preferredDecoder.codec
+                    ) || { value: decoder, label: decoder.toUpperCase(), kind: 'hardware' };
+              this.setProgressDecoder(room.mergeProgress, {
+                ...decoderInfo,
+                kind: decoder === 'software' ? 'software' : 'hardware'
+              });
+              room.mergeProgress.stageLabel = stageLabel;
+              room.mergeProgress.currentTimeSec = progressOffsetSec;
+              room.mergeProgress.percent = mergeDurationSec > 0 ? (progressOffsetSec / mergeDurationSec) * 100 : null;
+              room.mergeProgress.estimatedRemainingSec = null;
+              room.mergeProgress.message = `${stageLabel}（本段共 ${formatDurationSeconds(sourceDurationSec)}）`;
+              room.mergeProgress.updatedAt = Date.now();
+              this.emitState();
             }
-          );
+            await fsp.rm(normalizedPath, { force: true });
+            await runMergeFfmpeg(
+              createNormalizeSegmentArgs({
+                inputPath: segments[index].cleanPath,
+                outputPath: normalizedPath,
+                container: 'mkv',
+                durationSec: sourceDurationSec,
+                hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
+                targetVideoInfo,
+                videoCodec,
+                softwareThreads: mergeSoftwareThreads,
+                decoder,
+                decoderThreads,
+                recoverySeekSec,
+                timelineAlignment
+              }),
+              {
+                progressOffsetSec,
+                stageLabel,
+                segmentDurationSec: sourceDurationSec
+              }
+            );
+          };
+          try {
+            await runNormalizeAttempt({
+              stageLabel:
+                preferredDecoder.kind === 'hardware'
+                  ? `${baseStageLabel}（${preferredDecoder.label} 硬件解码）`
+                  : baseStageLabel,
+              decoderThreads: preferredDecoder.kind === 'hardware' ? 1 : 2
+            });
+          } catch (error) {
+            if (this.mergeCancelRequests.has(room.id)) throw error;
+            let recoveryError = error;
+            if (
+              preferredDecoder.kind === 'hardware' &&
+              (isFfmpegHardwareDecodeError(error) || isFfmpegVideoDecodeError(error))
+            ) {
+              this.log(
+                'warn',
+                `${roomLabel(room)} ${baseStageLabel}的 ${preferredDecoder.label} 硬件解码未能生成画面，仅将当前分段改用 CPU 解码；已完成分段不会重做。`
+              );
+              try {
+                await runNormalizeAttempt({
+                  stageLabel: `${baseStageLabel}（CPU 兼容解码）`,
+                  decoder: 'software',
+                  decoderThreads: 2
+                });
+                recoveryError = null;
+              } catch (softwareError) {
+                recoveryError = softwareError;
+              }
+            }
+            if (recoveryError && !isFfmpegVideoDecodeError(recoveryError)) throw recoveryError;
+            const recoverySeekSec = Math.min(
+              MERGE_CORRUPT_PREFIX_RECOVERY_SEEK_SEC,
+              Math.max(0, sourceDurationSec - 0.1)
+            );
+            if (recoveryError && recoverySeekSec >= 0.5) {
+              this.log(
+                'warn',
+                `${roomLabel(room)} ${baseStageLabel}兼容解码仍未恢复，将仅跳过当前分段开头 ${formatDurationSeconds(
+                  recoverySeekSec
+                )} 的损坏视频，补入等长黑场并保留原音频后继续；总时长及后续弹幕时间不变。`
+              );
+              try {
+                await runNormalizeAttempt({
+                  stageLabel: `${baseStageLabel}（修复损坏开头）`,
+                  decoder: 'software',
+                  decoderThreads: 1,
+                  recoverySeekSec
+                });
+                recoveryError = null;
+                this.log(
+                  'success',
+                  `${roomLabel(room)} ${baseStageLabel}已绕过损坏开头并恢复规范化，继续处理后续步骤。`
+                );
+              } catch (seekError) {
+                recoveryError = seekError;
+              }
+            }
+            if (recoveryError) {
+              const segmentError = new Error(
+                `${baseStageLabel}源视频持续无法解码：${path.basename(segments[index].cleanPath)}。已尝试兼容解码和损坏开头恢复；${compactLogLine(
+                  recoveryError.message
+                )}`
+              );
+              segmentError.code = 'MERGE_SEGMENT_UNDECODABLE';
+              segmentError.ffmpegExitCode = recoveryError.ffmpegExitCode;
+              segmentError.ffmpegSignal = recoveryError.ffmpegSignal;
+              segmentError.ffmpegStderr = recoveryError.ffmpegStderr;
+              throw segmentError;
+            }
+          }
           const normalizedInfo = await this.runMergePreparationStage(
             room,
             progress,
@@ -6576,6 +6984,10 @@ try {
             throw new Error(`规范化分段后没有检测到视频流：${path.basename(segments[index].cleanPath)}`);
           }
           normalizedPaths.push(normalizedPath);
+          // The concat demuxer must advance by the normalized presentation
+          // length, not by trailing H.26x DTS. The quick container probe is
+          // already required for validation and avoids another full scan.
+          normalizedDurations.push(Math.max(0, Number(normalizedInfo.durationSec) || sourceDurationSec));
           progressOffsetSec += sourceDurationSec;
         }
         if (room.mergeProgress?.id === progress.id) {
@@ -6585,7 +6997,7 @@ try {
           room.mergeProgress.updatedAt = Date.now();
           this.emitState();
         }
-        await writeConcatFile(concatPath, normalizedPaths);
+        await writeConcatFile(concatPath, normalizedPaths, { durations: normalizedDurations });
         await fsp.rm(tmpPath, { force: true });
         await runMergeFfmpeg(
           createConcatCopyArgs({
@@ -6614,7 +7026,8 @@ try {
             !mergeEncoderPlan.fallback ||
             this.mergeCancelRequests.has(room.id) ||
             isFfmpegMemoryPressureError(error) ||
-            error?.code === 'FFMPEG_NO_PROGRESS'
+            error?.code === 'FFMPEG_NO_PROGRESS' ||
+            error?.code === 'MERGE_SEGMENT_UNDECODABLE'
           ) {
             throw error;
           }
@@ -6686,65 +7099,50 @@ try {
         );
         if (!mergedTimingInfo.timingSafeForCopy && mergedMediaInfo.audioInfo) {
           const driftMs = Math.round(Math.abs(mergedTimingInfo.avDeltaSec) * 1000);
-          this.log('warn', `${roomLabel(room)} 合并候选音画相差 ${driftMs}ms，正在自动重采样、补齐或裁剪音频进行对齐。`);
-          for (let index = 0; index < segments.length; index += 1) {
-            try {
-              const sourceTiming = await this.runMergePreparationStage(
-                room,
-                progress,
-                '正在定位音画偏差分段 ' + (index + 1) + '/' + segments.length,
-                () => probeMediaTimelineInfo(this.ffmpegPath, segments[index].cleanPath, segmentMediaInfos[index], { timeoutMs: 120000 })
-              );
-              sourceTiming.auditMode = 'deep';
-              segmentTimelineInfos[index] = sourceTiming;
-              segments[index].timingInfo = sourceTiming;
-              this.log(
-                Math.abs(sourceTiming.avDeltaSec) > 0.08 ? 'warn' : 'info',
-                `${roomLabel(room)} 漂移来源检查 #${index + 1}：音频${sourceTiming.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
-                  sourceTiming.avDeltaSec
-                ).toFixed(3)}s。`
-              );
-            } catch (error) {
-              segmentTimelineInfos[index] = { ...segmentTimelineInfos[index], auditMode: 'failed', error: error.message };
-              this.log('warn', `${roomLabel(room)} 漂移来源检查 #${index + 1} 失败：${error.message}`);
+          if (!usedTimelinePreservingNormalization) {
+            this.log(
+              'warn',
+              `${roomLabel(room)} 无损拼接后检测到 ${driftMs}ms 音画偏差，将逐段重建原始时间轴后重试；不会拉伸或加速音频。`
+            );
+            if (room.mergeProgress?.id === progress.id) {
+              room.mergeProgress.message = `正在重建原始时间轴（检测到 ${driftMs}ms 偏差）`;
+              room.mergeProgress.percent = 99.2;
+              room.mergeProgress.updatedAt = Date.now();
+              this.emitState();
             }
-          }
-          if (room.mergeProgress?.id === progress.id) {
-            room.mergeProgress.message = `正在修复 ${driftMs}ms 音画偏差`;
-            room.mergeProgress.percent = 99.8;
-            room.mergeProgress.updatedAt = Date.now();
-            this.emitState();
-          }
-          await runMergeFfmpeg(
-            createAudioAlignArgs({
-              inputPath: tmpPath,
-              outputPath: syncTmpPath,
-              container,
-              videoDurationSec: mergedTimingInfo.videoPresentationDurationSec || mergedTimingInfo.videoDurationSec
-            }),
-            { trackProgress: false, stageLabel: '修复合并后音画偏差' }
-          );
-          const repairedMediaInfo = await this.runMergePreparationStage(
-            room,
-            progress,
-            '正在验证音画对齐结果',
-            () => probeMediaFileInfo(this.ffmpegPath, syncTmpPath, { timeoutMs: 15000 })
-          );
-          const repairedTimingInfo = await this.runMergePreparationStage(
-            room,
-            progress,
-            '正在复验音画对齐结果',
-            () => probeMediaTimelineInfo(this.ffmpegPath, syncTmpPath, repairedMediaInfo, { timeoutMs: 120000 })
-          );
-          if (!repairedMediaInfo.videoInfo || !repairedTimingInfo.timingSafeForCopy) {
-            throw new Error(
-              `自动音画对齐后仍相差 ${Math.round(Math.abs(repairedTimingInfo.avDeltaSec || 0) * 1000)}ms；所有源分段已保留`
+            await fsp.rm(tmpPath, { force: true });
+            await runSafeTranscode();
+            usedTimelinePreservingNormalization = true;
+            mergedMediaInfo = await this.runMergePreparationStage(
+              room,
+              progress,
+              '正在验证重建后的合并媒体文件',
+              () => probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 15000 })
+            );
+            if (!mergedMediaInfo.videoInfo) {
+              throw new Error('重建后的合并文件没有检测到视频流。');
+            }
+            mergedTimingInfo = await this.runMergePreparationStage(
+              room,
+              progress,
+              '正在复验重建后的音画时间轴',
+              () => probeMediaTimelineInfo(this.ffmpegPath, tmpPath, mergedMediaInfo, { timeoutMs: 120000 })
+            );
+            this.log(
+              Math.abs(mergedTimingInfo.avDeltaSec) > 0.08 ? 'warn' : 'success',
+              `${roomLabel(room)} 重建后时轴检查：视频 ${mergedTimingInfo.videoDurationSec.toFixed(3)}s，音频 ${mergedTimingInfo.audioDurationSec.toFixed(
+                3
+              )}s，音频${mergedTimingInfo.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(mergedTimingInfo.avDeltaSec).toFixed(3)}s。`
             );
           }
-          await atomicReplaceFile(syncTmpPath, tmpPath);
-          mergedMediaInfo = repairedMediaInfo;
-          mergedTimingInfo = repairedTimingInfo;
-          this.log('success', `${roomLabel(room)} 音画偏差已修复到 ${Math.round(Math.abs(repairedTimingInfo.avDeltaSec) * 1000)}ms。`);
+          if (!mergedTimingInfo.timingSafeForCopy) {
+            const verifiedDriftMs = Math.round(Math.abs(mergedTimingInfo.avDeltaSec || 0) * 1000);
+            const error = new Error(
+              `合并后音画仍相差 ${verifiedDriftMs}ms；已停止生成，避免用拉伸音频掩盖漂移，所有源分段已保留。`
+            );
+            error.code = 'MERGE_AV_TIMELINE_UNSAFE';
+            throw error;
+          }
         }
       } catch (error) {
         this.log('warn', `${roomLabel(room)} 合并后时轴检查失败：${error.message}`);
@@ -6895,7 +7293,6 @@ try {
       this.mergeCancelRequests.delete(room.id);
       await fsp.rm(concatPath, { force: true }).catch(() => {});
       await fsp.rm(tmpPath, { force: true }).catch(() => {});
-      await fsp.rm(syncTmpPath, { force: true }).catch(() => {});
       await fsp.rm(danmakuTmpPath, { force: true }).catch(() => {});
       await fsp.rm(cssTmpPath, { force: true }).catch(() => {});
       await fsp.rm(normalizeTempDir, { recursive: true, force: true }).catch(() => {});
@@ -7701,6 +8098,7 @@ try {
     if (!recording?.cleanPath || !recording?.danmakuPath || recording.valid === false) {
       throw new Error(`${roomLabel(room)} 没有可烧录的有效录像。`);
     }
+    const requestedCodec = normalizeBurnCodec(options.codec || this.settings.burnCodec);
     const cleanPathKey = path.resolve(recording.cleanPath).toLowerCase();
     const duplicate = [this.activeBurnQueueItem, ...this.burnQueue].filter(Boolean).find(
       (item) => item.roomId === room.id && path.resolve(item.recording.cleanPath).toLowerCase() === cleanPathKey
@@ -7721,7 +8119,11 @@ try {
       roomId: room.id,
       room,
       recording: cloneRecordingState(recording),
-      options: { ...options },
+      options: {
+        ...options,
+        codec: requestedCodec,
+        crf: clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35)
+      },
       label: `${roomLabel(room)}：${path.basename(recording.cleanPath)}`,
       createdAt: Date.now()
     };
@@ -7737,7 +8139,7 @@ try {
     if (this.burnQueueRunning || this.burnSessions.size > 0) {
       return;
     }
-    const item = this.burnQueue.shift();
+    const item = this.burnQueue[0];
     if (!item) {
       this.emitState();
       this.scheduleQueuedUpdateCheck();
@@ -7748,21 +8150,34 @@ try {
     this.emitState();
     setImmediate(async () => {
       let lease = null;
+      const removeWaitingItem = () => {
+        const index = this.burnQueue.findIndex((candidate) => candidate.id === item.id);
+        if (index >= 0) {
+          this.burnQueue.splice(index, 1);
+          this.emitState();
+        }
+      };
       try {
+        await this.waitForRuntimeCapabilities();
         const codec = this.chooseBurnCodec(item.options.codec || this.settings.burnCodec);
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'burn',
-          resource: codec.includes('libx') ? 'cpu' : 'gpu',
+          resource: this.getTranscodeResource(codec, item.recording?.videoInfo),
           cancel: () => this.cancelBurnDanmaku(item.roomId).catch(() => {})
         });
-        const started = await this.startBurnRecording(item.room, item.recording, item.options);
+        const started = await this.startBurnRecording(item.room, item.recording, {
+          ...item.options,
+          codec,
+          onProgressCreated: removeWaitingItem
+        });
         if (started) {
           await this.waitForBurnIdle(item.roomId);
         }
       } catch (error) {
         this.log('error', `烧录队列任务失败：${item.label}，${error.message || String(error)}`);
       } finally {
+        removeWaitingItem();
         lease?.release();
         this.activeBurnQueueItem = null;
         this.burnQueueRunning = false;
@@ -8009,6 +8424,40 @@ try {
     }
   }
 
+  async runFfmpegWithHardwareDecodeFallback({
+    decoder = 'software',
+    createArgs,
+    onStderr,
+    onChild,
+    beforeRetry,
+    onFallback,
+    label = '媒体处理'
+  } = {}) {
+    const preferredDecoder = String(decoder?.value || decoder || 'software');
+    try {
+      await runFfmpegJob(this.ffmpegPath, createArgs(preferredDecoder), onStderr, { onChild });
+      return preferredDecoder;
+    } catch (error) {
+      if (
+        preferredDecoder === 'software' ||
+        error?.code === 'BR2K_MEDIA_CANCELLED' ||
+        !isFfmpegHardwareDecodeError(error)
+      ) {
+        throw error;
+      }
+      this.log(
+        'warn',
+        `${label} 的 ${decoder?.label || preferredDecoder} 硬件解码不可用于当前视频，立即改用 CPU 解码重试：${compactLogLine(
+          error.message
+        )}`
+      );
+      await beforeRetry?.();
+      onFallback?.();
+      await runFfmpegJob(this.ffmpegPath, createArgs('software'), onStderr, { onChild });
+      return 'software';
+    }
+  }
+
   async runChunkedAvatarBurn({
     cleanPath,
     assPath,
@@ -8019,12 +8468,16 @@ try {
     duration,
     fps,
     avatarLayer,
+    decoder = 'software',
     includeAudio = true,
+    copyAudio = false,
     timelineAlignment,
     onChild,
     onStderr,
     onProgress,
     onStage,
+    onDecoderFallback,
+    label = '头像分段烧录',
     isCancelled
   } = {}) {
     const chunkDuration = Math.max(1, Number(avatarLayer?.chunkDuration || AVATAR_OVERLAY_CHUNK_SECONDS));
@@ -8042,6 +8495,7 @@ try {
     const chunkPaths = [];
     const chunkDurations = [];
     const scriptPaths = [];
+    let activeDecoder = decoder;
     const concatPath = path.join(temporaryDir, 'avatar-chunks.ffconcat');
     let completedDuration = 0;
     const cancellationError = () => {
@@ -8062,22 +8516,35 @@ try {
       while (completedDuration < totalDuration - 0.001) {
         if (isCancelled?.()) throw cancellationError();
         const chunkStart = sourceStart + completedDuration;
-        const chunkLength = Math.min(chunkDuration, totalDuration - completedDuration);
-        const chunkEnd = chunkStart + chunkLength;
+        let chunkLength = Math.min(chunkDuration, totalDuration - completedDuration);
+        let chunkEnd = chunkStart + chunkLength;
+        let activeEntries = clipAvatarOverlayEntries(avatarLayer, chunkStart, chunkEnd);
+        const canUseCuda = Boolean(String(codec || '').includes('nvenc') && this.ffmpegCapabilities?.cudaAvatarComposite);
+        while (
+          canUseCuda &&
+          activeEntries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
+          chunkLength > MIN_CUDA_AVATAR_CHUNK_SECONDS + 0.001
+        ) {
+          chunkLength = Math.max(MIN_CUDA_AVATAR_CHUNK_SECONDS, chunkLength / 2);
+          chunkEnd = chunkStart + chunkLength;
+          activeEntries = clipAvatarOverlayEntries(avatarLayer, chunkStart, chunkEnd);
+        }
         const initialChunk = chunkIndex === 0;
         const chunkVideoPaddingSec = initialChunk ? Math.min(leadingVideoPaddingSec, chunkLength) : 0;
         const chunkTimelineOffset = initialChunk ? chunkStart + chunkVideoPaddingSec : chunkStart;
         const chunkSeekPrerollSec = Math.min(AVATAR_CHUNK_SEEK_PREROLL_SECONDS, chunkStart);
         const chunkInputTrimEndSec = chunkSeekPrerollSec + chunkLength;
-        onStage?.(`正在烧录头像分段 ${chunkIndex + 1}`);
         const scriptPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.ffscript`);
         const chunkPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.mkv`);
-        const activeEntries = clipAvatarOverlayEntries(avatarLayer, chunkStart, chunkEnd);
         const useCudaForChunk = Boolean(
           activeEntries.length > 0 &&
             activeEntries.length <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
-            String(codec || '').includes('nvenc') &&
-            this.ffmpegCapabilities?.cudaAvatarComposite
+            canUseCuda
+        );
+        onStage?.(
+          `正在烧录头像分段 ${chunkIndex + 1}（${
+            activeEntries.length ? (useCudaForChunk ? 'CUDA 头像合成' : 'CPU 头像合成') : '本段无真实头像'
+          }）`
         );
         const script = createAvatarOverlayChunkFilterScript({
           assPath,
@@ -8103,26 +8570,36 @@ try {
           filterScriptPath: scriptPath,
           gpuComposite: useCudaForChunk
         };
-        const args = createBurnArgs({
-          cleanPath,
-          assPath,
-          burnedPath: chunkPath,
-          codec,
-          crf,
-          container: 'mkv',
-          startTime: chunkStart,
-          duration: chunkLength,
-          fps,
-          avatarOverlay: chunkAvatarLayer,
-          inputSeek: true,
-          inputSeekPrerollSec: chunkSeekPrerollSec,
-          inputTrimStartSec: chunkSeekPrerollSec,
-          inputTrimEndSec: chunkInputTrimEndSec,
-          timelineOffset: chunkTimelineOffset,
-          leadingVideoPaddingSec: chunkVideoPaddingSec,
-          includeAudio: false
+        const usedDecoder = await this.runFfmpegWithHardwareDecodeFallback({
+          decoder: activeDecoder,
+          createArgs: (nextDecoder) =>
+            createBurnArgs({
+              cleanPath,
+              assPath,
+              burnedPath: chunkPath,
+              codec,
+              crf,
+              container: 'mkv',
+              startTime: chunkStart,
+              duration: chunkLength,
+              fps,
+              avatarOverlay: chunkAvatarLayer,
+              inputSeek: true,
+              inputSeekPrerollSec: chunkSeekPrerollSec,
+              inputTrimStartSec: chunkSeekPrerollSec,
+              inputTrimEndSec: chunkInputTrimEndSec,
+              timelineOffset: chunkTimelineOffset,
+              leadingVideoPaddingSec: chunkVideoPaddingSec,
+              includeAudio: false,
+              decoder: nextDecoder
+            }),
+          onStderr: reportStderr,
+          onChild,
+          beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
+          onFallback: onDecoderFallback,
+          label: `${label} ${chunkIndex + 1}`
         });
-        await runFfmpegJob(this.ffmpegPath, args, reportStderr, { onChild });
+        activeDecoder = usedDecoder;
         // A short, static chunk can legitimately be smaller than the final
         // output-size sanity threshold.  Only reject a missing/nearly-empty
         // intermediate container here; the final output gets the full media
@@ -8156,7 +8633,8 @@ try {
               duration: totalDuration,
               container: getContainerFromPath(burnedPath),
               leadingAudioPaddingSec,
-              includeAudio: true
+              includeAudio: true,
+              copyAudio
             })
           : createConcatCopyArgs({
               concatPath,
@@ -8184,6 +8662,9 @@ try {
       this.log('warn', `${roomLabel(room)} 没有可烧录的最近录像。`);
       return false;
     }
+    await this.waitForRuntimeCapabilities();
+    const burnCodec = this.chooseBurnCodec(options.codec || this.settings.burnCodec);
+    const burnCrf = clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35);
 
     let avatarLayer = null;
     try {
@@ -8202,6 +8683,7 @@ try {
         recording.videoInfo = mediaInfo.videoInfo;
       }
       const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
+      const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
       const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout, avatarMode });
       if (options.prepareOnly) {
         this.log('success', `${roomLabel(room)} 字幕文件已生成：${path.basename(assets.cssPath)} / ${path.basename(assets.assPath)}`);
@@ -8210,7 +8692,8 @@ try {
       const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
       const burnedTmpPath = replaceExtension(burnedPath, `.tmp.${getContainerFromPath(burnedPath)}`);
       recording.burnedPath = burnedPath;
-      const codecInfo = this.getBurnCodecInfo(this.settings.burnCodec);
+      const codecInfo = this.getBurnCodecInfo(burnCodec);
+      const decoderInfo = this.getHardwareDecoder(recording.videoInfo || mediaInfo.videoInfo, burnCodec);
       const burnSourcePath = recording.cleanPath;
       const deleteSourceAfterSuccess = Boolean(
         options.automatic &&
@@ -8222,7 +8705,7 @@ try {
       await assertDiskSpace(burnedPath, { estimatedBytes: Number(recording.fileSize || 0) });
       await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
       const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
-      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
+      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(burnCodec, assets.avatarPlan);
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         recording,
         assPath: assets.assPath,
@@ -8241,11 +8724,15 @@ try {
         outputPath: burnedPath,
         durationSec: recording.durationSec,
         roomId: room.id,
-        codec: this.settings.burnCodec,
-        codecKind: codecInfo.kind
+        codec: burnCodec,
+        codecKind: codecInfo.kind,
+        decoder: decoderInfo.value,
+        decoderKind: decoderInfo.kind,
+        decoderLabel: decoderInfo.label
       });
       room.burning = true;
       room.burnProgress = progress;
+      options.onProgressCreated?.(progress);
       // A chunked burn has several short-lived FFmpeg children.  Keep a map
       // entry during the gaps between children so queue/cancel state remains
       // stable; onChild below replaces null with the current process.
@@ -8256,7 +8743,7 @@ try {
           overlayMode
         )}，${danmakuDisplayAreaLabel(danmakuArea)}，样式 ${stylePreset}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
           codecInfo.label
-        }，真实头像 ${burnAvatarModeLabel(avatarMode)}${
+        }，${decoderInfo.kind === 'hardware' ? `${decoderInfo.label} 硬件解码` : 'CPU 解码'}，真实头像 ${burnAvatarModeLabel(avatarMode)}${
           avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''
         }${assets.playWidth > 0 && assets.playHeight > 0 ? `，${assets.playWidth}x${assets.playHeight}${assets.portrait ? ' 竖屏适配' : ''}` : ''}）`
       );
@@ -8285,6 +8772,13 @@ try {
         if (updateFfmpegJobProgress(progress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
           this.emitState();
         }
+      };
+      const setBurnStage = (stage) => {
+        if (room.burnProgress?.id !== progress.id || progress.status !== 'running') return;
+        progress.stageLabel = stage;
+        progress.message = stage;
+        progress.updatedAt = Date.now();
+        this.emitState();
       };
       const finishBurn = async (processingError = null) => {
         const cancelled = this.burnCancelRequests.delete(room.id) || processingError?.code === 'BR2K_MEDIA_CANCELLED';
@@ -8367,36 +8861,59 @@ try {
               cleanPath: burnSourcePath,
               assPath: assets.assPath,
               burnedPath: burnedTmpPath,
-              codec: this.settings.burnCodec,
-              crf: this.settings.burnCrf,
+              codec: burnCodec,
+              crf: burnCrf,
               duration: durationSec,
               fps: burnFps,
               avatarLayer,
+              decoder: decoderInfo,
               includeAudio: Boolean(mediaInfo.audioInfo),
+              copyAudio: copySourceAudio,
               timelineAlignment: burnTimeline,
               onChild: (child) => this.burnSessions.set(room.id, child),
               onStderr: handleBurnLog,
               onProgress: handleBurnProgress,
+              onStage: setBurnStage,
+              onDecoderFallback: () => {
+                this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
+                this.emitState();
+              },
+              label: `${roomLabel(room)} 头像分段烧录`,
               isCancelled: () => this.burnCancelRequests.has(room.id)
             });
           } else {
-            const args = createBurnArgs({
-              cleanPath: burnSourcePath,
-              assPath: assets.assPath,
-              burnedPath: burnedTmpPath,
-              codec: this.settings.burnCodec,
-              crf: this.settings.burnCrf,
-              container: getContainerFromPath(burnedPath),
-              startTime: 0,
-              duration: durationSec,
-              fps: burnFps,
-              avatarOverlay: avatarLayer,
-              timelineOffset: burnTimeline.videoClockStartSec,
-              leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-              leadingAudioPaddingSec: burnTimeline.audioPaddingSec
-            });
-            await runFfmpegJob(this.ffmpegPath, args, handleBurnStderr, {
-              onChild: (child) => this.burnSessions.set(room.id, child)
+            await this.runFfmpegWithHardwareDecodeFallback({
+              decoder: decoderInfo,
+              createArgs: (decoder) =>
+                createBurnArgs({
+                  cleanPath: burnSourcePath,
+                  assPath: assets.assPath,
+                  burnedPath: burnedTmpPath,
+                  codec: burnCodec,
+                  crf: burnCrf,
+                  container: getContainerFromPath(burnedPath),
+                  startTime: 0,
+                  duration: durationSec,
+                  fps: burnFps,
+                  avatarOverlay: avatarLayer,
+                  timelineOffset: burnTimeline.videoClockStartSec,
+                  leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+                  leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
+                  copyAudio: copySourceAudio,
+                  decoder
+                }),
+              onStderr: handleBurnStderr,
+              onChild: (child) => this.burnSessions.set(room.id, child),
+              beforeRetry: () => fsp.rm(burnedTmpPath, { force: true }).catch(() => {}),
+              onFallback: () => {
+                this.setProgressDecoder(
+                  progress,
+                  { value: 'software', label: 'CPU', kind: 'software' },
+                  { reset: true, message: '硬件解码不兼容，正在使用 CPU 解码重新烧录' }
+                );
+                this.emitState();
+              },
+              label: `${roomLabel(room)} 烧录`
             });
           }
         } catch (error) {
@@ -8587,6 +9104,7 @@ try {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
     }
     const mode = normalizeExportMode(options.mode);
+    const requestedCodec = mode === 'burn' ? normalizeBurnCodec(options.codec || this.settings.burnCodec) : '';
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
@@ -8641,6 +9159,8 @@ try {
         stylePreset,
         styleLayout,
         avatarMode,
+        codec: requestedCodec,
+        crf: clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35),
         outputDir,
         outputPath
       }
@@ -8672,7 +9192,7 @@ try {
     if (this.exportQueueRunning || this.exportProcess || this.exportProgress?.status === 'running') {
       return;
     }
-    const item = this.exportQueue.shift();
+    const item = this.exportQueue[0];
     if (!item) {
       this.emitState();
       return;
@@ -8681,18 +9201,28 @@ try {
     this.emitState();
     setImmediate(async () => {
       let lease = null;
+      const removeWaitingItem = () => {
+        const index = this.exportQueue.findIndex((candidate) => candidate.id === item.id);
+        if (index >= 0) {
+          this.exportQueue.splice(index, 1);
+          this.emitState();
+        }
+      };
       try {
+        await this.waitForRuntimeCapabilities();
         const codec = this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'export',
-          resource: item.mode === 'clean' ? 'io' : codec.includes('libx') ? 'cpu' : 'gpu',
+          resource:
+            item.mode === 'clean' ? 'io' : this.getTranscodeResource(codec, item.request.recording?.videoInfo),
           cancel: () => this.cancelExportClip().catch(() => {})
         });
-        await this.runExportClipNow(item.request);
+        await this.runExportClipNow({ ...item.request, codec, onProgressCreated: removeWaitingItem });
       } catch (error) {
         this.log('error', `导出队列任务失败：${item.label}，${error.message || String(error)}`);
       } finally {
+        removeWaitingItem();
         lease?.release();
         this.exportQueueRunning = false;
         this.emitState();
@@ -8704,6 +9234,7 @@ try {
   }
 
   async runExportClipNow(options = {}) {
+    await this.waitForRuntimeCapabilities();
     let recording = this.normalizeRecording(options.recording || options);
     if (!recording) {
       throw new Error('请选择录像文件。');
@@ -8717,6 +9248,8 @@ try {
       throw new Error(`源视频不存在：${recording.cleanPath}`);
     }
     const mode = normalizeExportMode(options.mode);
+    const burnCodec = mode === 'burn' ? this.chooseBurnCodec(options.codec || this.settings.burnCodec) : '';
+    const burnCrf = clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
     const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
@@ -8749,14 +9282,20 @@ try {
       deriveClipPath(recording.cleanPath, outputDir, mode === 'clean' ? 'clean' : overlayMode, startTime, endTime);
     const outputContainer = getContainerFromPath(outputPath);
     const temporaryOutputPath = replaceExtension(outputPath, `.tmp.${outputContainer}`);
-    const codecInfo = mode === 'burn' ? this.getBurnCodecInfo(this.settings.burnCodec) : null;
+    const codecInfo = mode === 'burn' ? this.getBurnCodecInfo(burnCodec) : null;
+    const decoderInfo = mode === 'burn'
+      ? this.getHardwareDecoder(recording.videoInfo || mediaInfo.videoInfo, burnCodec)
+      : { value: 'software', label: 'CPU', kind: 'software' };
     const progress = createFfmpegJobProgress({
       kind: 'export',
       label: `导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`,
       outputPath,
       durationSec: duration,
       codec: codecInfo?.value,
-      codecKind: codecInfo?.kind
+      codecKind: codecInfo?.kind,
+      decoder: mode === 'burn' ? decoderInfo.value : undefined,
+      decoderKind: mode === 'burn' ? decoderInfo.kind : undefined,
+      decoderLabel: mode === 'burn' ? decoderInfo.label : undefined
     });
     const setExportStage = (stage) => {
       if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
@@ -8775,6 +9314,7 @@ try {
     this.exportProgress = progress;
     this.exportProcess = null;
     this.exportCancelRequested = false;
+    options.onProgressCreated?.(progress);
     setExportStage(mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段');
 
     let cssPath = recording.cssPath;
@@ -8782,7 +9322,9 @@ try {
     let temporaryAssDir = '';
     let avatarLayer = null;
     let args;
+    let createBurnExportArgs = null;
     let burnTimeline = null;
+    let copySourceAudio = false;
     let cancelled = false;
     try {
       await assertDiskSpace(outputPath, {
@@ -8821,8 +9363,9 @@ try {
       cssPath = assets.cssPath;
       assPath = assets.assPath;
       const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
-      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(this.settings.burnCodec, assets.avatarPlan);
+      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(burnCodec, assets.avatarPlan);
       burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       setExportStage('正在准备真实头像');
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         recording,
@@ -8839,22 +9382,26 @@ try {
       });
       throwIfExportCancelled();
       if (!avatarLayer?.chunked) {
-        args = createBurnArgs({
-          cleanPath: recording.cleanPath,
-          assPath,
-          burnedPath: temporaryOutputPath,
-          codec: this.settings.burnCodec,
-          crf: this.settings.burnCrf,
-          container: outputContainer,
-          startTime,
-          duration,
-          fps: exportFps,
-          avatarOverlay: avatarLayer,
-          inputSeek: true,
-          timelineOffset: burnTimeline.videoClockStartSec,
-          leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-          leadingAudioPaddingSec: burnTimeline.audioPaddingSec
-        });
+        createBurnExportArgs = (decoder) =>
+          createBurnArgs({
+            cleanPath: recording.cleanPath,
+            assPath,
+            burnedPath: temporaryOutputPath,
+            codec: burnCodec,
+            crf: burnCrf,
+            container: outputContainer,
+            startTime,
+            duration,
+            fps: exportFps,
+            avatarOverlay: avatarLayer,
+            inputSeek: true,
+            timelineOffset: burnTimeline.videoClockStartSec,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+            leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
+            copyAudio: copySourceAudio,
+            decoder
+          });
+        args = createBurnExportArgs(decoderInfo.value);
       }
       if (burnTimeline.videoPaddingSec > 0.05 || burnTimeline.audioPaddingSec > 0.05) {
         this.log(
@@ -8870,7 +9417,9 @@ try {
         codecInfo ? `（${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${codecInfo.label}）` : ''
       }${
         mode === 'burn'
-          ? `，真实头像 ${burnAvatarModeLabel(avatarMode)}${avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''}`
+          ? `，${decoderInfo.kind === 'hardware' ? `${decoderInfo.label} 硬件解码` : 'CPU 解码'}，真实头像 ${burnAvatarModeLabel(
+              avatarMode
+            )}${avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''}`
           : ''
       }`
     );
@@ -8902,19 +9451,43 @@ try {
           cleanPath: recording.cleanPath,
           assPath,
           burnedPath: temporaryOutputPath,
-          codec: this.settings.burnCodec,
-          crf: this.settings.burnCrf,
+          codec: burnCodec,
+          crf: burnCrf,
           startTime,
           duration,
           fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
           avatarLayer,
+          decoder: decoderInfo,
           includeAudio: Boolean(mediaInfo.audioInfo),
+          copyAudio: copySourceAudio,
           timelineAlignment: burnTimeline,
           onChild,
           onStderr: handleExportLog,
           onProgress: handleExportProgress,
           onStage: setExportStage,
+          onDecoderFallback: () => {
+            this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
+            this.emitState();
+          },
+          label: '烧录片段头像分段',
           isCancelled: () => this.exportCancelRequested
+        });
+      } else if (mode === 'burn') {
+        await this.runFfmpegWithHardwareDecodeFallback({
+          decoder: decoderInfo,
+          createArgs: createBurnExportArgs,
+          onStderr: handleExportStderr,
+          onChild,
+          beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+          onFallback: () => {
+            this.setProgressDecoder(
+              progress,
+              { value: 'software', label: 'CPU', kind: 'software' },
+              { reset: true, message: '硬件解码不兼容，正在使用 CPU 解码重新导出' }
+            );
+            this.emitState();
+          },
+          label: '烧录片段导出'
         });
       } else {
         await runFfmpegJob(this.ffmpegPath, args, handleExportStderr, { onChild });

@@ -114,7 +114,8 @@ test('mixed segment specifications select the highest resolution and require tra
   });
   const filter = args[args.indexOf('-filter_complex') + 1];
   assert.match(filter, /scale=w=3840:h=2160/);
-  assert.match(filter, /aresample=48000:async=1:first_pts=0,apad,atrim=duration=1/);
+  assert.match(filter, /aresample=48000,asetpts=PTS-STARTPTS,apad,atrim=duration=1/);
+  assert.doesNotMatch(filter, /async=1|fps=/, 'merge normalization must preserve the source clocks');
   assert.match(filter, /anullsrc=r=48000:cl=stereo/);
   assert.match(filter, /concat=n=2:v=1:a=1/);
   assert.ok(args.includes('hvc1'));
@@ -135,6 +136,34 @@ test('mixed segment specifications select the highest resolution and require tra
   assert.doesNotMatch(normalizeFilter, /concat=n=/);
   assert.equal(normalizeArgs[normalizeArgs.indexOf('-filter_threads') + 1], '1');
   assert.deepEqual(normalizeArgs.slice(0, 5), ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y']);
+
+  const alignedNormalizeArgs = createNormalizeSegmentArgs({
+    inputPath: 'lead-in.mp4',
+    outputPath: 'lead-in.normalized.mkv',
+    container: 'mkv',
+    durationSec: 2,
+    hasAudio: true,
+    targetVideoInfo: mediaInfos[1].videoInfo,
+    videoCodec: 'libx265',
+    timelineAlignment: { videoPaddingSec: 0.4, audioPaddingSec: 0.125 }
+  });
+  const alignedNormalizeFilter = alignedNormalizeArgs[alignedNormalizeArgs.indexOf('-filter_complex') + 1];
+  assert.match(alignedNormalizeFilter, /tpad=start_duration=0.4:start_mode=add:color=black,trim=duration=2,setpts=PTS-STARTPTS/);
+  assert.match(alignedNormalizeFilter, /adelay=125:all=1,apad,atrim=duration=2/);
+  assert.doesNotMatch(alignedNormalizeFilter, /async=1|fps=/);
+
+  const hlsLeadInArgs = createNormalizeSegmentArgs({
+    inputPath: 'hls-reconnect.mp4',
+    outputPath: 'hls-reconnect.normalized.mkv',
+    container: 'mkv',
+    durationSec: 60,
+    hasAudio: true,
+    targetVideoInfo: mediaInfos[1].videoInfo,
+    videoCodec: 'libx265',
+    timelineAlignment: { videoPaddingSec: 1.024, audioPaddingSec: 0 }
+  });
+  const hlsLeadInFilter = hlsLeadInArgs[hlsLeadInArgs.indexOf('-filter_complex') + 1];
+  assert.match(hlsLeadInFilter, /tpad=start_duration=1.024:start_mode=add:color=black,trim=duration=60,setpts=PTS-STARTPTS/);
 
   const copyArgs = createConcatCopyArgs({
     concatPath: 'normalized.concat.txt',
@@ -411,6 +440,7 @@ test('burn filter waits for the first decodable keyframe and still produces vali
     });
     const filter = args[args.indexOf('-vf') + 1];
     assert.match(filter, /select='if\(isnan\(prev_selected_t\)\\,key\\,1\)'/);
+    assert.doesNotMatch(filter, /fps=/, 'whole-file burns must retain the source video timestamps');
     const burned = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
     assert.equal(burned.status, 0, burned.stderr);
     const info = await probeMediaFileInfo(ffmpegPath, outputPath);

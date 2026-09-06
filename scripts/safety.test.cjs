@@ -132,6 +132,21 @@ test('new CPU-heavy jobs wait while recording has the highest priority', async (
   assert.equal(started, true);
 });
 
+test('hybrid hardware jobs reserve both CPU filters and the GPU encoder', async () => {
+  const manager = new MediaJobManager({ limits: { cpu: 1, gpu: 1 } });
+  const cpuLease = await manager.acquire({ id: 'cpu-preview', type: 'preview', resource: 'cpu' });
+  let hybridStarted = false;
+  const hybrid = manager.acquire({ id: 'nvenc-burn', type: 'burn', resource: 'hybrid' }).then((lease) => {
+    hybridStarted = true;
+    lease.release();
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(hybridStarted, false);
+  cpuLease.release();
+  await hybrid;
+  assert.equal(hybridStarted, true);
+});
+
 test('root updater accepts only a package bound to a valid official signature', async () => {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
   const packageName = `bili-record-2k_4.0.0_linux_${process.arch}.tar.gz`;

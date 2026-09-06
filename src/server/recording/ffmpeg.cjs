@@ -30,6 +30,18 @@ function formatFilterNumber(value) {
   return number.toFixed(3).replace(/\.?0+$/, '') || '0';
 }
 
+function appendHardwareDecodeInputArgs(args, decoder, options = {}) {
+  const value = String(decoder || '').trim().toLowerCase();
+  if (!value || value === 'software') return;
+  const supported = new Set(['cuda', 'qsv', 'd3d11va', 'dxva2', 'vaapi']);
+  if (!supported.has(value)) {
+    throw new Error(`不支持的硬件解码方式：${value}`);
+  }
+  args.push('-hwaccel', value);
+  const device = String(options.device || '').trim();
+  if (device) args.push('-hwaccel_device', device);
+}
+
 function normalizeAvatarOverlayEntries(avatarOverlay) {
   const entries = Array.isArray(avatarOverlay?.entries) ? avatarOverlay.entries : [];
   return entries
@@ -129,12 +141,12 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
 }
 
 function createBurnVideoFilter(assPath, fps, options = {}) {
-  // Independently rendered chunks already carry the source's frame cadence.
-  // Re-applying fps=... per chunk can round the last presentation timestamps
-  // differently in every encoder process, which then becomes cumulative A/V
-  // drift when the chunks are joined. Keep the original frame clock for that
-  // path and only normalize FPS for a single, whole-file render.
-  const targetFps = options.preserveSourceFrameTiming ? 0 : normalizeMergeFps(fps);
+  // Live recordings may be VFR even when their nominal stream metadata says
+  // 60fps.  Re-clocking only the rendered video to that nominal rate while
+  // leaving audio on its source clock creates a steadily growing A/V offset.
+  // Keep the source presentation clock unless an explicit compatibility caller
+  // asks for CFR; this applies to both full-file and chunked burns.
+  const targetFps = options.preserveSourceFrameTiming === false ? normalizeMergeFps(fps) : 0;
   const fpsFilter = targetFps ? `,fps=${targetFps}:start_time=0` : '';
   const timelineOffset = Math.max(0, Number(options.timelineOffset) || 0);
   const leadingVideoPaddingSec = Math.max(0, Number(options.leadingVideoPaddingSec) || 0);
@@ -519,7 +531,9 @@ function createBurnArgs({
   timelineOffset = 0,
   leadingVideoPaddingSec = 0,
   leadingAudioPaddingSec = 0,
-  includeAudio = true
+  includeAudio = true,
+  copyAudio = false,
+  decoder = 'software'
 }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
@@ -537,6 +551,9 @@ function createBurnArgs({
   if (gpuAvatarComposite) {
     args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
   }
+  appendHardwareDecodeInputArgs(args, decoder, {
+    device: gpuAvatarComposite && decoder === 'cuda' ? 'br2k_avatar' : ''
+  });
   if (inputSeek && hasStart) {
     args.push('-ss', formatFfmpegSeconds(inputSeekStart));
   }
@@ -589,19 +606,26 @@ function createBurnArgs({
 
   if (includeAudio) {
     const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
-    const audioFilters = ['aresample=48000:async=1:first_pts=0', 'asetpts=PTS-STARTPTS'];
-    if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
-    audioFilters.push('asetpts=PTS-STARTPTS');
-    args.push(
-      '-af',
-      audioFilters.join(','),
-      '-c:a',
-      'aac',
-      '-b:a',
-      '160k',
-      '-ac',
-      '2'
-    );
+    // A full AAC source can be muxed untouched. This is both faster and keeps
+    // its exact sample clock. Clipped/padded exports still need re-encoding,
+    // but must never use async resampling (which can silently alter timing).
+    if (copyAudio && audioPaddingMs <= 0) {
+      args.push('-c:a', 'copy');
+    } else {
+      const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
+      if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
+      audioFilters.push('asetpts=PTS-STARTPTS');
+      args.push(
+        '-af',
+        audioFilters.join(','),
+        '-c:a',
+        'aac',
+        '-b:a',
+        '160k',
+        '-ac',
+        '2'
+      );
+    }
   } else {
     args.push('-an');
   }
@@ -619,7 +643,8 @@ function createBurnAudioMuxArgs({
   duration,
   container,
   leadingAudioPaddingSec = 0,
-  includeAudio = true
+  includeAudio = true,
+  copyAudio = false
 }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
@@ -645,23 +670,27 @@ function createBurnAudioMuxArgs({
   args.push('-map', '0:v:0');
   if (includeAudio) {
     const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
-    const audioFilters = ['aresample=48000:async=1:first_pts=0', 'asetpts=PTS-STARTPTS'];
-    if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
-    if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
-    audioFilters.push('asetpts=PTS-STARTPTS');
-    args.push(
-      '-map',
-      '1:a?',
-      '-af',
-      audioFilters.join(','),
-      '-c:a',
-      'aac',
-      '-b:a',
-      '160k',
-      '-ac',
-      '2',
-      '-shortest'
-    );
+    if (copyAudio && audioPaddingMs <= 0) {
+      args.push('-map', '1:a?', '-c:a', 'copy', '-shortest');
+    } else {
+      const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
+      if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
+      if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
+      audioFilters.push('asetpts=PTS-STARTPTS');
+      args.push(
+        '-map',
+        '1:a?',
+        '-af',
+        audioFilters.join(','),
+        '-c:a',
+        'aac',
+        '-b:a',
+        '160k',
+        '-ac',
+        '2',
+        '-shortest'
+      );
+    }
   } else {
     args.push('-an');
   }
@@ -674,14 +703,17 @@ function createBurnAudioMuxArgs({
   return args;
 }
 
-function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern }) {
-  return [
+function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern, codec = 'libx264', decoder = 'software' }) {
+  const args = [
     '-hide_banner',
     '-y',
     '-fflags',
     '+genpts+discardcorrupt',
     '-err_detect',
-    'ignore_err',
+    'ignore_err'
+  ];
+  appendHardwareDecodeInputArgs(args, decoder);
+  args.push(
     '-i',
     inputPath,
     '-map',
@@ -691,11 +723,18 @@ function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern }) {
     '-vf',
     'scale=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p',
     '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '28',
+    codec
+  );
+  if (String(codec).includes('nvenc')) {
+    args.push('-preset', 'p4', '-cq', '28', '-b:v', '0');
+  } else if (String(codec).includes('qsv')) {
+    args.push('-global_quality', '28');
+  } else if (String(codec).includes('amf')) {
+    args.push('-quality', 'speed', '-qp_i', '28', '-qp_p', '28');
+  } else {
+    args.push('-preset', 'veryfast', '-crf', '28');
+  }
+  args.push(
     '-c:a',
     'aac',
     '-b:a',
@@ -713,7 +752,8 @@ function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern }) {
     '-hls_segment_filename',
     segmentPattern,
     playlistPath
-  ];
+  );
+  return args;
 }
 
 function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, container }) {
@@ -812,7 +852,11 @@ function createNormalizeSegmentArgs({
   hasAudio,
   targetVideoInfo,
   videoCodec,
-  softwareThreads = 4
+  softwareThreads = 4,
+  decoder = 'software',
+  decoderThreads = 2,
+  recoverySeekSec = 0,
+  timelineAlignment = null
 }) {
   const width = makeEvenDimension(targetVideoInfo?.width);
   const height = makeEvenDimension(targetVideoInfo?.height);
@@ -828,6 +872,12 @@ function createNormalizeSegmentArgs({
   // alive per source, which can push a long 2K merge over the host memory
   // limit.  The service normalizes segments one at a time, then concat-copies
   // the uniform intermediates.
+  const normalizedDuration = Number(durationSec);
+  const requestedRecoverySeekSec = Math.max(0, Number(recoverySeekSec) || 0);
+  const safeRecoverySeekSec =
+    normalizedDuration > 0
+      ? Math.min(requestedRecoverySeekSec, Math.max(0, normalizedDuration - 0.1))
+      : requestedRecoverySeekSec;
   const args = [
     '-hide_banner',
     '-nostats',
@@ -839,26 +889,54 @@ function createNormalizeSegmentArgs({
     '-filter_complex_threads',
     '1',
     '-threads',
-    '2',
+    String(Math.max(1, Number(decoderThreads) || 2)),
     '-fflags',
     '+genpts+discardcorrupt',
-    '-i',
-    inputPath
+    // Reconnect captures can contain a few broken HEVC NALs. Drop only those
+    // packets and keep their surrounding timestamps instead of letting one
+    // duplicate POC hold the entire normalization pass indefinitely.
+    '-err_detect',
+    'ignore_err'
   ];
-  const targetFps = normalizeMergeFps(targetVideoInfo?.fps);
-  const fpsFilter = targetFps ? `,fps=${targetFps}` : '';
-  const normalizedDuration = Number(durationSec);
+  appendHardwareDecodeInputArgs(args, decoder);
+  if (safeRecoverySeekSec > 0) {
+    args.push('-ss', formatFfmpegSeconds(safeRecoverySeekSec));
+  }
+  args.push('-i', inputPath);
+  // The damaged prefix recovery only needs to seek the video decoder. Open a
+  // second, unseeked input for audio so those first seconds remain audible
+  // under the replacement black frames and the original A/V clock is kept.
+  const recoveryAudioInputIndex = safeRecoverySeekSec > 0 && hasAudio ? 1 : 0;
+  if (recoveryAudioInputIndex) {
+    args.push('-i', inputPath);
+  }
   const videoDurationFilter = normalizedDuration > 0 ? `trim=duration=${formatFfmpegSeconds(normalizedDuration)},` : '';
   const audioDurationFilter = normalizedDuration > 0 ? `apad,atrim=duration=${formatFfmpegSeconds(normalizedDuration)},` : '';
   const pixelFormat = resolveMergePixelFormat(targetVideoInfo, videoCodec);
+  // Resetting both tracks to zero destroys a real source-side lead-in (common
+  // after an HLS reconnect). Restore the relative start offset with black
+  // video or silent audio before the common duration trim.
+  const leadingVideoPaddingSec = Math.max(0, Number(timelineAlignment?.videoPaddingSec) || 0);
+  const leadingAudioPaddingMs = Math.max(0, Math.round((Number(timelineAlignment?.audioPaddingSec) || 0) * 1000));
+  const totalVideoPaddingSec = safeRecoverySeekSec + leadingVideoPaddingSec;
+  const videoPaddingFilter =
+    totalVideoPaddingSec > 0.0005
+      ? `,tpad=start_duration=${formatFfmpegSeconds(totalVideoPaddingSec)}:start_mode=add:color=black${
+          normalizedDuration > 0
+            ? `,trim=duration=${formatFfmpegSeconds(normalizedDuration)},setpts=PTS-STARTPTS`
+            : ''
+        }`
+      : '';
   const filters = [
     `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
       `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
-      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=${pixelFormat}[vout]`
+      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=${pixelFormat}` +
+      `${videoPaddingFilter}[vout]`
   ];
   if (hasAudio) {
+    const audioPaddingFilter = leadingAudioPaddingMs > 0 ? `adelay=${leadingAudioPaddingMs}:all=1,` : '';
     filters.push(
-      `[0:a:0]aresample=48000:async=1:first_pts=0,${audioDurationFilter}` +
+      `[${recoveryAudioInputIndex}:a:0]aresample=48000,asetpts=PTS-STARTPTS,${audioPaddingFilter}${audioDurationFilter}` +
         'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[aout]'
     );
   } else {
@@ -883,31 +961,51 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     throw new Error('统一规格合并缺少有效的目标分辨率。');
   }
 
-  const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-fflags', '+genpts+discardcorrupt'];
+  const args = [
+    '-hide_banner',
+    '-nostats',
+    '-progress',
+    'pipe:2',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err'
+  ];
   for (const segment of segments) {
     args.push('-i', segment.filePath);
   }
 
-  const targetFps = normalizeMergeFps(targetVideoInfo?.fps);
   const pixelFormat = resolveMergePixelFormat(targetVideoInfo, videoCodec);
   const filters = [];
   const concatInputs = [];
   segments.forEach((segment, index) => {
-    const fpsFilter = targetFps ? `,fps=${targetFps}` : '';
     const videoDurationFilter = Number(segment.durationSec) > 0
       ? `trim=duration=${formatFfmpegSeconds(segment.durationSec)},`
       : '';
     const audioDurationFilter = Number(segment.durationSec) > 0
       ? `apad,atrim=duration=${formatFfmpegSeconds(segment.durationSec)},`
       : '';
+    const leadingVideoPaddingSec = Math.max(0, Number(segment.timelineAlignment?.videoPaddingSec) || 0);
+    const leadingAudioPaddingMs = Math.max(0, Math.round((Number(segment.timelineAlignment?.audioPaddingSec) || 0) * 1000));
+    const videoPaddingFilter =
+      leadingVideoPaddingSec > 0.0005
+        ? `,tpad=start_duration=${formatFfmpegSeconds(leadingVideoPaddingSec)}:start_mode=add:color=black${
+            Number(segment.durationSec) > 0
+              ? `,trim=duration=${formatFfmpegSeconds(segment.durationSec)},setpts=PTS-STARTPTS`
+              : ''
+          }`
+        : '';
+    const audioPaddingFilter = leadingAudioPaddingMs > 0 ? `adelay=${leadingAudioPaddingMs}:all=1,` : '';
     filters.push(
       `[${index}:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
         `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
-        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${fpsFilter},format=${pixelFormat}[v${index}]`
+        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=${pixelFormat}` +
+        `${videoPaddingFilter}[v${index}]`
     );
     if (segment.hasAudio) {
       filters.push(
-        `[${index}:a:0]aresample=48000:async=1:first_pts=0,${audioDurationFilter}` +
+        `[${index}:a:0]aresample=48000,asetpts=PTS-STARTPTS,${audioPaddingFilter}${audioDurationFilter}` +
           `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${index}]`
       );
     } else {
@@ -923,20 +1021,6 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
 
   args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-map', '[aout]');
   appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, softwareThreads });
-  args.push(outputPath);
-  return args;
-}
-
-function createAudioAlignArgs({ inputPath, outputPath, container, videoDurationSec }) {
-  const duration = Number(videoDurationSec || 0);
-  if (!duration) throw new Error('音画对齐缺少有效的视频时长。');
-  const args = [
-    '-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-i', inputPath,
-    '-filter_complex', `[0:a:0]aresample=48000:async=1:first_pts=0,apad,atrim=duration=${formatFfmpegSeconds(duration)},asetpts=PTS-STARTPTS[aout]`,
-    '-map', '0:v:0', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-ac', '2',
-    '-dn', '-sn', '-avoid_negative_ts', 'make_zero'
-  ];
-  if (container === 'mp4') args.push('-movflags', '+faststart');
   args.push(outputPath);
   return args;
 }
@@ -1144,7 +1228,6 @@ module.exports = {
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
-  createAudioAlignArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
   assertSafeMergeTargetProfile,

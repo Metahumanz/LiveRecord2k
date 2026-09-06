@@ -156,7 +156,7 @@ test('structured FFmpeg progress and merge resource waiting remain observable an
   }
 });
 
-test('merge normalization drops corrupt packets instead of explicitly ignoring decoder errors', () => {
+test('merge normalization can retry one corrupt segment with CUDA decode and a duration-preserving prefix repair', () => {
   const args = createNormalizeSegmentArgs({
     inputPath: 'source.clean.mp4',
     outputPath: 'normalized.mkv',
@@ -168,7 +168,29 @@ test('merge normalization drops corrupt packets instead of explicitly ignoring d
   });
 
   assert.ok(args.includes('+genpts+discardcorrupt'));
-  assert.equal(args.includes('ignore_err'), false);
+  assert.equal(args.includes('ignore_err'), true, '损坏 HEVC 包应跳过，不应卡住规范化作业');
+
+  const recoveryArgs = createNormalizeSegmentArgs({
+    inputPath: 'source.clean.mp4',
+    outputPath: 'normalized.mkv',
+    container: 'mkv',
+    durationSec: 30,
+    hasAudio: true,
+    targetVideoInfo: { width: 1920, height: 1080, fps: 30, codec: 'hevc', bitDepth: 8, pixelFormat: 'yuv420p' },
+    videoCodec: 'hevc_nvenc',
+    decoder: 'cuda',
+    decoderThreads: 1,
+    recoverySeekSec: 5
+  });
+  const filter = recoveryArgs[recoveryArgs.indexOf('-filter_complex') + 1];
+
+  assert.equal(recoveryArgs[recoveryArgs.indexOf('-hwaccel') + 1], 'cuda');
+  assert.equal(recoveryArgs[recoveryArgs.indexOf('-ss') + 1], '5');
+  assert.equal(recoveryArgs[recoveryArgs.indexOf('-threads') + 1], '1');
+  assert.equal(recoveryArgs.filter((value) => value === 'source.clean.mp4').length, 2);
+  assert.match(filter, /tpad=start_duration=5:start_mode=add:color=black,trim=duration=30/);
+  assert.match(filter, /\[1:a:0\]aresample=48000,asetpts=PTS-STARTPTS,apad,atrim=duration=30/);
+  assert.doesNotMatch(filter, /async=1|fps=/, 'recovery must retain original audio/video clocks');
 });
 
 test('real merge normalizes a timing-risk source segment and produces an A/V-safe merged recording', async () => {
