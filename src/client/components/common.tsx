@@ -142,6 +142,11 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const codecLabel = progress.codec
     ? `${progress.codecKind === 'hardware' ? '硬件' : '软件'}编码 ${progress.codec}`
     : '';
+  const decoderLabel = progress.decoder
+    ? progress.decoderKind === 'hardware'
+      ? `硬件解码 ${progress.decoderLabel || progress.decoder}`
+      : 'CPU 解码'
+    : '';
   const statusLabel =
     progress.status === 'completed'
       ? '完成'
@@ -169,6 +174,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         {[
           progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度'),
           hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : '',
+          decoderLabel,
           codecLabel
         ]
           .filter(Boolean)

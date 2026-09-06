@@ -35,6 +35,13 @@ const BURN_CODEC_CANDIDATES = [
   { value: 'h264_amf', label: 'AMD H.264 硬件编码', kind: 'hardware', vendor: 'amd' }
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
+const HARDWARE_DECODER_CANDIDATES = [
+  { value: 'cuda', label: 'NVIDIA CUDA', vendor: 'nvidia' },
+  { value: 'qsv', label: 'Intel Quick Sync', vendor: 'intel' },
+  { value: 'd3d11va', label: 'Direct3D 11', platform: 'win32' },
+  { value: 'dxva2', label: 'DirectX VA2', platform: 'win32' },
+  { value: 'vaapi', label: 'VA-API', platform: 'linux', vendors: ['intel', 'amd'] }
+];
 const APP_ROOT = getAppRoot();
 const APP_VERSION = getAppVersion();
 // 官方更新清单（releases/latest/download/update.json）与下载包共用镜像回退。
@@ -412,17 +419,150 @@ async function detectFfmpegCapabilities(ffmpegPath) {
     ['hwupload_cuda', 'overlay_cuda', 'scale_cuda'].every((filter) => filterNames.has(filter))
       ? await testFfmpegCudaAvatarComposite(ffmpegPath)
       : { ok: false, reason: '未检测到可用的 CUDA 透明图层合成链路' };
+  const hardwareDecoders = await detectFfmpegHardwareDecoders(ffmpegPath, {
+    encoderNames,
+    hwaccels,
+    videoAdapters
+  });
 
   return {
     burnCodecs,
     unavailableBurnCodecs,
     hwaccels,
+    hardwareDecoders,
     videoAdapters,
     cudaAvatarComposite: cudaAvatarComposite.ok,
     cudaAvatarCompositeReason: cudaAvatarComposite.reason || '',
     probedAt: Date.now(),
     probeError: encoderProbe.ok ? '' : encoderProbe.error
   };
+}
+
+function shouldTestHardwareDecoder(candidate, hwaccels, adapters, platform = process.platform) {
+  if (!hwaccels.includes(candidate.value)) return false;
+  if (candidate.platform && candidate.platform !== platform) return false;
+  if (candidate.vendor && platform === 'win32' && !hasVideoAdapterVendor(adapters, candidate.vendor)) return false;
+  if (
+    Array.isArray(candidate.vendors) &&
+    adapters.length > 0 &&
+    !candidate.vendors.some((vendor) => hasVideoAdapterVendor(adapters, vendor))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function createHardwareDecodeProbeSample(ffmpegPath, sourceCodec, outputPath) {
+  const encoder = sourceCodec === 'hevc' ? 'libx265' : 'libx264';
+  const result = await runCapturedProcess(
+    ffmpegPath,
+    [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'testsrc2=size=640x360:rate=3:duration=1',
+      '-frames:v',
+      '3',
+      '-an',
+      '-c:v',
+      encoder,
+      '-preset',
+      'ultrafast',
+      '-threads',
+      '1',
+      '-g',
+      '1',
+      '-pix_fmt',
+      'yuv420p',
+      '-f',
+      'matroska',
+      outputPath
+    ],
+    { timeoutMs: 15000, maxOutputBytes: 128 * 1024 }
+  );
+  return result.status === 0 && !result.error && !result.timedOut;
+}
+
+async function testFfmpegHardwareDecoder(ffmpegPath, accelerator, inputPath) {
+  try {
+    const result = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-hwaccel',
+        accelerator,
+        '-i',
+        inputPath,
+        '-frames:v',
+        '1',
+        '-vf',
+        'scale=320:180,format=yuv420p',
+        '-an',
+        '-f',
+        'null',
+        '-'
+      ],
+      { timeoutMs: 10000, maxOutputBytes: 128 * 1024 }
+    );
+    if (result.status === 0 && !result.error && !result.timedOut) {
+      return { ok: true, reason: '' };
+    }
+    const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+    return {
+      ok: false,
+      reason: result.timedOut ? '硬件解码测试超时' : output || result.error?.message || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+}
+
+async function detectFfmpegHardwareDecoders(ffmpegPath, options = {}) {
+  const encoderNames = options.encoderNames instanceof Set ? options.encoderNames : new Set();
+  const hwaccels = Array.isArray(options.hwaccels) ? options.hwaccels : [];
+  const videoAdapters = Array.isArray(options.videoAdapters) ? options.videoAdapters : [];
+  const candidates = HARDWARE_DECODER_CANDIDATES.filter((candidate) =>
+    shouldTestHardwareDecoder(candidate, hwaccels, videoAdapters)
+  );
+  const sourceProfiles = [
+    { codec: 'h264', encoder: 'libx264' },
+    { codec: 'hevc', encoder: 'libx265' }
+  ].filter((profile) => encoderNames.has(profile.encoder));
+  if (!candidates.length || !sourceProfiles.length) return [];
+
+  const temporaryDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-hwdecode-probe-'));
+  const samples = new Map();
+  const supported = [];
+  try {
+    for (const profile of sourceProfiles) {
+      const samplePath = path.join(temporaryDir, `${profile.codec}.mkv`);
+      if (await createHardwareDecodeProbeSample(ffmpegPath, profile.codec, samplePath)) {
+        samples.set(profile.codec, samplePath);
+      }
+    }
+    for (const candidate of candidates) {
+      for (const [codec, samplePath] of samples) {
+        const result = await testFfmpegHardwareDecoder(ffmpegPath, candidate.value, samplePath);
+        if (result.ok) {
+          supported.push({
+            value: candidate.value,
+            label: candidate.label,
+            vendor: candidate.vendor,
+            codec
+          });
+        }
+      }
+    }
+    return supported;
+  } finally {
+    await fsp.rm(temporaryDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function runFfmpegProbe(ffmpegPath, args, options = {}) {
@@ -949,7 +1089,18 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   });
 }
 
-function createFfmpegJobProgress({ kind, label, outputPath, durationSec, roomId, codec, codecKind }) {
+function createFfmpegJobProgress({
+  kind,
+  label,
+  outputPath,
+  durationSec,
+  roomId,
+  codec,
+  codecKind,
+  decoder,
+  decoderKind,
+  decoderLabel
+}) {
   const now = Date.now();
   const duration = Number(durationSec || 0);
   return {
@@ -961,6 +1112,9 @@ function createFfmpegJobProgress({ kind, label, outputPath, durationSec, roomId,
     roomId,
     codec: codec || '',
     codecKind: codecKind || undefined,
+    decoder: decoder || undefined,
+    decoderKind: decoderKind || undefined,
+    decoderLabel: decoderLabel || undefined,
     startedAt: now,
     updatedAt: now,
     currentTimeSec: 0,

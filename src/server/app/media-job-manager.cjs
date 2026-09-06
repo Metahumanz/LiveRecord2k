@@ -5,6 +5,10 @@ const { EventEmitter } = require('node:events');
 const DEFAULT_LIMITS = { cpu: 1, gpu: 1, io: 2 };
 const JOB_PRIORITIES = { recording: 100, merge: 70, burn: 60, export: 50, preview: 20 };
 
+function resourceSlots(resource) {
+  return resource === 'hybrid' ? ['cpu', 'gpu'] : [resource];
+}
+
 class MediaJobManager extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -87,10 +91,15 @@ class MediaJobManager extends EventEmitter {
 
   resourceAvailable(resource) {
     const recordingActive = Array.from(this.external.values()).some((job) => job.type === 'recording');
-    if (recordingActive && (resource === 'cpu' || resource === 'gpu')) return false;
-    const limit = Number(this.limits[resource] ?? 1);
-    const activeCount = Array.from(this.active.values()).filter((job) => job.resource === resource).length;
-    return activeCount < limit;
+    const requiredSlots = resourceSlots(resource);
+    if (recordingActive && requiredSlots.some((slot) => slot === 'cpu' || slot === 'gpu')) return false;
+    return requiredSlots.every((slot) => {
+      const limit = Number(this.limits[slot] ?? 1);
+      const activeCount = Array.from(this.active.values()).filter((job) =>
+        resourceSlots(job.resource).includes(slot)
+      ).length;
+      return activeCount < limit;
+    });
   }
 
   cancel(id) {

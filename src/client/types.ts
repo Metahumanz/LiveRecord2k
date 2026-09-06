@@ -255,6 +255,12 @@ export type FfmpegCapabilities = {
   burnCodecs: FfmpegCodecOption[];
   unavailableBurnCodecs: FfmpegCodecOption[];
   hwaccels: string[];
+  hardwareDecoders?: Array<{
+    value: string;
+    label: string;
+    codec: 'h264' | 'hevc';
+    vendor?: 'nvidia' | 'intel' | 'amd';
+  }>;
   videoAdapters: Array<{
     name: string;
     vendor: 'nvidia' | 'intel' | 'amd' | 'unknown';
@@ -272,6 +278,9 @@ export type FfmpegJobProgress = {
   roomId?: string;
   codec?: string;
   codecKind?: 'software' | 'hardware';
+  decoder?: string;
+  decoderKind?: 'software' | 'hardware';
+  decoderLabel?: string;
   startedAt: number;
   workStartedAt?: number;
   updatedAt: number;
