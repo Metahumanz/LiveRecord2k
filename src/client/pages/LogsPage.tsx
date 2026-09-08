@@ -8,7 +8,7 @@ export function LogsPage({
   run
 }: {
   logs: LogEntry[];
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   return (
@@ -19,7 +19,7 @@ export function LogsPage({
         actions={
           <button
             className="wide-button"
-            disabled={busy === 'clear-logs'}
+            disabled={busy.has('clear-logs')}
             onClick={() => run('clear-logs', recorder.clearLogs)}
           >
             清空

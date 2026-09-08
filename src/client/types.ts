@@ -214,6 +214,7 @@ export type PreviewStartResult = {
 export type ExportPreviewResult = {
   ok: boolean;
   id: string;
+  jobId?: string;
   previewUrl: string;
   ready: boolean;
   cached: boolean;
@@ -224,7 +225,7 @@ export type PreviewProxyState = {
   id: string;
   sourcePath: string;
   previewUrl: string;
-  status: 'running' | 'ready' | 'error';
+  status: 'queued' | 'running' | 'ready' | 'error' | 'cancelled';
   ready: boolean;
   cached: boolean;
   message?: string;
@@ -323,6 +324,23 @@ export type DiskSpaceState = {
   error?: string;
 };
 
+export type CleanupPreviewItem = {
+  path: string;
+  type: string;
+  sizeBytes: number;
+};
+
+export type CleanupScanResult = {
+  scanId: string;
+  groupCount: number;
+  skippedGroupCount: number;
+  fileCount: number;
+  totalBytes: number;
+  items: CleanupPreviewItem[];
+  omittedCount: number;
+  truncated: boolean;
+};
+
 export type ExportClipRequest = {
   mode: 'clean' | 'burn';
   cleanPath: string;
@@ -406,7 +424,7 @@ export type RecorderApi = {
   getDiskSpace: (path?: string) => Promise<DiskSpaceState>;
   saveSettings: (settings: Partial<AppSettings>) => Promise<AppState>;
   addRoom: (roomId: string) => Promise<AppState>;
-  removeRoom: (roomId: string) => Promise<AppState>;
+  removeRoom: (roomId: string, options?: { force?: boolean }) => Promise<AppState>;
   refreshRoom: (roomId: string, options?: { silent?: boolean }) => Promise<AppState>;
   setMonitoring: (roomId: string, enabled: boolean) => Promise<AppState>;
   setAutoRecord: (roomId: string, enabled: boolean) => Promise<AppState>;
@@ -443,7 +461,8 @@ export type RecorderApi = {
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
   cancelExport: () => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
-  cleanupMergedResiduals: () => Promise<AppState>;
+  scanMergedResiduals: () => Promise<CleanupScanResult>;
+  applyMergedResidualCleanup: (scanId: string) => Promise<AppState>;
   clearLogs: () => Promise<AppState>;
   openOutputDir: () => Promise<AppState>;
   openPathDir: (path: string, options?: { asDirectory?: boolean }) => Promise<AppState>;

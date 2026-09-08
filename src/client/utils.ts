@@ -85,6 +85,61 @@ export function parseSettingsImport(text: string): Partial<AppSettings> {
   return importedSettings;
 }
 
+export type SettingsImportChange = {
+  key: keyof AppSettings;
+  label: string;
+  previous: string;
+  next: string;
+  highRisk: boolean;
+};
+
+const settingsImportLabels: Partial<Record<keyof AppSettings, string>> = {
+  cookie: '登录 Cookie',
+  outputDir: '录像保存目录',
+  autoBurnDanmaku: '自动生成弹幕视频',
+  deleteSourceAfterBurn: '烧录后删除源文件',
+  serverHost: '监听地址',
+  serverPort: '服务端口',
+  trustedProxies: '可信反向代理',
+  accessUsername: '远程访问用户名',
+  webhookUrl: 'Webhook 地址',
+  webhookAllowPrivateNetwork: '允许 Webhook 私有网络'
+};
+
+const highRiskSettings = new Set<keyof AppSettings>([
+  'cookie',
+  'outputDir',
+  'autoBurnDanmaku',
+  'deleteSourceAfterBurn',
+  'serverHost',
+  'serverPort',
+  'trustedProxies',
+  'accessUsername',
+  'webhookAllowPrivateNetwork'
+]);
+
+function formatImportedSettingValue(key: keyof AppSettings, value: unknown) {
+  if (key === 'cookie') {
+    return String(value || '').trim() ? '已提供（内容隐藏）' : '空';
+  }
+  if (typeof value === 'boolean') return value ? '开启' : '关闭';
+  if (Array.isArray(value)) return value.length ? value.join(', ') : '无';
+  if (value && typeof value === 'object') return '已设置';
+  return String(value ?? '') || '空';
+}
+
+export function getSettingsImportChanges(current: AppSettings, imported: Partial<AppSettings>): SettingsImportChange[] {
+  return (Object.keys(imported) as Array<keyof AppSettings>)
+    .filter((key) => JSON.stringify(current[key]) !== JSON.stringify(imported[key]))
+    .map((key) => ({
+      key,
+      label: settingsImportLabels[key] || String(key),
+      previous: formatImportedSettingValue(key, current[key]),
+      next: formatImportedSettingValue(key, imported[key]),
+      highRisk: highRiskSettings.has(key)
+    }));
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }

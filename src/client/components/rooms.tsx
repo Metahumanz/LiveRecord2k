@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import Hls from 'hls.js';
+import type Hls from 'hls.js';
 import {
   Activity,
   CircleAlert,
@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { JobProgress } from './common';
-import type { AppSettings, AppState, RoomState } from '../types';
+import type { AppSettings, AppState, ExportPreviewResult, RoomState } from '../types';
 import { KEYFRAME_IMAGE_REFRESH_MS } from '../ui/options';
 import {
   commandCountsSummary,
@@ -37,6 +37,70 @@ import {
   loginStatusLabel,
   qnLabel
 } from '../utils';
+
+const KEYFRAME_VIEWPORT_MARGIN = '320px 0px';
+const keyframeRefreshSubscribers = new Set<() => void>();
+let keyframeRefreshTimer: number | null = null;
+
+function isDocumentVisible() {
+  return typeof document === 'undefined' || document.visibilityState !== 'hidden';
+}
+
+function runSharedKeyframeRefresh() {
+  if (!isDocumentVisible()) {
+    return;
+  }
+  for (const refresh of keyframeRefreshSubscribers) {
+    refresh();
+  }
+}
+
+function subscribeSharedKeyframeRefresh(refresh: () => void) {
+  keyframeRefreshSubscribers.add(refresh);
+  if (keyframeRefreshTimer === null) {
+    keyframeRefreshTimer = window.setInterval(runSharedKeyframeRefresh, KEYFRAME_IMAGE_REFRESH_MS);
+  }
+  return () => {
+    keyframeRefreshSubscribers.delete(refresh);
+    if (keyframeRefreshSubscribers.size === 0 && keyframeRefreshTimer !== null) {
+      window.clearInterval(keyframeRefreshTimer);
+      keyframeRefreshTimer = null;
+    }
+  };
+}
+
+function usePageVisible() {
+  const [pageVisible, setPageVisible] = useState(isDocumentVisible);
+  useEffect(() => {
+    const updatePageVisibility = () => setPageVisible(isDocumentVisible());
+    updatePageVisibility();
+    document.addEventListener('visibilitychange', updatePageVisibility);
+    return () => document.removeEventListener('visibilitychange', updatePageVisibility);
+  }, []);
+  return pageVisible;
+}
+
+function useNearViewport(targetRef: React.RefObject<HTMLElement | null>, enabled: boolean) {
+  const [nearViewport, setNearViewport] = useState(false);
+  useEffect(() => {
+    if (!enabled) {
+      setNearViewport(false);
+      return;
+    }
+    const target = targetRef.current;
+    if (!target || typeof IntersectionObserver === 'undefined') {
+      setNearViewport(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => setNearViewport(Boolean(entry?.isIntersecting)),
+      { rootMargin: KEYFRAME_VIEWPORT_MARGIN }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [enabled, targetRef]);
+  return nearViewport;
+}
 
 export function ImageModeSwitch({
   value,
@@ -84,14 +148,22 @@ export function RoomPreview({
 }) {
   const rawImageUrl = roomImageMode === 'cover' ? room.cover : room.keyframe;
   const [previewVersion, setPreviewVersion] = useState(Date.now());
+  const previewRef = useRef<HTMLDivElement | null>(null);
+  const pageVisible = usePageVisible();
+  const canRefreshKeyframe =
+    roomImageMode === 'keyframe' &&
+    Boolean(rawImageUrl) &&
+    (room.liveStatus === 1 || Boolean(room.recording));
+  const nearViewport = useNearViewport(previewRef, canRefreshKeyframe);
+  const shouldRefreshKeyframe = canRefreshKeyframe && pageVisible && nearViewport;
   useEffect(() => {
-    if (roomImageMode !== 'keyframe') {
+    if (!shouldRefreshKeyframe) {
       return;
     }
-    setPreviewVersion(Date.now());
-    const timer = window.setInterval(() => setPreviewVersion(Date.now()), KEYFRAME_IMAGE_REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [rawImageUrl, roomImageMode]);
+    const refresh = () => setPreviewVersion(Date.now());
+    refresh();
+    return subscribeSharedKeyframeRefresh(refresh);
+  }, [rawImageUrl, shouldRefreshKeyframe]);
   const imageVersion = roomImageMode === 'keyframe' ? previewVersion : room.lastCheckedAt;
   const imageUrl = rawImageUrl ? imageProxyUrl(rawImageUrl, imageVersion) : '';
   const imageKey = rawImageUrl ? `${rawImageUrl}:${imageVersion || 0}` : '';
@@ -100,7 +172,7 @@ export function RoomPreview({
   const canPreview = room.liveStatus === 1 || room.recording;
 
   return (
-    <div className="room-cover">
+    <div ref={previewRef} className="room-cover">
       {canShowImage ? (
         <img src={imageUrl} alt="" onError={() => setFailedSrc(imageKey)} />
       ) : (
@@ -127,12 +199,14 @@ export function RoomCard({
   roomImageMode,
   busy,
   run,
+  removeRoom,
   openPreview
 }: {
   room: RoomState;
   roomImageMode: AppSettings['roomImageMode'];
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
+  removeRoom: (roomId: string) => Promise<void>;
   openPreview: (roomId: string) => void;
 }) {
   const status = getRoomStatus(room);
@@ -166,8 +240,8 @@ export function RoomCard({
           <button
             className="icon-button danger"
             title="移除直播间"
-            disabled={room.recording || busy === `remove-${roomKey}`}
-            onClick={() => run(`remove-${roomKey}`, () => recorder.removeRoom(room.id))}
+            disabled={room.recording || busy.has(`remove-${roomKey}`)}
+            onClick={() => removeRoom(room.id)}
           >
             <Trash2 size={18} />
           </button>
@@ -202,7 +276,7 @@ export function RoomCard({
           <button
             className="wide-button danger fill"
             type="button"
-            disabled={busy === `cancel-merge-${roomKey}`}
+            disabled={busy.has(`cancel-merge-${roomKey}`)}
             onClick={() => run(`cancel-merge-${roomKey}`, () => recorder.cancelMerge(room.id))}
           >
             <Square size={17} />
@@ -213,7 +287,7 @@ export function RoomCard({
           <button
             className="wide-button fill"
             type="button"
-            disabled={busy === `retry-merge-${roomKey}`}
+            disabled={busy.has(`retry-merge-${roomKey}`)}
             onClick={() => run(`retry-merge-${roomKey}`, () => recorder.retryMerge(room.id))}
           >
             <RefreshCw size={17} />
@@ -226,7 +300,7 @@ export function RoomCard({
           <button
             className="wide-button danger fill"
             type="button"
-            disabled={busy === `cancel-burn-${roomKey}`}
+            disabled={busy.has(`cancel-burn-${roomKey}`)}
             onClick={() => run(`cancel-burn-${roomKey}`, () => recorder.cancelBurnDanmaku(room.id))}
           >
             <Square size={17} />
@@ -325,7 +399,7 @@ export function RoomCard({
           <button
             className="wide-button"
             title="刷新状态"
-            disabled={busy === `refresh-${roomKey}`}
+            disabled={busy.has(`refresh-${roomKey}`)}
             onClick={() => run(`refresh-${roomKey}`, () => recorder.refreshRoom(room.id))}
           >
             <RefreshCw size={18} />
@@ -333,7 +407,7 @@ export function RoomCard({
           </button>
           <button
             className={room.monitoring ? 'wide-button active' : 'wide-button'}
-            disabled={busy === `monitor-${roomKey}`}
+            disabled={busy.has(`monitor-${roomKey}`)}
             onClick={() =>
               run(`monitor-${roomKey}`, () => recorder.setMonitoring(room.id, !room.monitoring))
             }
@@ -343,7 +417,7 @@ export function RoomCard({
           </button>
           <button
             className={room.autoRecord ? 'wide-button active' : 'wide-button'}
-            disabled={busy === `auto-record-${roomKey}`}
+            disabled={busy.has(`auto-record-${roomKey}`)}
             title="监听只负责状态和通知；自动录制决定开播后是否自动开始录像"
             onClick={() =>
               run(`auto-record-${roomKey}`, () => recorder.setAutoRecord(room.id, !room.autoRecord))
@@ -355,7 +429,7 @@ export function RoomCard({
           {room.recording ? (
             <button
               className="wide-button danger"
-              disabled={busy === `stop-${roomKey}`}
+              disabled={busy.has(`stop-${roomKey}`)}
               onClick={() => run(`stop-${roomKey}`, () => recorder.stopRecording(room.id))}
             >
               <Square size={17} />
@@ -364,7 +438,7 @@ export function RoomCard({
           ) : (
             <button
               className="wide-button primary"
-              disabled={busy === `record-${roomKey}`}
+              disabled={busy.has(`record-${roomKey}`)}
               onClick={() => run(`record-${roomKey}`, () => recorder.startRecording(room.id))}
             >
               <Play size={17} />
@@ -385,6 +459,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
   const [previewMode, setPreviewMode] = useState<'recording' | 'live'>('live');
   const [temporaryPreviewVersion, setTemporaryPreviewVersion] = useState(Date.now());
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('');
   const [error, setError] = useState('');
   const temporarySegmentIndex = Number(room.currentRecording?.mergeSequence || 0);
 
@@ -401,6 +476,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
     let triedNetworkRecovery = false;
     let triedMediaRecovery = false;
     let nativeErrorHandler: (() => void) | null = null;
+    let unsubscribePreviewState: (() => void) | null = null;
     const video = videoRef.current;
     if (!video) {
       return;
@@ -439,9 +515,43 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
       }, Math.min(800 * liveRetryCount, 2400));
     }
 
+    function waitForCompatiblePreview(nextPreview: ExportPreviewResult): Promise<ExportPreviewResult> {
+      if (nextPreview.ready) {
+        return Promise.resolve(nextPreview);
+      }
+      return new Promise<ExportPreviewResult>((resolve, reject) => {
+        const inspect = (state: AppState) => {
+          const proxy = state.previewProxy;
+          if (proxy?.id === nextPreview.id && proxy.ready) {
+            unsubscribePreviewState?.();
+            unsubscribePreviewState = null;
+            resolve({ ...nextPreview, ready: true, previewUrl: proxy.previewUrl });
+            return;
+          }
+          const progress = state.previewProgress;
+          if (
+            progress &&
+            progress.id === nextPreview.jobId &&
+            (progress.status === 'error' || progress.status === 'cancelled')
+          ) {
+            unsubscribePreviewState?.();
+            unsubscribePreviewState = null;
+            reject(new Error(progress.message || '兼容预览未能完成。'));
+          }
+        };
+        unsubscribePreviewState = recorder.onStateChanged(inspect);
+        void recorder.getInitialState().then(inspect).catch((loadError) => {
+          unsubscribePreviewState?.();
+          unsubscribePreviewState = null;
+          reject(loadError);
+        });
+      });
+    }
+
     async function start() {
       setError('');
       setLoading(true);
+      setLoadingMessage(previewMode === 'recording' ? '正在生成临时录像 HLS 预览' : '正在连接实时画面');
       try {
         resetPlayer();
 
@@ -449,17 +559,49 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
           setError('当前还没有可预览的临时录像。');
           return;
         }
-        const nextPreview = previewMode === 'recording'
-          ? await recorder.startExportPreview({ cleanPath: temporaryPath })
-          : await recorder.startPreview(room.id);
+        let previewUrl = '';
+        if (previewMode === 'recording') {
+          let nextPreview = await recorder.startExportPreview({ cleanPath: temporaryPath });
+          if (cancelled) {
+            return;
+          }
+          if (!nextPreview.ready) {
+            setLoadingMessage(
+              nextPreview.progress?.status === 'queued'
+                ? '临时录像兼容预览排队中，正在等待媒体资源'
+                : '正在生成临时录像 HLS 预览'
+            );
+            nextPreview = await waitForCompatiblePreview(nextPreview);
+            if (cancelled) {
+              return;
+            }
+          }
+          previewUrl = nextPreview.previewUrl;
+        } else {
+          const nextPreview = await recorder.startPreview(room.id);
+          previewUrl = nextPreview.previewUrl;
+        }
         if (cancelled) {
           return;
         }
+        setLoadingMessage('');
         player.muted = previewMode === 'live';
         player.autoplay = previewMode === 'live';
         player.playsInline = true;
         nativeErrorHandler = () => scheduleLiveRetry('播放器无法读取实时流');
 
+        if (player.canPlayType('application/vnd.apple.mpegurl')) {
+          player.addEventListener('error', nativeErrorHandler);
+          player.src = previewUrl;
+          setLoading(false);
+          player.play().catch(() => {});
+          return;
+        }
+
+        const { default: Hls } = await import('hls.js');
+        if (cancelled) {
+          return;
+        }
         if (Hls.isSupported()) {
           const hls = new Hls({
             lowLatencyMode: true,
@@ -469,7 +611,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
           hlsRef.current = hls;
           hls.attachMedia(player);
           hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-            hls.loadSource(nextPreview.previewUrl);
+            hls.loadSource(previewUrl);
           });
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             setLoading(false);
@@ -505,14 +647,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
           return;
         }
 
-        if (player.canPlayType('application/vnd.apple.mpegurl')) {
-          player.addEventListener('error', nativeErrorHandler);
-          player.src = nextPreview.previewUrl;
-          setLoading(false);
-          player.play().catch(() => {});
-          return;
-        }
-
+        setLoading(false);
         setError('当前浏览器不支持 HLS 实时预览。');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -535,6 +670,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
       if (retryTimer) {
         window.clearTimeout(retryTimer);
       }
+      unsubscribePreviewState?.();
       resetPlayer();
       if (previewMode === 'recording') {
         void recorder.cancelExportPreview().catch(() => {});
@@ -601,7 +737,7 @@ export function LivePreviewModal({ room, onClose }: { room: RoomState; onClose: 
           {loading && !error ? (
             <div className="live-preview-status">
               <Activity className="spin" size={24} />
-              <span>{previewMode === 'recording' ? '正在生成临时录像 HLS 预览' : '正在连接实时画面'}</span>
+              <span>{loadingMessage || (previewMode === 'recording' ? '正在生成临时录像 HLS 预览' : '正在连接实时画面')}</span>
             </div>
           ) : null}
           {error ? (
@@ -622,7 +758,7 @@ export function QrLoginPanel({
   run
 }: {
   login: NonNullable<AppState['login']>;
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   return (
@@ -636,7 +772,7 @@ export function QrLoginPanel({
           <button
             className="icon-button"
             title="关闭"
-            disabled={busy === 'cancel-login'}
+            disabled={busy.has('cancel-login')}
             onClick={() => run('cancel-login', recorder.cancelQrLogin)}
           >
             <X size={18} />
@@ -654,7 +790,7 @@ export function QrLoginPanel({
           {login.status === 'expired' || login.status === 'error' ? (
             <button
               className="wide-button primary"
-              disabled={busy === 'qr-login'}
+              disabled={busy.has('qr-login')}
               onClick={() => run('qr-login', recorder.startQrLogin)}
             >
               <RefreshCw size={17} />

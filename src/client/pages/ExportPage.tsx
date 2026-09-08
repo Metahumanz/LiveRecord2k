@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type React from 'react';
-import Hls from 'hls.js';
+import type Hls from 'hls.js';
 import {
   CheckCircle2,
   CircleAlert,
@@ -49,7 +49,7 @@ export function ExportPage({
   state: AppState;
   draft: ExportDraft;
   result: ExportResult | null;
-  busy: string | null;
+  busy: Set<string>;
   setDraft: (draft: ExportDraft) => void;
   selectRecording: (recording: RecordingState) => void;
   prepareSubtitles: () => Promise<void>;
@@ -114,7 +114,8 @@ export function ExportPage({
   const activeProxy =
     state.previewProxy?.sourcePath.toLowerCase() === selectedPathKey && state.previewProxy.ready ? state.previewProxy : null;
   const activePreviewProgress =
-    state.previewProgress?.outputPath?.toLowerCase() === selectedPathKey && state.previewProgress.status === 'running'
+    state.previewProgress?.outputPath?.toLowerCase() === selectedPathKey &&
+    ['queued', 'running'].includes(state.previewProgress.status)
       ? state.previewProgress
       : null;
   const selectionLeft = canUseTimeline ? clampNumber((timelineStart / timelineDuration) * 100, 0, 100) : 0;
@@ -157,6 +158,7 @@ export function ExportPage({
   }, [draft.cleanPath]);
 
   useEffect(() => {
+    let cancelled = false;
     const video = videoRef.current;
     if (!video || !draft.cleanPath) {
       return;
@@ -166,22 +168,34 @@ export function ExportPage({
     if (activeProxy) {
       setPreviewError('');
       setPreviewNeedsProxy(false);
-      if (Hls.isSupported()) {
-        const hls = new Hls();
-        hlsRef.current = hls;
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(activeProxy.previewUrl));
-        hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (data.fatal) {
-            setPreviewError(`兼容预览播放失败：${data.details || data.type}`);
-          }
-        });
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = activeProxy.previewUrl;
       } else {
-        setPreviewError('当前浏览器无法播放 HLS 兼容预览。');
+        void import('hls.js')
+          .then(({ default: Hls }) => {
+            if (cancelled) return;
+            if (!Hls.isSupported()) {
+              setPreviewError('当前浏览器无法播放 HLS 兼容预览。');
+              return;
+            }
+            const hls = new Hls();
+            hlsRef.current = hls;
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(activeProxy.previewUrl));
+            hls.on(Hls.Events.ERROR, (_event, data) => {
+              if (data.fatal) {
+                setPreviewError(`兼容预览播放失败：${data.details || data.type}`);
+              }
+            });
+          })
+          .catch((error) => {
+            if (!cancelled) {
+              setPreviewError(error instanceof Error ? `播放器加载失败：${error.message}` : '播放器加载失败。');
+            }
+          });
       }
       return () => {
+        cancelled = true;
         releasePreviewVideo();
       };
     }
@@ -189,6 +203,7 @@ export function ExportPage({
     video.src = mediaSource;
     video.load();
     return () => {
+      cancelled = true;
       releasePreviewVideo();
     };
   }, [activeProxy?.id, activeProxy?.previewUrl, draft.cleanPath, mediaSource]);
@@ -335,7 +350,7 @@ export function ExportPage({
           <>
             <button
               className="wide-button"
-              disabled={busy === 'scan-recordings'}
+              disabled={busy.has('scan-recordings')}
               onClick={() => run('scan-recordings', recorder.scanRecordings)}
             >
               <RefreshCw size={18} />
@@ -541,6 +556,15 @@ export function ExportPage({
                 {activePreviewProgress ? (
                   <div className="clip-preview-progress">
                     <JobProgress progress={activePreviewProgress} />
+                    <button
+                      className="wide-button danger"
+                      type="button"
+                      disabled={busy.has('export-preview-cancel')}
+                      onClick={() => run('export-preview-cancel', recorder.cancelExportPreview)}
+                    >
+                      <Square size={17} />
+                      {activePreviewProgress.status === 'queued' ? '取消排队预览' : '取消兼容预览'}
+                    </button>
                   </div>
                 ) : null}
                 {previewError ? (
@@ -764,7 +788,7 @@ export function ExportPage({
               <button
                 className="wide-button"
                 type="button"
-                disabled={busy === 'save-settings'}
+                disabled={busy.has('save-settings')}
                 onClick={saveStyleAsDefault}
               >
                 设为默认
@@ -820,7 +844,7 @@ export function ExportPage({
           <div className="split-buttons export-actions">
             <button
               className="wide-button fill"
-              disabled={!canPrepare || busy === 'export-subtitles'}
+              disabled={!canPrepare || busy.has('export-subtitles')}
               onClick={prepareSubtitles}
             >
               <FileCode2 size={18} />
@@ -829,7 +853,7 @@ export function ExportPage({
             <button
               className="wide-button fill primary"
               title={exportBlockReason || (hasExportBacklog ? '任务会排在现有任务之后' : '开始导出')}
-              disabled={!canExport || busy === 'export-clip'}
+              disabled={!canExport || busy.has('export-clip')}
               onClick={exportClip}
             >
               <Scissors size={18} />
@@ -847,7 +871,7 @@ export function ExportPage({
             <button
               className="wide-button fill danger"
               type="button"
-              disabled={busy === 'export-cancel'}
+              disabled={busy.has('export-cancel')}
               onClick={() => run('export-cancel', recorder.cancelExport)}
             >
               <Square size={17} />

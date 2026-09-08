@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Bell, FileCode2, FolderOpen, HardDrive, LogIn, QrCode, Save, Video } from 'lucide-react';
+import { Bell, FileCode2, FolderOpen, HardDrive, LogIn, QrCode, Video } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, SettingPanel, Toggle } from '../components/common';
 import type { AppSettings, AppState, DiskSpaceState } from '../types';
@@ -18,19 +18,23 @@ export function SettingsPage({
   settingsDraft,
   busy,
   run,
-  saveSettings,
-  saveSettingsImmediately,
   chooseOutputDir,
-  setSettingsDraft
+  updateSettingsDraft,
+  settingsSaveStatus,
+  settingsSaveError,
+  retrySettingsSave,
+  dirtyFields
 }: {
   state: AppState;
   settingsDraft: AppSettings;
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
-  saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
-  saveSettingsImmediately: (settings: Partial<AppSettings>) => Promise<void>;
   chooseOutputDir: () => Promise<void>;
-  setSettingsDraft: (settings: AppSettings) => void;
+  updateSettingsDraft: (settings: Partial<AppSettings>) => void;
+  settingsSaveStatus: 'idle' | 'saving' | 'saved' | 'error';
+  settingsSaveError: string;
+  retrySettingsSave: () => void;
+  dirtyFields: Set<keyof AppSettings>;
 }) {
   const loggedIn = isBilibiliLoggedIn(state);
   const isLinux = state.platform === 'linux';
@@ -48,11 +52,8 @@ export function SettingsPage({
     .join('；');
   const [diskSpace, setDiskSpace] = useState<DiskSpaceState | null>(state.outputDiskSpace || null);
 
-  function updateSetting(nextSettings: Partial<AppSettings>, persist = true) {
-    setSettingsDraft({ ...settingsDraft, ...nextSettings });
-    if (persist) {
-      void saveSettingsImmediately(nextSettings);
-    }
+  function updateSetting(nextSettings: Partial<AppSettings>) {
+    updateSettingsDraft(nextSettings);
   }
 
   useEffect(() => {
@@ -94,17 +95,22 @@ export function SettingsPage({
       <PageHeader
         title="录制配置"
         subtitle={isLinux
-          ? '先完成登录和服务端录像目录；画质、弹幕视频和监听参数按需要再调整。选项会立即保存，输入框在失去焦点后保存。'
-          : '先完成登录和输出目录；画质、弹幕视频和通知按需要再调整。选项会立即保存，输入框在失去焦点后保存。'}
+          ? '先完成登录和服务端录像目录；画质、弹幕视频和监听参数会自动保存。'
+          : '先完成登录和输出目录；画质、弹幕视频和通知会自动保存。'}
         actions={
-          <button
-            className="wide-button primary"
-            disabled={busy === 'save-settings'}
-            onClick={() => saveSettings(settingsDraft)}
-          >
-            <Save size={18} />
-            保存录制配置
-          </button>
+          <div className={`inline-status ${settingsSaveStatus === 'error' ? 'error' : ''}`} aria-live="polite">
+            {settingsSaveStatus === 'error' ? (
+              <button className="link-button" type="button" onClick={retrySettingsSave}>
+                保存失败 · 重试{settingsSaveError ? `：${settingsSaveError}` : ''}
+              </button>
+            ) : settingsSaveStatus === 'saving' ? (
+              `保存中${dirtyFields.size ? `（${dirtyFields.size} 项）` : ''}`
+            ) : settingsSaveStatus === 'saved' ? (
+              '已保存'
+            ) : (
+              '修改后自动保存'
+            )}
+          </div>
         }
       />
 
@@ -112,14 +118,14 @@ export function SettingsPage({
         <SettingPanel title="开始使用" icon={<LogIn size={18} />} className="settings-panel-start">
           <p className="panel-intro">
             {isLinux
-              ? '第一次使用只需要完成扫码登录、填写服务端录像目录，然后保存配置。'
-              : '第一次使用只需要完成扫码登录、选择输出目录，然后保存配置。'}
+              ? '第一次使用只需要完成扫码登录、填写服务端录像目录；修改会自动保存。'
+              : '第一次使用只需要完成扫码登录、选择输出目录；修改会自动保存。'}
           </p>
           <div className="setting-row">
             <span className={loggedIn ? 'badge on' : 'badge'}>{loggedIn ? '已登录' : '未登录'}</span>
             <button
               className="wide-button primary"
-              disabled={busy === 'qr-login'}
+              disabled={busy.has('qr-login')}
               onClick={() => run('qr-login', recorder.startQrLogin)}
             >
               <QrCode size={18} />
@@ -144,8 +150,7 @@ export function SettingsPage({
               <textarea
                 rows={4}
                 value={settingsDraft.cookie}
-                onChange={(event) => updateSetting({ cookie: event.target.value }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ cookie: event.target.value })}
+                onChange={(event) => updateSetting({ cookie: event.target.value })}
                 placeholder="扫码成功后自动写入"
               />
             </label>
@@ -157,15 +162,14 @@ export function SettingsPage({
             <div className="path-row">
               <input
                 value={settingsDraft.outputDir}
-                onChange={(event) => updateSetting({ outputDir: event.target.value }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ outputDir: event.target.value })}
+                onChange={(event) => updateSetting({ outputDir: event.target.value })}
                 placeholder={isLinux ? '/var/lib/bili-record-2k/recordings' : '例如 C:\\Users\\你的用户名\\Videos\\哔哩录播2K'}
               />
               {canPickServerPath ? (
                 <button
                   className="icon-button"
                   title="选择目录"
-                  disabled={busy === 'choose-output-dir'}
+                  disabled={busy.has('choose-output-dir')}
                   onClick={chooseOutputDir}
                 >
                   <FolderOpen size={18} />
@@ -175,7 +179,7 @@ export function SettingsPage({
                 <button
                   className="icon-button"
                   title="打开目录"
-                  disabled={!settingsDraft.outputDir.trim() || busy === 'open-output-draft'}
+                  disabled={!settingsDraft.outputDir.trim() || busy.has('open-output-draft')}
                   onClick={() => run('open-output-draft', () => recorder.openPathDir(settingsDraft.outputDir, { asDirectory: true }))}
                 >
                   <HardDrive size={18} />
@@ -192,15 +196,6 @@ export function SettingsPage({
                 : '正在读取剩余磁盘空间…'}
           </p>
 
-          <button
-            className="wide-button fill primary"
-            type="button"
-            disabled={busy === 'save-settings'}
-            onClick={() => saveSettings(settingsDraft, '开始配置已保存')}
-          >
-            <Save size={18} />
-            保存开始配置
-          </button>
         </SettingPanel>
 
         <SettingPanel title="录制质量" icon={<Video size={18} />} className="settings-panel-quality">
@@ -242,8 +237,7 @@ export function SettingsPage({
                 min={1}
                 max={1440}
                 value={settingsDraft.segmentMinutes}
-                onChange={(event) => updateSetting({ segmentMinutes: Number(event.target.value) }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ segmentMinutes: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ segmentMinutes: Number(event.target.value) })}
               />
               <p className="field-help">长时间录制会按这个时长分段，便于保存和导出。</p>
             </label>
@@ -385,8 +379,7 @@ export function SettingsPage({
                 min={16}
                 max={35}
                 value={settingsDraft.burnCrf}
-                onChange={(event) => updateSetting({ burnCrf: Number(event.target.value) }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ burnCrf: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ burnCrf: Number(event.target.value) })}
               />
               <p className="field-help">数字越小画质越高、文件越大；常用范围是 18 到 28。</p>
             </label>
@@ -422,7 +415,7 @@ export function SettingsPage({
               <Toggle
                 label="开机自启"
                 checked={state.startupEnabled}
-                disabled={busy === 'startup'}
+                disabled={busy.has('startup')}
                 onChange={(checked) => run('startup', () => recorder.setStartup(checked))}
               />
             ) : null}
@@ -440,8 +433,7 @@ export function SettingsPage({
                 min={1}
                 max={300}
                 value={settingsDraft.pollIntervalSec}
-                onChange={(event) => updateSetting({ pollIntervalSec: Number(event.target.value) }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ pollIntervalSec: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ pollIntervalSec: Number(event.target.value) })}
               />
               <p className="field-help">HTTP 轮询是推送断线时的兜底；正常情况下会由直播弹幕连接即时触发开播。</p>
             </label>
@@ -462,8 +454,7 @@ export function SettingsPage({
                 inputMode="url"
                 placeholder="https://example.com/webhook"
                 value={settingsDraft.webhookUrl}
-                onChange={(event) => updateSetting({ webhookUrl: event.target.value }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ webhookUrl: event.target.value })}
+                onChange={(event) => updateSetting({ webhookUrl: event.target.value })}
               />
               <p className="field-help">
                 公网地址必须使用 HTTPS；DNS 和每一跳地址都会经过 SSRF 检查，重定向默认拒绝。
@@ -488,12 +479,6 @@ export function SettingsPage({
                 value={settingsDraft.webhookBearerToken}
                 onChange={(event) =>
                   updateSetting({
-                    webhookBearerToken: event.target.value,
-                    webhookBearerTokenClear: false
-                  }, false)
-                }
-                onBlur={(event) =>
-                  void saveSettingsImmediately({
                     webhookBearerToken: event.target.value,
                     webhookBearerTokenClear: false
                   })
@@ -564,21 +549,12 @@ export function SettingsPage({
             <button
               className="wide-button fill"
               type="button"
-              disabled={busy === 'test-webhook' || !state.settings.webhookEnabled || !state.settings.webhookUrl}
+              disabled={busy.has('test-webhook') || !state.settings.webhookEnabled || !state.settings.webhookUrl}
               onClick={() => run('test-webhook', recorder.testWebhook)}
               title="测试使用已保存的 Webhook 配置；修改后请先保存"
             >
               <Bell size={18} />
               发送 Webhook 测试
-            </button>
-            <button
-              className="wide-button fill primary"
-              type="button"
-              disabled={busy === 'save-settings'}
-              onClick={() => saveSettings(settingsDraft, isLinux ? '监听与通知配置已保存' : '通知和启动配置已保存')}
-            >
-              <Save size={18} />
-              {isLinux ? '保存监听与通知' : '保存通知配置'}
             </button>
           </div>
         </SettingPanel>

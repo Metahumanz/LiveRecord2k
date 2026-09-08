@@ -11,13 +11,15 @@ export function OverviewPage({
   busy,
   setPage,
   run,
+  removeRoom,
   openPreview
 }: {
   state: AppState;
   stats: ReturnType<typeof getStats>;
-  busy: string | null;
+  busy: Set<string>;
   setPage: (page: Page) => void;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
+  removeRoom: (roomId: string) => Promise<void>;
   openPreview: (roomId: string) => void;
 }) {
   const activeRooms = state.rooms.filter((room) => room.liveStatus === 1 || room.recording);
@@ -93,7 +95,7 @@ export function OverviewPage({
           <>
             <button
               className="wide-button"
-              disabled={busy === 'update-check'}
+              disabled={busy.has('update-check')}
               onClick={() => run('update-check', recorder.checkUpdate)}
             >
               <RefreshCw size={18} />
@@ -128,7 +130,7 @@ export function OverviewPage({
               <button
                 className="wide-button"
                 type="button"
-                disabled={busy === 'hide-next-step'}
+                disabled={busy.has('hide-next-step')}
                 onClick={() => run('hide-next-step', () => recorder.saveSettings({ hideOverviewNextStep: true }))}
               >
                 <X size={18} />
@@ -167,8 +169,9 @@ export function OverviewPage({
                 key={room.id}
                 room={room}
                 roomImageMode={state.settings.roomImageMode}
-                busy={null}
+                busy={busy}
                 run={run}
+                removeRoom={removeRoom}
                 openPreview={openPreview}
               />
             ))}

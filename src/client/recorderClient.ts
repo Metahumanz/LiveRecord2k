@@ -1,9 +1,21 @@
-import type { AppSettings, AppState, RecorderApi } from './types';
+import type { AppSettings, AppState, LogEntry, RecorderApi, RoomState } from './types';
 
 const listeners = new Set<(state: AppState) => void>();
 let eventSource: EventSource | null = null;
 let latestState: AppState | null = null;
 let eventSourceRetryCount = 0;
+
+export class RecorderApiError extends Error {
+  readonly code?: string;
+  readonly status: number;
+
+  constructor(message: string, options: { code?: string; status: number }) {
+    super(message);
+    this.name = 'RecorderApiError';
+    this.code = options.code;
+    this.status = options.status;
+  }
+}
 
 export const recorder: RecorderApi = {
   async getInitialState() {
@@ -29,7 +41,8 @@ export const recorder: RecorderApi = {
   getDiskSpace: (path) => api('/api/system/disk-space', { path }),
   saveSettings: (settings) => api<AppState>('/api/settings/save', { settings }, { timeoutMs: 120000 }),
   addRoom: (roomId) => api<AppState>('/api/rooms/add', { roomId }, { timeoutMs: 75000 }),
-  removeRoom: (roomId) => api<AppState>('/api/rooms/remove', { roomId }),
+  removeRoom: (roomId, options) =>
+    api<AppState>('/api/rooms/remove', { roomId, ...options }, { timeoutMs: options?.force ? 0 : undefined }),
   refreshRoom: (roomId, options) => api<AppState>('/api/rooms/refresh', { roomId, ...options }, { timeoutMs: 75000 }),
   setMonitoring: (roomId, enabled) => api<AppState>('/api/rooms/monitor', { roomId, enabled }),
   setAutoRecord: (roomId, enabled) => api<AppState>('/api/rooms/auto-record', { roomId, enabled }),
@@ -38,7 +51,7 @@ export const recorder: RecorderApi = {
   cancelMerge: (roomId) => api<AppState>('/api/rooms/merge/cancel', { roomId }),
   retryMerge: (roomId) => api<AppState>('/api/rooms/merge/retry', { roomId }),
   startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }, { timeoutMs: 120000 }),
-  startExportPreview: (request) => api('/api/export/preview/start', request),
+  startExportPreview: (request) => api('/api/export/preview/start', request, { timeoutMs: 0 }),
   cancelExportPreview: () => api<AppState>('/api/export/preview/cancel', {}),
   burnDanmaku: (roomId, options) => api<AppState>('/api/rooms/burn', { roomId, options }, { timeoutMs: 180000 }),
   cancelBurnDanmaku: (roomId) => api<AppState>('/api/rooms/burn/cancel', { roomId }),
@@ -47,7 +60,9 @@ export const recorder: RecorderApi = {
   exportClip: (request) => api('/api/export/clip', request),
   cancelExport: () => api<AppState>('/api/export/cancel', {}),
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}, { timeoutMs: 180000 }),
-  cleanupMergedResiduals: () => api<AppState>('/api/recordings/cleanup-merged', {}, { timeoutMs: 180000 }),
+  scanMergedResiduals: () => api('/api/recordings/cleanup-merged', {}, { timeoutMs: 180000 }),
+  applyMergedResidualCleanup: (scanId) =>
+    api<AppState>('/api/recordings/cleanup-merged', { confirm: true, scanId }, { timeoutMs: 180000 }),
   clearLogs: () => api<AppState>('/api/logs/clear', {}),
   openOutputDir: () => api<AppState>('/api/shell/open-output', {}),
   openPathDir: (path, options) => api<AppState>('/api/shell/open-path-dir', { path, ...options }),
@@ -99,7 +114,10 @@ async function api<T = unknown>(url: string, body?: unknown, options: { timeoutM
   }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.error || `请求失败：HTTP ${response.status}`);
+    throw new RecorderApiError(payload?.message || payload?.error || `请求失败：HTTP ${response.status}`, {
+      code: typeof payload?.code === 'string' ? payload.code : undefined,
+      status: response.status
+    });
   }
   if (isAppState(payload)) {
     latestState = payload;
@@ -107,24 +125,107 @@ async function api<T = unknown>(url: string, body?: unknown, options: { timeoutM
   return payload as T;
 }
 
+function publishState(state: AppState) {
+  eventSourceRetryCount = 0;
+  latestState = state;
+  for (const listener of listeners) listener(state);
+}
+
+function parseSsePayload<T>(event: MessageEvent<string>): T | null {
+  try {
+    return JSON.parse(event.data) as T;
+  } catch {
+    return null;
+  }
+}
+
+function mergeRoomEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<(RoomState & { deleted?: boolean })>(event);
+  if (!payload?.id || !latestState) return;
+  const roomId = String(payload.id);
+  const existingIndex = latestState.rooms.findIndex((room) => room.id === roomId);
+  const rooms = payload.deleted
+    ? latestState.rooms.filter((room) => room.id !== roomId)
+    : existingIndex >= 0
+      ? latestState.rooms.map((room, index) => (index === existingIndex ? payload : room))
+      : [...latestState.rooms, payload];
+  publishState({ ...latestState, rooms });
+}
+
+function mergeRecordingEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<{ recordings?: AppState['recordings'] }>(event);
+  if (!latestState || !Array.isArray(payload?.recordings)) return;
+  publishState({ ...latestState, recordings: payload.recordings });
+}
+
+function mergeMediaJobEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<Partial<AppState>>(event);
+  if (!latestState || !payload) return;
+  publishState({ ...latestState, ...payload });
+}
+
+function mergeLogEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<{ clear?: boolean; entries?: LogEntry[]; replace?: LogEntry[] }>(event);
+  if (!latestState || !payload) return;
+  let logs: LogEntry[];
+  if (payload.clear) {
+    logs = [];
+  } else if (Array.isArray(payload.replace)) {
+    logs = payload.replace;
+  } else if (Array.isArray(payload.entries)) {
+    const incomingIds = new Set(payload.entries.map((entry) => entry.id));
+    logs = [...latestState.logs.filter((entry) => !incomingIds.has(entry.id)), ...payload.entries].slice(-400);
+  } else {
+    return;
+  }
+  publishState({ ...latestState, logs });
+}
+
+function mergeSettingsEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<Partial<AppState>>(event);
+  if (!latestState || !payload?.settings) return;
+  publishState({ ...latestState, ...payload });
+}
+
+function mergeDiskSpaceEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<Pick<AppState, 'outputDiskSpace'>>(event);
+  if (!latestState || !payload || !('outputDiskSpace' in payload)) return;
+  publishState({ ...latestState, outputDiskSpace: payload.outputDiskSpace });
+}
+
+function mergeSystemEvent(event: MessageEvent<string>) {
+  const payload = parseSsePayload<Partial<AppState>>(event);
+  if (!latestState || !payload) return;
+  publishState({ ...latestState, ...payload });
+}
+
+function mergeFullStateEvent(event: MessageEvent<string>) {
+  const state = parseSsePayload<AppState>(event);
+  if (state && isAppState(state)) {
+    publishState(state);
+  }
+}
+
 function ensureEventSource() {
   if (eventSource) {
     return;
   }
-  eventSource = new EventSource('/api/events');
-  eventSource.onmessage = (event) => {
-    try {
-      const state = JSON.parse(event.data) as AppState;
-      if (!isAppState(state)) return;
-      eventSourceRetryCount = 0;
-      latestState = state;
-      for (const listener of listeners) listener(state);
-    } catch {
-      // Ignore one malformed event; EventSource remains connected for recovery.
-    }
-  };
-  eventSource.onerror = () => {
-    eventSource?.close();
+  const source = new EventSource('/api/events');
+  eventSource = source;
+  // Keep the default handler for older servers that still emit unnamed state
+  // messages during a rolling desktop/server upgrade.
+  source.onmessage = mergeFullStateEvent;
+  source.addEventListener('state', mergeFullStateEvent);
+  source.addEventListener('room', mergeRoomEvent);
+  source.addEventListener('recording', mergeRecordingEvent);
+  source.addEventListener('mediaJob', mergeMediaJobEvent);
+  source.addEventListener('log', mergeLogEvent);
+  source.addEventListener('settings', mergeSettingsEvent);
+  source.addEventListener('diskSpace', mergeDiskSpaceEvent);
+  source.addEventListener('system', mergeSystemEvent);
+  source.onerror = () => {
+    if (eventSource !== source) return;
+    source.close();
     eventSource = null;
     eventSourceRetryCount += 1;
     window.setTimeout(() => {

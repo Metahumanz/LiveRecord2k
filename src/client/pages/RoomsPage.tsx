@@ -12,6 +12,7 @@ export function RoomsPage({
   addRoom,
   busy,
   run,
+  removeRoom,
   openPreview
 }: {
   rooms: RoomState[];
@@ -20,8 +21,9 @@ export function RoomsPage({
   roomInput: string;
   setRoomInput: (value: string) => void;
   addRoom: () => Promise<void>;
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
+  removeRoom: (roomId: string) => Promise<void>;
   openPreview: (roomId: string) => void;
 }) {
   return (
@@ -33,7 +35,7 @@ export function RoomsPage({
           <div className="rooms-toolbar">
             <ImageModeSwitch
               value={roomImageMode}
-              busy={busy === 'image-mode'}
+              busy={busy.has('image-mode')}
               onChange={onRoomImageModeChange}
             />
             <div className="add-room page-add-room">
@@ -45,12 +47,12 @@ export function RoomsPage({
                     addRoom();
                   }
                 }}
-                inputMode="numeric"
-                placeholder="123456"
+                inputMode="url"
+                placeholder="房间号或 live.bilibili.com/..."
               />
               <button
                 className="wide-button primary"
-                disabled={busy === 'add-room'}
+                disabled={busy.has('add-room')}
                 onClick={addRoom}
               >
                 <Plus size={18} />
@@ -86,6 +88,7 @@ export function RoomsPage({
               roomImageMode={roomImageMode}
               busy={busy}
               run={run}
+              removeRoom={removeRoom}
               openPreview={openPreview}
             />
           ))
