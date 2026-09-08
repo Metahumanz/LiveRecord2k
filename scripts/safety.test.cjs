@@ -101,14 +101,14 @@ test('settings writes are serialized and corrupt primary state recovers from bac
 });
 
 test('media jobs honor priority while preserving the active resource limit', async () => {
-  const manager = new MediaJobManager({ limits: { cpu: 1 } });
-  const active = await manager.acquire({ id: 'active', type: 'export', resource: 'cpu' });
+  const manager = new MediaJobManager({ limits: { disk: 1, cpuEncode: 1 } });
+  const active = await manager.acquire({ id: 'active', type: 'export', resources: ['disk', 'cpuEncode'] });
   const order = [];
-  const previewPromise = manager.acquire({ id: 'preview', type: 'preview', resource: 'cpu' }).then((lease) => {
+  const previewPromise = manager.acquire({ id: 'preview', type: 'preview', resources: ['disk', 'cpuEncode'] }).then((lease) => {
     order.push('preview');
     lease.release();
   });
-  const mergePromise = manager.acquire({ id: 'merge', type: 'merge', resource: 'cpu' }).then((lease) => {
+  const mergePromise = manager.acquire({ id: 'merge', type: 'merge', resources: ['disk', 'cpuEncode'] }).then((lease) => {
     order.push('merge');
     lease.release();
   });
@@ -118,10 +118,10 @@ test('media jobs honor priority while preserving the active resource limit', asy
 });
 
 test('new CPU-heavy jobs wait while recording has the highest priority', async () => {
-  const manager = new MediaJobManager({ limits: { cpu: 1 } });
-  const releaseRecording = manager.registerExternal({ id: 'recording', type: 'recording' });
+  const manager = new MediaJobManager({ limits: { disk: 1, cpuEncode: 1 } });
+  const releaseRecording = manager.registerExternal({ id: 'recording', type: 'recording', resources: ['recording', 'network'] });
   let started = false;
-  const pending = manager.acquire({ id: 'burn', type: 'burn', resource: 'cpu' }).then((lease) => {
+  const pending = manager.acquire({ id: 'burn', type: 'burn', resources: ['disk', 'cpuEncode'] }).then((lease) => {
     started = true;
     lease.release();
   });
@@ -132,19 +132,49 @@ test('new CPU-heavy jobs wait while recording has the highest priority', async (
   assert.equal(started, true);
 });
 
-test('hybrid hardware jobs reserve both CPU filters and the GPU encoder', async () => {
-  const manager = new MediaJobManager({ limits: { cpu: 1, gpu: 1 } });
-  const cpuLease = await manager.acquire({ id: 'cpu-preview', type: 'preview', resource: 'cpu' });
-  let hybridStarted = false;
-  const hybrid = manager.acquire({ id: 'nvenc-burn', type: 'burn', resource: 'hybrid' }).then((lease) => {
-    hybridStarted = true;
+test('recording permits one GPU encoder but keeps CPU and composite jobs queued', async () => {
+  const manager = new MediaJobManager({ limits: { disk: 2, cpuEncode: 1, gpuEncode: 1, gpuComposite: 1 } });
+  const releaseRecording = manager.registerExternal({
+    id: 'recording',
+    type: 'recording',
+    resources: ['recording', 'network']
+  });
+  const gpuLease = await manager.acquire({ id: 'gpu-preview', type: 'preview', resources: ['disk', 'gpuEncode'] });
+  let cpuStarted = false;
+  let compositeStarted = false;
+  const cpu = manager.acquire({ id: 'cpu-burn', type: 'burn', resources: ['disk', 'cpuEncode'] }).then((lease) => {
+    cpuStarted = true;
+    lease.release();
+  });
+  const composite = manager
+    .acquire({ id: 'gpu-composite', type: 'burn', resources: ['disk', 'gpuEncode', 'gpuComposite'] })
+    .then((lease) => {
+      compositeStarted = true;
+      lease.release();
+    });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cpuStarted, false);
+  assert.equal(compositeStarted, false);
+  gpuLease.release();
+  releaseRecording();
+  await Promise.all([cpu, composite]);
+  assert.equal(cpuStarted, true);
+  assert.equal(compositeStarted, true);
+});
+
+test('disk-intensive jobs remain serialized even when they use different encoders', async () => {
+  const manager = new MediaJobManager({ limits: { disk: 1, cpuEncode: 1, gpuEncode: 1 } });
+  const gpuLease = await manager.acquire({ id: 'gpu', type: 'preview', resources: ['disk', 'gpuEncode'] });
+  let cpuStarted = false;
+  const cpu = manager.acquire({ id: 'cpu', type: 'merge', resources: ['disk', 'cpuEncode'] }).then((lease) => {
+    cpuStarted = true;
     lease.release();
   });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(hybridStarted, false);
-  cpuLease.release();
-  await hybrid;
-  assert.equal(hybridStarted, true);
+  assert.equal(cpuStarted, false);
+  gpuLease.release();
+  await cpu;
+  assert.equal(cpuStarted, true);
 });
 
 test('root updater accepts only a package bound to a valid official signature', async () => {

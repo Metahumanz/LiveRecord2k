@@ -88,6 +88,20 @@ function normalizeTrustedProxyList(value) {
   return values.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean).slice(0, 32);
 }
 
+function isValidTrustedProxyRule(value) {
+  const rule = String(value || '').trim().toLowerCase();
+  if (!rule) return false;
+  if (rule === 'loopback') return true;
+  const [base, prefixText, ...extra] = rule.split('/');
+  const normalizedBase = normalizeIpAddress(base);
+  const family = net.isIP(normalizedBase);
+  if (!family || extra.length) return false;
+  if (prefixText === undefined) return true;
+  if (!/^\d+$/.test(prefixText)) return false;
+  const prefix = Number(prefixText);
+  return family === 4 ? prefix >= 0 && prefix <= 32 : prefix >= 0 && prefix <= 128;
+}
+
 function isAddressInCidr(address, cidr) {
   const normalizedAddress = normalizeIpAddress(address);
   const rule = String(cidr || '').trim().toLowerCase();
@@ -225,6 +239,7 @@ module.exports = {
   isLoopbackAddress,
   isPrivateOrSpecialAddress,
   normalizeTrustedProxyList,
+  isValidTrustedProxyRule,
   isTrustedProxyAddress,
   hasForwardingHeaders,
   getRequestNetworkContext,

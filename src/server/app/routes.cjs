@@ -1,6 +1,6 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
-const { DIST_ROOT, writeJson, writeText, mimeType } = require('./service.cjs');
+const { DIST_ROOT, writeJson, writeText, mimeType, isBusinessError } = require('./service.cjs');
 const { parseCookieHeader, SESSION_TTL_MS } = require('./auth.cjs');
 const {
   getRequestNetworkContext,
@@ -48,7 +48,7 @@ async function handleRequest(service, vite, port, request, response) {
   }
   if (access.required && !access.authenticated) {
     if (parsed.pathname.startsWith('/api/')) {
-      writeJson(response, 401, { error: '请先登录远程管理页面。', code: 'ACCESS_AUTH_REQUIRED' });
+      writeApiError(response, 401, 'ACCESS_AUTH_REQUIRED', '请先登录远程管理页面。');
     } else {
       serveAccessLoginPage(service, response);
     }
@@ -70,7 +70,7 @@ async function handleRequest(service, vite, port, request, response) {
 async function handleApi(service, parsed, port, request, response, access) {
   const pathname = parsed.pathname;
   if (!isTrustedApiRequest(request, port)) {
-    writeJson(response, 403, { error: 'Forbidden' });
+    writeApiError(response, 403, 'FORBIDDEN', '请求来源不被允许。');
     return;
   }
   const localConsole = isLocalConsoleRequest(request);
@@ -132,7 +132,13 @@ async function handleApi(service, parsed, port, request, response, access) {
     return;
   }
 
-  const body = await readJsonBody(request);
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (error) {
+    writeRequestError(response, error);
+    return;
+  }
   const routes = {
     '/api/auth/qr/start': () => service.startQrLogin(),
     '/api/auth/qr/cancel': () => service.cancelQrLogin(),
@@ -140,7 +146,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/settings/save': () => service.saveSettings(body.settings || body, { preserveCookie: stateOptions.redactCookie }),
     '/api/system/disk-space': () => service.getDiskSpace(body.path),
     '/api/rooms/add': () => service.addRoom(body.roomId),
-    '/api/rooms/remove': () => service.removeRoom(body.roomId),
+    '/api/rooms/remove': () => service.removeRoom(body.roomId, { force: Boolean(body.force) }),
     '/api/rooms/refresh': () => service.refreshRoom(body.roomId, { silent: Boolean(body.silent) }),
     '/api/rooms/monitor': () => service.setMonitoring(body.roomId, body.enabled),
     '/api/rooms/auto-record': () => service.setAutoRecord(body.roomId, body.enabled),
@@ -158,7 +164,8 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/export/clip': () => service.exportClip(body),
     '/api/export/cancel': () => service.cancelExportClip(),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
-    '/api/recordings/cleanup-merged': () => service.cleanupMergedSegmentResiduals(),
+    '/api/recordings/cleanup-merged': () =>
+      service.cleanupMergedSegmentResiduals({ confirm: Boolean(body.confirm), scanId: body.scanId }),
     '/api/logs/clear': () => service.clearLogs(),
     '/api/shell/open-output': () => service.openOutputDir(),
     '/api/shell/open-path-dir': () => service.openPathDir(body.path, { asDirectory: Boolean(body.asDirectory) }),
@@ -176,7 +183,7 @@ async function handleApi(service, parsed, port, request, response, access) {
 
   const action = routes[pathname];
   if (!action) {
-    writeJson(response, 404, { error: 'Not found' });
+    writeApiError(response, 404, 'API_ROUTE_NOT_FOUND', '接口不存在。');
     return;
   }
 
@@ -184,9 +191,26 @@ async function handleApi(service, parsed, port, request, response, access) {
     const result = await action();
     writeJson(response, 200, result === undefined ? { ok: true } : redactRemoteState(result, stateOptions));
   } catch (error) {
+    if (isBusinessError(error)) {
+      writeApiError(response, error.statusCode, error.code, error.message);
+      return;
+    }
     service.log('error', error.message || String(error));
-    writeJson(response, 500, { error: error.message || String(error) });
+    writeApiError(response, 500, 'INTERNAL_ERROR', '服务器处理请求时发生异常，请稍后重试。');
   }
+}
+
+function writeApiError(response, statusCode, code, message) {
+  writeJson(response, statusCode, { code, message });
+}
+
+function writeRequestError(response, error) {
+  const statusCode = Number(error?.statusCode) || 400;
+  if (statusCode === 413) {
+    writeApiError(response, 413, 'REQUEST_TOO_LARGE', error.message || '请求体过大。');
+    return;
+  }
+  writeApiError(response, 400, 'INVALID_REQUEST', error?.message || '请求内容无效。');
 }
 
 async function handleAccessLogin(service, request, response) {

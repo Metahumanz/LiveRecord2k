@@ -2,17 +2,56 @@
 
 const { EventEmitter } = require('node:events');
 
-const DEFAULT_LIMITS = { cpu: 1, gpu: 1, io: 2 };
+const DEFAULT_LIMITS = {
+  recording: 50,
+  network: 12,
+  disk: 1,
+  cpuEncode: 1,
+  gpuEncode: 1,
+  gpuComposite: 1
+};
 const JOB_PRIORITIES = { recording: 100, merge: 70, burn: 60, export: 50, preview: 20 };
+const RESOURCE_ALIASES = {
+  cpu: ['disk', 'cpuEncode'],
+  gpu: ['disk', 'gpuEncode'],
+  hybrid: ['disk', 'cpuEncode', 'gpuEncode'],
+  io: ['disk'],
+  recording: ['recording', 'network']
+};
+const RESOURCE_SLOTS = new Set(['recording', 'network', 'disk', 'cpuEncode', 'gpuEncode', 'gpuComposite']);
 
-function resourceSlots(resource) {
-  return resource === 'hybrid' ? ['cpu', 'gpu'] : [resource];
+function normalizeResourceSlots(value) {
+  const values = Array.isArray(value) ? value : [value];
+  const slots = [];
+  for (const valueItem of values) {
+    const resource = String(valueItem || '').trim();
+    const expanded = RESOURCE_ALIASES[resource] || [resource];
+    for (const slot of expanded) {
+      if (RESOURCE_SLOTS.has(slot) && !slots.includes(slot)) {
+        slots.push(slot);
+      }
+    }
+  }
+  return slots.length ? slots : ['disk', 'cpuEncode'];
+}
+
+function resourceSummary(slots) {
+  return slots.join('+');
 }
 
 class MediaJobManager extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.limits = { ...DEFAULT_LIMITS, ...(options.limits || {}) };
+    const configuredLimits = options.limits || {};
+    this.limits = { ...DEFAULT_LIMITS, ...configuredLimits };
+    // Keep third-party/older callers that still provide cpu/gpu limits useful
+    // while the scheduler itself only reasons about the explicit dimensions.
+    if (configuredLimits.cpu !== undefined && configuredLimits.cpuEncode === undefined) {
+      this.limits.cpuEncode = Number(configuredLimits.cpu);
+    }
+    if (configuredLimits.gpu !== undefined && configuredLimits.gpuEncode === undefined) {
+      this.limits.gpuEncode = Number(configuredLimits.gpu);
+    }
     this.active = new Map();
     this.queue = [];
     this.external = new Map();
@@ -21,10 +60,12 @@ class MediaJobManager extends EventEmitter {
 
   acquire(job) {
     if (this.draining) return Promise.reject(new Error('服务正在 draining，不再接受新的媒体任务。'));
+    const resources = normalizeResourceSlots(job.resources ?? job.resource ?? 'cpu');
     const item = {
       id: String(job.id),
       type: String(job.type || 'media'),
-      resource: String(job.resource || 'cpu'),
+      resource: resourceSummary(resources),
+      resources,
       priority: Number(job.priority ?? JOB_PRIORITIES[job.type] ?? 0),
       createdAt: Date.now(),
       cancel: job.cancel
@@ -41,10 +82,12 @@ class MediaJobManager extends EventEmitter {
 
   registerExternal(job) {
     const id = String(job.id);
+    const resources = normalizeResourceSlots(job.resources ?? job.resource ?? 'recording');
     this.external.set(id, {
       id,
       type: String(job.type || 'recording'),
-      resource: String(job.resource || 'recording'),
+      resource: resourceSummary(resources),
+      resources,
       priority: Number(job.priority ?? JOB_PRIORITIES[job.type] ?? 100),
       status: 'running',
       startedAt: Date.now(),
@@ -52,9 +95,15 @@ class MediaJobManager extends EventEmitter {
     });
     if (String(job.type || '') === 'recording') {
       for (const activeJob of this.active.values()) {
-        if (activeJob.type === 'preview') activeJob.cancel?.();
+        // Copy-based recordings may safely coexist with one GPU encoder, but
+        // CPU encodes and composite work are still preempted for capture
+        // stability when a recording begins.
+        if (activeJob.resources.includes('cpuEncode') || activeJob.resources.includes('gpuComposite')) {
+          activeJob.cancel?.();
+        }
       }
     }
+    this.schedule();
     this.emit('change');
     return () => {
       this.external.delete(id);
@@ -67,7 +116,7 @@ class MediaJobManager extends EventEmitter {
     if (this.draining) return;
     for (let index = 0; index < this.queue.length; ) {
       const job = this.queue[index];
-      if (!this.resourceAvailable(job.resource)) {
+      if (!this.resourceAvailable(job.resources)) {
         index += 1;
         continue;
       }
@@ -89,15 +138,14 @@ class MediaJobManager extends EventEmitter {
     }
   }
 
-  resourceAvailable(resource) {
-    const recordingActive = Array.from(this.external.values()).some((job) => job.type === 'recording');
-    const requiredSlots = resourceSlots(resource);
-    if (recordingActive && requiredSlots.some((slot) => slot === 'cpu' || slot === 'gpu')) return false;
+  resourceAvailable(resources) {
+    const requiredSlots = normalizeResourceSlots(resources);
+    const runningJobs = [...this.active.values(), ...this.external.values()];
+    const recordingActive = runningJobs.some((job) => job.resources.includes('recording'));
+    if (recordingActive && requiredSlots.some((slot) => slot === 'cpuEncode' || slot === 'gpuComposite')) return false;
     return requiredSlots.every((slot) => {
-      const limit = Number(this.limits[slot] ?? 1);
-      const activeCount = Array.from(this.active.values()).filter((job) =>
-        resourceSlots(job.resource).includes(slot)
-      ).length;
+      const limit = Math.max(0, Number(this.limits[slot] ?? DEFAULT_LIMITS[slot] ?? 1));
+      const activeCount = runningJobs.filter((job) => job.resources.includes(slot)).length;
       return activeCount < limit;
     });
   }
@@ -124,6 +172,7 @@ class MediaJobManager extends EventEmitter {
       id: job.id,
       type: job.type,
       resource: job.resource,
+      resources: [...job.resources],
       priority: job.priority,
       status,
       createdAt: job.createdAt,
@@ -170,4 +219,4 @@ class MediaJobManager extends EventEmitter {
   }
 }
 
-module.exports = { MediaJobManager, JOB_PRIORITIES, DEFAULT_LIMITS };
+module.exports = { MediaJobManager, JOB_PRIORITIES, DEFAULT_LIMITS, normalizeResourceSlots };

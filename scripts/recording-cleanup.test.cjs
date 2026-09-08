@@ -39,6 +39,13 @@ async function writeLegacyMetadata(filePath, fields) {
   );
 }
 
+async function confirmMergedResidualCleanup(service) {
+  const scan = await service.cleanupMergedSegmentResiduals();
+  assert.ok(scan.scanId);
+  assert.ok(Number(scan.fileCount) >= 0);
+  return service.cleanupMergedSegmentResiduals({ confirm: true, scanId: scan.scanId });
+}
+
 test('merged recording metadata preserves cleanup lineage across a library refresh', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-metadata-'));
   const sourceOne = path.join(outputDir, 'session-part-1.clean.mp4');
@@ -71,7 +78,11 @@ test('merged recording metadata preserves cleanup lineage across a library refre
 
     const cleaner = createService(outputDir);
     cleaner.recordings = discovered.map((recording) => cleaner.normalizeRecording(recording)).filter(Boolean);
-    await cleaner.cleanupMergedSegmentResiduals();
+    const scan = await cleaner.cleanupMergedSegmentResiduals();
+    assert.ok(scan.scanId);
+    assert.ok(scan.fileCount >= 2);
+    assert.equal(await fileExists(sourceOne), true);
+    await cleaner.cleanupMergedSegmentResiduals({ confirm: true, scanId: scan.scanId });
 
     assert.equal(await fileExists(sourceOne), false);
     assert.equal(await fileExists(sourceTwo), false);
@@ -104,7 +115,7 @@ test('manual cleanup processes persisted pending cleanup tasks without recording
       mergedRecording
     });
 
-    await service.cleanupMergedSegmentResiduals();
+    await confirmMergedResidualCleanup(service);
 
     assert.equal(await fileExists(sourcePath), false);
     assert.equal(await fileExists(mergedPath), true);
@@ -165,7 +176,7 @@ test('manual cleanup can safely reconstruct a legacy merge group that predates p
     const discovered = await discoverRecordingFiles(outputDir, { concurrency: 1 });
     const cleaner = createService(outputDir);
     cleaner.recordings = discovered.map((recording) => cleaner.normalizeRecording(recording)).filter(Boolean);
-    await cleaner.cleanupMergedSegmentResiduals();
+    await confirmMergedResidualCleanup(cleaner);
 
     assert.equal(await fileExists(sourceOne), false);
     assert.equal(await fileExists(sourceTwo), false);
@@ -227,7 +238,7 @@ test('manual cleanup removes orphaned source sidecars only when their metadata p
     assert.deepEqual(discovered.map((recording) => recording.cleanPath), [mergedPath]);
     const cleaner = createService(outputDir);
     cleaner.recordings = discovered.map((recording) => cleaner.normalizeRecording(recording)).filter(Boolean);
-    await cleaner.cleanupMergedSegmentResiduals();
+    await confirmMergedResidualCleanup(cleaner);
 
     for (const filePath of [
       `${sourcePath}.metadata.json`,
