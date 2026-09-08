@@ -1,10 +1,12 @@
-import { useRef } from 'react';
-import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Save, Trash2, Upload } from 'lucide-react';
+import { useRef, useState } from 'react';
+import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, PathLine, SettingPanel, Toggle, UpdateProgress } from '../components/common';
-import type { AppSettings, AppState } from '../types';
+import type { AppSettings, AppState, CleanupScanResult } from '../types';
 import {
   ffmpegCodecSummary,
+  formatFileSize,
+  getSettingsImportChanges,
   parseChangelog,
   parseSettingsImport,
   pickSettings,
@@ -20,19 +22,32 @@ export function MaintenancePage({
   settingsDraft,
   busy,
   run,
-  saveSettings,
-  saveSettingsImmediately,
-  setSettingsDraft
+  updateSettingsDraft,
+  settingsSaveStatus,
+  settingsSaveError,
+  retrySettingsSave,
+  dirtyFields,
+  applyImportedSettings,
+  scanMergedResiduals
 }: {
   state: AppState;
   settingsDraft: AppSettings;
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
-  saveSettings: (settings: Partial<AppSettings>, message?: string) => Promise<void>;
-  saveSettingsImmediately: (settings: Partial<AppSettings>) => Promise<void>;
-  setSettingsDraft: (settings: AppSettings) => void;
+  updateSettingsDraft: (settings: Partial<AppSettings>) => void;
+  settingsSaveStatus: 'idle' | 'saving' | 'saved' | 'error';
+  settingsSaveError: string;
+  retrySettingsSave: () => void;
+  dirtyFields: Set<keyof AppSettings>;
+  applyImportedSettings: (settings: Partial<AppSettings>) => Promise<boolean>;
+  scanMergedResiduals: () => Promise<CleanupScanResult | null>;
 }) {
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importReview, setImportReview] = useState<{
+    settings: Partial<AppSettings>;
+    changes: ReturnType<typeof getSettingsImportChanges>;
+  } | null>(null);
+  const [cleanupScan, setCleanupScan] = useState<CleanupScanResult | null>(null);
   const isLinux = state.platform === 'linux';
   const canOpenServerPath = state.uiCapabilities?.openServerPath ?? !isLinux;
   const canShutdownService = state.uiCapabilities?.serviceShutdown ?? !isLinux;
@@ -43,11 +58,8 @@ export function MaintenancePage({
     .map((codec) => `${codec.label}：${codec.reason || '不可用'}`)
     .join('；');
 
-  function updateSetting(nextSettings: Partial<AppSettings>, persist = true) {
-    setSettingsDraft({ ...settingsDraft, ...nextSettings });
-    if (persist) {
-      void saveSettingsImmediately(nextSettings);
-    }
+  function updateSetting(nextSettings: Partial<AppSettings>) {
+    updateSettingsDraft(nextSettings);
   }
 
   function exportSettings() {
@@ -81,10 +93,32 @@ export function MaintenancePage({
     }
     try {
       const importedSettings = parseSettingsImport(await file.text());
-      await run('import-settings', () => recorder.saveSettings(importedSettings));
+      const changes = getSettingsImportChanges(settingsDraft, importedSettings);
+      if (!changes.length) {
+        window.alert('导入文件中的设置与当前配置相同，无需应用。');
+        return;
+      }
+      setImportReview({ settings: importedSettings, changes });
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '导入配置失败。');
     }
+  }
+
+  async function confirmImportSettings() {
+    if (!importReview) return;
+    const applied = await applyImportedSettings(importReview.settings);
+    if (applied) setImportReview(null);
+  }
+
+  async function scanCleanupCandidates() {
+    const scan = await scanMergedResiduals();
+    if (scan) setCleanupScan(scan);
+  }
+
+  async function confirmCleanup() {
+    if (!cleanupScan) return;
+    const completed = await run('cleanup-merged', () => recorder.applyMergedResidualCleanup(cleanupScan.scanId));
+    if (completed) setCleanupScan(null);
   }
 
   return (
@@ -92,17 +126,22 @@ export function MaintenancePage({
       <PageHeader
         title="软件维护"
         subtitle={isLinux
-          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。选项会立即保存，输入框在失去焦点后保存。'
-          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。选项会立即保存，输入框在失去焦点后保存。'}
+          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。运行设置会自动保存。'
+          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。运行设置会自动保存。'}
         actions={
-          <button
-            className="wide-button primary"
-            disabled={busy === 'save-settings'}
-            onClick={() => saveSettings(settingsDraft, '运行配置已保存')}
-          >
-            <Save size={18} />
-            保存运行配置
-          </button>
+          <div className={`inline-status ${settingsSaveStatus === 'error' ? 'error' : ''}`} aria-live="polite">
+            {settingsSaveStatus === 'error' ? (
+              <button className="link-button" type="button" onClick={retrySettingsSave}>
+                保存失败 · 重试{settingsSaveError ? `：${settingsSaveError}` : ''}
+              </button>
+            ) : settingsSaveStatus === 'saving' ? (
+              `保存中${dirtyFields.size ? `（${dirtyFields.size} 项）` : ''}`
+            ) : settingsSaveStatus === 'saved' ? (
+              '已保存'
+            ) : (
+              '修改后自动保存'
+            )}
+          </div>
         }
       />
 
@@ -128,24 +167,83 @@ export function MaintenancePage({
             <button
               className="wide-button fill primary"
               type="button"
-              disabled={busy === 'import-settings'}
+              disabled={busy.has('import-settings')}
               onClick={() => importInputRef.current?.click()}
             >
               <Upload size={18} />
               导入配置
             </button>
           </div>
+          {importReview ? (
+            <div className="maintenance-section import-review" aria-live="polite">
+              <h3>确认导入变更</h3>
+              <p className="field-help">高风险项会影响登录、文件位置、自动处理或网络监听。单个直播间的自动录制开关不会由设置文件修改。</p>
+              <div className="import-change-list">
+                {importReview.changes.map((change) => (
+                  <div key={change.key} className={change.highRisk ? 'import-change high-risk' : 'import-change'}>
+                    <strong>{change.label}</strong>
+                    {change.highRisk ? <span className="badge hot">高风险</span> : null}
+                    <span>{change.previous} → {change.next}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="split-buttons">
+                <button className="wide-button fill" type="button" onClick={() => setImportReview(null)}>
+                  取消
+                </button>
+                <button
+                  className="wide-button fill primary"
+                  type="button"
+                  disabled={busy.has('save-settings')}
+                  onClick={() => void confirmImportSettings()}
+                >
+                  确认应用 {importReview.changes.length} 项变更
+                </button>
+              </div>
+            </div>
+          ) : null}
           <div className="maintenance-section">
             <h3>录像清理</h3>
             <button
               className="wide-button fill"
               type="button"
-              disabled={busy === 'cleanup-merged'}
-              onClick={() => run('cleanup-merged', recorder.cleanupMergedResiduals)}
+              disabled={busy.has('cleanup-scan')}
+              onClick={() => void scanCleanupCandidates()}
             >
               <Trash2 size={18} />
-              清理已合并分段残留
+              扫描可清理的合并分段残留
             </button>
+            {cleanupScan ? (
+              <div className="cleanup-review" aria-live="polite">
+                <p className="field-help">
+                  发现 {cleanupScan.fileCount} 个文件 / {formatFileSize(cleanupScan.totalBytes)}，涉及 {cleanupScan.groupCount} 组记录。
+                  {cleanupScan.skippedGroupCount ? ` ${cleanupScan.skippedGroupCount} 组无法安全扫描，已跳过。` : ''}
+                  {cleanupScan.truncated ? ' metadata 扫描达到安全上限，未扫描的目录不会被清理。' : ''}
+                </p>
+                <div className="import-change-list">
+                  {cleanupScan.items.map((item) => (
+                    <div key={item.path} className="import-change">
+                      <strong>{item.type}</strong>
+                      <span>{item.path} · {formatFileSize(item.sizeBytes)}</span>
+                    </div>
+                  ))}
+                </div>
+                {cleanupScan.omittedCount ? <p className="field-help">另有 {cleanupScan.omittedCount} 个文件未展开显示。</p> : null}
+                <div className="split-buttons">
+                  <button className="wide-button fill" type="button" onClick={() => setCleanupScan(null)}>
+                    取消
+                  </button>
+                  <button
+                    className="wide-button fill danger"
+                    type="button"
+                    disabled={busy.has('cleanup-merged') || cleanupScan.fileCount === 0}
+                    onClick={() => void confirmCleanup()}
+                  >
+                    确认清理 {cleanupScan.fileCount} 个文件
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
         </SettingPanel>
 
@@ -170,7 +268,7 @@ export function MaintenancePage({
             <button
               className="wide-button fill"
               type="button"
-              disabled={busy === 'update-check'}
+              disabled={busy.has('update-check')}
               onClick={() => run('update-check', recorder.checkUpdate)}
             >
               <RefreshCw size={18} />
@@ -181,7 +279,7 @@ export function MaintenancePage({
                 className="wide-button fill"
                 type="button"
                 disabled={
-                  busy === 'update-apply' ||
+                  busy.has('update-apply') ||
                   ['checking', 'queued', 'downloading', 'ready', 'applying'].includes(state.update.status)
                 }
                 onClick={() => run('update-apply', recorder.applyUpdate)}
@@ -194,7 +292,7 @@ export function MaintenancePage({
               <button
                 className="wide-button fill active"
                 type="button"
-                disabled={busy === 'update-queue'}
+                disabled={busy.has('update-queue')}
                 onClick={() => run('update-queue', recorder.queueUpdate)}
               >
                 <Clock3 size={18} />
@@ -253,8 +351,7 @@ export function MaintenancePage({
                 min={1}
                 max={65535}
                 value={settingsDraft.serverPort}
-                onChange={(event) => updateSetting({ serverPort: Number(event.target.value) }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ serverPort: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ serverPort: Number(event.target.value) })}
               />
               <p className="field-help">端口只在保存并重启后台服务后生效。</p>
             </label>
@@ -264,8 +361,7 @@ export function MaintenancePage({
                 value={settingsDraft.accessUsername}
                 maxLength={64}
                 autoComplete="username"
-                onChange={(event) => updateSetting({ accessUsername: event.target.value }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ accessUsername: event.target.value })}
+                onChange={(event) => updateSetting({ accessUsername: event.target.value })}
               />
               <p className="field-help">默认 admin；只用于 WebUI 远程管理登录。</p>
             </label>
@@ -277,8 +373,7 @@ export function MaintenancePage({
                 value={settingsDraft.accessPassword}
                 autoComplete="new-password"
                 placeholder={settingsDraft.accessAuthConfigured ? '已配置；留空表示不修改' : '至少 8 个字符'}
-                onChange={(event) => updateSetting({ accessPassword: event.target.value }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ accessPassword: event.target.value })}
+                onChange={(event) => updateSetting({ accessPassword: event.target.value })}
               />
               <p className="field-help">密码只提交一次，服务端使用 scrypt 加盐哈希保存，不会回传明文。</p>
             </label>
@@ -290,10 +385,7 @@ export function MaintenancePage({
                 onChange={(event) =>
                   updateSetting({
                     trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean)
-                  }, false)
-                }
-                onBlur={(event) =>
-                  void saveSettingsImmediately({ trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean) })
+                  })
                 }
               />
               <p className="field-help">仅这些直连地址的 Forwarded/X-Forwarded-* 会被信任；配置不会让代理请求免登录。</p>
@@ -302,8 +394,7 @@ export function MaintenancePage({
               <span>更新源</span>
               <input
                 value={settingsDraft.updateManifestUrl}
-                onChange={(event) => updateSetting({ updateManifestUrl: event.target.value }, false)}
-                onBlur={(event) => void saveSettingsImmediately({ updateManifestUrl: event.target.value })}
+                onChange={(event) => updateSetting({ updateManifestUrl: event.target.value })}
               />
             </label>
           </div>
@@ -357,7 +448,7 @@ export function MaintenancePage({
               <button
                 className="wide-button fill danger"
                 type="button"
-                disabled={busy === 'shutdown'}
+                disabled={busy.has('shutdown')}
                 onClick={() => {
                   const message = hasActiveJobs
                     ? '当前有录制、合并、烧录、导出或预览任务；退出会先进入收尾流程，确定继续？'

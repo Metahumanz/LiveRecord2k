@@ -54,13 +54,15 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'notifyBurnEnded',
   'webhookEnabled',
   'webhookUrl',
+  'webhookAllowPrivateNetwork',
   'openBrowserOnStart',
   'hideOverviewNextStep',
   'autoUpdateEnabled',
   'updateManifestUrl',
   'serverHost',
   'serverPort',
-  'accessUsername'
+  'accessUsername',
+  'trustedProxies'
 ];
 
 export const KEYFRAME_IMAGE_REFRESH_MS = 5000;

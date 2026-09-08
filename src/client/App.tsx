@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import type React from 'react';
 import {
   Activity,
@@ -17,16 +17,10 @@ import {
   Video,
   Wrench
 } from 'lucide-react';
-import type { AppSettings, AppState, ExportDraft, ExportResult, Page, RecordingState } from './types';
-import { recorder } from './recorderClient';
+import type { AppSettings, AppState, CleanupScanResult, ExportDraft, ExportResult, Page, RecordingState } from './types';
+import { recorder, RecorderApiError } from './recorderClient';
 import { Metric, ToastHost, type ToastItem } from './components/common';
 import { LivePreviewModal, QrLoginPanel } from './components/rooms';
-import { OverviewPage } from './pages/OverviewPage';
-import { RoomsPage } from './pages/RoomsPage';
-import { ExportPage } from './pages/ExportPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { MaintenancePage } from './pages/MaintenancePage';
-import { LogsPage } from './pages/LogsPage';
 import { formatTimelineTime, getStats, hydrateExportDraft, isAppState } from './utils';
 
 const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
@@ -38,12 +32,21 @@ const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
   { id: 'logs', label: '日志', icon: <MessageSquareText size={20} /> }
 ];
 
+const OverviewPage = lazy(async () => ({ default: (await import('./pages/OverviewPage')).OverviewPage }));
+const RoomsPage = lazy(async () => ({ default: (await import('./pages/RoomsPage')).RoomsPage }));
+const ExportPage = lazy(async () => ({ default: (await import('./pages/ExportPage')).ExportPage }));
+const SettingsPage = lazy(async () => ({ default: (await import('./pages/SettingsPage')).SettingsPage }));
+const MaintenancePage = lazy(async () => ({ default: (await import('./pages/MaintenancePage')).MaintenancePage }));
+const LogsPage = lazy(async () => ({ default: (await import('./pages/LogsPage')).LogsPage }));
+
+type SettingsSaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
   const [state, setState] = useState<AppState | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
   const [roomInput, setRoomInput] = useState('');
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState<Set<string>>(() => new Set());
   const [navCollapsed, setNavCollapsed] = useState(() => window.localStorage.getItem('br2k-nav-collapsed') === '1');
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [exportDraft, setExportDraft] = useState<ExportDraft>({
@@ -63,7 +66,88 @@ export default function App() {
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [previewRoomId, setPreviewRoomId] = useState<string | null>(null);
   const [initialLoadError, setInitialLoadError] = useState('');
+  const [settingsSaveStatus, setSettingsSaveStatus] = useState<SettingsSaveStatus>('idle');
+  const [settingsSaveError, setSettingsSaveError] = useState('');
+  const [settingsDirtyFields, setSettingsDirtyFields] = useState<Set<keyof AppSettings>>(() => new Set());
   const settingsSaveQueueRef = useRef<Promise<boolean>>(Promise.resolve(true));
+  const settingsDraftRef = useRef<AppSettings | null>(null);
+  const settingsDirtyFieldsRef = useRef<Set<keyof AppSettings>>(new Set());
+  const pendingSettingsPatchRef = useRef<Partial<AppSettings>>({});
+  const pendingSettingsVersionRef = useRef(0);
+  const failedSettingsPatchRef = useRef<{ patch: Partial<AppSettings>; version: number } | null>(null);
+  const settingsAutoSaveTimerRef = useRef<number | null>(null);
+  const settingsChangeVersionRef = useRef(0);
+
+  function replaceDirtySettingsFields(nextFields: Set<keyof AppSettings>) {
+    const next = new Set(nextFields);
+    settingsDirtyFieldsRef.current = next;
+    setSettingsDirtyFields(next);
+  }
+
+  function syncSettingsDraftFromServer(nextSettings: AppSettings, options: { resetDirty?: boolean } = {}) {
+    if (options.resetDirty) {
+      replaceDirtySettingsFields(new Set());
+    }
+    setSettingsDraft((current) => {
+      const previous = current || settingsDraftRef.current;
+      if (!previous || options.resetDirty) {
+        settingsDraftRef.current = nextSettings;
+        return nextSettings;
+      }
+      const merged = { ...nextSettings };
+      for (const key of settingsDirtyFieldsRef.current) {
+        Object.assign(merged, { [key]: previous[key] });
+      }
+      settingsDraftRef.current = merged;
+      return merged;
+    });
+  }
+
+  function updateSettingsDraft(nextSettings: Partial<AppSettings>, options: { autoSave?: boolean } = {}) {
+    const keys = Object.keys(nextSettings) as Array<keyof AppSettings>;
+    if (!keys.length) return;
+    const changeVersion = ++settingsChangeVersionRef.current;
+    setSettingsDraft((current) => {
+      const previous = current || settingsDraftRef.current;
+      if (!previous) return current;
+      const next = { ...previous, ...nextSettings };
+      settingsDraftRef.current = next;
+      return next;
+    });
+    const dirty = new Set(settingsDirtyFieldsRef.current);
+    for (const key of keys) dirty.add(key);
+    replaceDirtySettingsFields(dirty);
+    if (options.autoSave !== false) {
+      queueSettingsAutoSave(nextSettings, changeVersion);
+    }
+  }
+
+  function queueSettingsAutoSave(nextSettings: Partial<AppSettings>, changeVersion: number) {
+    pendingSettingsPatchRef.current = { ...pendingSettingsPatchRef.current, ...nextSettings };
+    pendingSettingsVersionRef.current = changeVersion;
+    failedSettingsPatchRef.current = null;
+    setSettingsSaveError('');
+    setSettingsSaveStatus('saving');
+    if (settingsAutoSaveTimerRef.current !== null) {
+      window.clearTimeout(settingsAutoSaveTimerRef.current);
+    }
+    settingsAutoSaveTimerRef.current = window.setTimeout(() => {
+      settingsAutoSaveTimerRef.current = null;
+      const patch = pendingSettingsPatchRef.current;
+      const patchVersion = pendingSettingsVersionRef.current;
+      pendingSettingsPatchRef.current = {};
+      void persistSettings(patch, '', patchVersion);
+    }, 550);
+  }
+
+  function retryFailedSettingsSave() {
+    const failed = failedSettingsPatchRef.current;
+    if (!failed || !Object.keys(failed.patch).length) return;
+    failedSettingsPatchRef.current = null;
+    setSettingsSaveError('');
+    setSettingsSaveStatus('saving');
+    void persistSettings(failed.patch, '', failed.version);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -71,7 +155,7 @@ export default function App() {
       if (cancelled) return;
       setInitialLoadError('');
       setState(nextState);
-      setSettingsDraft(nextState.settings);
+      syncSettingsDraftFromServer(nextState.settings, { resetDirty: true });
       setExportDraft((current) => hydrateExportDraft(current, nextState));
     }).catch((error) => {
       if (!cancelled) setInitialLoadError(error instanceof Error ? error.message : '初始状态加载失败');
@@ -80,15 +164,7 @@ export default function App() {
     const unsubscribe = recorder.onStateChanged((nextState) => {
       setInitialLoadError('');
       setState(nextState);
-      setSettingsDraft((current) => {
-        if (!current) {
-          return nextState.settings;
-        }
-        if (nextState.login?.status === 'success') {
-          return { ...current, cookie: nextState.settings.cookie };
-        }
-        return current;
-      });
+      syncSettingsDraftFromServer(nextState.settings);
       setExportDraft((current) => hydrateExportDraft(current, nextState));
     });
     return () => {
@@ -101,20 +177,50 @@ export default function App() {
     window.localStorage.setItem('br2k-nav-collapsed', navCollapsed ? '1' : '0');
   }, [navCollapsed]);
 
+  useEffect(
+    () => () => {
+      if (settingsAutoSaveTimerRef.current !== null) {
+        window.clearTimeout(settingsAutoSaveTimerRef.current);
+      }
+    },
+    []
+  );
+
   const stats = useMemo(() => getStats(state?.rooms ?? []), [state?.rooms]);
   const previewRoom = previewRoomId ? state?.rooms.find((room) => room.id === previewRoomId) || null : null;
 
+  function beginBusy(key: string) {
+    setBusy((current) => {
+      const next = new Set(current);
+      next.add(key);
+      return next;
+    });
+  }
+
+  function endBusy(key: string) {
+    setBusy((current) => {
+      const next = new Set(current);
+      next.delete(key);
+      return next;
+    });
+  }
+
+  function applyStateResult(result: unknown) {
+    if (!isAppState(result)) {
+      return;
+    }
+    setState(result);
+    syncSettingsDraftFromServer(result.settings);
+    if (result.operationNotice) {
+      showToast(result.operationNotice);
+    }
+  }
+
   async function run<T>(key: string, action: () => Promise<T>): Promise<boolean> {
-    setBusy(key);
+    beginBusy(key);
     try {
       const result = await action();
-      if (isAppState(result)) {
-        setState(result);
-        setSettingsDraft(result.settings);
-        if (result.operationNotice) {
-          showToast(result.operationNotice);
-        }
-      }
+      applyStateResult(result);
       return true;
     } catch (error) {
       showToast({
@@ -124,7 +230,7 @@ export default function App() {
       });
       return false;
     } finally {
-      setBusy(null);
+      endBusy(key);
     }
   }
 
@@ -138,21 +244,44 @@ export default function App() {
     window.setTimeout(() => closeToast(id), 4200);
   }
 
-  async function persistSettings(settings: Partial<AppSettings>, successMessage = ''): Promise<boolean> {
+  function settingValueEquals(left: unknown, right: unknown) {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  function reconcileSavedSettings(savedPatch: Partial<AppSettings>, serverSettings: AppSettings) {
+    const current = settingsDraftRef.current;
+    const savedKeys = Object.keys(savedPatch) as Array<keyof AppSettings>;
+    if (current) {
+      const dirty = new Set(settingsDirtyFieldsRef.current);
+      for (const key of savedKeys) {
+        // A newer keystroke may have landed while this request was queued.
+        // Only clear the dirty marker when this response saved that exact value.
+        if (settingValueEquals(current[key], savedPatch[key])) {
+          dirty.delete(key);
+        }
+      }
+      replaceDirtySettingsFields(dirty);
+    }
+    syncSettingsDraftFromServer(serverSettings);
+  }
+
+  async function persistSettings(
+    settings: Partial<AppSettings>,
+    successMessage = '',
+    saveVersion = settingsChangeVersionRef.current
+  ): Promise<boolean> {
     const save = async () => {
-      setBusy('save-settings');
+      beginBusy('save-settings');
+      setSettingsSaveStatus('saving');
       try {
         const result = await recorder.saveSettings(settings);
         setState(result);
-        setSettingsDraft((current) => {
-          if (!current) {
-            return result.settings;
-          }
-          const savedPatch = Object.fromEntries(
-            (Object.keys(settings) as Array<keyof AppSettings>).map((key) => [key, result.settings[key]])
-          ) as Partial<AppSettings>;
-          return { ...current, ...savedPatch };
-        });
+        reconcileSavedSettings(settings, result.settings);
+        if (saveVersion === settingsChangeVersionRef.current) {
+          failedSettingsPatchRef.current = null;
+          setSettingsSaveError('');
+          setSettingsSaveStatus('saved');
+        }
         if (result.operationNotice) {
           showToast(result.operationNotice);
         }
@@ -161,14 +290,20 @@ export default function App() {
         }
         return true;
       } catch (error) {
+        const message = error instanceof Error ? error.message : '请求未能完成，请稍后重试。';
+        if (saveVersion === settingsChangeVersionRef.current) {
+          failedSettingsPatchRef.current = { patch: settings, version: saveVersion };
+          setSettingsSaveError(message);
+          setSettingsSaveStatus('error');
+        }
         showToast({
           kind: 'error',
           title: '设置未保存',
-          message: error instanceof Error ? error.message : '请求未能完成，请稍后重试。'
+          message
         });
         return false;
       } finally {
-        setBusy(null);
+        endBusy('save-settings');
       }
     };
     const queued = settingsSaveQueueRef.current.then(save, save);
@@ -180,11 +315,33 @@ export default function App() {
   }
 
   async function saveSettingsWithToast(settings: Partial<AppSettings>, message = '录制配置已保存') {
-    await persistSettings(settings, message);
+    updateSettingsDraft(settings, { autoSave: false });
+    await persistSettings(settings, message, settingsChangeVersionRef.current);
   }
 
-  async function saveSettingsImmediately(settings: Partial<AppSettings>) {
-    await persistSettings(settings);
+  async function applyImportedSettings(settings: Partial<AppSettings>) {
+    updateSettingsDraft(settings, { autoSave: false });
+    const saved = await persistSettings(settings);
+    if (saved) {
+      showToast({ title: '配置已导入', message: '已应用已确认的配置变更。' });
+    }
+    return saved;
+  }
+
+  async function scanMergedResiduals(): Promise<CleanupScanResult | null> {
+    beginBusy('cleanup-scan');
+    try {
+      return await recorder.scanMergedResiduals();
+    } catch (error) {
+      showToast({
+        kind: 'error',
+        title: '清理扫描失败',
+        message: error instanceof Error ? error.message : '无法扫描可清理文件。'
+      });
+      return null;
+    } finally {
+      endBusy('cleanup-scan');
+    }
   }
 
   async function addRoom() {
@@ -200,18 +357,49 @@ export default function App() {
     setPage('rooms');
   }
 
+  async function removeRoomWithConfirmation(roomId: string) {
+    const key = `remove-${roomId}`;
+    beginBusy(key);
+    try {
+      let result: AppState;
+      try {
+        result = await recorder.removeRoom(roomId);
+      } catch (error) {
+        if (!(error instanceof RecorderApiError) || error.code !== 'ROOM_BUSY') {
+          throw error;
+        }
+        const confirmed = window.confirm(
+          `${error.message}\n\n强制删除会取消该直播间的录制、合并、烧录、导出和兼容预览任务，并等待资源释放。确定继续吗？`
+        );
+        if (!confirmed) {
+          showToast({ kind: 'warning', title: '已保留直播间', message: '任务未取消，直播间没有被删除。' });
+          return;
+        }
+        result = await recorder.removeRoom(roomId, { force: true });
+      }
+      applyStateResult(result);
+    } catch (error) {
+      showToast({
+        kind: 'error',
+        title: '移除直播间失败',
+        message: error instanceof Error ? error.message : '请求未能完成，请稍后重试。'
+      });
+    } finally {
+      endBusy(key);
+    }
+  }
+
   async function chooseOutputDir() {
-    setBusy('choose-output-dir');
+    beginBusy('choose-output-dir');
     try {
       const selected = await recorder.chooseOutputDir(settingsDraft?.outputDir || '');
       if (selected && settingsDraft) {
-        setSettingsDraft({ ...settingsDraft, outputDir: selected });
-        void saveSettingsImmediately({ outputDir: selected });
+        updateSettingsDraft({ outputDir: selected });
       }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '系统路径选择器打开失败。');
     } finally {
-      setBusy(null);
+      endBusy('choose-output-dir');
     }
   }
 
@@ -219,8 +407,7 @@ export default function App() {
     if (!state || state.settings.roomImageMode === mode) {
       return;
     }
-    setSettingsDraft((current) => (current ? { ...current, roomImageMode: mode } : current));
-    await saveSettingsImmediately({ roomImageMode: mode });
+    updateSettingsDraft({ roomImageMode: mode });
   }
 
   function selectExportRecording(recording: RecordingState) {
@@ -243,7 +430,7 @@ export default function App() {
   }
 
   async function prepareExportSubtitles() {
-    setBusy('export-subtitles');
+    beginBusy('export-subtitles');
     try {
       const result = await recorder.prepareSubtitleAssets({
         cleanPath: exportDraft.cleanPath,
@@ -266,12 +453,12 @@ export default function App() {
         message: error instanceof Error ? error.message : '字幕生成未能完成。'
       });
     } finally {
-      setBusy(null);
+      endBusy('export-subtitles');
     }
   }
 
   async function exportClip() {
-    setBusy('export-clip');
+    beginBusy('export-clip');
     try {
       const result = await recorder.exportClip({
         mode: exportDraft.mode,
@@ -295,7 +482,7 @@ export default function App() {
         message: error instanceof Error ? error.message : '导出请求未能完成。'
       });
     } finally {
-      setBusy(null);
+      endBusy('export-clip');
     }
   }
 
@@ -367,60 +554,84 @@ export default function App() {
       </aside>
 
       <section className="workspace-panel">
-        {page === 'overview' ? (
-          <OverviewPage state={state} stats={stats} busy={busy} setPage={setPage} run={run} openPreview={setPreviewRoomId} />
-        ) : null}
-        {page === 'rooms' ? (
-          <RoomsPage
-            rooms={state.rooms}
-            roomImageMode={state.settings.roomImageMode}
-            onRoomImageModeChange={changeRoomImageMode}
-            roomInput={roomInput}
-            setRoomInput={setRoomInput}
-            addRoom={addRoom}
-            busy={busy}
-            run={run}
-            openPreview={setPreviewRoomId}
-          />
-        ) : null}
-        {page === 'export' ? (
-          <ExportPage
-            state={state}
-            draft={exportDraft}
-            result={exportResult}
-            busy={busy}
-            setDraft={setExportDraft}
-            selectRecording={selectExportRecording}
-            prepareSubtitles={prepareExportSubtitles}
-            exportClip={exportClip}
-            saveStyleAsDefault={saveExportStyleAsDefault}
-            run={run}
-          />
-        ) : null}
-        {page === 'settings' ? (
-          <SettingsPage
-            state={state}
-            settingsDraft={settingsDraft}
-            busy={busy}
-            run={run}
-            saveSettings={saveSettingsWithToast}
-            saveSettingsImmediately={saveSettingsImmediately}
-            chooseOutputDir={chooseOutputDir}
-            setSettingsDraft={setSettingsDraft}
-          />
-        ) : null}
-        {page === 'maintenance' ? (
-          <MaintenancePage
-            state={state}
-            settingsDraft={settingsDraft}
-            busy={busy}
-            run={run}
-            saveSettings={saveSettingsWithToast}
-            saveSettingsImmediately={saveSettingsImmediately}
-            setSettingsDraft={setSettingsDraft}
-          />
-        ) : null}
-        {page === 'logs' ? <LogsPage logs={state.logs} busy={busy} run={run} /> : null}
+        <Suspense
+          fallback={
+            <div className="empty-state" role="status">
+              <Activity className="spin" size={28} />
+              <span>正在加载页面</span>
+            </div>
+          }
+        >
+          {page === 'overview' ? (
+            <OverviewPage
+              state={state}
+              stats={stats}
+              busy={busy}
+              setPage={setPage}
+              run={run}
+              removeRoom={removeRoomWithConfirmation}
+              openPreview={setPreviewRoomId}
+            />
+          ) : null}
+          {page === 'rooms' ? (
+            <RoomsPage
+              rooms={state.rooms}
+              roomImageMode={state.settings.roomImageMode}
+              onRoomImageModeChange={changeRoomImageMode}
+              roomInput={roomInput}
+              setRoomInput={setRoomInput}
+              addRoom={addRoom}
+              busy={busy}
+              run={run}
+              removeRoom={removeRoomWithConfirmation}
+              openPreview={setPreviewRoomId}
+            />
+          ) : null}
+          {page === 'export' ? (
+            <ExportPage
+              state={state}
+              draft={exportDraft}
+              result={exportResult}
+              busy={busy}
+              setDraft={setExportDraft}
+              selectRecording={selectExportRecording}
+              prepareSubtitles={prepareExportSubtitles}
+              exportClip={exportClip}
+              saveStyleAsDefault={saveExportStyleAsDefault}
+              run={run}
+            />
+          ) : null}
+          {page === 'settings' ? (
+            <SettingsPage
+              state={state}
+              settingsDraft={settingsDraft}
+              busy={busy}
+              run={run}
+              chooseOutputDir={chooseOutputDir}
+              updateSettingsDraft={updateSettingsDraft}
+              settingsSaveStatus={settingsSaveStatus}
+              settingsSaveError={settingsSaveError}
+              retrySettingsSave={retryFailedSettingsSave}
+              dirtyFields={settingsDirtyFields}
+            />
+          ) : null}
+          {page === 'maintenance' ? (
+            <MaintenancePage
+              state={state}
+              settingsDraft={settingsDraft}
+              busy={busy}
+              run={run}
+              updateSettingsDraft={updateSettingsDraft}
+              settingsSaveStatus={settingsSaveStatus}
+              settingsSaveError={settingsSaveError}
+              retrySettingsSave={retryFailedSettingsSave}
+              dirtyFields={settingsDirtyFields}
+              applyImportedSettings={applyImportedSettings}
+              scanMergedResiduals={scanMergedResiduals}
+            />
+          ) : null}
+          {page === 'logs' ? <LogsPage logs={state.logs} busy={busy} run={run} /> : null}
+        </Suspense>
       </section>
 
       {state.login ? <QrLoginPanel login={state.login} busy={busy} run={run} /> : null}

@@ -187,10 +187,62 @@ const {
 } = require('../shared/helpers.cjs');
 const { AccessAuthManager, hashAccessPassword } = require('./auth.cjs');
 const { AtomicJsonStore } = require('./atomic-store.cjs');
-const { MediaJobManager } = require('./media-job-manager.cjs');
-const { normalizeTrustedProxyList, validateRemoteUrl, redactSensitive } = require('../shared/security.cjs');
+const { MediaJobManager, normalizeResourceSlots } = require('./media-job-manager.cjs');
+const { MONITOR_FAST_CONFIRM_MS, getMonitorPollDelayMs, jitterMonitorPollDelay } = require('./room-monitor-scheduler.cjs');
+const {
+  normalizeTrustedProxyList,
+  isValidTrustedProxyRule,
+  validateRemoteUrl,
+  redactSensitive
+} = require('../shared/security.cjs');
 const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safety.cjs');
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
+
+class BusinessError extends Error {
+  constructor(code, message, statusCode = 400) {
+    super(message);
+    this.name = 'BusinessError';
+    this.code = String(code || 'BUSINESS_ERROR');
+    this.statusCode = Number(statusCode) || 400;
+    this.isBusinessError = true;
+  }
+}
+
+function isBusinessError(error) {
+  return Boolean(error?.isBusinessError && error?.code && error?.statusCode);
+}
+
+function businessError(code, message, statusCode) {
+  return new BusinessError(code, message, statusCode);
+}
+
+function parseRoomInput(value) {
+  const raw = String(value || '').trim();
+  if (/^\d+$/.test(raw)) {
+    return raw;
+  }
+  if (!raw) {
+    throw businessError('INVALID_ROOM_ID', '请输入直播间房间号或 B 站直播间链接。', 400);
+  }
+
+  const urlText = /^(?:https?:)?\/\//i.test(raw) ? raw : `https://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(urlText);
+  } catch {
+    throw businessError('INVALID_ROOM_ID', '请输入有效的直播间房间号或 B 站直播间链接。', 400);
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname !== 'live.bilibili.com' && !hostname.endsWith('.live.bilibili.com')) {
+    throw businessError('INVALID_ROOM_ID', '仅支持 B 站直播间链接（live.bilibili.com）。', 400);
+  }
+  const pathParts = parsed.pathname.split('/').filter(Boolean);
+  const roomId = pathParts.find((part) => /^\d+$/.test(part));
+  if (!roomId) {
+    throw businessError('INVALID_ROOM_ID', '链接中没有找到有效的直播间房间号。', 400);
+  }
+  return roomId;
+}
 
 
 
@@ -214,7 +266,7 @@ const MIN_PLAYABLE_BYTES = 128 * 1024;
 const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
 const MEDIA_STALL_CHECK_MS = 20 * 1000;
 const MIN_MEDIA_GROWTH_BYTES = 32 * 1024;
-const LIVE_START_POLL_INTERVAL_MS = 3 * 1000;
+const MONITOR_FAST_CONFIRM_WINDOW_MS = 15 * 1000;
 const STARTUP_CORRUPTION_GUARD_MS = 12 * 1000;
 const WBI_MIXIN_KEY_TABLE = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14,
@@ -295,6 +347,8 @@ const MERGE_AV_DURATION_TOLERANCE_SEC = 0.08;
 const MERGE_AV_BOUNDARY_TOLERANCE_SEC = 0.12;
 const CLEANUP_METADATA_SCAN_MAX_DEPTH = 4;
 const CLEANUP_METADATA_SCAN_LIMIT = 2000;
+const MAINTENANCE_CLEANUP_PLAN_TTL_MS = 10 * 60 * 1000;
+const MAINTENANCE_CLEANUP_PREVIEW_LIMIT = 200;
 
 function avatarOverlayEntryLimit(mode) {
   switch (normalizeBurnAvatarMode(mode)) {
@@ -388,6 +442,76 @@ const BURN_CODEC_CANDIDATES = [
   { value: 'h264_amf', label: 'AMD H.264 硬件编码', kind: 'hardware', vendor: 'amd' }
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
+const SETTINGS_UPDATE_KEYS = new Set([
+  'outputDir',
+  'cookie',
+  'pollIntervalSec',
+  'targetQn',
+  'preferHevc',
+  'roomImageMode',
+  'outputContainer',
+  'segmentMinutes',
+  'autoBurnDanmaku',
+  'deleteSourceAfterBurn',
+  'burnOverlayMode',
+  'burnDanmakuArea',
+  'burnDanmakuStylePreset',
+  'burnDanmakuStyleLayout',
+  'burnAvatarMode',
+  'burnCodec',
+  'burnCrf',
+  'notifyLiveStarted',
+  'notifyLiveEnded',
+  'notifyRecordingStarted',
+  'notifyRecordingEnded',
+  'notifyBurnStarted',
+  'notifyBurnEnded',
+  'webhookEnabled',
+  'webhookUrl',
+  'webhookBearerToken',
+  'webhookBearerTokenConfigured',
+  'webhookBearerTokenClear',
+  'webhookAllowPrivateNetwork',
+  'openBrowserOnStart',
+  'hideOverviewNextStep',
+  'autoUpdateEnabled',
+  'updateManifestUrl',
+  'serverHost',
+  'serverPort',
+  'accessUsername',
+  'accessPassword',
+  'accessAuthConfigured',
+  'trustedProxies'
+]);
+const BOOLEAN_SETTINGS_UPDATE_KEYS = new Set([
+  'preferHevc',
+  'autoBurnDanmaku',
+  'deleteSourceAfterBurn',
+  'notifyLiveStarted',
+  'notifyLiveEnded',
+  'notifyRecordingStarted',
+  'notifyRecordingEnded',
+  'notifyBurnStarted',
+  'notifyBurnEnded',
+  'webhookEnabled',
+  'webhookBearerTokenConfigured',
+  'webhookBearerTokenClear',
+  'webhookAllowPrivateNetwork',
+  'openBrowserOnStart',
+  'hideOverviewNextStep',
+  'autoUpdateEnabled',
+  'accessAuthConfigured'
+]);
+const STRING_SETTINGS_UPDATE_LIMITS = {
+  outputDir: 4096,
+  cookie: 16 * 1024,
+  burnCodec: 128,
+  webhookUrl: 2048,
+  webhookBearerToken: 4096,
+  updateManifestUrl: 2048,
+  accessUsername: 64,
+  accessPassword: 1024
+};
 
 function isWindowsSystemDrivePath(targetPath) {
   if (process.platform !== 'win32') return false;
@@ -499,10 +623,35 @@ function deriveCapturePath(cleanPath) {
   return base ? path.join(parsed.dir, `${base}.recording.mkv`) : '';
 }
 
-function getMonitorPollDelayMs(room, settings) {
-  const configuredDelayMs = Math.max(1000, Number(settings?.pollIntervalSec || 15) * 1000);
-  if (room?.lastError || room?.liveStatus === 1) return configuredDelayMs;
-  return Math.min(configuredDelayMs, LIVE_START_POLL_INTERVAL_MS);
+async function getCleanupPreviewSize(filePath, stat, depth = 0) {
+  if (!stat?.isDirectory()) {
+    return Math.max(0, Number(stat?.size || 0));
+  }
+  if (depth >= 12) {
+    return 0;
+  }
+  const entries = await fsp.readdir(filePath, { withFileTypes: true }).catch(() => []);
+  let totalBytes = 0;
+  for (const entry of entries) {
+    const childPath = path.join(filePath, entry.name);
+    const childStat = await fsp.lstat(childPath).catch(() => null);
+    if (!childStat || childStat.isSymbolicLink()) continue;
+    if (childStat.isFile() || childStat.isDirectory()) {
+      totalBytes += await getCleanupPreviewSize(childPath, childStat, depth + 1);
+    }
+  }
+  return totalBytes;
+}
+
+function getCleanupArtifactType(filePath, stat) {
+  if (stat?.isDirectory()) return '关联目录';
+  const name = path.basename(String(filePath || '')).toLowerCase();
+  if (/\.clean\.(?:mp4|mkv)$/i.test(name)) return '合并前视频分段';
+  if (/\.metadata\.json$/i.test(name)) return '录像元数据';
+  if (/\.danmaku\.(?:jsonl|css|ass)$/i.test(name)) return '弹幕侧车文件';
+  if (/\.(?:recording\.mkv|finalizing\.mp4)$/i.test(name)) return '临时录像文件';
+  if (/\.danmaku(?:-only)?\.(?:mp4|mkv)$/i.test(name)) return '关联弹幕视频';
+  return '关联生成文件';
 }
 
 function isRecordingMetadataSidecar(fileName) {
@@ -738,6 +887,7 @@ class LiveRecordService {
     this.legacyRepairCacheDir = path.join(appData, 'BiliRecord2K', 'repair-cache');
     this.settings = this.createDefaultSettings();
     this.rooms = new Map();
+    this.removingRoomIds = new Set();
     this.logs = [];
     this.monitorTimers = new Map();
     this.livePushMonitors = new Map();
@@ -756,6 +906,7 @@ class LiveRecordService {
     this.activeBurnQueueItem = null;
     this.burnCancelRequests = new Set();
     this.pendingSegmentCleanups = new Map();
+    this.maintenanceCleanupPlans = new Map();
     this.mergeProcesses = new Map();
     this.mergeCancelRequests = new Set();
     this.mergeInFlightGroups = new Map();
@@ -776,6 +927,8 @@ class LiveRecordService {
     this.exportCancelRequested = false;
     this.exportQueue = [];
     this.exportQueueRunning = false;
+    this.activeExportQueueItem = null;
+    this.cancelledExportQueueIds = new Set();
     this.recordings = [];
     this.recordingScanPromise = null;
     this.clients = new Map();
@@ -1341,14 +1494,16 @@ class LiveRecordService {
     return selected ? { ...selected, kind: 'hardware' } : software;
   }
 
-  getTranscodeResource(codec, videoInfo) {
+  getTranscodeResources(codec, videoInfo, options = {}) {
     const encoder = String(codec || '').trim();
     const hardwareEncoder = Boolean(encoder) && !encoder.includes('libx');
-    const hasKnownVideoCodec = Boolean(String(videoInfo?.codec || '').trim());
-    const hardwareDecoder = hasKnownVideoCodec
-      ? this.getHardwareDecoder(videoInfo, codec).kind === 'hardware'
-      : (this.ffmpegCapabilities?.hardwareDecoders || []).length > 0;
-    return hardwareEncoder || hardwareDecoder ? 'hybrid' : 'cpu';
+    const resources = ['disk', hardwareEncoder ? 'gpuEncode' : 'cpuEncode'];
+    // Burn-in/compositing is deliberately a separate GPU budget.  It remains
+    // paused while a copy recording is active; a plain GPU transcode can run.
+    if (options.gpuComposite && hardwareEncoder) {
+      resources.push('gpuComposite');
+    }
+    return resources;
   }
 
   setProgressDecoder(progress, decoder, options = {}) {
@@ -1669,6 +1824,125 @@ class LiveRecordService {
     return Boolean(room?.burning || (room?.id && this.burnSessions.has(room.id)));
   }
 
+  getRoomRelatedMediaPaths(room) {
+    const roomId = String(room?.id || '');
+    const paths = new Set();
+    const addRecordingPaths = (recording) => {
+      if (!recording) return;
+      for (const candidate of [recording.cleanPath, recording.capturePath, recording.burnedPath]) {
+        if (candidate) paths.add(path.resolve(String(candidate)).toLowerCase());
+      }
+    };
+    addRecordingPaths(room?.currentRecording);
+    for (const recording of this.recordings) {
+      if (String(recording?.roomId || '') === roomId) {
+        addRecordingPaths(recording);
+      }
+    }
+    return paths;
+  }
+
+  isRoomRelatedMediaPath(room, candidate) {
+    if (!candidate) return false;
+    return this.getRoomRelatedMediaPaths(room).has(path.resolve(String(candidate)).toLowerCase());
+  }
+
+  isRoomRelatedExportItem(room, item) {
+    const roomId = String(room?.id || '');
+    const request = item?.request || {};
+    if (
+      String(item?.roomId || '') === roomId ||
+      String(request.roomId || '') === roomId ||
+      String(request.recording?.roomId || '') === roomId
+    ) {
+      return true;
+    }
+    return this.isRoomRelatedMediaPath(room, item?.cleanPath || request.cleanPath || request.recording?.cleanPath);
+  }
+
+  isRoomRelatedPreview(room) {
+    if (!this.exportPreviewProgress || !['queued', 'running'].includes(this.exportPreviewProgress.status)) {
+      return false;
+    }
+    return this.isRoomRelatedMediaPath(room, this.exportPreview?.sourcePath || this.exportPreviewProgress.outputPath);
+  }
+
+  getRoomActiveTaskKinds(room) {
+    const roomId = String(room?.id || '');
+    const tasks = [];
+    const mergeActive =
+      this.mergeProcesses.has(roomId) ||
+      [...this.mergeInFlightGroups.keys()].some((key) => key.startsWith(`${roomId}\u0000`)) ||
+      this.mergeRetryStates.size > 0 && [...this.mergeRetryStates.keys()].some((key) => key.startsWith(`${roomId}\u0000`)) ||
+      ['queued', 'running', 'retrying'].includes(room?.mergeProgress?.status);
+    const burnQueued =
+      this.burnQueue.some((item) => String(item?.roomId || '') === roomId) ||
+      (this.activeBurnQueueItem && String(this.activeBurnQueueItem.roomId || '') === roomId);
+    const exportQueued =
+      this.exportQueue.some((item) => this.isRoomRelatedExportItem(room, item)) ||
+      this.isRoomRelatedExportItem(room, this.activeExportQueueItem) ||
+      (String(this.exportProgress?.roomId || '') === roomId && ['queued', 'running'].includes(this.exportProgress?.status));
+    if (this.isRoomRecording(room)) tasks.push('录制');
+    if (mergeActive) tasks.push('合并');
+    if (this.isRoomBurning(room) || burnQueued) tasks.push('烧录');
+    if (exportQueued) tasks.push('导出');
+    if (this.isRoomRelatedPreview(room)) tasks.push('兼容预览');
+    return tasks;
+  }
+
+  async cancelRoomBurnTasks(room) {
+    const roomId = String(room.id);
+    const cancelledItems = this.burnQueue.filter((item) => String(item?.roomId || '') === roomId);
+    for (const item of cancelledItems) {
+      this.burnCancelRequests.add(roomId);
+      this.mediaJobs.cancel(item.id);
+    }
+    if (cancelledItems.length) {
+      this.burnQueue = this.burnQueue.filter((item) => String(item?.roomId || '') !== roomId);
+    }
+    if (this.activeBurnQueueItem && String(this.activeBurnQueueItem.roomId || '') === roomId) {
+      this.burnCancelRequests.add(roomId);
+      this.mediaJobs.cancel(this.activeBurnQueueItem.id);
+    }
+    if (this.isRoomBurning(room)) {
+      await this.cancelBurnDanmaku(roomId);
+    }
+  }
+
+  async cancelRoomExportTasks(room) {
+    const relatedItems = this.exportQueue.filter((item) => this.isRoomRelatedExportItem(room, item));
+    for (const item of relatedItems) {
+      this.cancelledExportQueueIds.add(item.id);
+      this.mediaJobs.cancel(item.id);
+    }
+    if (relatedItems.length) {
+      this.exportQueue = this.exportQueue.filter((item) => !this.isRoomRelatedExportItem(room, item));
+    }
+    if (this.isRoomRelatedExportItem(room, this.activeExportQueueItem)) {
+      this.cancelledExportQueueIds.add(this.activeExportQueueItem.id);
+      this.mediaJobs.cancel(this.activeExportQueueItem.id);
+      await this.cancelExportClip();
+    } else if (String(this.exportProgress?.roomId || '') === String(room.id)) {
+      await this.cancelExportClip();
+    }
+  }
+
+  async waitForRoomTasksReleased(room, timeoutMs = 90_000) {
+    const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 90_000);
+    let activeTasks = this.getRoomActiveTaskKinds(room);
+    while (activeTasks.length && Date.now() < deadline) {
+      await delay(100);
+      activeTasks = this.getRoomActiveTaskKinds(room);
+    }
+    if (activeTasks.length) {
+      throw businessError(
+        'ROOM_TASK_CANCEL_TIMEOUT',
+        `${roomLabel(room)} 的${activeTasks.join('、')}任务仍在释放资源，请稍后再次确认强制删除。`,
+        409
+      );
+    }
+  }
+
   getPublicUpdateState() {
     return {
       ...this.updateState,
@@ -1721,13 +1995,15 @@ class LiveRecordService {
   }
 
   addClient(response, options = {}) {
-    this.clients.set(response, {
+    const client = {
       redactCookie: Boolean(options.redactCookie),
       localConsole: Boolean(options.localConsole),
       accessAuthenticated: Boolean(options.accessAuthenticated),
-      accessRequired: Boolean(options.accessRequired)
-    });
-    this.writeSseState(response, options);
+      accessRequired: Boolean(options.accessRequired),
+      sseSnapshot: null
+    };
+    this.clients.set(response, client);
+    this.writeSseState(response, client);
     response.on('close', () => this.clients.delete(response));
   }
 
@@ -1741,17 +2017,125 @@ class LiveRecordService {
   }
 
   flushState() {
-    for (const [response, options] of this.clients) {
-      this.writeSseState(response, options);
+    for (const [response, client] of this.clients) {
+      this.writeSseDelta(response, client);
     }
   }
 
-  writeSseState(response, options = {}) {
+  getSseSettingsPayload(state) {
+    return {
+      settings: state.settings,
+      login: state.login,
+      bilibiliLoggedIn: state.bilibiliLoggedIn,
+      bilibiliCookieVisible: state.bilibiliCookieVisible,
+      access: state.access,
+      startupEnabled: state.startupEnabled
+    };
+  }
+
+  getSseMediaJobPayload(state) {
+    return {
+      mediaJobs: state.mediaJobs,
+      exportProgress: state.exportProgress,
+      exportQueue: state.exportQueue,
+      burnQueue: state.burnQueue,
+      previewProgress: state.previewProgress,
+      previewProxy: state.previewProxy
+    };
+  }
+
+  getSseSystemPayload(state) {
+    return {
+      version: state.version,
+      update: state.update,
+      ffmpegPath: state.ffmpegPath,
+      ffmpegCapabilities: state.ffmpegCapabilities,
+      currentPort: state.currentPort,
+      currentHost: state.currentHost,
+      platform: state.platform,
+      uiCapabilities: state.uiCapabilities,
+      storePath: state.storePath,
+      appRoot: state.appRoot,
+      distRoot: state.distRoot,
+      operationNotice: state.operationNotice
+    };
+  }
+
+  createSseSnapshot(state) {
+    return {
+      rooms: new Map(state.rooms.map((room) => [String(room.id), JSON.stringify(room)])),
+      recordings: JSON.stringify(state.recordings),
+      logIds: state.logs.map((entry) => String(entry.id)),
+      settings: JSON.stringify(this.getSseSettingsPayload(state)),
+      mediaJob: JSON.stringify(this.getSseMediaJobPayload(state)),
+      diskSpace: JSON.stringify(state.outputDiskSpace || null),
+      system: JSON.stringify(this.getSseSystemPayload(state))
+    };
+  }
+
+  writeSseEvent(response, eventName, payload) {
     try {
-      response.write(`data: ${JSON.stringify(this.getState(options))}\n\n`);
+      response.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+      return true;
     } catch {
       this.clients.delete(response);
+      return false;
     }
+  }
+
+  writeSseState(response, client = {}) {
+    const state = this.getState(client);
+    if (this.writeSseEvent(response, 'state', state)) {
+      client.sseSnapshot = this.createSseSnapshot(state);
+    }
+  }
+
+  writeSseDelta(response, client) {
+    if (!client?.sseSnapshot) {
+      this.writeSseState(response, client);
+      return;
+    }
+    const state = this.getState(client);
+    const previous = client.sseSnapshot;
+    const next = this.createSseSnapshot(state);
+
+    for (const room of state.rooms) {
+      const roomId = String(room.id);
+      if (previous.rooms.get(roomId) !== next.rooms.get(roomId)) {
+        if (!this.writeSseEvent(response, 'room', room)) return;
+      }
+    }
+    for (const roomId of previous.rooms.keys()) {
+      if (!next.rooms.has(roomId) && !this.writeSseEvent(response, 'room', { id: roomId, deleted: true })) {
+        return;
+      }
+    }
+
+    if (previous.recordings !== next.recordings && !this.writeSseEvent(response, 'recording', { recordings: state.recordings })) {
+      return;
+    }
+    const previousLogIds = new Set(previous.logIds);
+    const nextLogIds = new Set(next.logIds);
+    const newLogs = state.logs.filter((entry) => !previousLogIds.has(String(entry.id)));
+    if (state.logs.length === 0 && previous.logIds.length > 0) {
+      if (!this.writeSseEvent(response, 'log', { clear: true })) return;
+    } else if (newLogs.length) {
+      const replacesLogs = previous.logIds.length > 0 && !state.logs.some((entry) => previousLogIds.has(String(entry.id)));
+      if (!this.writeSseEvent(response, 'log', replacesLogs ? { replace: newLogs } : { entries: newLogs })) return;
+    } else if (previous.logIds.some((id) => !nextLogIds.has(id))) {
+      if (!this.writeSseEvent(response, 'log', { replace: state.logs })) return;
+    }
+
+    const scalarEvents = [
+      ['settings', previous.settings, next.settings, this.getSseSettingsPayload(state)],
+      ['mediaJob', previous.mediaJob, next.mediaJob, this.getSseMediaJobPayload(state)],
+      ['diskSpace', previous.diskSpace, next.diskSpace, { outputDiskSpace: state.outputDiskSpace || null }],
+      ['system', previous.system, next.system, this.getSseSystemPayload(state)]
+    ];
+    for (const [eventName, previousValue, nextValue, payload] of scalarEvents) {
+      if (previousValue !== nextValue && !this.writeSseEvent(response, eventName, payload)) return;
+    }
+    client.sseSnapshot = next;
   }
 
   log(level, message) {
@@ -2731,6 +3115,7 @@ try {
   }
 
   async saveSettings(nextSettings, options = {}) {
+    this.assertSettingsUpdate(nextSettings);
     const oldPollInterval = this.settings.pollIntervalSec;
     const oldOutputDir = this.settings.outputDir;
     const oldAccessUsername = this.settings.accessUsername;
@@ -2753,10 +3138,10 @@ try {
       settingsUpdate.accessPasswordHash = await hashAccessPassword(accessPassword);
     }
     if (webhookBearerToken.length > 4096) {
-      throw new Error('Webhook Bearer Token 不能超过 4096 个字符。');
+      throw businessError('INVALID_SETTINGS', 'Webhook Bearer Token 不能超过 4096 个字符。', 400);
     }
     if (/\r|\n/.test(webhookBearerToken)) {
-      throw new Error('Webhook Bearer Token 不能包含换行。');
+      throw businessError('INVALID_SETTINGS', 'Webhook Bearer Token 不能包含换行。', 400);
     }
     if (clearWebhookBearerToken) {
       settingsUpdate.webhookBearerToken = '';
@@ -2767,11 +3152,15 @@ try {
       ...this.settings,
       ...settingsUpdate
     });
-    normalizedSettings.webhookUrl = normalizeWebhookUrl(normalizedSettings.webhookUrl, {
-      required: normalizedSettings.webhookEnabled
-    });
+    try {
+      normalizedSettings.webhookUrl = normalizeWebhookUrl(normalizedSettings.webhookUrl, {
+        required: normalizedSettings.webhookEnabled
+      });
+    } catch (error) {
+      throw businessError('INVALID_SETTINGS', error.message || 'Webhook 配置无效。', 400);
+    }
     if (isPublicServerHost(normalizedSettings.serverHost) && !this.accessAuth.isConfigured(normalizedSettings)) {
-      throw new Error('监听 0.0.0.0/:: 前必须先在持久化配置中设置至少 8 位远程访问密码。');
+      throw businessError('INVALID_SETTINGS', '监听 0.0.0.0/:: 前必须先在持久化配置中设置至少 8 位远程访问密码。', 400);
     }
     const outputDirChanged = oldOutputDir !== normalizedSettings.outputDir;
     const outputReady = await this.ensureRecordingOutputRootReady(normalizedSettings.outputDir, {
@@ -2820,38 +3209,175 @@ try {
     return this.getState();
   }
 
+  assertSettingsUpdate(nextSettings) {
+    if (!nextSettings || typeof nextSettings !== 'object' || Array.isArray(nextSettings)) {
+      throw businessError('INVALID_SETTINGS', '设置内容必须是对象。', 400);
+    }
+    for (const key of Object.keys(nextSettings)) {
+      if (!SETTINGS_UPDATE_KEYS.has(key)) {
+        throw businessError('INVALID_SETTINGS', `未知设置项 ${key}。`, 400);
+      }
+    }
+    for (const key of BOOLEAN_SETTINGS_UPDATE_KEYS) {
+      if (key in nextSettings && typeof nextSettings[key] !== 'boolean') {
+        throw businessError('INVALID_SETTINGS', `设置项 ${key} 必须是布尔值。`, 400);
+      }
+    }
+    for (const [key, maxLength] of Object.entries(STRING_SETTINGS_UPDATE_LIMITS)) {
+      if (!(key in nextSettings)) continue;
+      if (typeof nextSettings[key] !== 'string') {
+        throw businessError('INVALID_SETTINGS', `设置项 ${key} 必须是文本。`, 400);
+      }
+      if (nextSettings[key].length > maxLength) {
+        throw businessError('INVALID_SETTINGS', `设置项 ${key} 不能超过 ${maxLength} 个字符。`, 400);
+      }
+    }
+    const numericRanges = {
+      pollIntervalSec: [1, 300, '监听轮询间隔必须在 1 到 300 秒之间。'],
+      targetQn: [1, 100000, '目标画质必须是有效的正整数。'],
+      segmentMinutes: [0.05, 1440, '分段时长必须在 0.05 到 1440 分钟之间。'],
+      burnCrf: [16, 35, '烧录 CRF 必须在 16 到 35 之间。'],
+      serverPort: [1, 65535, '服务端口必须在 1 到 65535 之间。']
+    };
+    for (const [key, [min, max, message]] of Object.entries(numericRanges)) {
+      if (!(key in nextSettings)) continue;
+      if (typeof nextSettings[key] !== 'number') {
+        throw businessError('INVALID_SETTINGS', `设置项 ${key} 必须是数字。`, 400);
+      }
+      const value = nextSettings[key];
+      if (!Number.isFinite(value) || value < min || value > max) {
+        throw businessError('INVALID_SETTINGS', message, 400);
+      }
+    }
+    const enumValues = {
+      roomImageMode: ['cover', 'keyframe'],
+      outputContainer: ['mp4', 'mkv'],
+      burnOverlayMode: ['danmaku', 'danmaku-gift'],
+      burnDanmakuArea: ['quarter', 'half', 'three-quarter', 'no-overlap', 'unlimited'],
+      burnAvatarMode: ['off', 'limited', 'high'],
+      serverHost: ['127.0.0.1', '0.0.0.0', 'localhost', '::']
+    };
+    for (const [key, values] of Object.entries(enumValues)) {
+      if (key in nextSettings && !values.includes(nextSettings[key])) {
+        throw businessError('INVALID_SETTINGS', `设置项 ${key} 的值无效。`, 400);
+      }
+    }
+    if ('burnCodec' in nextSettings && !BURN_CODEC_VALUES.has(nextSettings.burnCodec)) {
+      throw businessError('INVALID_SETTINGS', '烧录编码器的值无效。', 400);
+    }
+    if (
+      'burnDanmakuStylePreset' in nextSettings &&
+      normalizeDanmakuStylePreset(nextSettings.burnDanmakuStylePreset) !== nextSettings.burnDanmakuStylePreset
+    ) {
+      throw businessError('INVALID_SETTINGS', '弹幕样式预设的值无效。', 400);
+    }
+    if (
+      'burnDanmakuStyleLayout' in nextSettings &&
+      (!nextSettings.burnDanmakuStyleLayout ||
+        typeof nextSettings.burnDanmakuStyleLayout !== 'object' ||
+        Array.isArray(nextSettings.burnDanmakuStyleLayout))
+    ) {
+      throw businessError('INVALID_SETTINGS', '弹幕样式布局必须是对象。', 400);
+    }
+    if ('trustedProxies' in nextSettings) {
+      const proxies = nextSettings.trustedProxies;
+      if (
+        !Array.isArray(proxies) ||
+        proxies.length > 32 ||
+        proxies.some((rule) => typeof rule !== 'string' || !isValidTrustedProxyRule(rule))
+      ) {
+        throw businessError('INVALID_SETTINGS', '可信反向代理必须是最多 32 个 IP、CIDR 或 loopback 规则。', 400);
+      }
+    }
+    if ('outputDir' in nextSettings && !String(nextSettings.outputDir || '').trim()) {
+      throw businessError('INVALID_SETTINGS', '录像保存目录不能为空。', 400);
+    }
+  }
+
   async addRoom(roomId) {
-    const id = String(roomId || '').trim();
-    if (!/^\d+$/.test(id)) {
-      this.log('error', '房间号必须是数字。');
-      return this.getState();
-    }
+    const id = parseRoomInput(roomId);
     if (this.rooms.has(id)) {
-      this.log('warn', `房间 ${id} 已经在列表里。`);
-      return this.getState();
+      throw businessError('ROOM_ALREADY_EXISTS', '该直播间已经添加。', 409);
     }
-    const room = this.normalizeRoom({ id, monitoring: true });
+    const info = await this.fetchRoomInfo(id);
+    const realRoomId = String(info.realRoomId || '');
+    const duplicate = Array.from(this.rooms.values()).find(
+      (room) =>
+        (realRoomId && String(room.realRoomId || '') === realRoomId) ||
+        (room.shortId && String(room.shortId) === id)
+    );
+    if (duplicate) {
+      throw businessError('ROOM_ALREADY_EXISTS', '该直播间已经添加。', 409);
+    }
+    const room = this.normalizeRoom({
+      id,
+      ...info,
+      monitoring: false,
+      autoRecord: false,
+      lastCheckedAt: Date.now()
+    });
     this.rooms.set(id, room);
     await this.saveStore();
-    this.log('info', `已添加房间 ${id}。`);
+    this.log('info', `已添加房间 ${roomLabel(room)}；默认未开启监听和自动录制。`);
     this.emitState();
-    await this.refreshRoom(id);
-    await this.setMonitoring(id, true);
     return this.getState();
   }
 
-  async removeRoom(roomId) {
+  async removeRoom(roomId, options = {}) {
     const room = this.getRoom(roomId);
-    if (this.isRoomRecording(room)) {
-      await this.stopRecording(room.id);
+    if (this.removingRoomIds.has(room.id)) {
+      throw businessError('ROOM_REMOVAL_IN_PROGRESS', `${roomLabel(room)} 正在取消任务并删除，请稍候。`, 409);
     }
-    await this.cancelMerge(room.id);
+    const activeTasks = this.getRoomActiveTaskKinds(room);
+    if (activeTasks.length && !options.force) {
+      throw businessError(
+        'ROOM_BUSY',
+        `${roomLabel(room)} 仍有${activeTasks.join('、')}任务。请先完成或取消任务；如确认继续，可选择强制删除。`,
+        409
+      );
+    }
+    if (options.force) {
+      this.removingRoomIds.add(room.id);
+      try {
+        room.monitoring = false;
+        this.stopMonitorTimer(room.id);
+        this.stopLivePushMonitor(room.id);
+        const retryTimer = this.streamStartRetryTimers.get(room.id);
+        if (retryTimer) clearTimeout(retryTimer);
+        this.streamStartRetryTimers.delete(room.id);
+        this.streamStartRetryRooms.delete(room.id);
+        this.reconnectPendingRooms.delete(room.id);
+        if (this.isRoomRecording(room)) {
+          await this.stopRecording(room.id);
+        }
+        const mergeActive = this.getRoomActiveTaskKinds(room).includes('合并');
+        if (mergeActive) {
+          await this.cancelMerge(room.id);
+        }
+        this.clearMergeRetryStatesForRoom(room.id);
+        await this.cancelRoomBurnTasks(room);
+        await this.cancelRoomExportTasks(room);
+        if (this.isRoomRelatedPreview(room)) {
+          await this.cancelExportPreview({ silent: true });
+        }
+        for (const [cleanupId, cleanup] of this.pendingSegmentCleanups) {
+          if (String(cleanup?.roomId || '') === room.id) {
+            this.pendingSegmentCleanups.delete(cleanupId);
+          }
+        }
+        await this.waitForRoomTasksReleased(room);
+      } catch (error) {
+        this.removingRoomIds.delete(room.id);
+        throw error;
+      }
+    }
     this.clearMergeRetryStatesForRoom(room.id);
     this.stopMonitorTimer(room.id);
     this.stopLivePushMonitor(room.id);
     this.rooms.delete(room.id);
+    this.removingRoomIds.delete(room.id);
     await this.saveStore();
-    this.log('info', `已移除房间 ${room.id}。`);
+    this.log('info', `已${options.force ? '强制' : ''}移除房间 ${room.id}。`);
     this.emitState();
     return this.getState();
   }
@@ -2923,7 +3449,16 @@ try {
     return this.getState();
   }
 
-  startMonitorTimer(roomId) {
+  applyMonitorPollJitter(delayMs) {
+    return jitterMonitorPollDelay(delayMs);
+  }
+
+  isLivePushConnected(roomId) {
+    const monitor = this.livePushMonitors.get(String(roomId));
+    return Boolean(monitor?.authenticated && monitor?.client && !monitor.stopped);
+  }
+
+  startMonitorTimer(roomId, options = {}) {
     this.stopMonitorTimer(roomId);
     const schedule = (delayMs) => {
       const timer = setTimeout(async () => {
@@ -2931,25 +3466,23 @@ try {
         await this.tickRoom(roomId);
         const room = this.rooms.get(roomId);
         if (!room?.monitoring || this.monitorTimers.get(roomId) !== timer) return;
-        // The WebSocket LIVE event is the fast path but is not replayed to a
-        // client that connects after the broadcaster has already started.
-        // While a room is offline, cap the REST fallback at three seconds;
-        // once it is live (or an API error occurred), honour the user's normal
-        // polling interval to avoid needless requests.
-        schedule(getMonitorPollDelayMs(room, this.settings));
+        const delayMs = getMonitorPollDelayMs(room, this.settings, this.isLivePushConnected(room.id));
+        schedule(this.applyMonitorPollJitter(delayMs));
       }, Math.max(0, Number(delayMs) || 0));
       timer.unref?.();
       this.monitorTimers.set(roomId, timer);
     };
-    // A saved monitor used to wait a full polling interval after an app
-    // restart. Check immediately, then use the adaptive schedule above.
-    schedule(0);
+    // Spread initial checks across rooms: state changes and manual enabling
+    // still trigger an immediate tick separately, while a large restored list
+    // does not burst the live-status endpoint at once.
+    const initialDelayMs = options.initialDelayMs ?? Math.floor(Math.random() * 750);
+    schedule(initialDelayMs);
   }
 
   stopMonitorTimer(roomId) {
     const timer = this.monitorTimers.get(roomId);
     if (timer) {
-      clearInterval(timer);
+      clearTimeout(timer);
       this.monitorTimers.delete(roomId);
     }
   }
@@ -2973,7 +3506,10 @@ try {
         });
       }
     } catch (error) {
+      room.lastCheckedAt = Date.now();
+      room.lastError = error.message || String(error);
       this.log('error', `${roomLabel(room)} 监听异常：${error.message}`);
+      this.emitState();
     } finally {
       this.roomTickLocks.delete(roomId);
     }
@@ -2998,6 +3534,7 @@ try {
     room.lastCheckedAt = Date.now();
     room.lastError = undefined;
     if (previousLiveStatus !== undefined && previousLiveStatus !== room.liveStatus) {
+      room.monitorFastPollUntil = Date.now() + MONITOR_FAST_CONFIRM_WINDOW_MS;
       this.log(
         room.liveStatus === 1 ? 'success' : 'info',
         `${roomLabel(room)}：${room.liveStatus === 1 ? '开播' : '下播'}（${source}）`
@@ -3019,6 +3556,9 @@ try {
       this.saveStore().catch((error) => {
         this.log('warn', `${roomLabel(room)} 保存开播状态失败：${error.message}`);
       });
+      if (room.monitoring) {
+        this.startMonitorTimer(room.id, { initialDelayMs: this.applyMonitorPollJitter(MONITOR_FAST_CONFIRM_MS) });
+      }
     }
     this.emitState();
   }
@@ -3086,6 +3626,15 @@ try {
           }
           monitor.authenticated = false;
           if (!monitor.stopped) {
+            // Do not keep the slower push-backed fallback after the push
+            // channel disappears. Re-arm the HTTP check using the short
+            // disconnected fallback while the reconnect loop is in flight.
+            if (room.monitoring) {
+              const fallbackDelayMs = getMonitorPollDelayMs(room, this.settings, false);
+              this.startMonitorTimer(room.id, {
+                initialDelayMs: this.applyMonitorPollJitter(fallbackDelayMs)
+              });
+            }
             this.scheduleLivePushReconnect(room, monitor, reason);
           }
         }
@@ -3273,7 +3822,7 @@ try {
       Object.assign(room, await this.fetchRoomInfo(room.id));
     }
     if (room.liveStatus !== 1) {
-      throw new Error(`${roomLabel(room)} 当前未开播，无法打开实时预览。`);
+      throw businessError('ROOM_NOT_LIVE', `${roomLabel(room)} 当前未开播，无法打开实时预览。`, 409);
     }
     const stream = await this.resolvePlayStream(room, { requireHls: true, purpose: '实时预览' });
     const token = crypto.randomBytes(18).toString('base64url');
@@ -3293,16 +3842,17 @@ try {
   }
 
   async startExportPreview(options = {}) {
-    const sourcePath = path.resolve(String(options.cleanPath || options.path || '').trim());
-    if (!sourcePath) {
-      throw new Error('请选择要预览的视频文件。');
+    const requestedPath = String(options.cleanPath || options.path || '').trim();
+    if (!requestedPath) {
+      throw businessError('INVALID_PREVIEW_REQUEST', '请选择要预览的视频文件。', 400);
     }
+    const sourcePath = path.resolve(requestedPath);
     if (!this.isKnownMediaPath(sourcePath)) {
-      throw new Error('视频路径不在录像库或输出目录内。');
+      throw businessError('INVALID_PREVIEW_REQUEST', '视频路径不在录像库或输出目录内。', 400);
     }
     const stat = await fsp.stat(sourcePath).catch(() => null);
     if (!stat?.isFile()) {
-      throw new Error('视频文件不存在。');
+      throw businessError('RECORDING_NOT_FOUND', '视频文件不存在。', 404);
     }
     const id = this.createFileCacheId(sourcePath, stat, PREVIEW_CACHE_VERSION);
     const previewDir = path.join(this.previewCacheDir, id);
@@ -3322,8 +3872,19 @@ try {
       this.emitState();
       return { ok: true, id, previewUrl, ready: true, cached: true };
     }
-    if (this.exportPreviewProgress?.status === 'running' && this.exportPreview?.id === id) {
-      return { ok: true, id, previewUrl, ready: false, cached: false, progress: { ...this.exportPreviewProgress } };
+    if (
+      ['queued', 'running'].includes(this.exportPreviewProgress?.status) &&
+      this.exportPreview?.id === id
+    ) {
+      return {
+        ok: true,
+        id,
+        jobId: this.exportPreviewProgress.id,
+        previewUrl,
+        ready: false,
+        cached: false,
+        progress: { ...this.exportPreviewProgress }
+      };
     }
     await this.cancelExportPreview({ silent: true });
     const workingPreviewDir = `${previewDir}.work-${crypto.randomBytes(6).toString('hex')}`;
@@ -3347,13 +3908,15 @@ try {
       decoderKind: previewDecoder.kind,
       decoderLabel: previewDecoder.label
     });
+    progress.status = 'queued';
+    progress.message = '兼容预览已排队，等待媒体资源';
     clearTimeout(this.exportPreviewClearTimer);
     this.exportPreviewProgress = progress;
     this.exportPreview = {
       id,
       sourcePath,
       previewUrl,
-      status: 'running',
+      status: 'queued',
       ready: false,
       cached: false,
       updatedAt: Date.now()
@@ -3361,16 +3924,36 @@ try {
     this.emitState();
     this.log(
       'info',
-      `正在生成 H.264 兼容预览：${path.basename(sourcePath)}（${
+      `兼容预览已加入队列：${path.basename(sourcePath)}（${
         previewCodecInfo.kind === 'hardware' ? '硬件' : '软件'
       }编码 ${previewCodec}，${previewDecoder.kind === 'hardware' ? `${previewDecoder.label} 硬件解码` : 'CPU 解码'}）`
     );
-    const previewLease = await this.mediaJobs.acquire({
+    const previewLeasePromise = this.mediaJobs.acquire({
       id: progress.id,
       type: 'preview',
-      resource: this.getTranscodeResource(previewCodec, mediaInfo.videoInfo),
+      resources: this.getTranscodeResources(previewCodec, mediaInfo.videoInfo),
       cancel: () => this.cancelExportPreview({ silent: true }).catch(() => {})
     });
+
+    void previewLeasePromise
+      .then((previewLease) => {
+        if (
+          this.exportPreviewProgress?.id !== progress.id ||
+          this.exportPreviewProgress.status === 'cancelled'
+        ) {
+          previewLease.release();
+          fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
+          return;
+        }
+        progress.status = 'running';
+        progress.workStartedAt = Date.now();
+        progress.updatedAt = progress.workStartedAt;
+        progress.message = '正在生成兼容预览';
+        if (this.exportPreview?.id === id) {
+          this.exportPreview.status = 'running';
+          this.exportPreview.updatedAt = Date.now();
+        }
+        this.emitState();
 
     const handlePreviewStderr = (line) => {
       if (this.exportPreviewProgress?.id === progress.id && updateFfmpegJobProgress(this.exportPreviewProgress, line)) {
@@ -3498,20 +4081,59 @@ try {
         }
         this.emitState();
       });
+      })
+      .catch((error) => {
+        if (this.exportPreviewProgress?.id !== progress.id) {
+          fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
+          return;
+        }
+        if (this.exportPreviewProgress.status === 'cancelled') {
+          fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
+          return;
+        }
+        finishFfmpegJobProgress(this.exportPreviewProgress, 'error', `兼容预览失败：${error.message}`);
+        this.exportPreview = {
+          id,
+          sourcePath,
+          previewUrl,
+          status: 'error',
+          ready: false,
+          cached: false,
+          message: error.message,
+          updatedAt: Date.now()
+        };
+        this.log('error', `生成兼容预览失败：${error.message}`);
+        fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
+        this.emitState();
+      });
 
-    return { ok: true, id, previewUrl, ready: false, cached: false, progress: { ...progress } };
+    return { ok: true, id, jobId: progress.id, previewUrl, ready: false, cached: false, progress: { ...progress } };
   }
 
   async cancelExportPreview(options = {}) {
+    const progress = this.exportPreviewProgress;
+    const queued = progress?.status === 'queued';
     if (this.exportPreviewProcess) {
       requestFfmpegStop(this.exportPreviewProcess, { graceful: false, timeoutMs: 1500 });
       this.exportPreviewProcess = null;
     }
-    if (this.exportPreviewProgress?.status === 'running') {
-      finishFfmpegJobProgress(this.exportPreviewProgress, 'cancelled', '兼容预览已取消');
+    if (queued && progress?.id) {
+      this.mediaJobs.cancel(progress.id);
     }
-    if (!options.silent && this.exportPreview?.status === 'running') {
-      this.log('info', '已取消当前兼容预览生成。');
+    if (progress?.status === 'running' || queued) {
+      finishFfmpegJobProgress(progress, 'cancelled', queued ? '已取消排队中的兼容预览' : '兼容预览已取消');
+    }
+    if (this.exportPreview && ['queued', 'running'].includes(this.exportPreview.status)) {
+      this.exportPreview = {
+        ...this.exportPreview,
+        status: 'cancelled',
+        ready: false,
+        message: queued ? '已取消排队中的兼容预览' : '兼容预览已取消',
+        updatedAt: Date.now()
+      };
+    }
+    if (!options.silent && (queued || this.exportPreview?.status === 'running' || this.exportPreview?.status === 'cancelled')) {
+      this.log('info', queued ? '已取消排队中的兼容预览。' : '已取消当前兼容预览生成。');
     }
     this.emitState();
     return this.getState();
@@ -4126,13 +4748,19 @@ try {
 
   async startRecording(roomId, autoStart = false, options = {}) {
     if (this.draining) {
-      throw new Error('服务正在退出，不能开始新的录制。');
+      throw businessError('SERVICE_DRAINING', '服务正在退出，不能开始新的录制。', 409);
     }
     const room = this.getRoom(roomId);
+    if (this.removingRoomIds.has(room.id)) {
+      throw businessError('ROOM_REMOVAL_IN_PROGRESS', `${roomLabel(room)} 正在删除，不能开始新的录制。`, 409);
+    }
     const liveSessionId = String(options.liveSessionId || crypto.randomUUID());
     const startRecordingCalledAt = Date.now();
     const startRecordingMono = monotonicNowMs();
     if (this.hasActiveRecordingSession(room) || (this.reconnectPendingRooms.has(room.id) && !options.streamReconnect)) {
+      if (!autoStart) {
+        throw businessError('RECORDING_ALREADY_ACTIVE', `${roomLabel(room)} 已有录制任务正在进行。`, 409);
+      }
       return this.getState();
     }
     this.recordingStartLocks.add(room.id);
@@ -4145,8 +4773,12 @@ try {
         Object.assign(room, await this.fetchRoomInfo(room.id));
       }
       if (room.liveStatus !== 1) {
-        this.log('warn', `${roomLabel(room)} 当前未开播，未开始录制。`);
+        const error = businessError('ROOM_NOT_LIVE', `${roomLabel(room)} 当前未开播，无法开始录制。`, 409);
+        this.log('warn', error.message);
         this.emitState();
+        if (!autoStart) {
+          throw error;
+        }
         return this.getState();
       }
 
@@ -4397,7 +5029,7 @@ try {
       session.releaseMediaJob = this.mediaJobs.registerExternal({
         id: `recording:${room.id}:${session.startedAt}`,
         type: 'recording',
-        resource: 'recording',
+        resources: ['recording', 'network'],
         cancel: () => this.stopRecording(room.id).catch(() => {})
       });
       this.reconnectPendingRooms.delete(room.id);
@@ -4531,6 +5163,9 @@ try {
         this.scheduleInitialStreamRetry(room, options, error.message);
       }
       this.emitState();
+      if (!autoStart) {
+        throw error;
+      }
     } finally {
       this.recordingStartLocks.delete(room.id);
       if (!this.recordingSessions.has(room.id)) {
@@ -6119,6 +6754,7 @@ try {
       !room?.id ||
       !groupId ||
       this.draining ||
+      this.removingRoomIds.has(room?.id) ||
       this.mergeCancelRequests.has(room.id) ||
       isFfmpegMemoryPressureError(error) ||
       error?.code === 'MERGE_SEGMENT_UNDECODABLE'
@@ -6208,11 +6844,11 @@ try {
   async retryMerge(roomId) {
     const room = this.getRoom(roomId);
     if (this.mergeProcesses.has(room.id) || [...this.mergeInFlightGroups.keys()].some((key) => key.startsWith(`${room.id}\u0000`))) {
-      throw new Error('当前已有合并任务在运行，请稍候。');
+      throw businessError('MERGE_ALREADY_RUNNING', '当前已有合并任务在运行，请稍候。', 409);
     }
     const pending = await this.getPendingMergeGroupForRoom(room);
     if (!pending) {
-      throw new Error('没有找到可重新合并的完整源分段。');
+      throw businessError('MERGE_TASK_NOT_FOUND', '没有找到可重新合并的完整源分段。', 404);
     }
     this.clearMergeRetryState(room.id, pending.mergeGroup);
     if (room.mergeProgress?.kind === 'merge') {
@@ -6229,6 +6865,9 @@ try {
   }
 
   async finalizeReconnectGroup(room, mergeGroup, fallbackRecording) {
+    if (!room?.id || this.removingRoomIds.has(room.id) || !this.rooms.has(room.id)) {
+      return null;
+    }
     let recording;
     try {
       recording = await this.mergeReconnectGroupIfNeeded(room, mergeGroup, fallbackRecording);
@@ -6302,14 +6941,17 @@ try {
     return room ? roomLabel(room) : '其他直播录制';
   }
 
-  getMergeMediaWaitDetails(resource, progressId) {
+  getMergeMediaWaitDetails(resources, progressId) {
     const jobs = this.mediaJobs.snapshot();
-    const resourceSlots = (value) => (value === 'hybrid' ? ['cpu', 'gpu'] : [value]);
-    const overlaps = (left, right) => resourceSlots(left).some((slot) => resourceSlots(right).includes(slot));
-    const queued = jobs.filter((job) => job.status === 'queued' && overlaps(job.resource, resource));
+    const requiredSlots = normalizeResourceSlots(resources);
+    const overlaps = (job) => {
+      const jobSlots = Array.isArray(job.resources) ? job.resources : normalizeResourceSlots(job.resource);
+      return requiredSlots.some((slot) => jobSlots.includes(slot));
+    };
+    const queued = jobs.filter((job) => job.status === 'queued' && overlaps(job));
     const ownIndex = queued.findIndex((job) => job.id === progressId);
     const recordingLabels =
-      resource === 'cpu' || resource === 'gpu' || resource === 'hybrid'
+      requiredSlots.includes('cpuEncode') || requiredSlots.includes('gpuComposite')
         ? [
             ...new Set(
               jobs
@@ -6320,7 +6962,7 @@ try {
         : [];
     const activeSameResource = jobs.filter(
       (job) =>
-        job.status === 'running' && overlaps(job.resource, resource) && job.id !== progressId && job.type !== 'recording'
+        job.status === 'running' && overlaps(job) && job.id !== progressId && job.type !== 'recording'
     );
     return {
       queuePosition: ownIndex >= 0 ? ownIndex + 1 : 1,
@@ -6329,14 +6971,17 @@ try {
     };
   }
 
-  setMergeQueuedProgress(room, progress, resource, queuedAt) {
+  setMergeQueuedProgress(room, progress, resources, queuedAt) {
     if (room.mergeProgress?.id !== progress?.id) {
       return false;
     }
     const elapsedSec = Math.max(0, Math.floor((Date.now() - Number(queuedAt || Date.now())) / 1000));
-    const details = this.getMergeMediaWaitDetails(resource, progress.id);
-    const resourceLabel =
-      resource === 'hybrid' ? 'CPU/GPU' : resource === 'gpu' ? 'GPU' : resource === 'cpu' ? 'CPU' : resource.toUpperCase();
+    const details = this.getMergeMediaWaitDetails(resources, progress.id);
+    const resourceLabel = normalizeResourceSlots(resources)
+      .map((slot) =>
+        ({ disk: '磁盘', cpuEncode: 'CPU 编码', gpuEncode: 'GPU 编码', gpuComposite: 'GPU 合成' })[slot] || slot
+      )
+      .join(' / ');
     const waits = [];
     if (details.recordingLabels.length) {
       waits.push(`录制优先：${details.recordingLabels.join('、')}`);
@@ -6357,25 +7002,23 @@ try {
   }
 
   async acquireMergeMediaLease(room, progress, mergeEncoderPlan) {
-    const resource = mergeEncoderPlan.requiresTranscode
-      ? mergeEncoderPlan.usesHardwareDecoder || !mergeEncoderPlan.preferred.includes('libx')
-        ? 'hybrid'
-        : 'cpu'
-      : 'cpu';
+    const resources = mergeEncoderPlan.requiresTranscode
+      ? this.getTranscodeResources(mergeEncoderPlan.preferred, mergeEncoderPlan.videoInfo)
+      : ['disk'];
     const queuedAt = Date.now();
     const leasePromise = this.mediaJobs.acquire({
       id: progress.id,
       type: 'merge',
-      resource,
+      resources,
       cancel: () => {
         this.mergeCancelRequests.add(room.id);
         const child = this.mergeProcesses.get(room.id);
         if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
       }
     });
-    this.setMergeQueuedProgress(room, progress, resource, queuedAt);
+    this.setMergeQueuedProgress(room, progress, resources, queuedAt);
     const heartbeat = setInterval(() => {
-      this.setMergeQueuedProgress(room, progress, resource, queuedAt);
+      this.setMergeQueuedProgress(room, progress, resources, queuedAt);
     }, MERGE_STAGE_HEARTBEAT_MS);
     heartbeat.unref?.();
     try {
@@ -6606,11 +7249,6 @@ try {
     await this.waitForRuntimeCapabilities();
     const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
     mergeEncoderPlan.requiresTranscode = requiresTranscode;
-    mergeEncoderPlan.usesHardwareDecoder =
-      requiresTranscode &&
-      segmentMediaInfos.some(
-        (mediaInfo) => this.getHardwareDecoder(mediaInfo?.videoInfo, mergeEncoderPlan.preferred).kind === 'hardware'
-      );
     progress.codec = mergeEncoderPlan.preferred;
     progress.codecKind = mergeEncoderPlan.preferred.includes('libx') ? 'software' : 'hardware';
     const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
@@ -7797,6 +8435,21 @@ try {
       }
     }
 
+    if (options.preview) {
+      const items = [];
+      for (const [key, filePath] of cleanupPaths) {
+        if (protectedPaths.has(key) || !isPathInsideDirectory(filePath, cleanupRoot)) continue;
+        const stat = await fsp.stat(filePath).catch(() => null);
+        if (!stat?.isFile() && !stat?.isDirectory()) continue;
+        items.push({
+          path: filePath,
+          type: getCleanupArtifactType(filePath, stat),
+          sizeBytes: await getCleanupPreviewSize(filePath, stat)
+        });
+      }
+      return { preview: true, items };
+    }
+
     let deletedCount = 0;
     let failedCount = 0;
     for (const [key, filePath] of cleanupPaths) {
@@ -7921,11 +8574,52 @@ try {
     return { entries, truncated };
   }
 
-  async cleanupMergedSegmentResiduals() {
+  pruneMaintenanceCleanupPlans() {
+    const expiresAt = Date.now() - MAINTENANCE_CLEANUP_PLAN_TTL_MS;
+    for (const [scanId, plan] of this.maintenanceCleanupPlans) {
+      if (Number(plan?.createdAt || 0) < expiresAt) {
+        this.maintenanceCleanupPlans.delete(scanId);
+      }
+    }
+  }
+
+  async applyMaintenanceCleanupPlan(scanId) {
+    this.pruneMaintenanceCleanupPlans();
+    const id = String(scanId || '').trim();
+    const plan = this.maintenanceCleanupPlans.get(id);
+    if (!plan) {
+      throw businessError('CLEANUP_SCAN_EXPIRED', '清理预览已过期或不存在，请先重新扫描后再确认。', 409);
+    }
+    this.maintenanceCleanupPlans.delete(id);
     const fakeRoom = { id: 'maintenance', title: '维护', anchor: '历史录像' };
     let deletedCount = 0;
     let failedCount = 0;
     let groupCount = 0;
+    for (const { mergedRecording, segments, cleanupId } of plan.candidates) {
+      try {
+        const result = await this.cleanupMergedSegmentFiles(fakeRoom, segments, mergedRecording, { cleanupId });
+        deletedCount += Number(result?.deletedCount || 0);
+        failedCount += Number(result?.failedCount || 0);
+        groupCount += 1;
+      } catch (error) {
+        failedCount += 1;
+        groupCount += 1;
+        this.log('warn', `清理 ${path.basename(mergedRecording.cleanPath)} 的合并残留失败：${error.message}`);
+      }
+    }
+    this.log(
+      deletedCount > 0 ? 'success' : 'info',
+      `已执行确认的清理：扫描组 ${groupCount} 个，清理残留 ${deletedCount} 个${failedCount > 0 ? `，失败 ${failedCount} 个` : ''}。`
+    );
+    this.emitState();
+    return this.getState();
+  }
+
+  async cleanupMergedSegmentResiduals(options = {}) {
+    if (options.confirm) {
+      return this.applyMaintenanceCleanupPlan(options.scanId);
+    }
+    const fakeRoom = { id: 'maintenance', title: '维护', anchor: '历史录像' };
     const cleanupCandidates = new Map();
     const pathKey = (filePath) => {
       const value = String(filePath || '').trim();
@@ -8062,32 +8756,51 @@ try {
       addCleanupCandidate(mergedRecording, [createSegmentFromPath(entry.mediaPath)], mergedRecording.cleanupId);
     }
 
-    for (const { mergedRecording, segments, cleanupId } of cleanupCandidates.values()) {
+    const candidates = Array.from(cleanupCandidates.values()).map(({ mergedRecording, segments, cleanupId }) => ({
+      mergedRecording: cloneRecordingState(mergedRecording),
+      segments: segments.map((segment) => cloneRecordingState(segment)),
+      cleanupId
+    }));
+    const itemByPath = new Map();
+    let skippedGroupCount = 0;
+    for (const { mergedRecording, segments, cleanupId } of candidates) {
       try {
-        const result = await this.cleanupMergedSegmentFiles(fakeRoom, segments, mergedRecording, { cleanupId });
-        deletedCount += Number(result?.deletedCount || 0);
-        failedCount += Number(result?.failedCount || 0);
-        groupCount += 1;
+        const preview = await this.cleanupMergedSegmentFiles(fakeRoom, segments, mergedRecording, { cleanupId, preview: true });
+        for (const item of preview?.items || []) {
+          const key = path.resolve(String(item.path || '')).toLowerCase();
+          if (key && !itemByPath.has(key)) itemByPath.set(key, item);
+        }
       } catch (error) {
-        failedCount += 1;
-        groupCount += 1;
-        this.log('warn', `清理 ${path.basename(mergedRecording.cleanPath)} 的合并残留失败：${error.message}`);
+        skippedGroupCount += 1;
+        this.log('warn', `扫描 ${path.basename(mergedRecording.cleanPath)} 的合并残留失败：${error.message}`);
       }
     }
+    const allItems = Array.from(itemByPath.values());
+    const scanId = crypto.randomUUID();
+    this.pruneMaintenanceCleanupPlans();
+    this.maintenanceCleanupPlans.set(scanId, { createdAt: Date.now(), candidates });
+    const totalBytes = allItems.reduce((total, item) => total + Math.max(0, Number(item.sizeBytes || 0)), 0);
     this.log(
-      deletedCount > 0 ? 'success' : 'info',
-      `已扫描 ${groupCount} 个合并记录或待清理任务，清理残留 ${deletedCount} 个${failedCount > 0 ? `，失败 ${failedCount} 个` : ''}。`
+      'info',
+      `已扫描 ${candidates.length} 个合并记录或待清理任务，发现 ${allItems.length} 个可清理文件，等待确认。`
     );
-    this.emitState();
-    return this.getState();
+    return {
+      scanId,
+      groupCount: candidates.length,
+      skippedGroupCount,
+      fileCount: allItems.length,
+      totalBytes,
+      items: allItems.slice(0, MAINTENANCE_CLEANUP_PREVIEW_LIMIT),
+      omittedCount: Math.max(0, allItems.length - MAINTENANCE_CLEANUP_PREVIEW_LIMIT),
+      truncated: metadataScan.truncated
+    };
   }
 
   async startBurnDanmaku(roomId, options = {}) {
     const room = this.getRoom(roomId);
     const recording = room.currentRecording;
     if (!recording?.cleanPath || !recording?.danmakuPath) {
-      this.log('warn', `${roomLabel(room)} 没有可烧录的最近录像。`);
-      return this.getState();
+      throw businessError('RECORDING_NOT_FOUND', `${roomLabel(room)} 没有可烧录的最近录像。`, 404);
     }
 
     await this.enqueueBurnRecording(room, recording, options);
@@ -8095,6 +8808,9 @@ try {
   }
 
   async enqueueBurnRecording(room, recording, options = {}) {
+    if (!room?.id || this.removingRoomIds.has(room.id) || !this.rooms.has(room.id)) {
+      return null;
+    }
     if (!recording?.cleanPath || !recording?.danmakuPath || recording.valid === false) {
       throw new Error(`${roomLabel(room)} 没有可烧录的有效录像。`);
     }
@@ -8163,7 +8879,7 @@ try {
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'burn',
-          resource: this.getTranscodeResource(codec, item.recording?.videoInfo),
+          resources: this.getTranscodeResources(codec, item.recording?.videoInfo, { gpuComposite: true }),
           cancel: () => this.cancelBurnDanmaku(item.roomId).catch(() => {})
         });
         const started = await this.startBurnRecording(item.room, item.recording, {
@@ -8206,8 +8922,7 @@ try {
     const room = this.getRoom(roomId);
     const recording = room.currentRecording;
     if (!recording?.cleanPath || !recording?.danmakuPath) {
-      this.log('warn', `${roomLabel(room)} 没有可生成字幕的最近录像。`);
-      return this.getState();
+      throw businessError('RECORDING_NOT_FOUND', `${roomLabel(room)} 没有可生成字幕的最近录像。`, 404);
     }
     const assets = await this.generateSubtitleAssets(recording, {
       overlayMode: options.overlayMode || this.settings.burnOverlayMode,
@@ -9198,6 +9913,7 @@ try {
       return;
     }
     this.exportQueueRunning = true;
+    this.activeExportQueueItem = item;
     this.emitState();
     setImmediate(async () => {
       let lease = null;
@@ -9209,21 +9925,36 @@ try {
         }
       };
       try {
+        if (this.cancelledExportQueueIds.has(item.id)) {
+          return;
+        }
         await this.waitForRuntimeCapabilities();
+        if (this.cancelledExportQueueIds.has(item.id)) {
+          return;
+        }
         const codec = this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'export',
-          resource:
-            item.mode === 'clean' ? 'io' : this.getTranscodeResource(codec, item.request.recording?.videoInfo),
+          resources:
+            item.mode === 'clean' ? ['disk'] : this.getTranscodeResources(codec, item.request.recording?.videoInfo, { gpuComposite: true }),
           cancel: () => this.cancelExportClip().catch(() => {})
         });
+        if (this.cancelledExportQueueIds.has(item.id)) {
+          lease.release();
+          lease = null;
+          return;
+        }
         await this.runExportClipNow({ ...item.request, codec, onProgressCreated: removeWaitingItem });
       } catch (error) {
         this.log('error', `导出队列任务失败：${item.label}，${error.message || String(error)}`);
       } finally {
         removeWaitingItem();
         lease?.release();
+        this.cancelledExportQueueIds.delete(item.id);
+        if (this.activeExportQueueItem?.id === item.id) {
+          this.activeExportQueueItem = null;
+        }
         this.exportQueueRunning = false;
         this.emitState();
         if (this.exportQueue.length > 0) {
@@ -9291,6 +10022,7 @@ try {
       label: `导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}`,
       outputPath,
       durationSec: duration,
+      roomId: recording.roomId || undefined,
       codec: codecInfo?.value,
       codecKind: codecInfo?.kind,
       decoder: mode === 'burn' ? decoderInfo.value : undefined,
@@ -10414,7 +11146,7 @@ try {
   getRoom(roomId) {
     const room = this.rooms.get(String(roomId));
     if (!room) {
-      throw new Error(`找不到房间 ${roomId}`);
+      throw businessError('ROOM_NOT_FOUND', `找不到房间 ${roomId}。`, 404);
     }
     return room;
   }
@@ -10438,7 +11170,7 @@ try {
     }
     this.pathPickerStarting = false;
     for (const timer of this.monitorTimers.values()) {
-      clearInterval(timer);
+      clearTimeout(timer);
     }
     this.monitorTimers.clear();
     for (const roomId of Array.from(this.livePushMonitors.keys())) {
@@ -10743,6 +11475,8 @@ function isSingleExecutableRuntime() {
 
 module.exports = {
   LiveRecordService,
+  BusinessError,
+  isBusinessError,
   isFfmpegMemoryPressureError,
   getMergeSegmentTimingAssessment,
   getMonitorPollDelayMs,

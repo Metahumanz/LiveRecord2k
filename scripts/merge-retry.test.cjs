@@ -137,7 +137,7 @@ test('structured FFmpeg progress and merge resource waiting remain observable an
     resource: 'recording'
   });
   try {
-    const waitForLease = service.acquireMergeMediaLease(room, progress, { preferred: 'libx264' }).then(
+    const waitForLease = service.acquireMergeMediaLease(room, progress, { preferred: 'libx264', requiresTranscode: true }).then(
       () => null,
       (error) => error
     );

@@ -12,7 +12,7 @@ export function UpdateNotice({
 }: {
   state: AppState;
   stats: ReturnType<typeof getStats>;
-  busy: string | null;
+  busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
 }) {
   const update = state.update;
@@ -58,7 +58,7 @@ export function UpdateNotice({
         {showQueue ? (
           <button
             className="wide-button active"
-            disabled={busy === 'update-queue'}
+            disabled={busy.has('update-queue')}
             onClick={() => run('update-queue', recorder.queueUpdate)}
           >
             <Clock3 size={18} />
@@ -68,7 +68,7 @@ export function UpdateNotice({
         {canInstall ? (
           <button
             className="wide-button"
-            disabled={busy === 'update-apply' || update.status === 'downloading'}
+            disabled={busy.has('update-apply') || update.status === 'downloading'}
             onClick={() => run('update-apply', recorder.applyUpdate)}
           >
             <Download size={18} />
@@ -78,7 +78,7 @@ export function UpdateNotice({
         {update.status === 'error' && canOpenServerPath ? (
           <button
             className="wide-button"
-            disabled={busy === 'update-check'}
+            disabled={busy.has('update-check')}
             onClick={() => run('update-check', recorder.checkUpdate)}
           >
             <RefreshCw size={18} />
@@ -94,7 +94,7 @@ export function UpdateNotice({
         {update.packagePath && canOpenServerPath ? (
           <button
             className="wide-button"
-            disabled={busy === 'open-update-package'}
+            disabled={busy.has('open-update-package')}
             onClick={() => run('open-update-package', () => recorder.openPathDir(update.packagePath || ''))}
           >
             <FolderOpen size={18} />

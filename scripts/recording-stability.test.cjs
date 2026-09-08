@@ -212,11 +212,14 @@ test('media clock uses first FFmpeg progress rather than FFmpeg spawn wall time'
   assert.equal(service.resolveSessionVideoTime(session, 8000), 3, 'post-first-frame event does not include 5s startup wait or source PTS offset');
 });
 
-test('offline rooms poll for live start at most every three seconds while live rooms retain the configured interval', () => {
-  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 15 }), 3000);
-  assert.equal(getMonitorPollDelayMs({ liveStatus: 1 }, { pollIntervalSec: 15 }), 15000);
-  assert.equal(getMonitorPollDelayMs({ liveStatus: 0, lastError: 'timeout' }, { pollIntervalSec: 15 }), 15000);
-  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 2 }), 2000);
+test('room monitoring uses a slow push-backed fallback, faster disconnected fallback, and short change confirmation', () => {
+  const now = 1_000_000;
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 15 }, true, now), 30_000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 1 }, { pollIntervalSec: 300 }, true, now), 60_000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 15 }, false, now), 15_000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0 }, { pollIntervalSec: 2 }, false, now), 10_000);
+  assert.equal(getMonitorPollDelayMs({ liveStatus: 0, lastError: 'timeout' }, { pollIntervalSec: 60 }, true, now), 15_000);
+  assert.equal(getMonitorPollDelayMs({ monitorFastPollUntil: now + 1 }, { pollIntervalSec: 60 }, true, now), 3_000);
 });
 
 test('FFmpeg timeline regressions rotate the current segment and recording args disable hidden reconnects', () => {
