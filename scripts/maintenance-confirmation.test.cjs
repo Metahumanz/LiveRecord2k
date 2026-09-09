@@ -4,13 +4,18 @@ const path = require('node:path');
 const test = require('node:test');
 
 const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'app', 'service.cjs'), 'utf8');
+const maintenanceServiceSource = fs.readFileSync(
+  path.join(__dirname, '..', 'src', 'server', 'app', 'maintenance-service.cjs'),
+  'utf8'
+);
 const maintenanceSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'client', 'pages', 'MaintenancePage.tsx'), 'utf8');
 
 test('merged-residual cleanup scans into an expiring plan before a confirmation can delete', () => {
-  assert.match(serviceSource, /maintenanceCleanupPlans/);
-  assert.match(serviceSource, /options\.confirm/);
-  assert.match(serviceSource, /CLEANUP_SCAN_EXPIRED/);
-  assert.match(serviceSource, /preview: true/);
+  assert.match(serviceSource, /maintenanceService/);
+  assert.match(maintenanceServiceSource, /maintenanceCleanupPlans/);
+  assert.match(maintenanceServiceSource, /options\.confirm/);
+  assert.match(maintenanceServiceSource, /CLEANUP_SCAN_EXPIRED/);
+  assert.match(maintenanceServiceSource, /preview: true/);
 });
 
 test('maintenance UI previews configuration changes and cleanup files before applying either action', () => {
