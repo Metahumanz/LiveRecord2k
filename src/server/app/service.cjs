@@ -188,7 +188,7 @@ const {
 const { AccessAuthManager, hashAccessPassword } = require('./auth.cjs');
 const { AtomicJsonStore } = require('./atomic-store.cjs');
 const { MediaJobManager, normalizeResourceSlots } = require('./media-job-manager.cjs');
-const { MONITOR_FAST_CONFIRM_MS, getMonitorPollDelayMs, jitterMonitorPollDelay } = require('./room-monitor-scheduler.cjs');
+const { RoomMonitorService, getMonitorPollDelayMs } = require('./room-monitor-service.cjs');
 const { StatePublisher } = require('./state-publisher.cjs');
 const {
   normalizeTrustedProxyList,
@@ -267,7 +267,6 @@ const MIN_PLAYABLE_BYTES = 128 * 1024;
 const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
 const MEDIA_STALL_CHECK_MS = 20 * 1000;
 const MIN_MEDIA_GROWTH_BYTES = 32 * 1024;
-const MONITOR_FAST_CONFIRM_WINDOW_MS = 15 * 1000;
 const STARTUP_CORRUPTION_GUARD_MS = 12 * 1000;
 const WBI_MIXIN_KEY_TABLE = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14,
@@ -890,9 +889,17 @@ class LiveRecordService {
     this.rooms = new Map();
     this.removingRoomIds = new Set();
     this.logs = [];
-    this.monitorTimers = new Map();
-    this.livePushMonitors = new Map();
-    this.roomTickLocks = new Set();
+    this.roomMonitor = new RoomMonitorService(this, {
+      roomLabel,
+      getCookieValue,
+      createBiliError,
+      DanmakuClient
+    });
+    // Keep the existing fields available to shutdown, diagnostics, and
+    // integrations while their lifecycle moves into RoomMonitorService.
+    this.monitorTimers = this.roomMonitor.monitorTimers;
+    this.livePushMonitors = this.roomMonitor.livePushMonitors;
+    this.roomTickLocks = this.roomMonitor.roomTickLocks;
     this.recordingSessions = new Map();
     this.recordingStartLocks = new Set();
     this.reconnectPendingRooms = new Set();
@@ -3427,278 +3434,55 @@ try {
   }
 
   async setMonitoring(roomId, enabled) {
-    const room = this.getRoom(roomId);
-    room.monitoring = Boolean(enabled);
-    if (room.monitoring) {
-      this.startMonitorTimer(room.id);
-      this.startLivePushMonitor(room.id).catch((error) => {
-        this.log('warn', `${roomLabel(room)} 开播推送监听启动失败：${error.message}`);
-      });
-      this.log('info', `${roomLabel(room)} 已开始监听。`);
-      this.tickRoom(room.id);
-    } else {
-      this.stopMonitorTimer(room.id);
-      this.stopLivePushMonitor(room.id);
-      this.log('info', `${roomLabel(room)} 已停止监听。`);
-    }
-    await this.saveStore();
-    this.emitState();
-    return this.getState();
+    return this.roomMonitor.setMonitoring(roomId, enabled);
   }
 
   applyMonitorPollJitter(delayMs) {
-    return jitterMonitorPollDelay(delayMs);
+    return this.roomMonitor.applyMonitorPollJitter(delayMs);
   }
 
   isLivePushConnected(roomId) {
-    const monitor = this.livePushMonitors.get(String(roomId));
-    return Boolean(monitor?.authenticated && monitor?.client && !monitor.stopped);
+    return this.roomMonitor.isLivePushConnected(roomId);
   }
 
   startMonitorTimer(roomId, options = {}) {
-    this.stopMonitorTimer(roomId);
-    const schedule = (delayMs) => {
-      const timer = setTimeout(async () => {
-        if (this.monitorTimers.get(roomId) !== timer) return;
-        await this.tickRoom(roomId);
-        const room = this.rooms.get(roomId);
-        if (!room?.monitoring || this.monitorTimers.get(roomId) !== timer) return;
-        const delayMs = getMonitorPollDelayMs(room, this.settings, this.isLivePushConnected(room.id));
-        schedule(this.applyMonitorPollJitter(delayMs));
-      }, Math.max(0, Number(delayMs) || 0));
-      timer.unref?.();
-      this.monitorTimers.set(roomId, timer);
-    };
-    // Spread initial checks across rooms: state changes and manual enabling
-    // still trigger an immediate tick separately, while a large restored list
-    // does not burst the live-status endpoint at once.
-    const initialDelayMs = options.initialDelayMs ?? Math.floor(Math.random() * 750);
-    schedule(initialDelayMs);
+    return this.roomMonitor.startMonitorTimer(roomId, options);
   }
 
   stopMonitorTimer(roomId) {
-    const timer = this.monitorTimers.get(roomId);
-    if (timer) {
-      clearTimeout(timer);
-      this.monitorTimers.delete(roomId);
-    }
+    return this.roomMonitor.stopMonitorTimer(roomId);
   }
 
   async tickRoom(roomId) {
-    const room = this.rooms.get(roomId);
-    if (!room || !room.monitoring || this.roomTickLocks.has(roomId)) {
-      return;
-    }
-    this.roomTickLocks.add(roomId);
-    try {
-      const previousLiveStatus = room.liveStatus;
-      const status = await this.fetchRoomLiveStatus(room.id);
-      const liveDetectedAt = Date.now();
-      room.realRoomId = status.realRoomId || room.realRoomId;
-      await this.applyDetectedLiveStatus(room, status.liveStatus, '轮询');
-      if (room.liveStatus === 1 && room.autoRecord && !this.isRoomRecording(room)) {
-        await this.startRecording(room.id, true, {
-          liveDetectedAt,
-          liveDetectionSource: previousLiveStatus === 1 ? '轮询恢复' : '轮询'
-        });
-      }
-    } catch (error) {
-      room.lastCheckedAt = Date.now();
-      room.lastError = error.message || String(error);
-      this.log('error', `${roomLabel(room)} 监听异常：${error.message}`);
-      this.emitState();
-    } finally {
-      this.roomTickLocks.delete(roomId);
-    }
+    return this.roomMonitor.tickRoom(roomId);
   }
 
   async fetchRoomLiveStatus(roomId) {
-    const roomInit = await this.fetchBiliJson(
-      `https://api.live.bilibili.com/room/v1/Room/room_init?id=${encodeURIComponent(roomId)}`
-    );
-    if (roomInit.code !== 0) {
-      throw createBiliError('开播状态检查', roomInit);
-    }
-    return {
-      realRoomId: Number(roomInit.data?.room_id || 0),
-      liveStatus: Number(roomInit.data?.live_status || 0)
-    };
+    return this.roomMonitor.fetchRoomLiveStatus(roomId);
   }
 
   async applyDetectedLiveStatus(room, liveStatus, source) {
-    const previousLiveStatus = room.liveStatus;
-    room.liveStatus = Number(liveStatus || 0);
-    room.lastCheckedAt = Date.now();
-    room.lastError = undefined;
-    if (previousLiveStatus !== undefined && previousLiveStatus !== room.liveStatus) {
-      room.monitorFastPollUntil = Date.now() + MONITOR_FAST_CONFIRM_WINDOW_MS;
-      this.log(
-        room.liveStatus === 1 ? 'success' : 'info',
-        `${roomLabel(room)}：${room.liveStatus === 1 ? '开播' : '下播'}（${source}）`
-      );
-      if (room.liveStatus === 1 && this.settings.notifyLiveStarted) {
-        this.notify('开播提醒', `${roomLabel(room)} 已开播`, 'live.started', {
-          roomId: room.id,
-          roomTitle: room.title || '',
-          anchor: room.anchor || ''
-        });
-      }
-      if (previousLiveStatus === 1 && room.liveStatus !== 1 && this.settings.notifyLiveEnded) {
-        this.notify('下播提醒', `${roomLabel(room)} 已下播`, 'live.ended', {
-          roomId: room.id,
-          roomTitle: room.title || '',
-          anchor: room.anchor || ''
-        });
-      }
-      this.saveStore().catch((error) => {
-        this.log('warn', `${roomLabel(room)} 保存开播状态失败：${error.message}`);
-      });
-      if (room.monitoring) {
-        this.startMonitorTimer(room.id, { initialDelayMs: this.applyMonitorPollJitter(MONITOR_FAST_CONFIRM_MS) });
-      }
-    }
-    this.emitState();
+    return this.roomMonitor.applyDetectedLiveStatus(room, liveStatus, source);
   }
 
   async startLivePushMonitor(roomId) {
-    const room = this.rooms.get(String(roomId));
-    if (!room || !room.monitoring || this.livePushMonitors.has(room.id)) {
-      return;
-    }
-    const monitor = {
-      roomId: room.id,
-      client: null,
-      retryTimer: null,
-      retryDelayMs: 2000,
-      stopped: false,
-      authenticated: false
-    };
-    this.livePushMonitors.set(room.id, monitor);
-    await this.connectLivePushMonitor(room, monitor);
+    return this.roomMonitor.startLivePushMonitor(roomId);
   }
 
   async connectLivePushMonitor(room, monitor) {
-    if (monitor.stopped || !room.monitoring || this.livePushMonitors.get(room.id) !== monitor) {
-      return;
-    }
-    try {
-      if (!room.realRoomId) {
-        const status = await this.fetchRoomLiveStatus(room.id);
-        room.realRoomId = status.realRoomId || room.realRoomId;
-        await this.applyDetectedLiveStatus(room, status.liveStatus, '推送监听初始化');
-      }
-      const info = await this.fetchDanmuInfo(room.realRoomId || room.id);
-      if (info.code !== 0) {
-        throw createBiliError('开播推送服务器', info);
-      }
-      const client = new DanmakuClient({
-        roomId: Number(room.realRoomId || room.id),
-        uid: Number(getCookieValue(this.settings.cookie, 'DedeUserID') || 0),
-        buvid: getCookieValue(this.settings.cookie, 'buvid3') || getCookieValue(this.settings.cookie, 'buvid4') || '',
-        token: info.data?.token || '',
-        hosts: info.data?.host_list || [],
-        onAuthReply: (reply) => {
-          if (Number(reply?.code || 0) === 0) {
-            monitor.authenticated = true;
-            monitor.retryDelayMs = 2000;
-            this.log('info', `${roomLabel(room)} 开播推送监听已连接。`);
-            return;
-          }
-          this.log('warn', `${roomLabel(room)} 开播推送认证失败：${reply?.message || reply?.code || '未知错误'}`);
-          client.close('auth failed');
-        },
-        onCommand: (command) => {
-          this.handleLivePushCommand(room, monitor, command).catch((error) => {
-            this.log('warn', `${roomLabel(room)} 处理开播推送失败：${error.message}`);
-          });
-        },
-        onError: (error) => {
-          if (!monitor.stopped) {
-            this.log('warn', `${roomLabel(room)} 开播推送连接错误：${error.message}`);
-          }
-        },
-        onClose: (reason) => {
-          if (monitor.client === client) {
-            monitor.client = null;
-          }
-          monitor.authenticated = false;
-          if (!monitor.stopped) {
-            // Do not keep the slower push-backed fallback after the push
-            // channel disappears. Re-arm the HTTP check using the short
-            // disconnected fallback while the reconnect loop is in flight.
-            if (room.monitoring) {
-              const fallbackDelayMs = getMonitorPollDelayMs(room, this.settings, false);
-              this.startMonitorTimer(room.id, {
-                initialDelayMs: this.applyMonitorPollJitter(fallbackDelayMs)
-              });
-            }
-            this.scheduleLivePushReconnect(room, monitor, reason);
-          }
-        }
-      });
-      monitor.client = client;
-      client.connect();
-    } catch (error) {
-      this.scheduleLivePushReconnect(room, monitor, error.message);
-    }
+    return this.roomMonitor.connectLivePushMonitor(room, monitor);
   }
 
   async handleLivePushCommand(room, monitor, command) {
-    if (monitor.stopped || !room.monitoring) {
-      return;
-    }
-    const commandType = String(command?.cmd || '').split(':')[0].toUpperCase();
-    if (commandType === 'LIVE') {
-      const liveDetectedAt = Date.now();
-      await this.applyDetectedLiveStatus(room, 1, '弹幕服务器推送');
-      if (room.autoRecord && !this.isRoomRecording(room)) {
-        await this.startRecording(room.id, true, {
-          livePushReceivedAt: liveDetectedAt,
-          liveDetectedAt,
-          liveDetectionSource: '弹幕服务器推送'
-        });
-      }
-      setImmediate(() => {
-        this.refreshRoom(room.id, { silent: true }).catch(() => {});
-      });
-      return;
-    }
-    if (commandType === 'PREPARING') {
-      await this.applyDetectedLiveStatus(room, 0, '弹幕服务器推送');
-      return;
-    }
-    if (commandType === 'ROOM_CHANGE') {
-      const data = command?.data || {};
-      room.title = String(data.title || room.title || '');
-      this.emitState();
-    }
+    return this.roomMonitor.handleLivePushCommand(room, monitor, command);
   }
 
   scheduleLivePushReconnect(room, monitor, reason) {
-    if (monitor.stopped || monitor.retryTimer || !room.monitoring) {
-      return;
-    }
-    const delayMs = Math.min(60000, Math.max(2000, monitor.retryDelayMs || 2000));
-    monitor.retryDelayMs = Math.min(60000, delayMs * 2);
-    if (monitor.authenticated || delayMs >= 10000) {
-      this.log('warn', `${roomLabel(room)} 开播推送已断开，${Math.round(delayMs / 1000)} 秒后重连：${reason || '连接关闭'}`);
-    }
-    monitor.retryTimer = setTimeout(() => {
-      monitor.retryTimer = null;
-      this.connectLivePushMonitor(room, monitor).catch(() => {});
-    }, delayMs);
-    monitor.retryTimer.unref?.();
+    return this.roomMonitor.scheduleLivePushReconnect(room, monitor, reason);
   }
 
   stopLivePushMonitor(roomId) {
-    const monitor = this.livePushMonitors.get(String(roomId));
-    if (!monitor) {
-      return;
-    }
-    monitor.stopped = true;
-    clearTimeout(monitor.retryTimer);
-    monitor.client?.close('停止监听');
-    this.livePushMonitors.delete(String(roomId));
+    return this.roomMonitor.stopLivePushMonitor(roomId);
   }
 
   async fetchRoomInfo(roomId) {
@@ -11176,13 +10960,7 @@ try {
       this.pathPickerPromise = null;
     }
     this.pathPickerStarting = false;
-    for (const timer of this.monitorTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.monitorTimers.clear();
-    for (const roomId of Array.from(this.livePushMonitors.keys())) {
-      this.stopLivePushMonitor(roomId);
-    }
+    this.roomMonitor.stopAll();
     for (const timer of this.streamStartRetryTimers.values()) {
       clearTimeout(timer);
     }
