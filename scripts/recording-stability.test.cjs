@@ -131,6 +131,134 @@ test('录制不会中断仅占用一个读写预算的 GPU 预览', async () => 
   releaseRecording();
 });
 
+test('第二路录制会聚合既有录制的磁盘写入预算并抢占低优先级预览', async () => {
+  const manager = new MediaJobManager({ limits: { diskRead: 2, diskWrite: 2, gpuEncode: 1 } });
+  const releaseRecordingA = manager.registerExternal({
+    id: 'recording-a',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+  let previewCancelCount = 0;
+  const preview = await manager.acquire({
+    id: 'gpu-preview-before-recording-b',
+    type: 'preview',
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    resourceCosts: { diskRead: 1, diskWrite: 1 },
+    cancel: () => {
+      previewCancelCount += 1;
+    }
+  });
+
+  const releaseRecordingB = manager.registerExternal({
+    id: 'recording-b',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+
+  assert.equal(
+    previewCancelCount,
+    1,
+    '第二路录制必须把第一路 external recording 一并计入 diskWrite 预算'
+  );
+  assert.deepEqual(
+    manager.snapshot().filter((job) => job.type === 'recording').map((job) => job.id),
+    ['recording-a', 'recording-b']
+  );
+
+  preview.release();
+  const releaseRecordingC = manager.registerExternal({
+    id: 'recording-c',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+  assert.equal(manager.snapshot().filter((job) => job.type === 'recording').length, 3);
+
+  releaseRecordingC();
+  releaseRecordingB();
+  releaseRecordingA();
+});
+
+test('录制抢占按媒体优先级从低到高释放聚合磁盘预算', async () => {
+  const manager = new MediaJobManager({ limits: { diskRead: 3, diskWrite: 3, gpuEncode: 1 } });
+  const releaseRecordingA = manager.registerExternal({
+    id: 'recording-priority-a',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite']
+  });
+  let previewCancelCount = 0;
+  let exportCancelCount = 0;
+  const preview = await manager.acquire({
+    id: 'preview-low-priority',
+    type: 'preview',
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    cancel: () => {
+      previewCancelCount += 1;
+    }
+  });
+  const exportJob = await manager.acquire({
+    id: 'export-higher-priority',
+    type: 'export',
+    resources: ['diskRead', 'diskWrite'],
+    cancel: () => {
+      exportCancelCount += 1;
+    }
+  });
+
+  const releaseRecordingB = manager.registerExternal({
+    id: 'recording-priority-b',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite']
+  });
+
+  assert.equal(previewCancelCount, 1);
+  assert.equal(exportCancelCount, 0);
+
+  preview.release();
+  exportJob.release();
+  releaseRecordingB();
+  releaseRecordingA();
+});
+
+test('第三路录制同样会聚合前两路 external recording 的写入成本', async () => {
+  const manager = new MediaJobManager({ limits: { diskRead: 3, diskWrite: 3, gpuEncode: 1 } });
+  const releaseRecordingA = manager.registerExternal({
+    id: 'recording-third-a',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite']
+  });
+  const releaseRecordingB = manager.registerExternal({
+    id: 'recording-third-b',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite']
+  });
+  let previewCancelCount = 0;
+  const preview = await manager.acquire({
+    id: 'preview-before-third-recording',
+    type: 'preview',
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    cancel: () => {
+      previewCancelCount += 1;
+    }
+  });
+
+  const releaseRecordingC = manager.registerExternal({
+    id: 'recording-third-c',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite']
+  });
+
+  assert.equal(previewCancelCount, 1);
+  assert.equal(manager.snapshot().filter((job) => job.type === 'recording').length, 3);
+
+  preview.release();
+  releaseRecordingC();
+  releaseRecordingB();
+  releaseRecordingA();
+});
+
 test('guard protocol variants collapse to one session event and USER_TOAST_MSG_V2 is supported', () => {
   const deduper = new SessionEventDeduper();
   const guardBuy = {
