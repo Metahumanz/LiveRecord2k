@@ -81,16 +81,15 @@ async function readPackageJson() {
 
 async function bundleServer() {
   await fsp.mkdir(buildDir, { recursive: true });
-  runNodeScript(path.join(root, 'node_modules', 'esbuild', 'bin', 'esbuild'), [
-    path.join(root, 'src', 'server', 'index.cjs'),
-    '--bundle',
-    '--platform=node',
-    '--target=node24',
-    '--format=cjs',
-    '--external:vite',
-    '--external:ffmpeg-static',
-    `--outfile=${serverBundlePath}`
-  ]);
+  await require('esbuild').build({
+    entryPoints: [path.join(root, 'src', 'server', 'index.cjs')],
+    bundle: true,
+    platform: 'node',
+    target: 'node24',
+    format: 'cjs',
+    external: ['vite', 'ffmpeg-static'],
+    outfile: serverBundlePath
+  });
 }
 
 async function buildServiceExe() {
