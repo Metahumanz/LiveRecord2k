@@ -1912,6 +1912,10 @@ class LiveRecordService {
     this.statePublisher.markDirty('diskSpace');
   }
 
+  markSystemDirty() {
+    this.statePublisher.markDirty('system');
+  }
+
   flushState() {
     this.statePublisher.flush();
   }

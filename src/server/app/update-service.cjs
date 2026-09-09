@@ -76,7 +76,7 @@ async function deferMsixUpdateToAppInstaller() {
       message: this.createMsixUpdateMessage()
     };
     this.log('info', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
   }
   return this.getState();
 }
@@ -94,7 +94,7 @@ async function checkUpdate() {
     updateLogPath: this.getUpdateLogPath(),
     statusPath: this.getUpdateStatusPath()
   };
-  this.emitState();
+  this.markSystemDirty();
   let acceptingStatus = true;
   try {
     const manifest = await withTimeout(this.fetchUpdateManifest((message) => {
@@ -107,7 +107,7 @@ async function checkUpdate() {
         message,
         checkedAt: Date.now()
       };
-      this.emitState();
+      this.markSystemDirty();
     }), 45000, '检查更新超时：45 秒内没有收到更新源响应。');
     acceptingStatus = false;
     const latestVersion = manifest.version || manifest.tagName || '';
@@ -130,7 +130,7 @@ async function checkUpdate() {
       manifest
     };
     this.log(hasUpdate ? 'success' : 'info', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
     return this.getState();
   } catch (error) {
     acceptingStatus = false;
@@ -146,7 +146,7 @@ async function checkUpdate() {
       statusPath: this.getUpdateStatusPath()
     };
     this.log('error', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
     return this.getState();
   }
 }
@@ -173,7 +173,7 @@ async function queueUpdateAfterJobs() {
       : `已排队更新到 ${this.updateState.latestVersion}，全部媒体任务结束后自动下载更新包。`
   };
   this.log('info', this.updateState.message);
-  this.emitState();
+  this.markSystemDirty();
   return this.getState();
 }
 
@@ -208,7 +208,7 @@ async function downloadUpdateOnly() {
       statusPath: this.getUpdateStatusPath(),
       packagePath: usablePackagePath || ''
     };
-    this.emitState();
+    this.markSystemDirty();
 
     const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
     this.updateState = {
@@ -220,7 +220,7 @@ async function downloadUpdateOnly() {
       packagePath
     };
     this.log('success', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
   } catch (error) {
     this.updateState = {
       ...this.updateState,
@@ -232,7 +232,7 @@ async function downloadUpdateOnly() {
       statusPath: this.getUpdateStatusPath()
     };
     this.log('error', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
   }
   return this.getState();
 }
@@ -263,7 +263,7 @@ async function applyUpdateInternal() {
       queued: false,
       message: '当前仍有录制或媒体处理任务，暂不安装更新；可以排队等待任务结束。'
     };
-    this.emitState();
+    this.markSystemDirty();
     return this.getState();
   }
 
@@ -291,7 +291,7 @@ async function applyUpdateInternal() {
       statusPath: this.getUpdateStatusPath(),
       packagePath: usablePackagePath || ''
     };
-    this.emitState();
+    this.markSystemDirty();
 
     const packagePath = usablePackagePath || (await this.downloadUpdatePackage(manifest));
     if (process.platform === 'linux' && this.supportsManagedLinuxUpdate()) {
@@ -307,7 +307,7 @@ async function applyUpdateInternal() {
         packagePath
       };
       this.log('success', this.updateState.message);
-      this.emitState();
+      this.markSystemDirty();
       return this.getState();
     }
     this.updateState = {
@@ -319,7 +319,7 @@ async function applyUpdateInternal() {
       packagePath
     };
     this.log('success', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
   } catch (error) {
     this.updateState = {
       ...this.updateState,
@@ -331,7 +331,7 @@ async function applyUpdateInternal() {
       statusPath: this.getUpdateStatusPath()
     };
     this.log('error', this.updateState.message);
-    this.emitState();
+    this.markSystemDirty();
   }
   return this.getState();
 }
@@ -464,7 +464,7 @@ async function downloadUpdatePackage(manifest) {
     ...this.updateState,
     packagePath
   };
-  this.emitState();
+  this.markSystemDirty();
   let lastEmitAt = 0;
   await downloadFile(manifest.packageUrl, packagePath, (progress) => {
     if (progress.retrying) {
@@ -477,7 +477,7 @@ async function downloadUpdatePackage(manifest) {
               progress.error?.message || progress.error || '网络错误'
             }`
       };
-      this.emitState();
+      this.markSystemDirty();
       return;
     }
     const receivedBytes = Number(progress.receivedBytes || 0);
@@ -497,7 +497,7 @@ async function downloadUpdatePackage(manifest) {
     };
     if (progress.done || now - lastEmitAt > 300) {
       lastEmitAt = now;
-      this.emitState();
+      this.markSystemDirty();
     }
   }, { officialSource: manifest.officialSource === true });
   this.updateState = {
@@ -505,7 +505,7 @@ async function downloadUpdatePackage(manifest) {
     message: manifest.sha256 ? `${updatePackageLabel(manifest)}下载完成，正在校验...` : `${updatePackageLabel(manifest)}下载完成。`,
     downloadProgress: 100
   };
-  this.emitState();
+  this.markSystemDirty();
   if (manifest.sha256) {
     const actual = await fileSha256(packagePath);
     if (actual.toLowerCase() !== String(manifest.sha256).toLowerCase()) {
@@ -687,7 +687,7 @@ function scheduleQueuedUpdateCheck(delayMs = 1500) {
         message: `自动下载更新失败：${error.message}`
       };
       this.log('error', this.updateState.message);
-      this.emitState();
+      this.markSystemDirty();
     });
   }, delayMs);
   this.queuedUpdateTimer.unref?.();
