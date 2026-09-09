@@ -828,7 +828,12 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
     const isRed = ([red, green, blue]) => red > 180 && green < 70 && blue < 70;
     const isBlue = ([red, green, blue]) => blue > 180 && red < 70 && green < 70;
 
-    assert.ok(isBlack(await samplePixel(0.5, 'lead-in')), 'the original video lead-in must remain black');
+    const firstFrame = await samplePixel(0, 'first-frame');
+    const leadInFrame = await samplePixel(0.5, 'lead-in');
+    assert.ok(
+      isBlack(leadInFrame),
+      `the original video lead-in must remain black (first=${firstFrame.join(',')}, lead-in=${leadInFrame.join(',')})`
+    );
     assert.ok(isRed(await samplePixel(1.2, 'red')), 'red source video must begin after the one-second lead-in');
     assert.ok(isBlue(await samplePixel(2.2, 'blue')), 'later chunks must remain on the same source clock');
   } finally {
