@@ -223,6 +223,15 @@ function ensureEventSource() {
   source.addEventListener('settings', mergeSettingsEvent);
   source.addEventListener('diskSpace', mergeDiskSpaceEvent);
   source.addEventListener('system', mergeSystemEvent);
+  source.addEventListener('auth-invalidated', () => {
+    if (eventSource !== source) return;
+    source.close();
+    eventSource = null;
+    // The server has invalidated the access cookie. Reload through the normal
+    // page route so the remote login screen is rendered instead of retrying a
+    // now-unauthorized EventSource forever.
+    window.location.reload();
+  });
   source.onerror = () => {
     if (eventSource !== source) return;
     source.close();

@@ -2032,6 +2032,13 @@ class LiveRecordService {
     this.statePublisher.addClient(response, options);
   }
 
+  invalidateRemoteSseClients() {
+    return this.statePublisher.invalidateAccessClients({
+      code: 'ACCESS_AUTH_INVALIDATED',
+      message: '远程访问凭据已更新，请重新登录。'
+    });
+  }
+
   emitState(types) {
     if (types === undefined || types === null) {
       this.statePublisher.markAllDirty();
@@ -2350,7 +2357,7 @@ class LiveRecordService {
         error: error.message
       };
     }
-    this.emitState();
+    this.markDiskSpaceDirty();
     return this.outputDiskSpace;
   }
 
@@ -3163,6 +3170,7 @@ try {
       oldAccessPasswordHash !== this.settings.accessPasswordHash
     ) {
       this.accessAuth.clearSessions();
+      this.invalidateRemoteSseClients();
       this.log('info', '远程访问凭据已更新，已有远程会话已退出。');
     }
     if (!outputReady) {
@@ -3194,7 +3202,7 @@ try {
       this.scheduleAutomaticUpdateCheck(this.settings.autoUpdateEnabled ? 5000 : 0);
     }
     this.log('success', '设置已保存。');
-    this.emitState();
+    this.markSettingsDirty();
     return this.getState();
   }
 

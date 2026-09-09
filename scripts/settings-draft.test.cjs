@@ -20,7 +20,15 @@ function loadSettingsSaveQueue() {
 }
 
 function createDraft() {
-  return { outputDir: 'C:/recordings', webhookUrl: '', accessUsername: 'admin', accessPassword: '' };
+  return {
+    outputDir: 'C:/recordings',
+    webhookUrl: '',
+    serverHost: '127.0.0.1',
+    serverPort: 3263,
+    accessUsername: 'admin',
+    accessPassword: '',
+    trustedProxies: []
+  };
 }
 
 test('settings drafts retain dirty fields while server state is merged and autosaved', () => {
@@ -121,14 +129,38 @@ test('settings page uses automatic save feedback rather than duplicate save conf
   assert.doesNotMatch(settingsSource, /saveSettingsImmediately/);
 });
 
-test('设置输入按字段风险选择即时、延迟或失焦保存', () => {
+test('普通设置按字段风险选择即时、延迟或失焦保存', () => {
   assert.match(settingsSource, /outputDir: event\.target\.value \}, 'commit'/);
   assert.match(settingsSource, /onBlur=\{\(\) => commitSetting\('outputDir'\)\}/);
   assert.match(settingsSource, /webhookUrl: event\.target\.value \}, 'debounced'/);
   assert.match(settingsSource, /cookie: event\.target\.value \}, 'commit'/);
-  assert.match(maintenanceSource, /accessPassword: event\.target\.value \}, 'commit'/);
-  assert.match(maintenanceSource, /onBlur=\{\(\) => commitSetting\('accessPassword'\)\}/);
-  assert.match(maintenanceSource, /serverPort: Number\(event\.target\.value\) \}, 'commit'/);
   assert.match(maintenanceSource, /updateManifestUrl: event\.target\.value \}, 'debounced'/);
   assert.match(settingsSource, /onChange=\{\(checked\) => updateSetting\(\{ preferHevc: checked \}\)\}/);
+});
+
+test('远程运行配置在点击应用前只保留草稿，并作为一个原子 patch 提交', () => {
+  const { SettingsSaveCoordinator } = loadSettingsSaveQueue();
+  const queue = new SettingsSaveCoordinator();
+  const draft = createDraft();
+  const runtimeKeys = ['serverHost', 'serverPort', 'accessUsername', 'accessPassword', 'trustedProxies'];
+
+  draft.serverHost = '0.0.0.0';
+  draft.accessPassword = 'safe-password';
+  queue.markChanged({ serverHost: draft.serverHost, accessPassword: draft.accessPassword }, { queue: false });
+  assert.equal(queue.takePending(), null);
+
+  queue.queueCurrent(runtimeKeys, draft);
+  const attempt = queue.takePending();
+  assert.deepEqual(attempt.patch, {
+    serverHost: '0.0.0.0',
+    accessPassword: 'safe-password'
+  });
+
+  assert.match(appSource, /RUNTIME_CONFIG_KEYS/);
+  assert.match(maintenanceSource, /应用运行配置/);
+  assert.match(appSource, /commitSettingsDraft\(RUNTIME_CONFIG_KEYS, '运行配置已应用。'\)/);
+  assert.match(maintenanceSource, /applyRuntimeSettings/);
+  assert.match(maintenanceSource, /accessPassword: event\.target\.value \}, 'commit'/);
+  assert.doesNotMatch(maintenanceSource, /onBlur=\{\(\) => commitSetting\('serverHost'\)\}/);
+  assert.doesNotMatch(maintenanceSource, /onBlur=\{\(\) => commitSetting\('accessPassword'\)\}/);
 });
