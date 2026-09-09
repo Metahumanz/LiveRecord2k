@@ -808,16 +808,21 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
 
     const samplePixel = async (time, label) => {
       const rawPath = path.join(tempDir, `${label}.raw`);
+      const frameIndex = Math.floor(Number(time) * 30);
       const sampled = await runCapturedProcess(
         ffmpegPath,
         [
-          '-hide_banner', '-loglevel', 'error', '-y', '-i', outputPath, '-ss', String(time),
-          '-frames:v', '1', '-vf', 'scale=1:1:flags=area,format=rgb24', '-f', 'rawvideo', rawPath
+          '-hide_banner', '-loglevel', 'error', '-y', '-i', outputPath,
+          '-frames:v', String(frameIndex + 1),
+          '-vf', 'fps=30:start_time=0,scale=1:1:flags=area,format=rgb24', '-f', 'rawvideo', rawPath
         ],
         { timeoutMs: 20_000 }
       );
       assert.equal(sampled.status, 0, sampled.stderr);
-      return [...(await fsp.readFile(rawPath)).subarray(0, 3)];
+      const pixels = await fsp.readFile(rawPath);
+      const offset = frameIndex * 3;
+      assert.ok(pixels.length >= offset + 3, `未能读取 ${time}s 的视频帧`);
+      return [...pixels.subarray(offset, offset + 3)];
     };
     const isBlack = ([red, green, blue]) => red < 20 && green < 20 && blue < 20;
     const isRed = ([red, green, blue]) => red > 180 && green < 70 && blue < 70;

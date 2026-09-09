@@ -3855,7 +3855,13 @@ try {
   }
 
   isKnownMediaPath(filePath) {
-    const normalized = path.resolve(filePath).toLowerCase();
+    const normalized = path.resolve(filePath);
+    const comparablePath = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    const matchesPath = (candidate) => {
+      if (!candidate) return false;
+      const resolved = path.resolve(candidate);
+      return (process.platform === 'win32' ? resolved.toLowerCase() : resolved) === comparablePath;
+    };
     if (!this.isRecordingMediaFileName(normalized)) {
       return false;
     }
@@ -3863,9 +3869,7 @@ try {
       return true;
     }
     const knownRecordingPath = this.recordings.some((recording) =>
-      [recording.cleanPath, recording.capturePath, recording.burnedPath].some(
-        (candidate) => candidate && path.resolve(candidate).toLowerCase() === normalized
-      )
+      [recording.cleanPath, recording.capturePath, recording.burnedPath].some(matchesPath)
     );
     if (knownRecordingPath) {
       return true;
@@ -3874,9 +3878,7 @@ try {
       const recording = room.currentRecording;
       if (
         recording &&
-        [recording.cleanPath, recording.capturePath, recording.burnedPath].some(
-          (candidate) => candidate && path.resolve(candidate).toLowerCase() === normalized
-        )
+        [recording.cleanPath, recording.capturePath, recording.burnedPath].some(matchesPath)
       ) {
         return true;
       }

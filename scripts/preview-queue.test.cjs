@@ -23,7 +23,9 @@ async function waitFor(predicate, timeoutMs = 12_000) {
 }
 
 test('compatibility preview returns a queued job immediately and can cancel it before resources are acquired', async () => {
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-preview-queue-'));
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-preview-queue-'));
+  const tempDir = path.join(tempRoot, 'PreviewQueueCase');
+  await fsp.mkdir(tempDir);
   const sourcePath = path.join(tempDir, 'queue-test.clean.mp4');
   const service = new LiveRecordService();
   service.ffmpegPath = ffmpegPath;
@@ -71,6 +73,6 @@ test('compatibility preview returns a queued job immediately and can cancel it b
   } finally {
     releaseRecording();
     await service.mediaJobs.shutdown();
-    await fsp.rm(tempDir, { recursive: true, force: true });
+    await fsp.rm(tempRoot, { recursive: true, force: true });
   }
 });
