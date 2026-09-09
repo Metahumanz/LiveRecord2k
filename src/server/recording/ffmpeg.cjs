@@ -128,7 +128,13 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
   const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
   if (padding <= 0.0005) return '';
   const filters = [
-    `tpad=start_duration=${formatFilterNumber(padding)}:start_mode=add:color=black`
+    `tpad=start_duration=${formatFilterNumber(padding)}:start_mode=add:color=black`,
+    // FFmpeg builds disagree on whether start padding is emitted before the
+    // source clock (negative PTS) or shifts the source forward. Normalize
+    // both forms before trimming so the black lead-in is never discarded.
+    'settb=AVTB',
+    `setpts=PTS+${formatFilterNumber(padding)}/TB`,
+    'setpts=PTS-STARTPTS'
   ];
   const duration = Math.max(0, Number(outputDuration) || 0);
   // The source can begin with audio while its first decodable video frame is
