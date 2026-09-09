@@ -49,6 +49,22 @@ test('Linux hardware encoders are decided by the real FFmpeg probe even when ada
   assert.equal(shouldTestHardwareEncoder(candidate, [{ vendor: 'nvidia' }], 'win32'), true);
 });
 
+test('媒体资源计划区分录制写入、轻量预览和高负载转码', () => {
+  const service = new LiveRecordService();
+  assert.deepEqual(service.getRecordingMediaResourcePlan(), {
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+  assert.deepEqual(service.getTranscodeResourcePlan('h264_nvenc', null, { lightweight: true }), {
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    resourceCosts: { diskRead: 1, diskWrite: 1 }
+  });
+  assert.deepEqual(service.getTranscodeResourcePlan('libx264'), {
+    resources: ['diskRead', 'diskWrite', 'cpuEncode'],
+    resourceCosts: { diskRead: 2, diskWrite: 2 }
+  });
+});
+
 test('bootstrap environment credentials cannot override persistent settings after the first migration', async () => {
   const previousPassword = process.env.BILI_RECORD_AUTH_PASSWORD;
   const previousOutput = process.env.BILI_RECORD_OUTPUT_DIR;

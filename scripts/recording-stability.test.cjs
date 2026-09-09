@@ -14,6 +14,7 @@ const {
 } = require('../src/server/danmaku/ass.cjs');
 const { createRecordingArgs, mergeDanmakuFiles } = require('../src/server/recording/ffmpeg.cjs');
 const { LiveRecordService, getMonitorPollDelayMs } = require('../src/server/app/service.cjs');
+const { MediaJobManager } = require('../src/server/app/media-job-manager.cjs');
 const { runCapturedProcess } = require('../src/server/shared/helpers.cjs');
 const ffmpegPath = require('ffmpeg-static');
 
@@ -41,6 +42,94 @@ function decodePacketBuffer(buffer) {
 function timing(videoTime = 1) {
   return { receivedAt: 1_786_432_100_123, receivedMono: 1234.5, videoTime };
 }
+
+test('录制可与一个轻量 GPU 预览并行，但高读写任务必须等待磁盘预算释放', async () => {
+  const manager = new MediaJobManager({ limits: { diskRead: 2, diskWrite: 2, gpuEncode: 1 } });
+  const releaseRecording = manager.registerExternal({
+    id: 'recording',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+  const preview = await manager.acquire({
+    id: 'gpu-preview',
+    type: 'preview',
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    resourceCosts: { diskRead: 1, diskWrite: 1 }
+  });
+  const activeResources = new Map(manager.snapshot().map((job) => [job.id, job.resources]));
+  assert.deepEqual(activeResources.get('recording'), ['recording', 'network', 'diskWrite']);
+  assert.deepEqual(activeResources.get('gpu-preview'), ['diskRead', 'diskWrite', 'gpuEncode']);
+  let mergeStarted = false;
+  const merge = manager.acquire({
+    id: 'lossless-merge',
+    type: 'merge',
+    resources: ['diskRead', 'diskWrite'],
+    resourceCosts: { diskRead: 2, diskWrite: 2 }
+  }).then((lease) => {
+    mergeStarted = true;
+    lease.release();
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mergeStarted, false);
+  preview.release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(mergeStarted, false);
+  releaseRecording();
+  await merge;
+  assert.equal(mergeStarted, true);
+});
+
+test('录制在高写入 GPU 任务之后启动时会优先请求停止该任务', async () => {
+  const manager = new MediaJobManager({ limits: { diskRead: 2, diskWrite: 2, gpuEncode: 1 } });
+  let cancelCount = 0;
+  const heavy = await manager.acquire({
+    id: 'heavy-gpu-encode',
+    type: 'export',
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    resourceCosts: { diskRead: 2, diskWrite: 2 },
+    cancel: () => {
+      cancelCount += 1;
+    }
+  });
+
+  const releaseRecording = manager.registerExternal({
+    id: 'recording-after-encode',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+
+  assert.equal(cancelCount, 1);
+  heavy.release();
+  releaseRecording();
+});
+
+test('录制不会中断仅占用一个读写预算的 GPU 预览', async () => {
+  const manager = new MediaJobManager({ limits: { diskRead: 2, diskWrite: 2, gpuEncode: 1 } });
+  let cancelCount = 0;
+  const preview = await manager.acquire({
+    id: 'light-gpu-preview',
+    type: 'preview',
+    resources: ['diskRead', 'diskWrite', 'gpuEncode'],
+    resourceCosts: { diskRead: 1, diskWrite: 1 },
+    cancel: () => {
+      cancelCount += 1;
+    }
+  });
+
+  const releaseRecording = manager.registerExternal({
+    id: 'recording-after-preview',
+    type: 'recording',
+    resources: ['recording', 'network', 'diskWrite'],
+    resourceCosts: { diskWrite: 1 }
+  });
+
+  assert.equal(cancelCount, 0);
+  preview.release();
+  releaseRecording();
+});
 
 test('guard protocol variants collapse to one session event and USER_TOAST_MSG_V2 is supported', () => {
   const deduper = new SessionEventDeduper();
