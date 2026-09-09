@@ -79,3 +79,97 @@ test('设置落盘失败时不会提交内存设置或触发凭据副作用', as
   assert.equal(refreshDiskCalls, 0);
   assert.equal(markSettingsDirtyCalls, 0);
 });
+
+test('一次保存可以同时启用公网监听并设置新密码', async () => {
+  const service = new LiveRecordService();
+  let saveCalls = 0;
+  let persistedSettings;
+  service.ensureRecordingOutputRootReady = async () => true;
+  service.saveStore = async ({ settings } = {}) => {
+    saveCalls += 1;
+    persistedSettings = settings;
+    assert.equal(service.settings.accessPasswordHash, '');
+  };
+  service.refreshOutputDiskSpace = async () => {};
+  service.markSettingsDirty = () => {};
+  service.invalidateRemoteSseClients = () => {};
+
+  await service.saveSettings({
+    serverHost: '0.0.0.0',
+    accessPassword: 'new-password'
+  });
+
+  assert.equal(saveCalls, 1);
+  assert.equal(persistedSettings.serverHost, '0.0.0.0');
+  assert.ok(persistedSettings.accessPasswordHash);
+  assert.equal(service.accessAuth.isConfigured(persistedSettings), true);
+  assert.equal(service.settings.serverHost, '0.0.0.0');
+  assert.equal(service.accessAuth.isConfigured(service.settings), true);
+});
+
+test('远程凭据保存成功后会清除会话并断开远程 SSE', async () => {
+  const service = new LiveRecordService();
+  const effects = [];
+  service.ensureRecordingOutputRootReady = async () => true;
+  service.accessAuth.sessions.set('existing-session', { expiresAt: Date.now() + 60_000 });
+  const clearSessions = service.accessAuth.clearSessions.bind(service.accessAuth);
+  service.accessAuth.clearSessions = () => {
+    effects.push('clear-sessions');
+    clearSessions();
+  };
+  service.invalidateRemoteSseClients = () => {
+    effects.push('close-remote-sse');
+  };
+  service.saveStore = async () => {
+    effects.push('persist');
+  };
+  service.refreshOutputDiskSpace = async () => {};
+  service.markSettingsDirty = () => {};
+
+  await service.saveSettings({
+    accessUsername: 'operator',
+    accessPassword: 'new-password'
+  });
+
+  assert.deepEqual(effects, ['persist', 'clear-sessions', 'close-remote-sse']);
+  assert.equal(service.accessAuth.sessions.has('existing-session'), false);
+});
+
+test('轮询间隔变化时只重启正在监听的房间', async () => {
+  const service = new LiveRecordService();
+  const restartedRoomIds = [];
+  service.rooms.set('monitoring-room', { id: 'monitoring-room', monitoring: true });
+  service.rooms.set('idle-room', { id: 'idle-room', monitoring: false });
+  service.ensureRecordingOutputRootReady = async () => true;
+  service.saveStore = async () => {};
+  service.startMonitorTimer = (roomId) => {
+    restartedRoomIds.push(roomId);
+  };
+  service.refreshOutputDiskSpace = async () => {};
+  service.markSettingsDirty = () => {};
+
+  await service.saveSettings({ pollIntervalSec: service.settings.pollIntervalSec + 1 });
+
+  assert.deepEqual(restartedRoomIds, ['monitoring-room']);
+});
+
+test('输出目录校验失败时不会保存候选设置', async () => {
+  const service = new LiveRecordService();
+  const originalSettings = service.settings;
+  let saveCalls = 0;
+  service.ensureRecordingOutputRootReady = async () => {
+    throw new Error('输出目录不可用');
+  };
+  service.saveStore = async () => {
+    saveCalls += 1;
+  };
+
+  await assert.rejects(
+    service.saveSettings({ outputDir: 'X:\\unavailable-recordings' }),
+    /输出目录不可用/
+  );
+
+  assert.equal(saveCalls, 0);
+  assert.equal(service.settings, originalSettings);
+  assert.equal(service.settings.outputDir, originalSettings.outputDir);
+});
