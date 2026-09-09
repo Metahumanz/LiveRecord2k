@@ -24,6 +24,7 @@ const {
   parseFfmpegVideoInfo,
   probeMediaFileInfo,
   probeMediaTimelineInfo,
+  probeMediaTimelineHealth,
   runCapturedProcess
 } = require('../src/server/shared/helpers.cjs');
 
@@ -805,6 +806,7 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
     assert.ok(Math.abs(outputInfo.durationSec - 3) < 0.15, JSON.stringify(outputInfo));
     const timeline = await probeMediaTimelineInfo(ffmpegPath, outputPath, outputInfo);
     assert.ok(Math.abs(timeline.avDeltaSec) < 0.12, JSON.stringify(timeline));
+    const timelineHealth = await probeMediaTimelineHealth(ffmpegPath, outputPath, outputInfo);
 
     const samplePixel = async (time, label) => {
       const rawPath = path.join(tempDir, `${label}.raw`);
@@ -832,7 +834,8 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
     const leadInFrame = await samplePixel(0.5, 'lead-in');
     assert.ok(
       isBlack(leadInFrame),
-      `the original video lead-in must remain black (first=${firstFrame.join(',')}, lead-in=${leadInFrame.join(',')})`
+      `the original video lead-in must remain black (first=${firstFrame.join(',')}, lead-in=${leadInFrame.join(',')}, ` +
+        `videoPts=${timelineHealth.firstVideoPts}, audioPts=${timelineHealth.firstAudioPts})`
     );
     assert.ok(isRed(await samplePixel(1.2, 'red')), 'red source video must begin after the one-second lead-in');
     assert.ok(isBlue(await samplePixel(2.2, 'blue')), 'later chunks must remain on the same source clock');
