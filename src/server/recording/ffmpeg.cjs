@@ -164,7 +164,8 @@ function createExplicitLeadingVideoPaddingGraph({
   return [
     `${sourceLabel}split=2[${padSource}][${mainSource}]`,
     `[${padSource}]trim=duration=${formatFilterNumber(frameDuration)},setpts=PTS-STARTPTS,` +
-      `geq=lum=16:cb=128:cr=128,loop=loop=-1:size=1:start=0,trim=duration=${formatFilterNumber(padding)},` +
+      `geq=lum=16:cb=128:cr=128,tpad=stop_duration=${formatFilterNumber(padding)}:stop_mode=clone,` +
+      `trim=duration=${formatFilterNumber(padding)},` +
       `setpts=PTS-STARTPTS[${blackPad}]`,
     `[${mainSource}]setpts=PTS-STARTPTS[${mainVideo}]`,
     `[${blackPad}][${mainVideo}]concat=n=2:v=1:a=0${outputTrim},setpts=PTS-STARTPTS,format=yuv420p${outputLabel}`
