@@ -239,6 +239,12 @@ class MaintenanceService {
     }
   }
 
+  clearMaintenanceCleanupPlans() {
+    const count = this.owner.maintenanceCleanupPlans.size;
+    this.owner.maintenanceCleanupPlans.clear();
+    return count;
+  }
+
   async applyMaintenanceCleanupPlan(scanId) {
     const owner = this.owner;
     this.pruneMaintenanceCleanupPlans();

@@ -7937,6 +7937,10 @@ try {
     return this.maintenanceService.pruneMaintenanceCleanupPlans();
   }
 
+  clearMaintenanceCleanupPlans() {
+    return this.maintenanceService.clearMaintenanceCleanupPlans();
+  }
+
   async applyMaintenanceCleanupPlan(scanId) {
     return this.maintenanceService.applyMaintenanceCleanupPlan(scanId);
   }
@@ -9696,6 +9700,7 @@ try {
     }
     this.pathPickerStarting = false;
     this.roomMonitor.stopAll();
+    this.clearMaintenanceCleanupPlans();
     for (const timer of this.streamStartRetryTimers.values()) {
       clearTimeout(timer);
     }
