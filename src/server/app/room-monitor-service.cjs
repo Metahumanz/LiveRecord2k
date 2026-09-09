@@ -3,6 +3,10 @@
 const { MONITOR_FAST_CONFIRM_MS, getMonitorPollDelayMs, jitterMonitorPollDelay } = require('./room-monitor-scheduler.cjs');
 
 const MONITOR_FAST_CONFIRM_WINDOW_MS = 15 * 1000;
+// Stable checks should still surface a fresh "last checked" value eventually,
+// but sending one room delta for every 10–15 second fallback poll does not add
+// useful information for an unchanged room.
+const ROOM_STATE_SYNC_INTERVAL_MS = 45 * 1000;
 
 /**
  * Owns the live-status polling and danmaku-push lifecycle.  The recorder
@@ -19,6 +23,21 @@ class RoomMonitorService {
     this.monitorTimers = new Map();
     this.livePushMonitors = new Map();
     this.roomTickLocks = new Set();
+    this.lastRoomStateSyncAt = new Map();
+  }
+
+  publishRoomState(room, options = {}) {
+    const roomId = String(room?.id || '');
+    if (!roomId) return false;
+    const now = Number(options.now ?? Date.now());
+    const lastSyncedAt = Number(this.lastRoomStateSyncAt.get(roomId) || 0);
+    const force = Boolean(options.force);
+    if (!force && lastSyncedAt > 0 && now - lastSyncedAt < ROOM_STATE_SYNC_INTERVAL_MS) {
+      return false;
+    }
+    this.lastRoomStateSyncAt.set(roomId, now);
+    this.owner.markRoomDirty(roomId);
+    return true;
   }
 
   async setMonitoring(roomId, enabled) {
@@ -37,7 +56,7 @@ class RoomMonitorService {
       this.owner.log('info', `${this.roomLabel(room)} 已停止监听。`);
     }
     await this.owner.saveStore();
-    this.owner.emitState();
+    this.publishRoomState(room, { force: true });
     return this.owner.getState();
   }
 
@@ -89,10 +108,14 @@ class RoomMonitorService {
     this.roomTickLocks.add(roomKey);
     try {
       const previousLiveStatus = room.liveStatus;
+      const previousRealRoomId = room.realRoomId;
       const status = await this.owner.fetchRoomLiveStatus(room.id);
       const liveDetectedAt = Date.now();
       room.realRoomId = status.realRoomId || room.realRoomId;
       await this.owner.applyDetectedLiveStatus(room, status.liveStatus, '轮询');
+      if (room.realRoomId !== previousRealRoomId) {
+        this.publishRoomState(room, { force: true });
+      }
       if (room.liveStatus === 1 && room.autoRecord && !this.owner.isRoomRecording(room)) {
         await this.owner.startRecording(room.id, true, {
           liveDetectedAt,
@@ -100,10 +123,11 @@ class RoomMonitorService {
         });
       }
     } catch (error) {
+      const previousError = room.lastError;
       room.lastCheckedAt = Date.now();
       room.lastError = error.message || String(error);
       this.owner.log('error', `${this.roomLabel(room)} 监听异常：${error.message}`);
-      this.owner.emitState();
+      this.publishRoomState(room, { force: previousError !== room.lastError });
     } finally {
       this.roomTickLocks.delete(roomKey);
     }
@@ -124,10 +148,12 @@ class RoomMonitorService {
 
   async applyDetectedLiveStatus(room, liveStatus, source) {
     const previousLiveStatus = room.liveStatus;
+    const previousLastError = room.lastError;
     room.liveStatus = Number(liveStatus || 0);
     room.lastCheckedAt = Date.now();
     room.lastError = undefined;
-    if (previousLiveStatus !== undefined && previousLiveStatus !== room.liveStatus) {
+    const liveStatusChanged = previousLiveStatus !== room.liveStatus;
+    if (previousLiveStatus !== undefined && liveStatusChanged) {
       room.monitorFastPollUntil = Date.now() + MONITOR_FAST_CONFIRM_WINDOW_MS;
       this.owner.log(
         room.liveStatus === 1 ? 'success' : 'info',
@@ -156,7 +182,7 @@ class RoomMonitorService {
         });
       }
     }
-    this.owner.emitState();
+    this.publishRoomState(room, { force: liveStatusChanged || Boolean(previousLastError) });
   }
 
   async startLivePushMonitor(roomId) {
@@ -266,7 +292,7 @@ class RoomMonitorService {
     if (commandType === 'ROOM_CHANGE') {
       const data = command?.data || {};
       room.title = String(data.title || room.title || '');
-      this.owner.emitState();
+      this.publishRoomState(room, { force: true });
     }
   }
 
@@ -309,6 +335,7 @@ class RoomMonitorService {
     for (const roomId of Array.from(this.livePushMonitors.keys())) {
       this.owner.stopLivePushMonitor(roomId);
     }
+    this.lastRoomStateSyncAt.clear();
   }
 }
 

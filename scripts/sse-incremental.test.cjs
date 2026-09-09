@@ -93,6 +93,46 @@ test('FFmpeg 风格的房间增量不会为每个 SSE 客户端构造完整 AppS
   assert.doesNotMatch(response.writes.join(''), /event: settings/);
 });
 
+test('监听服务的稳定轮询只发送限频的 room 增量，不会退回完整 AppState', async () => {
+  const service = new LiveRecordService();
+  const room = {
+    id: 'monitor-123',
+    title: '监听增量测试直播间',
+    realRoomId: '123',
+    liveStatus: 0,
+    monitoring: true,
+    autoRecord: false,
+    recording: false
+  };
+  service.rooms.set(room.id, room);
+  service.saveStore = async () => {};
+  service.log = () => {};
+  const response = new FakeSseResponse();
+  service.addClient(response);
+  response.writes.length = 0;
+
+  const originalGetState = service.getState.bind(service);
+  let fullStateCalls = 0;
+  service.getState = (...args) => {
+    fullStateCalls += 1;
+    return originalGetState(...args);
+  };
+
+  await service.applyDetectedLiveStatus(room, 0, '轮询');
+  service.flushState();
+  const firstDelta = response.writes.join('');
+  assert.equal(fullStateCalls, 0);
+  assert.match(firstDelta, /event: room/);
+  assert.doesNotMatch(firstDelta, /event: state/);
+  assert.doesNotMatch(firstDelta, /event: recording/);
+  assert.doesNotMatch(firstDelta, /event: mediaJob/);
+
+  response.writes.length = 0;
+  await service.applyDetectedLiveStatus(room, 0, '轮询');
+  service.flushState();
+  assert.equal(response.writes.length, 0, '稳定状态的 lastCheckedAt 不应在每次轮询时都发送');
+});
+
 test('删除房间通过删除增量通知既有 SSE 客户端', () => {
   const service = new LiveRecordService();
   service.rooms.set('123', {
