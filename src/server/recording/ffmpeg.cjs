@@ -141,8 +141,8 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
 }
 
 // `tpad` has incompatible start-PTS behavior across FFmpeg builds when it is
-// appended to a filtered stream. Avatar graphs can use labels, so build the
-// black lead-in explicitly from one source frame and concatenate it before the
+// appended to a filtered stream. Avatar graphs know the probed video size, so
+// generate a finite black source explicitly and concatenate it before the
 // rendered source. This keeps video at the same clock on Windows and Linux.
 function createExplicitLeadingVideoPaddingGraph({
   sourceLabel,
@@ -150,6 +150,8 @@ function createExplicitLeadingVideoPaddingGraph({
   leadingVideoPaddingSec,
   outputDuration,
   fps,
+  videoWidth = 0,
+  videoHeight = 0,
   prefix = 'leading_video'
 } = {}) {
   const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
@@ -157,10 +159,25 @@ function createExplicitLeadingVideoPaddingGraph({
   const duration = Math.max(0, Number(outputDuration) || 0);
   const frameDuration = 1 / Math.max(1, normalizeMergeFps(fps) || 30);
   const outputTrim = duration > 0 ? `,trim=duration=${formatFilterNumber(duration)}` : '';
-  const padSource = `${prefix}_pad_source`;
-  const mainSource = `${prefix}_main_source`;
+  const width = Math.floor(Math.max(0, Number(videoWidth) || 0) / 2) * 2;
+  const height = Math.floor(Math.max(0, Number(videoHeight) || 0) / 2) * 2;
   const blackPad = `${prefix}_black_pad`;
   const mainVideo = `${prefix}_main_video`;
+  if (width >= 2 && height >= 2) {
+    const frameRate = normalizeMergeFps(fps) || 30;
+    return [
+      `color=c=black:s=${width}x${height}:r=${formatFilterNumber(frameRate)}:d=${formatFilterNumber(padding)},` +
+        `format=yuv420p,setpts=PTS-STARTPTS[${blackPad}]`,
+      `${sourceLabel}setpts=PTS-STARTPTS[${mainVideo}]`,
+      `[${blackPad}][${mainVideo}]concat=n=2:v=1:a=0${outputTrim},setpts=PTS-STARTPTS,format=yuv420p${outputLabel}`
+    ].join(';\n');
+  }
+
+  // Older internal callers did not carry probed dimensions. Keep a bounded
+  // fallback for those callers; normal burn/export paths always use the finite
+  // color source above.
+  const padSource = `${prefix}_pad_source`;
+  const mainSource = `${prefix}_main_source`;
   return [
     `${sourceLabel}split=2[${padSource}][${mainSource}]`,
     `[${padSource}]trim=duration=${formatFilterNumber(frameDuration)},setpts=PTS-STARTPTS,` +
@@ -435,6 +452,8 @@ function createAvatarOverlayFilterScript({
         leadingVideoPaddingSec: leadingVideoPadding,
         outputDuration,
         fps,
+        videoWidth: avatarOverlay?.videoWidth,
+        videoHeight: avatarOverlay?.videoHeight,
         prefix: 'avatar_leading'
       })
     );
@@ -483,6 +502,8 @@ function createAvatarOverlayChunkFilterScript({
         leadingVideoPaddingSec: leadingVideoPadding,
         outputDuration,
         fps,
+        videoWidth: avatarOverlay?.videoWidth,
+        videoHeight: avatarOverlay?.videoHeight,
         prefix: 'chunk_leading'
       })}\n`
     );

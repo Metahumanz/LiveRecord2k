@@ -8655,7 +8655,14 @@ try {
         this.log('warn', `${label} 未能准备真实头像，继续使用通用头像图标。`);
         return null;
       }
-      const overlay = { panel: avatarPlan.panel, entries };
+      const videoWidth = Math.floor(Math.max(0, Number(options.recording?.videoInfo?.width) || 0) / 2) * 2;
+      const videoHeight = Math.floor(Math.max(0, Number(options.recording?.videoInfo?.height) || 0) / 2) * 2;
+      const overlay = {
+        panel: avatarPlan.panel,
+        entries,
+        videoWidth,
+        videoHeight
+      };
       const filterScriptPath = path.join(workingDir, 'avatar-layer.ffscript');
       const gpuComposite = Boolean(options.gpuComposite);
       const chunkDuration = !gpuComposite && entries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES ? AVATAR_OVERLAY_CHUNK_SECONDS : 0;

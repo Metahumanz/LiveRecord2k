@@ -792,6 +792,8 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
       fps: 30,
       avatarLayer: {
         panel: { left: 10, width: 120, height: 180 },
+        videoWidth: 320,
+        videoHeight: 180,
         temporaryDir,
         chunkDuration: 1.5,
         entries: []
@@ -890,6 +892,8 @@ test('CUDA avatar chunks download once before applying a CPU-only video lead-in'
     fps: 60,
     avatarOverlay: {
       panel: { left: 10, width: 120, height: 180 },
+      videoWidth: 1920,
+      videoHeight: 1080,
       entries: [
         {
           imagePath: 'C:/temp/avatar.png',
@@ -905,8 +909,8 @@ test('CUDA avatar chunks download once before applying a CPU-only video lead-in'
     gpuComposite: true
   });
   assert.match(script, /scale_cuda=format=yuv420p,hwdownload,format=yuv420p,setpts=PTS-STARTPTS\[avatar_leading_source\]/);
-  assert.match(script, /\[avatar_leading_source\]split=2\[avatar_leading_pad_source\]\[avatar_leading_main_source\]/);
-  assert.match(script, /geq=lum=16:cb=128:cr=128,tpad=stop_duration=1:stop_mode=clone,trim=duration=1/);
+  assert.match(script, /color=c=black:s=1920x1080:r=60:d=1,format=yuv420p,setpts=PTS-STARTPTS\[avatar_leading_black_pad\]/);
+  assert.match(script, /\[avatar_leading_source\]setpts=PTS-STARTPTS\[avatar_leading_main_video\]/);
   assert.match(script, /\[avatar_leading_black_pad\]\[avatar_leading_main_video\]concat=n=2:v=1:a=0,trim=duration=2/);
 });
 
