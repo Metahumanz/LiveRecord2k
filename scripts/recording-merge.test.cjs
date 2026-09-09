@@ -904,10 +904,10 @@ test('CUDA avatar chunks download once before applying a CPU-only video lead-in'
     outputDuration: 2,
     gpuComposite: true
   });
-  assert.match(
-    script,
-    /scale_cuda=format=yuv420p,hwdownload,format=yuv420p,setpts=PTS-STARTPTS,tpad=start_duration=1:start_mode=add:color=black/
-  );
+  assert.match(script, /scale_cuda=format=yuv420p,hwdownload,format=yuv420p,setpts=PTS-STARTPTS\[avatar_leading_source\]/);
+  assert.match(script, /\[avatar_leading_source\]split=2\[avatar_leading_pad_source\]\[avatar_leading_main_source\]/);
+  assert.match(script, /geq=lum=16:cb=128:cr=128,loop=loop=-1:size=1:start=0,trim=duration=1/);
+  assert.match(script, /\[avatar_leading_black_pad\]\[avatar_leading_main_video\]concat=n=2:v=1:a=0,trim=duration=2/);
 });
 
 test('multiple static avatar inputs hold their first frame until their queue window', () => {

@@ -128,12 +128,7 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
   const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
   if (padding <= 0.0005) return '';
   const filters = [
-    `tpad=start_duration=${formatFilterNumber(padding)}:start_mode=add:color=black`,
-    // FFmpeg builds disagree on whether start padding is emitted before the
-    // source clock (negative PTS) or shifts the source forward. Normalize
-    // both forms before trimming so the black lead-in is never discarded.
-    'settb=AVTB',
-    `setpts=PTS+${formatFilterNumber(padding)}/TB`
+    `tpad=start_duration=${formatFilterNumber(padding)}:start_mode=add:color=black`
   ];
   const duration = Math.max(0, Number(outputDuration) || 0);
   // The source can begin with audio while its first decodable video frame is
@@ -143,6 +138,37 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
     filters.push(`trim=duration=${formatFilterNumber(duration)}`, 'setpts=PTS-STARTPTS');
   }
   return `,${filters.join(',')}`;
+}
+
+// `tpad` has incompatible start-PTS behavior across FFmpeg builds when it is
+// appended to a filtered stream. Avatar graphs can use labels, so build the
+// black lead-in explicitly from one source frame and concatenate it before the
+// rendered source. This keeps video at the same clock on Windows and Linux.
+function createExplicitLeadingVideoPaddingGraph({
+  sourceLabel,
+  outputLabel,
+  leadingVideoPaddingSec,
+  outputDuration,
+  fps,
+  prefix = 'leading_video'
+} = {}) {
+  const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  if (padding <= 0.0005) return '';
+  const duration = Math.max(0, Number(outputDuration) || 0);
+  const frameDuration = 1 / Math.max(1, normalizeMergeFps(fps) || 30);
+  const outputTrim = duration > 0 ? `,trim=duration=${formatFilterNumber(duration)}` : '';
+  const padSource = `${prefix}_pad_source`;
+  const mainSource = `${prefix}_main_source`;
+  const blackPad = `${prefix}_black_pad`;
+  const mainVideo = `${prefix}_main_video`;
+  return [
+    `${sourceLabel}split=2[${padSource}][${mainSource}]`,
+    `[${padSource}]trim=duration=${formatFilterNumber(frameDuration)},setpts=PTS-STARTPTS,` +
+      `geq=lum=16:cb=128:cr=128,loop=loop=-1:size=1:start=0,trim=duration=${formatFilterNumber(padding)},` +
+      `setpts=PTS-STARTPTS[${blackPad}]`,
+    `[${mainSource}]setpts=PTS-STARTPTS[${mainVideo}]`,
+    `[${blackPad}][${mainVideo}]concat=n=2:v=1:a=0${outputTrim},setpts=PTS-STARTPTS,format=yuv420p${outputLabel}`
+  ].join(';\n');
 }
 
 function createBurnVideoFilter(assPath, fps, options = {}) {
@@ -330,8 +356,9 @@ function createAvatarOverlayFilterScript({
     ? `,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(sourceClockOffset)}/TB`
     : '';
   const leadingVideoPadding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  const usesExplicitLeadingPadding = leadingVideoPadding > 0.0005;
   const outputClockFilter = resetOutputTimestamps || sourceClockOffset || leadingVideoPadding > 0 ? ',setpts=PTS-STARTPTS' : '';
-  const leadingPaddingFilter = createLeadingVideoPaddingFilter(leadingVideoPadding, outputDuration);
+  const outputLabel = usesExplicitLeadingPadding ? '[avatar_leading_source]' : '[vout]';
   const panel = avatarOverlay?.panel || {};
   const panelLeft = Math.max(0, Number(panel.left) || 0);
   const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
@@ -394,11 +421,23 @@ function createAvatarOverlayFilterScript({
   filters.push(
     gpuComposite
       ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
-          leadingPaddingFilter ? ',hwdownload,format=yuv420p' : ''
-        }${outputClockFilter}${leadingPaddingFilter}[vout]`
+          usesExplicitLeadingPadding ? ',hwdownload,format=yuv420p' : ''
+        }${outputClockFilter}${outputLabel}`
       : `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
-          `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${leadingPaddingFilter}[vout]`
+          `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${outputLabel}`
   );
+  if (usesExplicitLeadingPadding) {
+    filters.push(
+      createExplicitLeadingVideoPaddingGraph({
+        sourceLabel: outputLabel,
+        outputLabel: '[vout]',
+        leadingVideoPaddingSec: leadingVideoPadding,
+        outputDuration,
+        fps,
+        prefix: 'avatar_leading'
+      })
+    );
+  }
   return `${filters.join(';\n')}\n`;
 }
 
@@ -423,18 +462,28 @@ function createAvatarOverlayChunkFilterScript({
   const end = Number(chunkEnd);
   const entries = clipAvatarOverlayEntries(avatarOverlay, start, end);
   const sourceClockOffset = Math.max(0, Number.isFinite(Number(timelineOffset)) ? Number(timelineOffset) : start);
+  const leadingVideoPadding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
   if (!entries.length) {
-    return (
-      `[0:v]${createBurnVideoFilter(assPath, fps, {
+    const outputLabel = leadingVideoPadding > 0.0005 ? '[chunk_leading_source]' : '[vout]';
+    const sourceFilter = `[0:v]${createBurnVideoFilter(assPath, fps, {
         timelineOffset: sourceClockOffset,
         skipInitialKeyframeGuard: true,
         resetOutputTimestamps: true,
-        leadingVideoPaddingSec,
-        outputDuration,
         inputTrimStartSec,
         inputTrimEndSec,
         preserveSourceFrameTiming
-      })},format=yuv420p[vout]\n`
+      })},format=yuv420p${outputLabel}`;
+    if (leadingVideoPadding <= 0.0005) return `${sourceFilter}\n`;
+    return (
+      `${sourceFilter};\n` +
+      `${createExplicitLeadingVideoPaddingGraph({
+        sourceLabel: outputLabel,
+        outputLabel: '[vout]',
+        leadingVideoPaddingSec: leadingVideoPadding,
+        outputDuration,
+        fps,
+        prefix: 'chunk_leading'
+      })}\n`
     );
   }
   return createAvatarOverlayFilterScript({
