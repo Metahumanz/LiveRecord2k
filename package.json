@@ -9,6 +9,7 @@
     "build": "node scripts/build-webui.cjs",
     "build:msix": "node scripts/build-msix.cjs",
     "build:linux": "node scripts/build-linux.cjs",
+    "stress:recording": "node scripts/recording-preemption-stress.cjs",
     "test": "node --test scripts/*.test.cjs"
   },
   "dependencies": {
