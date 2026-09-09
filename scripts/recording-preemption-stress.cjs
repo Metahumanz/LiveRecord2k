@@ -100,6 +100,20 @@ function startNvencPreview(fixturePath, outputPath, label) {
   ]);
 }
 
+async function probeNvenc() {
+  const probe = startFfmpeg('NVENC probe', [
+    '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=1:duration=1',
+    '-frames:v', '1', '-c:v', 'h264_nvenc', '-f', 'null', '-'
+  ]);
+  const result = await probe.completion;
+  if (result.code === 0) return { available: true };
+  const detail = String(result.stderr || '').trim().replace(/\s+/g, ' ').slice(0, 600);
+  return {
+    available: false,
+    reason: detail || `FFmpeg 以 code=${result.code}, signal=${result.signal || 'none'} 退出`
+  };
+}
+
 async function runScenario({ directory, fixturePath, name, initialRecordings, diskWriteLimit }) {
   const manager = new MediaJobManager({
     limits: { diskRead: initialRecordings + 1, diskWrite: diskWriteLimit, gpuEncode: 1 }
@@ -196,6 +210,15 @@ async function runScenario({ directory, fixturePath, name, initialRecordings, di
 }
 
 async function main() {
+  const nvenc = await probeNvenc();
+  if (!nvenc.available) {
+    process.stdout.write(`${JSON.stringify({
+      status: 'SKIPPED',
+      reason: `NVENC 不可用，未执行录制抢占压力测试：${nvenc.reason}`,
+      scenarios: []
+    }, null, 2)}\n`);
+    return;
+  }
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-recording-preemption-'));
   try {
     const fixturePath = await createLoopFixture(directory);
