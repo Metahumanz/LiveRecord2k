@@ -133,8 +133,7 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
     // source clock (negative PTS) or shifts the source forward. Normalize
     // both forms before trimming so the black lead-in is never discarded.
     'settb=AVTB',
-    `setpts=PTS+${formatFilterNumber(padding)}/TB`,
-    'setpts=PTS-STARTPTS'
+    `setpts=PTS+${formatFilterNumber(padding)}/TB`
   ];
   const duration = Math.max(0, Number(outputDuration) || 0);
   // The source can begin with audio while its first decodable video frame is
