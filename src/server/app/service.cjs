@@ -189,6 +189,7 @@ const { AccessAuthManager, hashAccessPassword } = require('./auth.cjs');
 const { AtomicJsonStore } = require('./atomic-store.cjs');
 const { MediaJobManager, normalizeResourceSlots } = require('./media-job-manager.cjs');
 const { MONITOR_FAST_CONFIRM_MS, getMonitorPollDelayMs, jitterMonitorPollDelay } = require('./room-monitor-scheduler.cjs');
+const { StatePublisher } = require('./state-publisher.cjs');
 const {
   normalizeTrustedProxyList,
   isValidTrustedProxyRule,
@@ -931,8 +932,6 @@ class LiveRecordService {
     this.cancelledExportQueueIds = new Set();
     this.recordings = [];
     this.recordingScanPromise = null;
-    this.clients = new Map();
-    this.stateEmitTimer = null;
     this.notifications = [];
     this.notificationSeq = 0;
     this.webhookQueue = [];
@@ -978,6 +977,14 @@ class LiveRecordService {
     };
     this.runtimeCapabilitiesPromise = null;
     this.settings = this.normalizeSettings(this.settings);
+    this.statePublisher = new StatePublisher({
+      getFullState: (options) => this.getState(options),
+      getRoomIds: () => Array.from(this.rooms.keys()),
+      getDeltaPayload: (type, detail, client) => this.getSseDeltaPayload(type, detail, client)
+    });
+    this.mediaJobs.on('change', () => this.markMediaJobDirty());
+    // Keep the old public field available for diagnostics and test helpers.
+    this.clients = this.statePublisher.clients;
   }
 
   createDefaultSettings() {
@@ -1494,16 +1501,34 @@ class LiveRecordService {
     return selected ? { ...selected, kind: 'hardware' } : software;
   }
 
-  getTranscodeResources(codec, videoInfo, options = {}) {
+  getRecordingMediaResourcePlan() {
+    return {
+      resources: ['recording', 'network', 'diskWrite'],
+      resourceCosts: { diskWrite: 1 }
+    };
+  }
+
+  getTranscodeResourcePlan(codec, videoInfo, options = {}) {
     const encoder = String(codec || '').trim();
     const hardwareEncoder = Boolean(encoder) && !encoder.includes('libx');
-    const resources = ['disk', hardwareEncoder ? 'gpuEncode' : 'cpuEncode'];
+    const lightweight = Boolean(options.lightweight);
+    const resources = ['diskRead', 'diskWrite', hardwareEncoder ? 'gpuEncode' : 'cpuEncode'];
     // Burn-in/compositing is deliberately a separate GPU budget.  It remains
     // paused while a copy recording is active; a plain GPU transcode can run.
     if (options.gpuComposite && hardwareEncoder) {
       resources.push('gpuComposite');
     }
-    return resources;
+    return {
+      resources,
+      resourceCosts: {
+        diskRead: lightweight ? 1 : 2,
+        diskWrite: lightweight ? 1 : 2
+      }
+    };
+  }
+
+  getTranscodeResources(codec, videoInfo, options = {}) {
+    return this.getTranscodeResourcePlan(codec, videoInfo, options).resources;
   }
 
   setProgressDecoder(progress, decoder, options = {}) {
@@ -1654,7 +1679,7 @@ class LiveRecordService {
     });
   }
 
-  getState(options = {}) {
+  getPublicSettings(options = {}) {
     const settings = { ...this.settings };
     delete settings.accessPasswordHash;
     const webhookBearerTokenConfigured = Boolean(settings.webhookBearerToken);
@@ -1667,6 +1692,20 @@ class LiveRecordService {
     if (options.redactCookie) {
       settings.cookie = '';
     }
+    return settings;
+  }
+
+  getPublicAccessState(options = {}) {
+    return {
+      required: options.accessRequired ?? isPublicServerHost(this.currentHost || this.settings.serverHost),
+      configured: this.accessAuth.isConfigured(this.settings),
+      authenticated: Boolean(options.accessAuthenticated),
+      username: this.settings.accessUsername
+    };
+  }
+
+  getState(options = {}) {
+    const settings = this.getPublicSettings(options);
     return {
       settings,
       rooms: Array.from(this.rooms.values()).map((room) => this.getPublicRoomState(room)),
@@ -1687,12 +1726,7 @@ class LiveRecordService {
       mediaJobs: this.mediaJobs.snapshot(),
       startupEnabled: this.startupEnabled,
       outputDiskSpace: this.outputDiskSpace ? { ...this.outputDiskSpace } : null,
-      access: {
-        required: options.accessRequired ?? isPublicServerHost(this.currentHost || this.settings.serverHost),
-        configured: this.accessAuth.isConfigured(this.settings),
-        authenticated: Boolean(options.accessAuthenticated),
-        username: this.settings.accessUsername
-      },
+      access: this.getPublicAccessState(options),
       currentPort: this.currentPort || DEFAULT_PORT,
       currentHost: this.currentHost || DEFAULT_HOST,
       platform: UI_PLATFORM,
@@ -1995,160 +2029,115 @@ class LiveRecordService {
   }
 
   addClient(response, options = {}) {
-    const client = {
-      redactCookie: Boolean(options.redactCookie),
-      localConsole: Boolean(options.localConsole),
-      accessAuthenticated: Boolean(options.accessAuthenticated),
-      accessRequired: Boolean(options.accessRequired),
-      sseSnapshot: null
-    };
-    this.clients.set(response, client);
-    this.writeSseState(response, client);
-    response.on('close', () => this.clients.delete(response));
+    this.statePublisher.addClient(response, options);
   }
 
-  emitState() {
-    if (this.stateEmitTimer) return;
-    this.stateEmitTimer = setTimeout(() => {
-      this.stateEmitTimer = null;
-      this.flushState();
-    }, 80);
-    this.stateEmitTimer.unref?.();
+  emitState(types) {
+    if (types === undefined || types === null) {
+      this.statePublisher.markAllDirty();
+    } else {
+      this.statePublisher.markDirty(types);
+    }
+  }
+
+  markRoomDirty(roomId) {
+    this.statePublisher.markRoomDirty(roomId);
+  }
+
+  markRoomDeleted(roomId) {
+    this.statePublisher.markRoomDeleted(roomId);
+  }
+
+  markRecordingsDirty() {
+    this.statePublisher.markDirty('recording');
+  }
+
+  markMediaJobDirty() {
+    this.statePublisher.markDirty('mediaJob');
+  }
+
+  markLogsDirty() {
+    this.statePublisher.markDirty('log');
+  }
+
+  markSettingsDirty() {
+    this.statePublisher.markDirty('settings');
+  }
+
+  markDiskSpaceDirty() {
+    this.statePublisher.markDirty('diskSpace');
   }
 
   flushState() {
-    for (const [response, client] of this.clients) {
-      this.writeSseDelta(response, client);
-    }
+    this.statePublisher.flush();
   }
 
-  getSseSettingsPayload(state) {
+  getSseSettingsPayload(options = {}) {
     return {
-      settings: state.settings,
-      login: state.login,
-      bilibiliLoggedIn: state.bilibiliLoggedIn,
-      bilibiliCookieVisible: state.bilibiliCookieVisible,
-      access: state.access,
-      startupEnabled: state.startupEnabled
+      settings: this.getPublicSettings(options),
+      login: this.getPublicLoginState(),
+      bilibiliLoggedIn: Boolean(getCookieValue(this.settings.cookie, 'SESSDATA')),
+      bilibiliCookieVisible: !options.redactCookie,
+      access: this.getPublicAccessState(options),
+      startupEnabled: this.startupEnabled
     };
   }
 
-  getSseMediaJobPayload(state) {
+  getSseMediaJobPayload() {
     return {
-      mediaJobs: state.mediaJobs,
-      exportProgress: state.exportProgress,
-      exportQueue: state.exportQueue,
-      burnQueue: state.burnQueue,
-      previewProgress: state.previewProgress,
-      previewProxy: state.previewProxy
+      mediaJobs: this.mediaJobs.snapshot(),
+      exportProgress: this.exportProgress ? { ...this.exportProgress } : null,
+      exportQueue: this.exportQueue.map((item) => this.getPublicExportQueueItem(item)),
+      burnQueue: this.burnQueue.map((item) => this.getPublicBurnQueueItem(item)),
+      previewProgress: this.exportPreviewProgress ? { ...this.exportPreviewProgress } : null,
+      previewProxy: this.exportPreview ? { ...this.exportPreview } : null
     };
   }
 
-  getSseSystemPayload(state) {
+  getSseSystemPayload(options = {}) {
     return {
-      version: state.version,
-      update: state.update,
-      ffmpegPath: state.ffmpegPath,
-      ffmpegCapabilities: state.ffmpegCapabilities,
-      currentPort: state.currentPort,
-      currentHost: state.currentHost,
-      platform: state.platform,
-      uiCapabilities: state.uiCapabilities,
-      storePath: state.storePath,
-      appRoot: state.appRoot,
-      distRoot: state.distRoot,
-      operationNotice: state.operationNotice
+      version: APP_VERSION,
+      update: this.getPublicUpdateState(),
+      ffmpegPath: this.ffmpegPath,
+      ffmpegCapabilities: this.ffmpegCapabilities,
+      currentPort: this.currentPort || DEFAULT_PORT,
+      currentHost: this.currentHost || DEFAULT_HOST,
+      platform: UI_PLATFORM,
+      uiCapabilities: createUiCapabilities(UI_PLATFORM, process.env, options),
+      storePath: this.storePath,
+      appRoot: APP_ROOT,
+      distRoot: DIST_ROOT
     };
   }
 
-  createSseSnapshot(state) {
-    return {
-      rooms: new Map(state.rooms.map((room) => [String(room.id), JSON.stringify(room)])),
-      recordings: JSON.stringify(state.recordings),
-      logIds: state.logs.map((entry) => String(entry.id)),
-      settings: JSON.stringify(this.getSseSettingsPayload(state)),
-      mediaJob: JSON.stringify(this.getSseMediaJobPayload(state)),
-      diskSpace: JSON.stringify(state.outputDiskSpace || null),
-      system: JSON.stringify(this.getSseSystemPayload(state))
-    };
-  }
-
-  writeSseEvent(response, eventName, payload) {
-    try {
-      response.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
-      return true;
-    } catch {
-      this.clients.delete(response);
-      return false;
+  getSseDeltaPayload(type, detail = {}, client = {}) {
+    if (type === 'room') {
+      const roomId = String(detail.roomId || '');
+      if (detail.deleted) return { id: roomId, deleted: true };
+      const room = this.rooms.get(roomId);
+      return room ? this.getPublicRoomState(room) : { id: roomId, deleted: true };
     }
-  }
-
-  writeSseState(response, client = {}) {
-    const state = this.getState(client);
-    if (this.writeSseEvent(response, 'state', state)) {
-      client.sseSnapshot = this.createSseSnapshot(state);
-    }
-  }
-
-  writeSseDelta(response, client) {
-    if (!client?.sseSnapshot) {
-      this.writeSseState(response, client);
-      return;
-    }
-    const state = this.getState(client);
-    const previous = client.sseSnapshot;
-    const next = this.createSseSnapshot(state);
-
-    for (const room of state.rooms) {
-      const roomId = String(room.id);
-      if (previous.rooms.get(roomId) !== next.rooms.get(roomId)) {
-        if (!this.writeSseEvent(response, 'room', room)) return;
-      }
-    }
-    for (const roomId of previous.rooms.keys()) {
-      if (!next.rooms.has(roomId) && !this.writeSseEvent(response, 'room', { id: roomId, deleted: true })) {
-        return;
-      }
-    }
-
-    if (previous.recordings !== next.recordings && !this.writeSseEvent(response, 'recording', { recordings: state.recordings })) {
-      return;
-    }
-    const previousLogIds = new Set(previous.logIds);
-    const nextLogIds = new Set(next.logIds);
-    const newLogs = state.logs.filter((entry) => !previousLogIds.has(String(entry.id)));
-    if (state.logs.length === 0 && previous.logIds.length > 0) {
-      if (!this.writeSseEvent(response, 'log', { clear: true })) return;
-    } else if (newLogs.length) {
-      const replacesLogs = previous.logIds.length > 0 && !state.logs.some((entry) => previousLogIds.has(String(entry.id)));
-      if (!this.writeSseEvent(response, 'log', replacesLogs ? { replace: newLogs } : { entries: newLogs })) return;
-    } else if (previous.logIds.some((id) => !nextLogIds.has(id))) {
-      if (!this.writeSseEvent(response, 'log', { replace: state.logs })) return;
-    }
-
-    const scalarEvents = [
-      ['settings', previous.settings, next.settings, this.getSseSettingsPayload(state)],
-      ['mediaJob', previous.mediaJob, next.mediaJob, this.getSseMediaJobPayload(state)],
-      ['diskSpace', previous.diskSpace, next.diskSpace, { outputDiskSpace: state.outputDiskSpace || null }],
-      ['system', previous.system, next.system, this.getSseSystemPayload(state)]
-    ];
-    for (const [eventName, previousValue, nextValue, payload] of scalarEvents) {
-      if (previousValue !== nextValue && !this.writeSseEvent(response, eventName, payload)) return;
-    }
-    client.sseSnapshot = next;
+    if (type === 'recording') return { recordings: this.recordings };
+    if (type === 'log') return { replace: this.logs };
+    if (type === 'settings') return this.getSseSettingsPayload(client);
+    if (type === 'mediaJob') return this.getSseMediaJobPayload();
+    if (type === 'diskSpace') return { outputDiskSpace: this.outputDiskSpace ? { ...this.outputDiskSpace } : null };
+    if (type === 'system') return this.getSseSystemPayload(client);
+    return undefined;
   }
 
   log(level, message) {
-    this.logs.push({
+    const entry = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       time: Date.now(),
       level,
       message: redactSensitive(message)
-    });
+    };
+    this.logs.push(entry);
     if (this.logs.length > 400) {
       this.logs.splice(0, this.logs.length - 400);
     }
-    this.emitState();
+    this.statePublisher.markLog(entry);
   }
 
   notify(title, message, event = 'notification', data = {}, options = {}) {
@@ -3319,7 +3308,7 @@ try {
     this.rooms.set(id, room);
     await this.saveStore();
     this.log('info', `已添加房间 ${roomLabel(room)}；默认未开启监听和自动录制。`);
-    this.emitState();
+    this.markRoomDirty(room.id);
     return this.getState();
   }
 
@@ -3378,7 +3367,7 @@ try {
     this.removingRoomIds.delete(room.id);
     await this.saveStore();
     this.log('info', `已${options.force ? '强制' : ''}移除房间 ${room.id}。`);
-    this.emitState();
+    this.markRoomDeleted(room.id);
     return this.getState();
   }
 
@@ -3921,7 +3910,7 @@ try {
       cached: false,
       updatedAt: Date.now()
     };
-    this.emitState();
+    this.emitState('mediaJob');
     this.log(
       'info',
       `兼容预览已加入队列：${path.basename(sourcePath)}（${
@@ -3931,7 +3920,7 @@ try {
     const previewLeasePromise = this.mediaJobs.acquire({
       id: progress.id,
       type: 'preview',
-      resources: this.getTranscodeResources(previewCodec, mediaInfo.videoInfo),
+      ...this.getTranscodeResourcePlan(previewCodec, mediaInfo.videoInfo, { lightweight: true }),
       cancel: () => this.cancelExportPreview({ silent: true }).catch(() => {})
     });
 
@@ -3953,11 +3942,11 @@ try {
           this.exportPreview.status = 'running';
           this.exportPreview.updatedAt = Date.now();
         }
-        this.emitState();
+        this.emitState('mediaJob');
 
     const handlePreviewStderr = (line) => {
       if (this.exportPreviewProgress?.id === progress.id && updateFfmpegJobProgress(this.exportPreviewProgress, line)) {
-        this.emitState();
+        this.emitState('mediaJob');
       }
       if (/error|failed|invalid/i.test(line)) {
         this.log('warn', `兼容预览：${compactLogLine(line)}`);
@@ -4012,7 +4001,7 @@ try {
           progress.percent = durationSec > 0 ? 0 : null;
           progress.estimatedRemainingSec = null;
           progress.message = '正在使用兼容路径重新生成预览';
-          this.emitState();
+          this.emitState('mediaJob');
           await fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
           await fsp.mkdir(workingPreviewDir, { recursive: true });
         }
@@ -4074,12 +4063,12 @@ try {
           this.exportPreviewClearTimer = setTimeout(() => {
             if (this.exportPreviewProgress?.id === progress.id && this.exportPreviewProgress.status !== 'running') {
               this.exportPreviewProgress = null;
-              this.emitState();
+              this.emitState('mediaJob');
             }
           }, 5000);
           this.exportPreviewClearTimer.unref?.();
         }
-        this.emitState();
+        this.emitState('mediaJob');
       });
       })
       .catch((error) => {
@@ -4104,7 +4093,7 @@ try {
         };
         this.log('error', `生成兼容预览失败：${error.message}`);
         fsp.rm(workingPreviewDir, { recursive: true, force: true }).catch(() => {});
-        this.emitState();
+        this.emitState('mediaJob');
       });
 
     return { ok: true, id, jobId: progress.id, previewUrl, ready: false, cached: false, progress: { ...progress } };
@@ -4135,7 +4124,7 @@ try {
     if (!options.silent && (queued || this.exportPreview?.status === 'running' || this.exportPreview?.status === 'cancelled')) {
       this.log('info', queued ? '已取消排队中的兼容预览。' : '已取消当前兼容预览生成。');
     }
-    this.emitState();
+    this.emitState('mediaJob');
     return this.getState();
   }
 
@@ -5029,7 +5018,7 @@ try {
       session.releaseMediaJob = this.mediaJobs.registerExternal({
         id: `recording:${room.id}:${session.startedAt}`,
         type: 'recording',
-        resources: ['recording', 'network'],
+        ...this.getRecordingMediaResourcePlan(),
         cancel: () => this.stopRecording(room.id).catch(() => {})
       });
       this.reconnectPendingRooms.delete(room.id);
@@ -6931,7 +6920,7 @@ try {
     progress.updatedAt = Date.now();
     progress.message =
       progress.stageLabel + (elapsedSec >= 2 ? '（已用' + formatDurationSeconds(elapsedSec) + '）' : '');
-    this.emitState();
+    this.markRoomDirty(room.id);
     return true;
   }
 
@@ -6979,7 +6968,15 @@ try {
     const details = this.getMergeMediaWaitDetails(resources, progress.id);
     const resourceLabel = normalizeResourceSlots(resources)
       .map((slot) =>
-        ({ disk: '磁盘', cpuEncode: 'CPU 编码', gpuEncode: 'GPU 编码', gpuComposite: 'GPU 合成' })[slot] || slot
+        ({
+          network: '网络',
+          disk: '磁盘',
+          diskRead: '磁盘读取',
+          diskWrite: '磁盘写入',
+          cpuEncode: 'CPU 编码',
+          gpuEncode: 'GPU 编码',
+          gpuComposite: 'GPU 合成'
+        })[slot] || slot
       )
       .join(' / ');
     const waits = [];
@@ -6997,19 +6994,20 @@ try {
     progress.message =
       `正在等待可用媒体资源（${waits.join('；')}）` +
       (elapsedSec >= 2 ? `（已等${formatDurationSeconds(elapsedSec)}）` : '');
-    this.emitState();
+    this.emitState(['room', 'mediaJob']);
     return true;
   }
 
   async acquireMergeMediaLease(room, progress, mergeEncoderPlan) {
-    const resources = mergeEncoderPlan.requiresTranscode
-      ? this.getTranscodeResources(mergeEncoderPlan.preferred, mergeEncoderPlan.videoInfo)
-      : ['disk'];
+    const resourcePlan = mergeEncoderPlan.requiresTranscode
+      ? this.getTranscodeResourcePlan(mergeEncoderPlan.preferred, mergeEncoderPlan.videoInfo)
+      : { resources: ['diskRead', 'diskWrite'], resourceCosts: { diskRead: 2, diskWrite: 2 } };
+    const resources = resourcePlan.resources;
     const queuedAt = Date.now();
     const leasePromise = this.mediaJobs.acquire({
       id: progress.id,
       type: 'merge',
-      resources,
+      ...resourcePlan,
       cancel: () => {
         this.mergeCancelRequests.add(room.id);
         const child = this.mergeProcesses.get(room.id);
@@ -7038,7 +7036,7 @@ try {
         progress.stageStartedAt = workStartedAt;
         progress.message = '已取得媒体资源，正在启动合并';
         progress.updatedAt = workStartedAt;
-        this.emitState();
+        this.emitState(['room', 'mediaJob']);
       }
       return lease;
     } finally {
@@ -7272,7 +7270,7 @@ try {
         finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
       }
       this.mergeCancelRequests.delete(room.id);
-      this.emitState();
+      this.emitState(['room', 'mediaJob']);
       return null;
     }
     let mergeLease;
@@ -7284,7 +7282,7 @@ try {
           finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消排队合并，所有源分段均已保留');
         }
         this.mergeCancelRequests.delete(room.id);
-        this.emitState();
+        this.emitState(['room', 'mediaJob']);
         return null;
       }
       throw error;
@@ -7294,7 +7292,7 @@ try {
         finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
       }
       this.mergeCancelRequests.delete(room.id);
-      this.emitState();
+      this.emitState(['room', 'mediaJob']);
       return null;
     }
     this.mergeCancelRequests.delete(room.id);
@@ -7307,7 +7305,7 @@ try {
           : '各分段规格一致，使用快速无损合并'
       }`
     );
-    this.emitState();
+    this.emitState(['room', 'mediaJob']);
     try {
       await fsp.rm(tmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
@@ -7342,7 +7340,7 @@ try {
             room.mergeProgress.updatedAt = Date.now();
           }
           this.log('error', `${roomLabel(room)} ${message}`);
-          this.emitState();
+          this.markRoomDirty(room.id);
           requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
         };
         const updateWaitingForMedia = () => {
@@ -7373,7 +7371,7 @@ try {
           room.mergeProgress.updatedAt = now;
           room.mergeProgress.message =
             stageLabel + '，等待首个媒体时间戳' + (elapsedSec >= 2 ? '（已用' + formatDurationSeconds(elapsedSec) + '）' : '');
-          this.emitState();
+          this.markRoomDirty(room.id);
         };
         updateWaitingForMedia();
         const firstProgressHeartbeat = setInterval(updateWaitingForMedia, MERGE_STAGE_HEARTBEAT_MS);
@@ -7403,7 +7401,7 @@ try {
                   ? `time=${formatFfmpegSeconds(progressOffsetSec + Math.max(0, processedSec))}`
                   : line;
                 if (updateFfmpegJobProgress(room.mergeProgress, progressLine)) {
-                  this.emitState();
+                  this.markRoomDirty(room.id);
                 }
               } else if (Number.isFinite(processedSec) && room.mergeProgress?.id === progress.id) {
                 if (now - lastStageProgressEmitAt >= 500) {
@@ -7413,7 +7411,7 @@ try {
                       ? `${stageLabel} · 本段 ${formatDurationSeconds(Math.min(segmentDurationSec, Math.max(0, processedSec)))} / ${formatDurationSeconds(segmentDurationSec)}`
                       : stageLabel) + ' · 已处理 ' + formatDurationSeconds(processedSec);
                   room.mergeProgress.updatedAt = now;
-                  this.emitState();
+                  this.markRoomDirty(room.id);
                 }
               }
               const decodeErrorCount = countRepeatedVideoDecodeErrors(line);
@@ -7447,7 +7445,7 @@ try {
                   room.mergeProgress.updatedAt = Date.now();
                 }
                 this.log('error', `${roomLabel(room)} ${message}`);
-                this.emitState();
+                this.markRoomDirty(room.id);
               }
             });
           } catch (error) {
@@ -7468,7 +7466,7 @@ try {
           room.mergeProgress.codec = videoCodec;
           room.mergeProgress.codecKind = videoCodec.includes('libx') ? 'software' : 'hardware';
           room.mergeProgress.updatedAt = Date.now();
-          this.emitState();
+          this.markRoomDirty(room.id);
         }
         const normalizedPaths = [];
         const normalizedDurations = [];
@@ -7516,7 +7514,7 @@ try {
               room.mergeProgress.estimatedRemainingSec = null;
               room.mergeProgress.message = `${stageLabel}（本段共 ${formatDurationSeconds(sourceDurationSec)}）`;
               room.mergeProgress.updatedAt = Date.now();
-              this.emitState();
+              this.markRoomDirty(room.id);
             }
             await fsp.rm(normalizedPath, { force: true });
             await runMergeFfmpeg(
@@ -7633,7 +7631,7 @@ try {
           room.mergeProgress.currentTimeSec = mergeDurationSec;
           room.mergeProgress.percent = 99.4;
           room.mergeProgress.updatedAt = Date.now();
-          this.emitState();
+          this.markRoomDirty(room.id);
         }
         await writeConcatFile(concatPath, normalizedPaths, { durations: normalizedDurations });
         await fsp.rm(tmpPath, { force: true });
@@ -7702,7 +7700,7 @@ try {
         room.mergeProgress.message = '正在合并弹幕记录';
         room.mergeProgress.percent = 99.5;
         room.mergeProgress.updatedAt = Date.now();
-        this.emitState();
+        this.markRoomDirty(room.id);
       }
       let mergedMediaInfo = await this.runMergePreparationStage(
         room,
@@ -7719,7 +7717,7 @@ try {
           room.mergeProgress.message = '正在检查合并后的音画时间轴';
           room.mergeProgress.percent = 99.7;
           room.mergeProgress.updatedAt = Date.now();
-          this.emitState();
+          this.markRoomDirty(room.id);
         }
         mergedTimingInfo = await this.runMergePreparationStage(
           room,
@@ -7746,7 +7744,7 @@ try {
               room.mergeProgress.message = `正在重建原始时间轴（检测到 ${driftMs}ms 偏差）`;
               room.mergeProgress.percent = 99.2;
               room.mergeProgress.updatedAt = Date.now();
-              this.emitState();
+              this.markRoomDirty(room.id);
             }
             await fsp.rm(tmpPath, { force: true });
             await runSafeTranscode();
@@ -7900,11 +7898,11 @@ try {
           mergedRecording.durationSec
         )}。`
       );
-      this.emitState();
+      this.emitState(['room', 'recording', 'mediaJob']);
       setTimeout(() => {
         if (room.mergeProgress?.id === progress.id) {
           delete room.mergeProgress;
-          this.emitState();
+          this.markRoomDirty(room.id);
         }
       }, 5000).unref?.();
       return mergedRecording;
@@ -7922,7 +7920,7 @@ try {
         );
       }
       this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : failureMessage}；源分段未删除。`);
-      this.emitState();
+      this.emitState(['room', 'mediaJob']);
       if (cancelled) return null;
       throw error;
     } finally {
@@ -8283,7 +8281,7 @@ try {
         finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消排队合并，所有源分段均已保留');
       }
       this.log('info', `${roomLabel(room)} 已取消排队合并；源分段未删除。`);
-      this.emitState();
+      this.emitState(['room', 'mediaJob']);
       return this.getState();
     }
     if (!child && !running && !queued && !retrying && !cancelledRetryCount) return this.getState();
@@ -8292,13 +8290,13 @@ try {
         finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消自动合并重试，所有源分段均已保留');
       }
       this.log('info', `${roomLabel(room)} 已取消自动合并重试；源分段未删除。`);
-      this.emitState();
+      this.emitState(['room', 'mediaJob']);
       return this.getState();
     }
     this.mergeCancelRequests.add(room.id);
     if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
     if (running || queued) room.mergeProgress.message = queued ? '正在取消排队合并，源分段会全部保留' : '正在取消合并，源分段会全部保留';
-    this.emitState();
+    this.emitState(['room', 'mediaJob']);
     return this.getState();
   }
 
@@ -8879,7 +8877,7 @@ try {
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'burn',
-          resources: this.getTranscodeResources(codec, item.recording?.videoInfo, { gpuComposite: true }),
+          ...this.getTranscodeResourcePlan(codec, item.recording?.videoInfo, { gpuComposite: true }),
           cancel: () => this.cancelBurnDanmaku(item.roomId).catch(() => {})
         });
         const started = await this.startBurnRecording(item.room, item.recording, {
@@ -9473,7 +9471,7 @@ try {
 
       const handleBurnStderr = (text) => {
         if (updateFfmpegJobProgress(progress, text)) {
-          this.emitState();
+          this.markRoomDirty(room.id);
         }
         handleBurnLog(text);
       };
@@ -9485,7 +9483,7 @@ try {
       const handleBurnProgress = (currentTimeSec) => {
         const value = Math.max(0, Number(currentTimeSec) || 0);
         if (updateFfmpegJobProgress(progress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
-          this.emitState();
+          this.markRoomDirty(room.id);
         }
       };
       const setBurnStage = (stage) => {
@@ -9493,7 +9491,7 @@ try {
         progress.stageLabel = stage;
         progress.message = stage;
         progress.updatedAt = Date.now();
-        this.emitState();
+        this.markRoomDirty(room.id);
       };
       const finishBurn = async (processingError = null) => {
         const cancelled = this.burnCancelRequests.delete(room.id) || processingError?.code === 'BR2K_MEDIA_CANCELLED';
@@ -9559,11 +9557,11 @@ try {
             this.log('warn', `${roomLabel(room)} 弹幕版已生成，但自动删除源文件失败：${error.message}`);
           }
         }
-        this.emitState();
+        this.emitState(['room', 'recording', 'mediaJob']);
         setTimeout(() => {
           if (room.burnProgress?.id === progress.id) {
             delete room.burnProgress;
-            this.emitState();
+            this.markRoomDirty(room.id);
           }
         }, 5000).unref?.();
         this.scheduleQueuedUpdateCheck();
@@ -9591,7 +9589,7 @@ try {
               onStage: setBurnStage,
               onDecoderFallback: () => {
                 this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
-                this.emitState();
+                this.markRoomDirty(room.id);
               },
               label: `${roomLabel(room)} 头像分段烧录`,
               isCancelled: () => this.burnCancelRequests.has(room.id)
@@ -9626,7 +9624,7 @@ try {
                   { value: 'software', label: 'CPU', kind: 'software' },
                   { reset: true, message: '硬件解码不兼容，正在使用 CPU 解码重新烧录' }
                 );
-                this.emitState();
+                this.markRoomDirty(room.id);
               },
               label: `${roomLabel(room)} 烧录`
             });
@@ -9641,10 +9639,10 @@ try {
           this.burnSessions.delete(room.id);
           await this.cleanupAvatarOverlayLayer(avatarLayer);
           this.log('error', `${roomLabel(room)} 烧录收尾失败：${error.message}`);
-          this.emitState();
+          this.emitState(['room', 'recording', 'mediaJob']);
         }
       })();
-      this.emitState();
+      this.emitState(['room', 'recording', 'mediaJob']);
       return true;
     } catch (error) {
       await this.cleanupAvatarOverlayLayer(avatarLayer);
@@ -9657,10 +9655,10 @@ try {
         cancelled ? '弹幕视频生成已取消' : `生成失败：${error.message}`
       );
       this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '已取消生成弹幕视频' : `生成弹幕版失败：${error.message}`}`);
-      this.emitState();
+      this.emitState(['room', 'recording', 'mediaJob']);
       return false;
     }
-    this.emitState();
+    this.emitState(['room', 'recording', 'mediaJob']);
     return true;
   }
 
@@ -9671,7 +9669,7 @@ try {
     if (!ffmpeg) {
       if (room.burning) {
         this.log('info', `${roomLabel(room)} 已标记取消，当前分段结束后停止弹幕视频生成。`);
-        this.emitState();
+        this.emitState(['room', 'mediaJob']);
       }
       return this.getState();
     }
@@ -9681,7 +9679,7 @@ try {
     }
     this.log('info', `${roomLabel(room)} 正在取消弹幕视频生成。`);
     requestFfmpegStop(ffmpeg, { graceful: false, timeoutMs: 1500 });
-    this.emitState();
+    this.emitState(['room', 'mediaJob']);
     return this.getState();
   }
 
@@ -9936,8 +9934,9 @@ try {
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'export',
-          resources:
-            item.mode === 'clean' ? ['disk'] : this.getTranscodeResources(codec, item.request.recording?.videoInfo, { gpuComposite: true }),
+          ...(item.mode === 'clean'
+            ? { resources: ['diskRead', 'diskWrite'], resourceCosts: { diskRead: 2, diskWrite: 2 } }
+            : this.getTranscodeResourcePlan(codec, item.request.recording?.videoInfo, { gpuComposite: true })),
           cancel: () => this.cancelExportClip().catch(() => {})
         });
         if (this.cancelledExportQueueIds.has(item.id)) {
@@ -10034,7 +10033,7 @@ try {
       progress.stageLabel = stage;
       progress.message = stage;
       progress.updatedAt = Date.now();
-      this.emitState();
+      this.emitState('mediaJob');
     };
     const throwIfExportCancelled = () => {
       if (!this.exportCancelRequested) return;
@@ -10157,7 +10156,7 @@ try {
     );
       const handleExportStderr = (line) => {
         if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
-          this.emitState();
+          this.emitState('mediaJob');
         }
         handleExportLog(line);
       };
@@ -10172,7 +10171,7 @@ try {
           this.exportProgress?.id === progress.id &&
           updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)
         ) {
-          this.emitState();
+          this.emitState('mediaJob');
         }
       };
       const onChild = (child) => {
@@ -10199,7 +10198,7 @@ try {
           onStage: setExportStage,
           onDecoderFallback: () => {
             this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
-            this.emitState();
+            this.emitState('mediaJob');
           },
           label: '烧录片段头像分段',
           isCancelled: () => this.exportCancelRequested
@@ -10217,7 +10216,7 @@ try {
               { value: 'software', label: 'CPU', kind: 'software' },
               { reset: true, message: '硬件解码不兼容，正在使用 CPU 解码重新导出' }
             );
-            this.emitState();
+            this.emitState('mediaJob');
           },
           label: '烧录片段导出'
         });
@@ -10233,7 +10232,7 @@ try {
       await atomicReplaceFile(temporaryOutputPath, outputPath);
       if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'completed', '片段已导出');
-        this.emitState();
+        this.emitState('mediaJob');
       }
       this.log('success', `片段已导出：${path.basename(outputPath)}`);
     } catch (error) {
@@ -10242,13 +10241,13 @@ try {
       if (cancelled) {
         if (this.exportProgress?.id === progress.id) {
           finishFfmpegJobProgress(this.exportProgress, 'cancelled', '导出已取消');
-          this.emitState();
+          this.emitState('mediaJob');
         }
         await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
         this.log('info', `已取消导出片段：${path.basename(outputPath)}`);
       } else if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'error', `导出失败：${message}`);
-        this.emitState();
+        this.emitState('mediaJob');
       }
       if (!cancelled) {
         throw error;
@@ -10267,7 +10266,7 @@ try {
       this.exportProgressClearTimer = setTimeout(() => {
         if (this.exportProgress?.id === progressId) {
           this.exportProgress = null;
-          this.emitState();
+          this.emitState('mediaJob');
         }
       }, 5000);
       this.exportProgressClearTimer.unref?.();
@@ -10297,7 +10296,7 @@ try {
       this.exportProgress.updatedAt = Date.now();
     }
     this.log('info', '正在取消当前导出任务。');
-    this.emitState();
+    this.emitState('mediaJob');
     if (!this.exportProcess) {
       return this.getState();
     }
@@ -10319,7 +10318,7 @@ try {
 
   async clearLogs() {
     this.logs = [];
-    this.emitState();
+    this.statePublisher.markLogsCleared();
     return this.getState();
   }
 

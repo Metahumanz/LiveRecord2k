@@ -239,8 +239,8 @@ export function RoomCard({
           </div>
           <button
             className="icon-button danger"
-            title="移除直播间"
-            disabled={room.recording || busy.has(`remove-${roomKey}`)}
+            title={room.recording || mergeActive || room.burning ? '移除直播间（将先确认并停止相关任务）' : '移除直播间'}
+            disabled={busy.has(`remove-${roomKey}`)}
             onClick={() => removeRoom(room.id)}
           >
             <Trash2 size={18} />

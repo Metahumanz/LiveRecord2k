@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import type React from 'react';
 import { Bell, FileCode2, FolderOpen, HardDrive, LogIn, QrCode, Video } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, SettingPanel, Toggle } from '../components/common';
@@ -20,6 +21,7 @@ export function SettingsPage({
   run,
   chooseOutputDir,
   updateSettingsDraft,
+  commitSettingsDraft,
   settingsSaveStatus,
   settingsSaveError,
   retrySettingsSave,
@@ -30,8 +32,12 @@ export function SettingsPage({
   busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
   chooseOutputDir: () => Promise<void>;
-  updateSettingsDraft: (settings: Partial<AppSettings>) => void;
-  settingsSaveStatus: 'idle' | 'saving' | 'saved' | 'error';
+  updateSettingsDraft: (
+    settings: Partial<AppSettings>,
+    options?: { saveMode?: 'immediate' | 'debounced' | 'commit' }
+  ) => void;
+  commitSettingsDraft: (keys: Array<keyof AppSettings>) => Promise<boolean>;
+  settingsSaveStatus: 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
   settingsSaveError: string;
   retrySettingsSave: () => void;
   dirtyFields: Set<keyof AppSettings>;
@@ -52,8 +58,18 @@ export function SettingsPage({
     .join('；');
   const [diskSpace, setDiskSpace] = useState<DiskSpaceState | null>(state.outputDiskSpace || null);
 
-  function updateSetting(nextSettings: Partial<AppSettings>) {
-    updateSettingsDraft(nextSettings);
+  function updateSetting(nextSettings: Partial<AppSettings>, saveMode: 'immediate' | 'debounced' | 'commit' = 'immediate') {
+    updateSettingsDraft(nextSettings, { saveMode });
+  }
+
+  function commitSetting(...keys: Array<keyof AppSettings>) {
+    void commitSettingsDraft(keys);
+  }
+
+  function commitOnEnter(event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    event.currentTarget.blur();
   }
 
   useEffect(() => {
@@ -105,6 +121,8 @@ export function SettingsPage({
               </button>
             ) : settingsSaveStatus === 'saving' ? (
               `保存中${dirtyFields.size ? `（${dirtyFields.size} 项）` : ''}`
+            ) : settingsSaveStatus === 'dirty' ? (
+              `待保存${dirtyFields.size ? `（${dirtyFields.size} 项）` : ''}`
             ) : settingsSaveStatus === 'saved' ? (
               '已保存'
             ) : (
@@ -150,7 +168,9 @@ export function SettingsPage({
               <textarea
                 rows={4}
                 value={settingsDraft.cookie}
-                onChange={(event) => updateSetting({ cookie: event.target.value })}
+                onChange={(event) => updateSetting({ cookie: event.target.value }, 'commit')}
+                onBlur={() => commitSetting('cookie')}
+                onKeyDown={commitOnEnter}
                 placeholder="扫码成功后自动写入"
               />
             </label>
@@ -162,7 +182,9 @@ export function SettingsPage({
             <div className="path-row">
               <input
                 value={settingsDraft.outputDir}
-                onChange={(event) => updateSetting({ outputDir: event.target.value })}
+                onChange={(event) => updateSetting({ outputDir: event.target.value }, 'commit')}
+                onBlur={() => commitSetting('outputDir')}
+                onKeyDown={commitOnEnter}
                 placeholder={isLinux ? '/var/lib/bili-record-2k/recordings' : '例如 C:\\Users\\你的用户名\\Videos\\哔哩录播2K'}
               />
               {canPickServerPath ? (
@@ -237,7 +259,9 @@ export function SettingsPage({
                 min={1}
                 max={1440}
                 value={settingsDraft.segmentMinutes}
-                onChange={(event) => updateSetting({ segmentMinutes: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ segmentMinutes: Number(event.target.value) }, 'commit')}
+                onBlur={() => commitSetting('segmentMinutes')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">长时间录制会按这个时长分段，便于保存和导出。</p>
             </label>
@@ -379,7 +403,9 @@ export function SettingsPage({
                 min={16}
                 max={35}
                 value={settingsDraft.burnCrf}
-                onChange={(event) => updateSetting({ burnCrf: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ burnCrf: Number(event.target.value) }, 'commit')}
+                onBlur={() => commitSetting('burnCrf')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">数字越小画质越高、文件越大；常用范围是 18 到 28。</p>
             </label>
@@ -433,7 +459,9 @@ export function SettingsPage({
                 min={1}
                 max={300}
                 value={settingsDraft.pollIntervalSec}
-                onChange={(event) => updateSetting({ pollIntervalSec: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ pollIntervalSec: Number(event.target.value) }, 'commit')}
+                onBlur={() => commitSetting('pollIntervalSec')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">HTTP 轮询是推送断线时的兜底；正常情况下会由直播弹幕连接即时触发开播。</p>
             </label>
@@ -454,7 +482,7 @@ export function SettingsPage({
                 inputMode="url"
                 placeholder="https://example.com/webhook"
                 value={settingsDraft.webhookUrl}
-                onChange={(event) => updateSetting({ webhookUrl: event.target.value })}
+                onChange={(event) => updateSetting({ webhookUrl: event.target.value }, 'debounced')}
               />
               <p className="field-help">
                 公网地址必须使用 HTTPS；DNS 和每一跳地址都会经过 SSRF 检查，重定向默认拒绝。
@@ -481,8 +509,10 @@ export function SettingsPage({
                   updateSetting({
                     webhookBearerToken: event.target.value,
                     webhookBearerTokenClear: false
-                  })
+                  }, 'commit')
                 }
+                onBlur={() => commitSetting('webhookBearerToken', 'webhookBearerTokenClear')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">
                 发送时使用 Authorization: Bearer &lt;Token&gt;；Token 不会回传到页面或写入设置导出文件。

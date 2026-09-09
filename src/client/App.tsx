@@ -21,6 +21,7 @@ import type { AppSettings, AppState, CleanupScanResult, ExportDraft, ExportResul
 import { recorder, RecorderApiError } from './recorderClient';
 import { Metric, ToastHost, type ToastItem } from './components/common';
 import { LivePreviewModal, QrLoginPanel } from './components/rooms';
+import { SettingsSaveCoordinator, type SettingsSaveKey } from './settings-save-queue';
 import { formatTimelineTime, getStats, hydrateExportDraft, isAppState } from './utils';
 
 const pages: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
@@ -39,7 +40,9 @@ const SettingsPage = lazy(async () => ({ default: (await import('./pages/Setting
 const MaintenancePage = lazy(async () => ({ default: (await import('./pages/MaintenancePage')).MaintenancePage }));
 const LogsPage = lazy(async () => ({ default: (await import('./pages/LogsPage')).LogsPage }));
 
-type SettingsSaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+type SettingsSaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
+type SettingsSaveMode = 'immediate' | 'debounced' | 'commit';
+type SettingsDraftUpdateOptions = { autoSave?: boolean; saveMode?: SettingsSaveMode };
 
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
@@ -72,11 +75,10 @@ export default function App() {
   const settingsSaveQueueRef = useRef<Promise<boolean>>(Promise.resolve(true));
   const settingsDraftRef = useRef<AppSettings | null>(null);
   const settingsDirtyFieldsRef = useRef<Set<keyof AppSettings>>(new Set());
-  const pendingSettingsPatchRef = useRef<Partial<AppSettings>>({});
-  const pendingSettingsVersionRef = useRef(0);
-  const failedSettingsPatchRef = useRef<{ patch: Partial<AppSettings>; version: number } | null>(null);
+  const settingsSaveCoordinatorRef = useRef(new SettingsSaveCoordinator<AppSettings>());
   const settingsAutoSaveTimerRef = useRef<number | null>(null);
-  const settingsChangeVersionRef = useRef(0);
+  const settingsAutoRetryTimerRef = useRef<number | null>(null);
+  const settingsHaveSavedRef = useRef(false);
 
   function replaceDirtySettingsFields(nextFields: Set<keyof AppSettings>) {
     const next = new Set(nextFields);
@@ -84,9 +86,34 @@ export default function App() {
     setSettingsDirtyFields(next);
   }
 
+  function syncDirtySettingsFieldsFromCoordinator() {
+    replaceDirtySettingsFields(settingsSaveCoordinatorRef.current.getDirtyFields());
+  }
+
+  function refreshSettingsSaveStatus() {
+    const coordinator = settingsSaveCoordinatorRef.current;
+    if (coordinator.hasFailures() && !coordinator.hasPending() && !coordinator.hasInFlight()) {
+      setSettingsSaveStatus('error');
+      return;
+    }
+    if (coordinator.hasPending() || coordinator.hasInFlight()) {
+      setSettingsSaveStatus('saving');
+      return;
+    }
+    if (coordinator.isFullySaved()) {
+      setSettingsSaveStatus(settingsHaveSavedRef.current ? 'saved' : 'idle');
+      return;
+    }
+    setSettingsSaveStatus('dirty');
+  }
+
   function syncSettingsDraftFromServer(nextSettings: AppSettings, options: { resetDirty?: boolean } = {}) {
     if (options.resetDirty) {
-      replaceDirtySettingsFields(new Set());
+      settingsSaveCoordinatorRef.current.reset();
+      settingsHaveSavedRef.current = false;
+      syncDirtySettingsFieldsFromCoordinator();
+      setSettingsSaveError('');
+      setSettingsSaveStatus('idle');
     }
     setSettingsDraft((current) => {
       const previous = current || settingsDraftRef.current;
@@ -103,10 +130,10 @@ export default function App() {
     });
   }
 
-  function updateSettingsDraft(nextSettings: Partial<AppSettings>, options: { autoSave?: boolean } = {}) {
+  function updateSettingsDraft(nextSettings: Partial<AppSettings>, options: SettingsDraftUpdateOptions = {}) {
     const keys = Object.keys(nextSettings) as Array<keyof AppSettings>;
     if (!keys.length) return;
-    const changeVersion = ++settingsChangeVersionRef.current;
+    const saveMode = options.saveMode ?? (options.autoSave === false ? 'commit' : 'debounced');
     setSettingsDraft((current) => {
       const previous = current || settingsDraftRef.current;
       if (!previous) return current;
@@ -114,39 +141,55 @@ export default function App() {
       settingsDraftRef.current = next;
       return next;
     });
-    const dirty = new Set(settingsDirtyFieldsRef.current);
-    for (const key of keys) dirty.add(key);
-    replaceDirtySettingsFields(dirty);
-    if (options.autoSave !== false) {
-      queueSettingsAutoSave(nextSettings, changeVersion);
+    settingsSaveCoordinatorRef.current.markChanged(nextSettings, { queue: saveMode !== 'commit' });
+    syncDirtySettingsFieldsFromCoordinator();
+    if (!settingsSaveCoordinatorRef.current.hasFailures()) {
+      setSettingsSaveError('');
+    }
+    refreshSettingsSaveStatus();
+    if (saveMode === 'immediate') {
+      void persistSettings();
+    } else if (saveMode === 'debounced') {
+      queueSettingsAutoSave();
     }
   }
 
-  function queueSettingsAutoSave(nextSettings: Partial<AppSettings>, changeVersion: number) {
-    pendingSettingsPatchRef.current = { ...pendingSettingsPatchRef.current, ...nextSettings };
-    pendingSettingsVersionRef.current = changeVersion;
-    failedSettingsPatchRef.current = null;
-    setSettingsSaveError('');
-    setSettingsSaveStatus('saving');
+  function queueSettingsAutoSave() {
     if (settingsAutoSaveTimerRef.current !== null) {
       window.clearTimeout(settingsAutoSaveTimerRef.current);
     }
     settingsAutoSaveTimerRef.current = window.setTimeout(() => {
       settingsAutoSaveTimerRef.current = null;
-      const patch = pendingSettingsPatchRef.current;
-      const patchVersion = pendingSettingsVersionRef.current;
-      pendingSettingsPatchRef.current = {};
-      void persistSettings(patch, '', patchVersion);
+      void persistSettings();
     }, 550);
   }
 
+  function queueSettingsAutoRetry() {
+    if (settingsAutoRetryTimerRef.current !== null) return;
+    settingsAutoRetryTimerRef.current = window.setTimeout(() => {
+      settingsAutoRetryTimerRef.current = null;
+      void persistSettings();
+    }, 900);
+  }
+
+  function commitSettingsDraft(keys: Array<SettingsSaveKey<AppSettings>>, successMessage = '') {
+    const draft = settingsDraftRef.current;
+    if (!draft) return Promise.resolve(false);
+    settingsSaveCoordinatorRef.current.queueCurrent(keys, draft);
+    syncDirtySettingsFieldsFromCoordinator();
+    refreshSettingsSaveStatus();
+    return persistSettings(successMessage);
+  }
+
   function retryFailedSettingsSave() {
-    const failed = failedSettingsPatchRef.current;
-    if (!failed || !Object.keys(failed.patch).length) return;
-    failedSettingsPatchRef.current = null;
+    const draft = settingsDraftRef.current;
+    if (!draft) return;
+    const retriedKeys = settingsSaveCoordinatorRef.current.retryFailed(draft);
+    if (!retriedKeys.length) return;
     setSettingsSaveError('');
-    setSettingsSaveStatus('saving');
-    void persistSettings(failed.patch, '', failed.version);
+    syncDirtySettingsFieldsFromCoordinator();
+    refreshSettingsSaveStatus();
+    void persistSettings();
   }
 
   useEffect(() => {
@@ -181,6 +224,9 @@ export default function App() {
     () => () => {
       if (settingsAutoSaveTimerRef.current !== null) {
         window.clearTimeout(settingsAutoSaveTimerRef.current);
+      }
+      if (settingsAutoRetryTimerRef.current !== null) {
+        window.clearTimeout(settingsAutoRetryTimerRef.current);
       }
     },
     []
@@ -244,44 +290,27 @@ export default function App() {
     window.setTimeout(() => closeToast(id), 4200);
   }
 
-  function settingValueEquals(left: unknown, right: unknown) {
-    return JSON.stringify(left) === JSON.stringify(right);
-  }
-
-  function reconcileSavedSettings(savedPatch: Partial<AppSettings>, serverSettings: AppSettings) {
-    const current = settingsDraftRef.current;
-    const savedKeys = Object.keys(savedPatch) as Array<keyof AppSettings>;
-    if (current) {
-      const dirty = new Set(settingsDirtyFieldsRef.current);
-      for (const key of savedKeys) {
-        // A newer keystroke may have landed while this request was queued.
-        // Only clear the dirty marker when this response saved that exact value.
-        if (settingValueEquals(current[key], savedPatch[key])) {
-          dirty.delete(key);
-        }
-      }
-      replaceDirtySettingsFields(dirty);
-    }
-    syncSettingsDraftFromServer(serverSettings);
-  }
-
-  async function persistSettings(
-    settings: Partial<AppSettings>,
-    successMessage = '',
-    saveVersion = settingsChangeVersionRef.current
-  ): Promise<boolean> {
+  function persistSettings(successMessage = ''): Promise<boolean> {
     const save = async () => {
+      const coordinator = settingsSaveCoordinatorRef.current;
+      const attempt = coordinator.takePending();
+      if (!attempt) {
+        refreshSettingsSaveStatus();
+        return true;
+      }
       beginBusy('save-settings');
-      setSettingsSaveStatus('saving');
+      refreshSettingsSaveStatus();
       try {
-        const result = await recorder.saveSettings(settings);
+        const result = await recorder.saveSettings(attempt.patch);
+        coordinator.settleSuccess(attempt);
+        settingsHaveSavedRef.current = true;
+        syncDirtySettingsFieldsFromCoordinator();
         setState(result);
-        reconcileSavedSettings(settings, result.settings);
-        if (saveVersion === settingsChangeVersionRef.current) {
-          failedSettingsPatchRef.current = null;
+        syncSettingsDraftFromServer(result.settings);
+        if (!coordinator.hasFailures()) {
           setSettingsSaveError('');
-          setSettingsSaveStatus('saved');
         }
+        refreshSettingsSaveStatus();
         if (result.operationNotice) {
           showToast(result.operationNotice);
         }
@@ -291,11 +320,14 @@ export default function App() {
         return true;
       } catch (error) {
         const message = error instanceof Error ? error.message : '请求未能完成，请稍后重试。';
-        if (saveVersion === settingsChangeVersionRef.current) {
-          failedSettingsPatchRef.current = { patch: settings, version: saveVersion };
-          setSettingsSaveError(message);
-          setSettingsSaveStatus('error');
+        const draft = settingsDraftRef.current;
+        const failure = draft ? coordinator.settleFailure(attempt, draft) : { autoRetryKeys: [], manualRetryKeys: [] };
+        syncDirtySettingsFieldsFromCoordinator();
+        setSettingsSaveError(message);
+        if (failure.autoRetryKeys.length) {
+          queueSettingsAutoRetry();
         }
+        refreshSettingsSaveStatus();
         showToast({
           kind: 'error',
           title: '设置未保存',
@@ -315,13 +347,13 @@ export default function App() {
   }
 
   async function saveSettingsWithToast(settings: Partial<AppSettings>, message = '录制配置已保存') {
-    updateSettingsDraft(settings, { autoSave: false });
-    await persistSettings(settings, message, settingsChangeVersionRef.current);
+    updateSettingsDraft(settings, { saveMode: 'commit' });
+    await commitSettingsDraft(Object.keys(settings) as Array<SettingsSaveKey<AppSettings>>, message);
   }
 
   async function applyImportedSettings(settings: Partial<AppSettings>) {
-    updateSettingsDraft(settings, { autoSave: false });
-    const saved = await persistSettings(settings);
+    updateSettingsDraft(settings, { saveMode: 'commit' });
+    const saved = await commitSettingsDraft(Object.keys(settings) as Array<SettingsSaveKey<AppSettings>>);
     if (saved) {
       showToast({ title: '配置已导入', message: '已应用已确认的配置变更。' });
     }
@@ -357,6 +389,15 @@ export default function App() {
     setPage('rooms');
   }
 
+  function roomRemovalTaskLabels(message: string) {
+    const labels = [];
+    if (message.includes('录制')) labels.push('正在录制');
+    if (message.includes('合并')) labels.push('正在合并');
+    if (message.includes('烧录')) labels.push('正在烧录');
+    if (message.includes('导出') || message.includes('预览')) labels.push('正在导出/预览');
+    return labels;
+  }
+
   async function removeRoomWithConfirmation(roomId: string) {
     const key = `remove-${roomId}`;
     beginBusy(key);
@@ -368,8 +409,12 @@ export default function App() {
         if (!(error instanceof RecorderApiError) || error.code !== 'ROOM_BUSY') {
           throw error;
         }
+        const taskLabels = roomRemovalTaskLabels(error.message);
+        const taskSummary = taskLabels.length
+          ? `当前关联任务：\n${taskLabels.map((label) => `- ${label}`).join('\n')}`
+          : error.message;
         const confirmed = window.confirm(
-          `${error.message}\n\n强制删除会取消该直播间的录制、合并、烧录、导出和兼容预览任务，并等待资源释放。确定继续吗？`
+          `${taskSummary}\n\n将停止相关任务并删除直播间，不会删除已经生成的录像文件。\n\n确定继续吗？`
         );
         if (!confirmed) {
           showToast({ kind: 'warning', title: '已保留直播间', message: '任务未取消，直播间没有被删除。' });
@@ -394,7 +439,7 @@ export default function App() {
     try {
       const selected = await recorder.chooseOutputDir(settingsDraft?.outputDir || '');
       if (selected && settingsDraft) {
-        updateSettingsDraft({ outputDir: selected });
+        updateSettingsDraft({ outputDir: selected }, { saveMode: 'immediate' });
       }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '系统路径选择器打开失败。');
@@ -407,7 +452,7 @@ export default function App() {
     if (!state || state.settings.roomImageMode === mode) {
       return;
     }
-    updateSettingsDraft({ roomImageMode: mode });
+    updateSettingsDraft({ roomImageMode: mode }, { saveMode: 'immediate' });
   }
 
   function selectExportRecording(recording: RecordingState) {
@@ -609,6 +654,7 @@ export default function App() {
               run={run}
               chooseOutputDir={chooseOutputDir}
               updateSettingsDraft={updateSettingsDraft}
+              commitSettingsDraft={commitSettingsDraft}
               settingsSaveStatus={settingsSaveStatus}
               settingsSaveError={settingsSaveError}
               retrySettingsSave={retryFailedSettingsSave}
@@ -622,6 +668,7 @@ export default function App() {
               busy={busy}
               run={run}
               updateSettingsDraft={updateSettingsDraft}
+              commitSettingsDraft={commitSettingsDraft}
               settingsSaveStatus={settingsSaveStatus}
               settingsSaveError={settingsSaveError}
               retrySettingsSave={retryFailedSettingsSave}

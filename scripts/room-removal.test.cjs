@@ -1,7 +1,10 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
 const { BusinessError, LiveRecordService } = require('../src/server/app/service.cjs');
+const projectRoot = path.join(__dirname, '..');
 
 function createService() {
   const service = new LiveRecordService();
@@ -71,4 +74,18 @@ test('forced room removal cancels related queues and preview before deleting the
   assert.equal(service.exportQueue.length, 0);
   assert.equal(service.pendingSegmentCleanups.has('cleanup-job'), false);
   assert.deepEqual(new Set(cancelledJobIds), new Set(['burn-job', 'export-job', 'preview-job']));
+});
+
+test('room card allows a busy room to enter the explicit force-remove confirmation flow', () => {
+  const roomCardSource = fs.readFileSync(path.join(projectRoot, 'src', 'client', 'components', 'rooms.tsx'), 'utf8');
+  const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'client', 'App.tsx'), 'utf8');
+
+  assert.doesNotMatch(roomCardSource, /disabled=\{room\.recording \|\| busy\.has\(`remove-/);
+  assert.match(roomCardSource, /disabled=\{busy\.has\(`remove-/);
+  assert.match(appSource, /正在录制/);
+  assert.match(appSource, /正在合并/);
+  assert.match(appSource, /正在烧录/);
+  assert.match(appSource, /正在导出\/预览/);
+  assert.match(appSource, /不会删除已经生成的录像文件/);
+  assert.match(appSource, /removeRoom\(roomId, \{ force: true \}\)/);
 });
