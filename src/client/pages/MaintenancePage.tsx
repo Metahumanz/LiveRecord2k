@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import type React from 'react';
 import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, PathLine, SettingPanel, Toggle, UpdateProgress } from '../components/common';
@@ -23,6 +24,7 @@ export function MaintenancePage({
   busy,
   run,
   updateSettingsDraft,
+  commitSettingsDraft,
   settingsSaveStatus,
   settingsSaveError,
   retrySettingsSave,
@@ -34,8 +36,12 @@ export function MaintenancePage({
   settingsDraft: AppSettings;
   busy: Set<string>;
   run: <T>(key: string, action: () => Promise<T>) => Promise<boolean>;
-  updateSettingsDraft: (settings: Partial<AppSettings>) => void;
-  settingsSaveStatus: 'idle' | 'saving' | 'saved' | 'error';
+  updateSettingsDraft: (
+    settings: Partial<AppSettings>,
+    options?: { saveMode?: 'immediate' | 'debounced' | 'commit' }
+  ) => void;
+  commitSettingsDraft: (keys: Array<keyof AppSettings>) => Promise<boolean>;
+  settingsSaveStatus: 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
   settingsSaveError: string;
   retrySettingsSave: () => void;
   dirtyFields: Set<keyof AppSettings>;
@@ -58,8 +64,18 @@ export function MaintenancePage({
     .map((codec) => `${codec.label}：${codec.reason || '不可用'}`)
     .join('；');
 
-  function updateSetting(nextSettings: Partial<AppSettings>) {
-    updateSettingsDraft(nextSettings);
+  function updateSetting(nextSettings: Partial<AppSettings>, saveMode: 'immediate' | 'debounced' | 'commit' = 'immediate') {
+    updateSettingsDraft(nextSettings, { saveMode });
+  }
+
+  function commitSetting(...keys: Array<keyof AppSettings>) {
+    void commitSettingsDraft(keys);
+  }
+
+  function commitOnEnter(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    event.currentTarget.blur();
   }
 
   function exportSettings() {
@@ -136,6 +152,8 @@ export function MaintenancePage({
               </button>
             ) : settingsSaveStatus === 'saving' ? (
               `保存中${dirtyFields.size ? `（${dirtyFields.size} 项）` : ''}`
+            ) : settingsSaveStatus === 'dirty' ? (
+              `待保存${dirtyFields.size ? `（${dirtyFields.size} 项）` : ''}`
             ) : settingsSaveStatus === 'saved' ? (
               '已保存'
             ) : (
@@ -336,8 +354,9 @@ export function MaintenancePage({
                 onChange={(event) =>
                   updateSetting({
                     serverHost: event.target.value as AppSettings['serverHost']
-                  })
+                  }, 'commit')
                 }
+                onBlur={() => commitSetting('serverHost')}
               >
                 <option value="127.0.0.1">仅本机 127.0.0.1</option>
                 <option value="0.0.0.0">外部网络 0.0.0.0</option>
@@ -351,7 +370,9 @@ export function MaintenancePage({
                 min={1}
                 max={65535}
                 value={settingsDraft.serverPort}
-                onChange={(event) => updateSetting({ serverPort: Number(event.target.value) })}
+                onChange={(event) => updateSetting({ serverPort: Number(event.target.value) }, 'commit')}
+                onBlur={() => commitSetting('serverPort')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">端口只在保存并重启后台服务后生效。</p>
             </label>
@@ -361,7 +382,9 @@ export function MaintenancePage({
                 value={settingsDraft.accessUsername}
                 maxLength={64}
                 autoComplete="username"
-                onChange={(event) => updateSetting({ accessUsername: event.target.value })}
+                onChange={(event) => updateSetting({ accessUsername: event.target.value }, 'commit')}
+                onBlur={() => commitSetting('accessUsername')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">默认 admin；只用于 WebUI 远程管理登录。</p>
             </label>
@@ -373,7 +396,9 @@ export function MaintenancePage({
                 value={settingsDraft.accessPassword}
                 autoComplete="new-password"
                 placeholder={settingsDraft.accessAuthConfigured ? '已配置；留空表示不修改' : '至少 8 个字符'}
-                onChange={(event) => updateSetting({ accessPassword: event.target.value })}
+                onChange={(event) => updateSetting({ accessPassword: event.target.value }, 'commit')}
+                onBlur={() => commitSetting('accessPassword')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">密码只提交一次，服务端使用 scrypt 加盐哈希保存，不会回传明文。</p>
             </label>
@@ -385,8 +410,10 @@ export function MaintenancePage({
                 onChange={(event) =>
                   updateSetting({
                     trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean)
-                  })
+                  }, 'commit')
                 }
+                onBlur={() => commitSetting('trustedProxies')}
+                onKeyDown={commitOnEnter}
               />
               <p className="field-help">仅这些直连地址的 Forwarded/X-Forwarded-* 会被信任；配置不会让代理请求免登录。</p>
             </label>
@@ -394,7 +421,7 @@ export function MaintenancePage({
               <span>更新源</span>
               <input
                 value={settingsDraft.updateManifestUrl}
-                onChange={(event) => updateSetting({ updateManifestUrl: event.target.value })}
+                onChange={(event) => updateSetting({ updateManifestUrl: event.target.value }, 'debounced')}
               />
             </label>
           </div>
