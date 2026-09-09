@@ -157,6 +157,12 @@ class SettingsService {
       allowUnavailable: !outputDirChanged,
       permissionsRequired: outputDirChanged
     });
+
+    // Persist the candidate first.  Until this succeeds, the current settings
+    // must remain the source of truth for authentication, SSE clients and room
+    // monitors.  saveStore accepts the candidate specifically for this
+    // prepare/commit boundary.
+    await owner.saveStore({ settings: normalizedSettings });
     owner.settings = normalizedSettings;
     if (
       oldAccessUsername !== owner.settings.accessUsername ||
@@ -182,7 +188,6 @@ class SettingsService {
     } else if (outputDirChanged) {
       owner.log('info', '当前有录制或处理任务，已保留现有录像库；新保存目录会从下一次新录制开始使用。');
     }
-    await owner.saveStore();
     if (oldPollInterval !== owner.settings.pollIntervalSec) {
       for (const room of owner.rooms.values()) {
         if (room.monitoring) {

@@ -1251,7 +1251,7 @@ class LiveRecordService {
     }
   }
 
-  async saveStore() {
+  async saveStore(options = {}) {
     const rooms = Array.from(this.rooms.values()).map((room) => ({
       id: room.id,
       realRoomId: room.realRoomId,
@@ -1265,7 +1265,7 @@ class LiveRecordService {
       autoRecord: room.autoRecord !== false
     }));
     await this.stateStore.save({
-      settings: this.settings,
+      settings: options.settings ?? this.settings,
       rooms,
       recordings: this.recordings,
       mediaJobs: [],
