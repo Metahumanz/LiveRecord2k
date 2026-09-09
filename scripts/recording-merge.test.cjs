@@ -811,8 +811,8 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
       const sampled = await runCapturedProcess(
         ffmpegPath,
         [
-          '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(time), '-i', outputPath,
-          '-frames:v', '1', '-vf', 'crop=1:1:160:90,format=rgb24', '-f', 'rawvideo', rawPath
+          '-hide_banner', '-loglevel', 'error', '-y', '-i', outputPath, '-ss', String(time),
+          '-frames:v', '1', '-vf', 'scale=1:1:flags=area,format=rgb24', '-f', 'rawvideo', rawPath
         ],
         { timeoutMs: 20_000 }
       );

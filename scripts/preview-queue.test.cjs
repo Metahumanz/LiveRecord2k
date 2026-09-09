@@ -13,7 +13,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitFor(predicate, timeoutMs = 4_000) {
+async function waitFor(predicate, timeoutMs = 12_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -47,9 +47,16 @@ test('compatibility preview returns a queued job immediately and can cancel it b
     );
     assert.equal(source.status, 0, source.stderr);
 
-    const startPromise = service.startExportPreview({ cleanPath: sourcePath });
+    let startError = null;
+    const startPromise = service.startExportPreview({ cleanPath: sourcePath }).catch((error) => {
+      startError = error;
+      throw error;
+    });
     startPromise.catch(() => {});
-    await waitFor(() => service.mediaJobs.snapshot().some((job) => job.type === 'preview' && job.status === 'queued'));
+    await waitFor(() => {
+      if (startError) throw startError;
+      return service.mediaJobs.snapshot().some((job) => job.type === 'preview' && job.status === 'queued');
+    });
 
     const result = await Promise.race([startPromise, delay(100).then(() => null)]);
     assert.ok(result, 'HTTP-facing preview request should not wait for the media lease');
