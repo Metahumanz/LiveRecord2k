@@ -43,6 +43,13 @@ const LogsPage = lazy(async () => ({ default: (await import('./pages/LogsPage'))
 type SettingsSaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
 type SettingsSaveMode = 'immediate' | 'debounced' | 'commit';
 type SettingsDraftUpdateOptions = { autoSave?: boolean; saveMode?: SettingsSaveMode };
+const RUNTIME_CONFIG_KEYS: Array<SettingsSaveKey<AppSettings>> = [
+  'serverHost',
+  'serverPort',
+  'accessUsername',
+  'accessPassword',
+  'trustedProxies'
+];
 
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
@@ -179,6 +186,10 @@ export default function App() {
     syncDirtySettingsFieldsFromCoordinator();
     refreshSettingsSaveStatus();
     return persistSettings(successMessage);
+  }
+
+  function applyRuntimeSettings() {
+    return commitSettingsDraft(RUNTIME_CONFIG_KEYS, '运行配置已应用。');
   }
 
   function retryFailedSettingsSave() {
@@ -668,7 +679,8 @@ export default function App() {
               busy={busy}
               run={run}
               updateSettingsDraft={updateSettingsDraft}
-              commitSettingsDraft={commitSettingsDraft}
+              applyRuntimeSettings={applyRuntimeSettings}
+              runtimeConfigDirty={RUNTIME_CONFIG_KEYS.some((key) => settingsDirtyFields.has(key))}
               settingsSaveStatus={settingsSaveStatus}
               settingsSaveError={settingsSaveError}
               retrySettingsSave={retryFailedSettingsSave}

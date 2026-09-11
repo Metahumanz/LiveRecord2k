@@ -104,26 +104,7 @@ class MediaJobManager extends EventEmitter {
     const resources = normalizeResourceSlots(job.resources ?? job.resource ?? 'recording');
     const resourceCosts = normalizeResourceCosts(resources, job.resourceCosts);
     const type = String(job.type || 'recording');
-    if (type === 'recording') {
-      for (const activeJob of this.active.values()) {
-        // A capture that starts after an encode still gets priority. Keep a
-        // lightweight GPU preview (1 + 1 write units) alive, but stop a job
-        // whose write budget would collide with the capture.
-        const exceedsRecordingBudget = resources.some((slot) => {
-          const limit = Math.max(0, Number(this.limits[slot] ?? DEFAULT_LIMITS[slot] ?? 1));
-          const activeCost = activeJob.resources.includes(slot) ? Number(activeJob.resourceCosts?.[slot] || 1) : 0;
-          return activeCost + Number(resourceCosts[slot] || 1) > limit;
-        });
-        if (
-          activeJob.resources.includes('cpuEncode') ||
-          activeJob.resources.includes('gpuComposite') ||
-          exceedsRecordingBudget
-        ) {
-          activeJob.cancel?.();
-        }
-      }
-    }
-    this.external.set(id, {
+    const externalJob = {
       id,
       type,
       resource: resourceSummary(resources),
@@ -133,7 +114,16 @@ class MediaJobManager extends EventEmitter {
       status: 'running',
       startedAt: Date.now(),
       cancel: job.cancel
-    });
+    };
+    if (type === 'recording') {
+      // External captures are not scheduled through acquire(), so account for
+      // every already-running recording before allowing the next capture to
+      // displace lower-priority media work. A recording is never rejected: if
+      // recordings alone exceed a configured budget, all conflicting media
+      // work is still asked to yield and the capture continues.
+      this.preemptForRecording(externalJob);
+    }
+    this.external.set(id, externalJob);
     this.schedule();
     this.emit('change');
     return () => {
@@ -175,14 +165,67 @@ class MediaJobManager extends EventEmitter {
     const runningJobs = [...this.active.values(), ...this.external.values()];
     const recordingActive = runningJobs.some((job) => job.resources.includes('recording'));
     if (recordingActive && requiredSlots.some((slot) => slot === 'cpuEncode' || slot === 'gpuComposite')) return false;
+    const usage = this.getResourceUsage(runningJobs);
     return requiredSlots.every((slot) => {
-      const limit = Math.max(0, Number(this.limits[slot] ?? DEFAULT_LIMITS[slot] ?? 1));
-      const activeCost = runningJobs.reduce(
-        (total, job) => total + (job.resources.includes(slot) ? Number(job.resourceCosts?.[slot] || 1) : 0),
-        0
-      );
-      return activeCost + Number(requiredCosts[slot] || 1) <= limit;
+      return usage[slot] + Number(requiredCosts[slot] || 1) <= this.getResourceLimit(slot);
     });
+  }
+
+  getResourceLimit(slot) {
+    return Math.max(0, Number(this.limits[slot] ?? DEFAULT_LIMITS[slot] ?? 1));
+  }
+
+  getResourceUsage(jobs) {
+    const usage = Object.fromEntries(Array.from(RESOURCE_SLOTS, (slot) => [slot, 0]));
+    for (const job of jobs) {
+      for (const slot of job.resources) {
+        usage[slot] += Number(job.resourceCosts?.[slot] || 1);
+      }
+    }
+    return usage;
+  }
+
+  getOverBudgetSlots(jobs) {
+    const usage = this.getResourceUsage(jobs);
+    return new Set(Array.from(RESOURCE_SLOTS).filter((slot) => usage[slot] > this.getResourceLimit(slot)));
+  }
+
+  preemptForRecording(recording) {
+    const activeJobs = Array.from(this.active.values()).sort(
+      (left, right) => left.priority - right.priority || left.createdAt - right.createdAt
+    );
+    const projectedJobs = [
+      ...Array.from(this.external.values()).filter((job) => job.id !== recording.id),
+      recording,
+      ...activeJobs
+    ];
+    const preemptions = [];
+
+    while (activeJobs.length) {
+      const overBudgetSlots = this.getOverBudgetSlots(projectedJobs);
+      const index = activeJobs.findIndex((activeJob) => {
+        if (activeJob.preemptRequested) return false;
+        return (
+          activeJob.resources.includes('cpuEncode') ||
+          activeJob.resources.includes('gpuComposite') ||
+          activeJob.resources.some((slot) => overBudgetSlots.has(slot))
+        );
+      });
+      if (index < 0) break;
+      const [activeJob] = activeJobs.splice(index, 1);
+      const projectedIndex = projectedJobs.indexOf(activeJob);
+      if (projectedIndex >= 0) projectedJobs.splice(projectedIndex, 1);
+      preemptions.push(activeJob);
+    }
+
+    for (const activeJob of preemptions) {
+      activeJob.preemptRequested = true;
+      try {
+        activeJob.cancel?.();
+      } catch {
+        // Capture startup must not be blocked by a best-effort cancellation.
+      }
+    }
   }
 
   cancel(id) {

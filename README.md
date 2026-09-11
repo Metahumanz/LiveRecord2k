@@ -228,7 +228,7 @@ http://192.168.1.23:3263
 curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh
 ```
 
-脚本只会交互询问并确认一次 WebUI 管理密码，其余步骤自动完成：识别发行版和 CPU 架构、安装依赖、读取最新 Release、验证 Ed25519 官方签名、选择 Deb 或通用包、复验 SHA-256、写入首次鉴权配置、启用 systemd、启动服务并检查 `/api/state`。默认监听 `0.0.0.0:3263`，完成后会打印访问地址。
+脚本会在首次安装时交互询问并确认一次 WebUI 管理密码，并选择监听 `127.0.0.1:3263`（默认，仅本机）或 `0.0.0.0:3263`（所有网卡）；其余步骤自动完成：识别发行版和 CPU 架构、安装依赖、读取最新 Release、验证 Ed25519 官方签名、选择 Deb 或通用包、复验 SHA-256、写入鉴权配置、启用 systemd、启动服务并检查 `/api/state`。签名校验使用 OpenSSL 1.1.1 也支持的 Ed25519 EVP 接口，不要求 OpenSSL 3.x。重装时若没有显式传入配置变量，会沿用已保存的监听地址、端口、管理用户名、自动更新设置和密码 hash。
 
 安装包默认通过 `https://gh-proxy.com/` 镜像下载；版本、包名、架构与 SHA-256 必须匹配内置公钥验证过的官方签名清单，镜像下载失败或内容不匹配时会自动回退 GitHub 官方源。可以指定其他兼容的 GitHub 代理前缀，或关闭镜像直连：
 
@@ -253,11 +253,11 @@ curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/script
   | sudo env BILI_RECORD_AUTH_PASSWORD='替换成至少8位的密码' sh
 ```
 
-如果只通过本机反向代理或 SSH 隧道访问：
+无人值守安装，或重装时需要改为让局域网/公网客户端直连，可显式监听所有网卡：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh \
-  | sudo env BILI_RECORD_HOST=127.0.0.1 sh
+  | sudo env BILI_RECORD_HOST=0.0.0.0 sh
 ```
 
 ### Debian / Ubuntu
@@ -289,7 +289,7 @@ sudo systemctl status bili-record-2k
 /etc/bili-record-2k/environment
 ```
 
-Host、Port、管理用户名和密码只在首次 bootstrap 时从这个环境文件迁移；之后以 WebUI 持久化设置为准，密码只保留 scrypt hash，环境文件会删除这些明文项。修改持久化配置后可重启并查看日志：
+普通安装包只在首次 bootstrap 时从这个环境文件迁移 Host、Port、管理用户名和密码；之后以 WebUI 持久化设置为准，密码只保留 scrypt hash，环境文件会删除这些明文项。一键安装器在显式传入这些变量时会做一次受控覆盖，方便重装或重设管理密码；没有显式传入时保留原值。修改持久化配置后可重启并查看日志：
 
 ```bash
 sudo systemctl restart bili-record-2k
@@ -298,7 +298,11 @@ sudo journalctl -u bili-record-2k -f
 
 如果需要在首次安装后改为监听所有网卡，请在 WebUI 的“软件维护”页修改监听地址为 `0.0.0.0`；不要继续编辑 bootstrap 环境变量。反向代理部署应在同页填写实际直连代理的 IP/CIDR（本机 Caddy/Nginx 通常填 `loopback`）作为可信代理，仅可信直连代理的 `X-Forwarded-*` 才参与客户端地址和 HTTPS 判断；可信代理不会获得免认证权限。这时仍应只通过防火墙开放 HTTPS 反向代理端口，不应把明文 WebUI 直接暴露到公网。
 
-0.4.0 以后新录像根目录使用 setgid 与组可写权限，systemd 服务使用 `UMask=0007`。录像目录改到挂载盘时，需要让 `bili-record-2k` 用户或组拥有目标目录写权限；保存自定义路径、启动录像库和开始新录像时，应用会将其配置的录像根目录节点规范为当前服务组的 `2770`。这个操作严格只作用于根目录本身，安装、升级和运行时都不会递归 chmod/chown 历史子目录或录像；若现有根目录不属于服务用户而无法安全修改，应用会要求管理员只修正该目录节点后再开始新录像。
+0.4.0 以后新录像根目录使用 setgid 与组可写权限，systemd 服务使用 `UMask=0007`。录像目录改到挂载盘时，需要让 `bili-record-2k` 用户或组拥有目标目录写权限；保存自定义路径、启动录像库和开始新录像时，应用会将其配置的录像根目录节点规范为当前服务组的 `2770`。这个操作严格只作用于根目录本身，安装、升级和运行时都不会递归 chmod/chown 历史子目录或录像；若现有根目录不属于服务用户而无法安全修改，应用会要求管理员只修正该目录节点后再开始新录像。一键安装完成前还会以实际 systemd 服务用户 `bili-record-2k:bili-record-2k` 对最终录像目录创建临时目录、写入、读取并删除测试文件；SMB/CIFS 挂载失败时安装会停止，并提示检查 `uid`、`gid`、`file_mode` 与 `dir_mode`，而不是等到开始录制才报错。
+
+### Jetson 硬件编码
+
+在 Jetson AGX Orin 的 Ubuntu 20.04 / L4T R35 系列上，安装器会保留服务用户的 `video`、`render` 组成员资格。运行时会先实际试编码 FFmpeg 的 `h264_v4l2m2m` / `hevc_v4l2m2m`；若系统 FFmpeg 没有可用硬编，则检测 `gst-inspect-1.0` 和两帧 `nvv4l2h264enc` / `nvv4l2h265enc` 管线。检测通过后，弹幕烧录、片段导出及头像分段烧录会将 FFmpeg 的渲染后 I420 帧流式传给 Jetson GStreamer V4L2 编码器，再由 FFmpeg 封装音视频；检测或试编码失败时才保留软件编码回退。
 
 ### systemd 与自动更新
 

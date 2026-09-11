@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
+const { spawn } = require('node:child_process');
 const { readDanmakuEvents, getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
 
 const USER_AGENT =
@@ -18,6 +19,56 @@ function formatFfmpegSeconds(value) {
 function isHevcCodec(codec) {
   const value = String(codec || '').toLowerCase();
   return value.includes('hevc') || value.includes('h265') || value.includes('x265');
+}
+
+function isV4l2M2mCodec(codec) {
+  return /_v4l2m2m$/i.test(String(codec || '').trim());
+}
+
+function isJetsonGstreamerCodec(codec) {
+  return /^(?:h264|hevc)_nvv4l2$/i.test(String(codec || '').trim());
+}
+
+function getJetsonGstreamerEncoder(codec) {
+  if (!isJetsonGstreamerCodec(codec)) return '';
+  return isHevcCodec(codec) ? 'nvv4l2h265enc' : 'nvv4l2h264enc';
+}
+
+// V4L2 M2M encoders use a target bitrate rather than CRF.  Keep the existing
+// quality control meaningful by mapping its 16–35 range to a conservative
+// bitrate range; the real capability probe guarantees that this encoder can
+// accept a raw FFmpeg filter output on the host before it reaches this path.
+function getV4l2TargetBitrate(quality, codec, options = {}) {
+  const normalizedQuality = Math.min(35, Math.max(16, Number(quality) || 24));
+  const ratio = (35 - normalizedQuality) / 19;
+  const isPreview = Boolean(options.preview);
+  const minMbps = isPreview ? 2 : isHevcCodec(codec) ? 6 : 8;
+  const maxMbps = isPreview ? 6 : isHevcCodec(codec) ? 22 : 30;
+  return `${Math.round(minMbps + (maxMbps - minMbps) * ratio)}M`;
+}
+
+function getJetsonGstreamerBitrate(quality, codec, options = {}) {
+  const value = getV4l2TargetBitrate(quality, codec, options);
+  return Math.max(1_000_000, Number.parseInt(value, 10) * 1_000_000);
+}
+
+function formatGstreamerFramerate(value) {
+  const fps = Math.max(1, Math.min(240, Number(value) || 30));
+  const rounded = Math.round(fps);
+  if (Math.abs(fps - rounded) < 0.0001) return `${rounded}/1`;
+  const numerator = Math.max(1, Math.round(fps * 1000));
+  const denominator = 1000;
+  const divisor = greatestCommonDivisor(numerator, denominator);
+  return `${numerator / divisor}/${denominator / divisor}`;
+}
+
+function greatestCommonDivisor(left, right) {
+  let a = Math.abs(Math.trunc(left));
+  let b = Math.abs(Math.trunc(right));
+  while (b) {
+    [a, b] = [b, a % b];
+  }
+  return a || 1;
 }
 
 function escapeFilterPath(filePath) {
@@ -138,6 +189,55 @@ function createLeadingVideoPaddingFilter(leadingVideoPaddingSec, outputDuration)
     filters.push(`trim=duration=${formatFilterNumber(duration)}`, 'setpts=PTS-STARTPTS');
   }
   return `,${filters.join(',')}`;
+}
+
+// `tpad` has incompatible start-PTS behavior across FFmpeg builds when it is
+// appended to a filtered stream. Avatar graphs know the probed video size, so
+// generate a finite black source explicitly and concatenate it before the
+// rendered source. This keeps video at the same clock on Windows and Linux.
+function createExplicitLeadingVideoPaddingGraph({
+  sourceLabel,
+  outputLabel,
+  leadingVideoPaddingSec,
+  outputDuration,
+  fps,
+  videoWidth = 0,
+  videoHeight = 0,
+  prefix = 'leading_video'
+} = {}) {
+  const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  if (padding <= 0.0005) return '';
+  const duration = Math.max(0, Number(outputDuration) || 0);
+  const frameDuration = 1 / Math.max(1, normalizeMergeFps(fps) || 30);
+  const outputTrim = duration > 0 ? `,trim=duration=${formatFilterNumber(duration)}` : '';
+  const width = Math.floor(Math.max(0, Number(videoWidth) || 0) / 2) * 2;
+  const height = Math.floor(Math.max(0, Number(videoHeight) || 0) / 2) * 2;
+  const blackPad = `${prefix}_black_pad`;
+  const mainVideo = `${prefix}_main_video`;
+  if (width >= 2 && height >= 2) {
+    const frameRate = normalizeMergeFps(fps) || 30;
+    return [
+      `color=c=black:s=${width}x${height}:r=${formatFilterNumber(frameRate)}:d=${formatFilterNumber(padding)},` +
+        `format=yuv420p,setpts=PTS-STARTPTS[${blackPad}]`,
+      `${sourceLabel}setpts=PTS-STARTPTS[${mainVideo}]`,
+      `[${blackPad}][${mainVideo}]concat=n=2:v=1:a=0${outputTrim},setpts=PTS-STARTPTS,format=yuv420p${outputLabel}`
+    ].join(';\n');
+  }
+
+  // Older internal callers did not carry probed dimensions. Keep a bounded
+  // fallback for those callers; normal burn/export paths always use the finite
+  // color source above.
+  const padSource = `${prefix}_pad_source`;
+  const mainSource = `${prefix}_main_source`;
+  return [
+    `${sourceLabel}split=2[${padSource}][${mainSource}]`,
+    `[${padSource}]trim=duration=${formatFilterNumber(frameDuration)},setpts=PTS-STARTPTS,` +
+      `geq=lum=16:cb=128:cr=128,tpad=stop_duration=${formatFilterNumber(padding)}:stop_mode=clone,` +
+      `trim=duration=${formatFilterNumber(padding)},` +
+      `setpts=PTS-STARTPTS[${blackPad}]`,
+    `[${mainSource}]setpts=PTS-STARTPTS[${mainVideo}]`,
+    `[${blackPad}][${mainVideo}]concat=n=2:v=1:a=0${outputTrim},setpts=PTS-STARTPTS,format=yuv420p${outputLabel}`
+  ].join(';\n');
 }
 
 function createBurnVideoFilter(assPath, fps, options = {}) {
@@ -325,8 +425,9 @@ function createAvatarOverlayFilterScript({
     ? `,settb=AVTB,setpts=PTS-STARTPTS+${formatFilterNumber(sourceClockOffset)}/TB`
     : '';
   const leadingVideoPadding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  const usesExplicitLeadingPadding = leadingVideoPadding > 0.0005;
   const outputClockFilter = resetOutputTimestamps || sourceClockOffset || leadingVideoPadding > 0 ? ',setpts=PTS-STARTPTS' : '';
-  const leadingPaddingFilter = createLeadingVideoPaddingFilter(leadingVideoPadding, outputDuration);
+  const outputLabel = usesExplicitLeadingPadding ? '[avatar_leading_source]' : '[vout]';
   const panel = avatarOverlay?.panel || {};
   const panelLeft = Math.max(0, Number(panel.left) || 0);
   const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
@@ -389,11 +490,25 @@ function createAvatarOverlayFilterScript({
   filters.push(
     gpuComposite
       ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
-          leadingPaddingFilter ? ',hwdownload,format=yuv420p' : ''
-        }${outputClockFilter}${leadingPaddingFilter}[vout]`
+          usesExplicitLeadingPadding ? ',hwdownload,format=yuv420p' : ''
+        }${outputClockFilter}${outputLabel}`
       : `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
-          `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${leadingPaddingFilter}[vout]`
+          `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${outputLabel}`
   );
+  if (usesExplicitLeadingPadding) {
+    filters.push(
+      createExplicitLeadingVideoPaddingGraph({
+        sourceLabel: outputLabel,
+        outputLabel: '[vout]',
+        leadingVideoPaddingSec: leadingVideoPadding,
+        outputDuration,
+        fps,
+        videoWidth: avatarOverlay?.videoWidth,
+        videoHeight: avatarOverlay?.videoHeight,
+        prefix: 'avatar_leading'
+      })
+    );
+  }
   return `${filters.join(';\n')}\n`;
 }
 
@@ -418,18 +533,30 @@ function createAvatarOverlayChunkFilterScript({
   const end = Number(chunkEnd);
   const entries = clipAvatarOverlayEntries(avatarOverlay, start, end);
   const sourceClockOffset = Math.max(0, Number.isFinite(Number(timelineOffset)) ? Number(timelineOffset) : start);
+  const leadingVideoPadding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
   if (!entries.length) {
-    return (
-      `[0:v]${createBurnVideoFilter(assPath, fps, {
+    const outputLabel = leadingVideoPadding > 0.0005 ? '[chunk_leading_source]' : '[vout]';
+    const sourceFilter = `[0:v]${createBurnVideoFilter(assPath, fps, {
         timelineOffset: sourceClockOffset,
         skipInitialKeyframeGuard: true,
         resetOutputTimestamps: true,
-        leadingVideoPaddingSec,
-        outputDuration,
         inputTrimStartSec,
         inputTrimEndSec,
         preserveSourceFrameTiming
-      })},format=yuv420p[vout]\n`
+      })},format=yuv420p${outputLabel}`;
+    if (leadingVideoPadding <= 0.0005) return `${sourceFilter}\n`;
+    return (
+      `${sourceFilter};\n` +
+      `${createExplicitLeadingVideoPaddingGraph({
+        sourceLabel: outputLabel,
+        outputLabel: '[vout]',
+        leadingVideoPaddingSec: leadingVideoPadding,
+        outputDuration,
+        fps,
+        videoWidth: avatarOverlay?.videoWidth,
+        videoHeight: avatarOverlay?.videoHeight,
+        prefix: 'chunk_leading'
+      })}\n`
     );
   }
   return createAvatarOverlayFilterScript({
@@ -591,6 +718,8 @@ function createBurnArgs({
     args.push('-global_quality', String(crf));
   } else if ((codec || '').includes('amf')) {
     args.push('-quality', 'balanced', '-qp_i', String(crf), '-qp_p', String(crf));
+  } else if (isV4l2M2mCodec(codec)) {
+    args.push('-b:v', getV4l2TargetBitrate(crf, codec));
   } else {
     args.push('-preset', 'medium', '-crf', String(crf));
   }
@@ -630,6 +759,171 @@ function createBurnArgs({
     args.push('-an');
   }
   args.push(burnedPath);
+  return args;
+}
+
+// Jetson's L4T FFmpeg package commonly has NVIDIA V4L2 *decode* support but
+// not an encoder.  Render the existing FFmpeg filter graph to raw I420 and
+// stream it into the proven nvv4l2 GStreamer encoder instead of buffering a
+// multi-gigabyte raw intermediate on disk.
+function createBurnRawVideoArgs({
+  cleanPath,
+  assPath,
+  fps,
+  avatarOverlay,
+  startTime,
+  duration,
+  inputSeek = false,
+  inputSeekPrerollSec = 0,
+  inputTrimStartSec = 0,
+  inputTrimEndSec = 0,
+  timelineOffset = 0,
+  leadingVideoPaddingSec = 0,
+  decoder = 'software'
+}) {
+  const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
+  const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
+  const inputSeekPreroll = inputSeek && hasStart
+    ? Math.min(Number(startTime), Math.max(0, Number(inputSeekPrerollSec) || 0))
+    : 0;
+  const inputSeekStart = Math.max(0, Number(startTime) - inputSeekPreroll);
+  const hasFilterScript = Boolean(String(avatarOverlay?.filterScriptPath || '').trim());
+  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  appendHardwareDecodeInputArgs(args, decoder);
+  if (inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(inputSeekStart));
+  args.push('-i', cleanPath);
+  if (!inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+  if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
+  if (hasFilterScript) {
+    args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]');
+  } else {
+    args.push(
+      '-map',
+      '0:v:0',
+      '-vf',
+      createBurnVideoFilter(assPath, fps, {
+        timelineOffset,
+        resetOutputTimestamps: Boolean(inputSeek) || Math.max(0, Number(leadingVideoPaddingSec) || 0) > 0,
+        leadingVideoPaddingSec,
+        outputDuration: duration,
+        skipInitialKeyframeGuard: Boolean(inputSeek),
+        inputTrimStartSec,
+        inputTrimEndSec
+      })
+    );
+  }
+  // Rawvideo carries no timestamps.  Force the same CFR that rawvideoparse
+  // will assign downstream so a VFR source cannot silently drift against the
+  // separately muxed source audio.
+  args.push(
+    '-an',
+    '-r',
+    formatGstreamerFramerate(fps),
+    '-c:v',
+    'rawvideo',
+    '-pix_fmt',
+    'yuv420p',
+    '-f',
+    'rawvideo',
+    'pipe:1'
+  );
+  return args;
+}
+
+function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false }) {
+  const encoder = getJetsonGstreamerEncoder(codec);
+  const outputWidth = makeEvenDimension(width);
+  const outputHeight = makeEvenDimension(height);
+  if (!encoder || !outputWidth || !outputHeight || !outputPath) {
+    throw new Error('Jetson GStreamer 编码缺少有效的编码器、画面尺寸或输出路径。');
+  }
+  const hevc = isHevcCodec(codec);
+  const parser = hevc ? 'h265parse' : 'h264parse';
+  const encodedCaps = hevc
+    ? 'video/x-h265,stream-format=byte-stream,alignment=au'
+    : 'video/x-h264,stream-format=byte-stream,alignment=au';
+  return [
+    '-q',
+    '-e',
+    'fdsrc',
+    'fd=0',
+    'blocksize=1048576',
+    '!',
+    'rawvideoparse',
+    `width=${outputWidth}`,
+    `height=${outputHeight}`,
+    'format=i420',
+    `framerate=${formatGstreamerFramerate(fps)}`,
+    '!',
+    'nvvidconv',
+    '!',
+    'video/x-raw(memory:NVMM),format=NV12',
+    '!',
+    encoder,
+    `bitrate=${getJetsonGstreamerBitrate(quality, codec, { preview })}`,
+    '!',
+    parser,
+    '!',
+    encodedCaps,
+    '!',
+    'filesink',
+    `location=${outputPath}`
+  ];
+}
+
+function createBurnEncodedVideoMuxArgs({
+  encodedVideoPath,
+  cleanPath,
+  outputPath,
+  codec,
+  fps,
+  startTime,
+  duration,
+  container,
+  leadingAudioPaddingSec = 0,
+  includeAudio = true,
+  copyAudio = false
+}) {
+  const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
+  const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
+  const args = [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-r',
+    formatGstreamerFramerate(fps),
+    '-i',
+    encodedVideoPath
+  ];
+  if (includeAudio) {
+    if (hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+    args.push('-i', cleanPath);
+  }
+  if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
+  args.push('-map', '0:v:0');
+  if (includeAudio) {
+    const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
+    if (copyAudio && audioPaddingMs <= 0) {
+      args.push('-map', '1:a?', '-c:a', 'copy', '-shortest');
+    } else {
+      const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
+      if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
+      if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
+      audioFilters.push('asetpts=PTS-STARTPTS');
+      args.push('-map', '1:a?', '-af', audioFilters.join(','), '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-shortest');
+    }
+  } else {
+    args.push('-an');
+  }
+  args.push('-c:v', 'copy', '-dn', '-sn', '-avoid_negative_ts', 'make_zero');
+  if (container === 'mp4') {
+    if (isHevcCodec(codec)) args.push('-tag:v', 'hvc1');
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
   return args;
 }
 
@@ -731,6 +1025,8 @@ function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern, codec =
     args.push('-global_quality', '28');
   } else if (String(codec).includes('amf')) {
     args.push('-quality', 'speed', '-qp_i', '28', '-qp_p', '28');
+  } else if (isV4l2M2mCodec(codec)) {
+    args.push('-b:v', getV4l2TargetBitrate(28, codec, { preview: true }));
   } else {
     args.push('-preset', 'veryfast', '-crf', '28');
   }
@@ -754,6 +1050,112 @@ function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern, codec =
     playlistPath
   );
   return args;
+}
+
+// Runs the existing FFmpeg filter/decode stage and a Jetson GStreamer encoder
+// as a bounded streaming pipeline.  FFmpeg is deliberately the child exposed
+// to callers: killing it closes GStreamer's fdsrc cleanly, which causes the
+// latter to receive EOS and leave a playable elementary stream for the mux
+// stage.  A GStreamer failure also terminates FFmpeg so a stalled pipe cannot
+// keep the recording job alive.
+function runFfmpegToGstreamerJob({
+  ffmpegPath,
+  ffmpegArgs,
+  gstreamerPath = 'gst-launch-1.0',
+  gstreamerArgs,
+  onFfmpegStderr,
+  onGstreamerStderr,
+  onChild
+}) {
+  return new Promise((resolve, reject) => {
+    let ffmpeg = null;
+    let gstreamer = null;
+    let ffmpegClosed = false;
+    let gstreamerClosed = false;
+    let ffmpegResult = { code: null, signal: '', error: null, stderr: '' };
+    let gstreamerResult = { code: null, signal: '', error: null, stderr: '' };
+    let settled = false;
+
+    const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim().slice(-4000);
+    const stop = (child) => {
+      if (!child || child.exitCode !== null || child.signalCode) return;
+      try {
+        child.kill('SIGKILL');
+      } catch {}
+    };
+    const finish = () => {
+      if (settled || !ffmpegClosed || !gstreamerClosed) return;
+      settled = true;
+      onChild?.(null);
+      if (ffmpegResult.code === 0 && !ffmpegResult.error && gstreamerResult.code === 0 && !gstreamerResult.error) {
+        resolve();
+        return;
+      }
+      const detail = compact(
+        gstreamerResult.stderr || ffmpegResult.stderr || gstreamerResult.error?.message || ffmpegResult.error?.message
+      );
+      const error = new Error(
+        `Jetson GStreamer 编码失败：FFmpeg 退出码 ${ffmpegResult.code ?? '-'}，GStreamer 退出码 ${
+          gstreamerResult.code ?? '-'
+        }${detail ? `：${detail}` : ''}`
+      );
+      error.ffmpegExitCode = ffmpegResult.code;
+      error.ffmpegSignal = ffmpegResult.signal || '';
+      error.ffmpegStderr = compact(ffmpegResult.stderr);
+      error.gstreamerExitCode = gstreamerResult.code;
+      error.gstreamerSignal = gstreamerResult.signal || '';
+      error.gstreamerStderr = compact(gstreamerResult.stderr);
+      reject(error);
+    };
+
+    try {
+      gstreamer = spawn(gstreamerPath, gstreamerArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+      ffmpeg = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      onChild?.(ffmpeg);
+      ffmpeg.stdout.pipe(gstreamer.stdin);
+      ffmpeg.stdout.on('error', () => {});
+      gstreamer.stdin.on('error', () => {
+        stop(ffmpeg);
+      });
+    } catch (error) {
+      onChild?.(null);
+      reject(error);
+      return;
+    }
+
+    ffmpeg.stderr.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      ffmpegResult.stderr = `${ffmpegResult.stderr}${text}`.slice(-8000);
+      onFfmpegStderr?.(text);
+    });
+    gstreamer.stderr.on('data', (chunk) => {
+      const text = chunk.toString('utf8');
+      gstreamerResult.stderr = `${gstreamerResult.stderr}${text}`.slice(-8000);
+      onGstreamerStderr?.(text);
+    });
+    ffmpeg.on('error', (error) => {
+      ffmpegResult.error = error;
+      stop(gstreamer);
+    });
+    gstreamer.on('error', (error) => {
+      gstreamerResult.error = error;
+      stop(ffmpeg);
+    });
+    ffmpeg.on('close', (code, signal) => {
+      ffmpegResult.code = code;
+      ffmpegResult.signal = signal || '';
+      ffmpegClosed = true;
+      if (code !== 0) stop(gstreamer);
+      finish();
+    });
+    gstreamer.on('close', (code, signal) => {
+      gstreamerResult.code = code;
+      gstreamerResult.signal = signal || '';
+      gstreamerClosed = true;
+      if (code !== 0) stop(ffmpeg);
+      finish();
+    });
+  });
 }
 
 function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, container }) {
@@ -802,7 +1204,7 @@ function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec }
 
 function resolveMergePixelFormat(targetVideoInfo, videoCodec) {
   const sourcePixelFormat = String(targetVideoInfo?.pixelFormat || '').toLowerCase();
-  const hardwareCodec = /(?:nvenc|qsv|amf)/.test(String(videoCodec || ''));
+  const hardwareCodec = /(?:nvenc|qsv|amf|v4l2m2m)/.test(String(videoCodec || ''));
   const bitDepth = Number(targetVideoInfo?.bitDepth || 8);
   const softwarePixelFormats = new Set([
     'yuv420p', 'yuv422p', 'yuv444p',
@@ -828,6 +1230,8 @@ function appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, s
   } else if (codec.includes('amf')) {
     const qp = isHevcCodec(codec) ? '24' : '20';
     args.push('-quality', 'balanced', '-qp_i', qp, '-qp_p', qp);
+  } else if (isV4l2M2mCodec(codec)) {
+    args.push('-b:v', getV4l2TargetBitrate(isHevcCodec(codec) ? 24 : 20, codec));
   } else {
     args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20', '-threads', String(Math.max(1, Number(softwareThreads) || 4)));
   }
@@ -1216,14 +1620,24 @@ async function copyFirstExistingFile(candidates, outputPath, fallbackText) {
 }
 
 module.exports = {
+  isV4l2M2mCodec,
+  isJetsonGstreamerCodec,
+  getJetsonGstreamerEncoder,
+  getV4l2TargetBitrate,
+  getJetsonGstreamerBitrate,
+  formatGstreamerFramerate,
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnArgs,
+  createBurnRawVideoArgs,
+  createJetsonGstreamerEncodeArgs,
+  createBurnEncodedVideoMuxArgs,
   createBurnAudioMuxArgs,
   createAvatarOverlayFilterScript,
   createAvatarOverlayChunkFilterScript,
   clipAvatarOverlayEntries,
   createPreviewHlsArgs,
+  runFfmpegToGstreamerJob,
   createClipCopyArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,

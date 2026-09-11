@@ -24,6 +24,7 @@ const {
   parseFfmpegVideoInfo,
   probeMediaFileInfo,
   probeMediaTimelineInfo,
+  probeMediaTimelineHealth,
   runCapturedProcess
 } = require('../src/server/shared/helpers.cjs');
 
@@ -791,6 +792,8 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
       fps: 30,
       avatarLayer: {
         panel: { left: 10, width: 120, height: 180 },
+        videoWidth: 320,
+        videoHeight: 180,
         temporaryDir,
         chunkDuration: 1.5,
         entries: []
@@ -805,25 +808,37 @@ test('chunked burns preserve a source video lead-in instead of pulling video ahe
     assert.ok(Math.abs(outputInfo.durationSec - 3) < 0.15, JSON.stringify(outputInfo));
     const timeline = await probeMediaTimelineInfo(ffmpegPath, outputPath, outputInfo);
     assert.ok(Math.abs(timeline.avDeltaSec) < 0.12, JSON.stringify(timeline));
+    const timelineHealth = await probeMediaTimelineHealth(ffmpegPath, outputPath, outputInfo);
 
     const samplePixel = async (time, label) => {
       const rawPath = path.join(tempDir, `${label}.raw`);
+      const frameIndex = Math.floor(Number(time) * 30);
       const sampled = await runCapturedProcess(
         ffmpegPath,
         [
-          '-hide_banner', '-loglevel', 'error', '-y', '-ss', String(time), '-i', outputPath,
-          '-frames:v', '1', '-vf', 'crop=1:1:160:90,format=rgb24', '-f', 'rawvideo', rawPath
+          '-hide_banner', '-loglevel', 'error', '-y', '-i', outputPath,
+          '-frames:v', String(frameIndex + 1),
+          '-vf', 'fps=30:start_time=0,scale=1:1:flags=area,format=rgb24', '-f', 'rawvideo', rawPath
         ],
         { timeoutMs: 20_000 }
       );
       assert.equal(sampled.status, 0, sampled.stderr);
-      return [...(await fsp.readFile(rawPath)).subarray(0, 3)];
+      const pixels = await fsp.readFile(rawPath);
+      const offset = frameIndex * 3;
+      assert.ok(pixels.length >= offset + 3, `未能读取 ${time}s 的视频帧`);
+      return [...pixels.subarray(offset, offset + 3)];
     };
     const isBlack = ([red, green, blue]) => red < 20 && green < 20 && blue < 20;
     const isRed = ([red, green, blue]) => red > 180 && green < 70 && blue < 70;
     const isBlue = ([red, green, blue]) => blue > 180 && red < 70 && green < 70;
 
-    assert.ok(isBlack(await samplePixel(0.5, 'lead-in')), 'the original video lead-in must remain black');
+    const firstFrame = await samplePixel(0, 'first-frame');
+    const leadInFrame = await samplePixel(0.5, 'lead-in');
+    assert.ok(
+      isBlack(leadInFrame),
+      `the original video lead-in must remain black (first=${firstFrame.join(',')}, lead-in=${leadInFrame.join(',')}, ` +
+        `videoPts=${timelineHealth.firstVideoPts}, audioPts=${timelineHealth.firstAudioPts})`
+    );
     assert.ok(isRed(await samplePixel(1.2, 'red')), 'red source video must begin after the one-second lead-in');
     assert.ok(isBlue(await samplePixel(2.2, 'blue')), 'later chunks must remain on the same source clock');
   } finally {
@@ -877,6 +892,8 @@ test('CUDA avatar chunks download once before applying a CPU-only video lead-in'
     fps: 60,
     avatarOverlay: {
       panel: { left: 10, width: 120, height: 180 },
+      videoWidth: 1920,
+      videoHeight: 1080,
       entries: [
         {
           imagePath: 'C:/temp/avatar.png',
@@ -891,10 +908,10 @@ test('CUDA avatar chunks download once before applying a CPU-only video lead-in'
     outputDuration: 2,
     gpuComposite: true
   });
-  assert.match(
-    script,
-    /scale_cuda=format=yuv420p,hwdownload,format=yuv420p,setpts=PTS-STARTPTS,tpad=start_duration=1:start_mode=add:color=black/
-  );
+  assert.match(script, /scale_cuda=format=yuv420p,hwdownload,format=yuv420p,setpts=PTS-STARTPTS\[avatar_leading_source\]/);
+  assert.match(script, /color=c=black:s=1920x1080:r=60:d=1,format=yuv420p,setpts=PTS-STARTPTS\[avatar_leading_black_pad\]/);
+  assert.match(script, /\[avatar_leading_source\]setpts=PTS-STARTPTS\[avatar_leading_main_video\]/);
+  assert.match(script, /\[avatar_leading_black_pad\]\[avatar_leading_main_video\]concat=n=2:v=1:a=0,trim=duration=2/);
 });
 
 test('multiple static avatar inputs hold their first frame until their queue window', () => {

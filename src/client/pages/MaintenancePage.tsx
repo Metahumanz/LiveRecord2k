@@ -1,5 +1,4 @@
 import { useRef, useState } from 'react';
-import type React from 'react';
 import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, PathLine, SettingPanel, Toggle, UpdateProgress } from '../components/common';
@@ -24,7 +23,8 @@ export function MaintenancePage({
   busy,
   run,
   updateSettingsDraft,
-  commitSettingsDraft,
+  applyRuntimeSettings,
+  runtimeConfigDirty,
   settingsSaveStatus,
   settingsSaveError,
   retrySettingsSave,
@@ -40,7 +40,8 @@ export function MaintenancePage({
     settings: Partial<AppSettings>,
     options?: { saveMode?: 'immediate' | 'debounced' | 'commit' }
   ) => void;
-  commitSettingsDraft: (keys: Array<keyof AppSettings>) => Promise<boolean>;
+  applyRuntimeSettings: () => Promise<boolean>;
+  runtimeConfigDirty: boolean;
   settingsSaveStatus: 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
   settingsSaveError: string;
   retrySettingsSave: () => void;
@@ -66,16 +67,6 @@ export function MaintenancePage({
 
   function updateSetting(nextSettings: Partial<AppSettings>, saveMode: 'immediate' | 'debounced' | 'commit' = 'immediate') {
     updateSettingsDraft(nextSettings, { saveMode });
-  }
-
-  function commitSetting(...keys: Array<keyof AppSettings>) {
-    void commitSettingsDraft(keys);
-  }
-
-  function commitOnEnter(event: React.KeyboardEvent<HTMLInputElement>) {
-    if (event.key !== 'Enter') return;
-    event.preventDefault();
-    event.currentTarget.blur();
   }
 
   function exportSettings() {
@@ -142,12 +133,22 @@ export function MaintenancePage({
       <PageHeader
         title="软件维护"
         subtitle={isLinux
-          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。运行设置会自动保存。'
-          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。运行设置会自动保存。'}
+          ? '备份配置、管理更新，并查看 Linux 服务、路径和编码信息。普通设置会自动保存，运行配置需统一应用。'
+          : '备份配置、检查更新、查看运行信息，以及需要时重启或退出后台服务。普通设置会自动保存，运行配置需统一应用。'}
         actions={
           <div className={`inline-status ${settingsSaveStatus === 'error' ? 'error' : ''}`} aria-live="polite">
             {settingsSaveStatus === 'error' ? (
-              <button className="link-button" type="button" onClick={retrySettingsSave}>
+              <button
+                className="link-button"
+                type="button"
+                onClick={() => {
+                  if (runtimeConfigDirty) {
+                    void applyRuntimeSettings();
+                    return;
+                  }
+                  retrySettingsSave();
+                }}
+              >
                 保存失败 · 重试{settingsSaveError ? `：${settingsSaveError}` : ''}
               </button>
             ) : settingsSaveStatus === 'saving' ? (
@@ -356,7 +357,6 @@ export function MaintenancePage({
                     serverHost: event.target.value as AppSettings['serverHost']
                   }, 'commit')
                 }
-                onBlur={() => commitSetting('serverHost')}
               >
                 <option value="127.0.0.1">仅本机 127.0.0.1</option>
                 <option value="0.0.0.0">外部网络 0.0.0.0</option>
@@ -371,8 +371,6 @@ export function MaintenancePage({
                 max={65535}
                 value={settingsDraft.serverPort}
                 onChange={(event) => updateSetting({ serverPort: Number(event.target.value) }, 'commit')}
-                onBlur={() => commitSetting('serverPort')}
-                onKeyDown={commitOnEnter}
               />
               <p className="field-help">端口只在保存并重启后台服务后生效。</p>
             </label>
@@ -383,8 +381,6 @@ export function MaintenancePage({
                 maxLength={64}
                 autoComplete="username"
                 onChange={(event) => updateSetting({ accessUsername: event.target.value }, 'commit')}
-                onBlur={() => commitSetting('accessUsername')}
-                onKeyDown={commitOnEnter}
               />
               <p className="field-help">默认 admin；只用于 WebUI 远程管理登录。</p>
             </label>
@@ -397,8 +393,6 @@ export function MaintenancePage({
                 autoComplete="new-password"
                 placeholder={settingsDraft.accessAuthConfigured ? '已配置；留空表示不修改' : '至少 8 个字符'}
                 onChange={(event) => updateSetting({ accessPassword: event.target.value }, 'commit')}
-                onBlur={() => commitSetting('accessPassword')}
-                onKeyDown={commitOnEnter}
               />
               <p className="field-help">密码只提交一次，服务端使用 scrypt 加盐哈希保存，不会回传明文。</p>
             </label>
@@ -412,8 +406,6 @@ export function MaintenancePage({
                     trustedProxies: event.target.value.split(/[\s,]+/).filter(Boolean)
                   }, 'commit')
                 }
-                onBlur={() => commitSetting('trustedProxies')}
-                onKeyDown={commitOnEnter}
               />
               <p className="field-help">仅这些直连地址的 Forwarded/X-Forwarded-* 会被信任；配置不会让代理请求免登录。</p>
             </label>
@@ -425,6 +417,17 @@ export function MaintenancePage({
               />
             </label>
           </div>
+          <div className="split-buttons">
+            <button
+              className="wide-button fill primary"
+              type="button"
+              disabled={busy.has('save-settings') || !runtimeConfigDirty}
+              onClick={() => void applyRuntimeSettings()}
+            >
+              应用运行配置
+            </button>
+          </div>
+          <p className="field-help">监听地址、端口、远程用户名、密码和可信代理会一起校验并保存；输入过程中不会向服务端提交。</p>
           <PathLine label="当前监听" value={`${state.currentHost || '127.0.0.1'}:${state.currentPort || ''}`} />
           <PathLine
             label="远程鉴权"
