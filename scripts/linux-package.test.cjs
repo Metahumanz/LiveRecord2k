@@ -10,8 +10,16 @@ const {
   createUpdateDownloadSources,
   getAppPackageType,
   normalizeUpdateManifest,
-  updatePackageFileName
+  updatePackageFileName,
+  shouldTestHardwareEncoder
 } = require('../src/server/shared/helpers.cjs');
+const {
+  isJetsonGstreamerCodec,
+  createBurnRawVideoArgs,
+  createJetsonGstreamerEncodeArgs,
+  createBurnEncodedVideoMuxArgs,
+  runFfmpegToGstreamerJob
+} = require('../src/server/recording/ffmpeg.cjs');
 const {
   main: applyLinuxUpdate,
   getPaths,
@@ -495,6 +503,101 @@ test('Linux bootstrap hashes legacy plaintext and ignores credentials after the 
     { BILI_RECORD_AUTH_PASSWORD: 'must-not-return' }
   );
   assert.equal(alreadyBootstrapped.settings.accessPasswordHash, undefined);
+
+  const installerReset = await migrateBootstrapStore(
+    {
+      settings: {
+        configBootstrapVersion: 1,
+        outputDir: '/mnt/recordings',
+        serverHost: '127.0.0.1',
+        serverPort: 3263,
+        accessUsername: 'old-admin',
+        accessPasswordHash: 'scrypt$old'
+      }
+    },
+    {
+      BILI_RECORD_APPLY_BOOTSTRAP: '1',
+      BILI_RECORD_OUTPUT_DIR: '/mnt/smb-recordings',
+      BILI_RECORD_HOST: '0.0.0.0',
+      BILI_RECORD_PORT: '4321',
+      BILI_RECORD_AUTH_USERNAME: 'new-admin',
+      BILI_RECORD_AUTH_PASSWORD: 'new-password',
+      BILI_RECORD_AUTO_UPDATE: '0'
+    }
+  );
+  assert.equal(installerReset.settings.outputDir, '/mnt/smb-recordings');
+  assert.equal(installerReset.settings.serverHost, '0.0.0.0');
+  assert.equal(installerReset.settings.serverPort, 4321);
+  assert.equal(installerReset.settings.accessUsername, 'new-admin');
+  assert.equal(installerReset.settings.autoUpdateEnabled, false);
+  assert.match(installerReset.settings.accessPasswordHash, /^scrypt\$/);
+  assert.notEqual(installerReset.settings.accessPasswordHash, 'scrypt$old');
+});
+
+test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmpeg', () => {
+  assert.equal(isJetsonGstreamerCodec('h264_nvv4l2'), true);
+  assert.equal(isJetsonGstreamerCodec('hevc_nvv4l2'), true);
+  assert.equal(isJetsonGstreamerCodec('h264_v4l2m2m'), false);
+  assert.equal(
+    shouldTestHardwareEncoder({ value: 'h264_nvv4l2', platform: 'linux' }, [], 'win32'),
+    false
+  );
+  assert.equal(
+    shouldTestHardwareEncoder({ value: 'h264_nvv4l2', platform: 'linux' }, [], 'linux'),
+    true
+  );
+
+  const rawArgs = createBurnRawVideoArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    duration: 12
+  });
+  assert.ok(rawArgs.includes('rawvideo'));
+  assert.ok(rawArgs.includes('pipe:1'));
+  assert.ok(rawArgs.includes('-an'));
+  assert.ok(rawArgs.includes('-r'));
+
+  const gstreamerArgs = createJetsonGstreamerEncodeArgs({
+    codec: 'h264_nvv4l2',
+    width: 1920,
+    height: 1080,
+    fps: 29.97,
+    quality: 24,
+    outputPath: '/recordings/temporary.h264'
+  });
+  assert.ok(gstreamerArgs.includes('rawvideoparse'));
+  assert.ok(gstreamerArgs.includes('nvv4l2h264enc'));
+  assert.ok(gstreamerArgs.includes('nvvidconv'));
+  assert.ok(gstreamerArgs.includes('framerate=2997/100'));
+
+  const muxArgs = createBurnEncodedVideoMuxArgs({
+    encodedVideoPath: '/recordings/temporary.h264',
+    cleanPath: '/recordings/source.mkv',
+    outputPath: '/recordings/final.mp4',
+    codec: 'h264_nvv4l2',
+    fps: 30,
+    duration: 12,
+    container: 'mp4'
+  });
+  assert.ok(muxArgs.includes('copy'));
+  assert.ok(muxArgs.includes('/recordings/final.mp4'));
+});
+
+test('FFmpeg-to-GStreamer bridge streams stdout into stdin and clears its cancellable child', async () => {
+  const children = [];
+  await runFfmpegToGstreamerJob({
+    ffmpegPath: process.execPath,
+    ffmpegArgs: ['-e', "process.stdout.write('raw-i420-frame')"],
+    gstreamerPath: process.execPath,
+    gstreamerArgs: [
+      '-e',
+      "let size=0; process.stdin.on('data', (chunk) => { size += chunk.length; }); process.stdin.on('end', () => process.exit(size ? 0 : 1));"
+    ],
+    onChild: (child) => children.push(child)
+  });
+  assert.ok(children.some(Boolean));
+  assert.equal(children.at(-1), null);
 });
 
 test('root updater refuses to append through a symbolic-link log target', { skip: process.platform !== 'linux' }, async () => {
@@ -531,6 +634,19 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(source, /\.platform == "linux"/);
   assert.match(source, /sha256sum "\$PACKAGE_PATH"/);
   assert.match(source, /BILI_RECORD_AUTH_PASSWORD/);
+  assert.match(source, /BILI_RECORD_APPLY_BOOTSTRAP=1/);
+  assert.match(source, /BILI_RECORD_OUTPUT_DIR/);
+  assert.match(source, /SERVER_HOST=\$\{BILI_RECORD_HOST:-127\.0\.0\.1\}/);
+  assert.match(source, /choose_listen_host/);
+  assert.match(source, /LISTEN_CHOICE/);
+  assert.match(source, /SERVER_HOST=0\.0\.0\.0/);
+  assert.match(source, /inherit_existing_settings/);
+  assert.match(source, /EVP_DigestVerifyInit/);
+  assert.match(source, /EVP_DigestVerify/);
+  assert.match(source, /python3/);
+  assert.match(source, /gstreamer1\.0-plugins-base/);
+  assert.doesNotMatch(source, /pkeyutl -verify/);
+  assert.doesNotMatch(source, /-rawin/);
   assert.match(source, /BILI_RECORD_DOWNLOAD_MIRROR/);
   assert.match(source, /https:\/\/gh-proxy\.com\//);
   assert.match(source, /MIRROR_PACKAGE_URL=.*\$PACKAGE_URL/);
@@ -543,7 +659,12 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(provision, /install -d -m 0770 -o root -g "\$SERVICE_GROUP" "\$UPDATE_ROOT"/);
   assert.match(provision, /install -d -m 2770 -o root -g "\$SERVICE_GROUP" "\$STATE_ROOT\/recordings"/);
   assert.match(provision, /bootstrap-config\.cjs/);
-  assert.doesNotMatch(provision, /\brunuser\b|\bsu -s\b/);
+  assert.match(provision, /usermod -a -G "\$hardware_group" "\$SERVICE_USER"/);
+  assert.match(provision, /runuser -u "\$SERVICE_USER"/);
+  assert.match(provision, /read_recording_output_dir/);
+  assert.match(provision, /bili-record-2k-permission-check/);
+  assert.match(provision, /write-test/);
+  assert.match(provision, /cat "\$probe_dir\/write-test"/);
   assert.doesNotMatch(provision, /SANITIZED_ENV_FILE/);
   assert.match(provision, /BILI_RECORD_UPDATE_APPLYING/);
   const updatePathUnit = fs.readFileSync(

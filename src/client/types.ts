@@ -249,6 +249,8 @@ export type FfmpegCodecOption = {
   label: string;
   kind: 'software' | 'hardware';
   vendor?: 'nvidia' | 'intel' | 'amd';
+  platform?: 'linux' | 'win32';
+  backend?: 'v4l2m2m' | 'gstreamer';
   reason?: string;
 };
 
@@ -266,6 +268,7 @@ export type FfmpegCapabilities = {
     name: string;
     vendor: 'nvidia' | 'intel' | 'amd' | 'unknown';
   }>;
+  gstreamerEncoders?: string[];
   probedAt: number;
   probeError?: string;
 };

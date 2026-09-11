@@ -24,6 +24,8 @@ if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 for hardware_group in video render; do
   if getent group "$hardware_group" >/dev/null 2>&1; then
+    # systemd initializes the user's supplementary groups for User=, so keep
+    # Jetson's V4L2/DRM device access available to the service process.
     usermod -a -G "$hardware_group" "$SERVICE_USER"
   fi
 done
@@ -80,6 +82,63 @@ done
 chmod 0640 "$ENV_FILE"
 chown root:"$SERVICE_GROUP" "$ENV_FILE"
 rm -f "$INITIAL_PASSWORD_FILE"
+
+read_recording_output_dir() {
+  /usr/lib/bili-record-2k/bin/node - "$STATE_ROOT/BiliRecord2K/settings.json" <<'NODE'
+const fs = require('node:fs');
+const settingsPath = process.argv[2];
+const store = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+const outputDir = String(store?.settings?.outputDir || '').trim();
+if (!outputDir) process.exitCode = 1;
+else process.stdout.write(outputDir);
+NODE
+}
+
+check_recording_directory_access() {
+  target_path=$1
+  [ -n "$target_path" ] || {
+    echo '录像保存目录为空，无法验证服务用户权限。' >&2
+    return 1
+  }
+  command -v runuser >/dev/null 2>&1 || {
+    echo '缺少 runuser，无法以 bili-record-2k 服务用户验证录像目录权限。' >&2
+    return 1
+  }
+  runuser -u "$SERVICE_USER" -- sh -eu -c '
+    target_path=$1
+    probe_dir=
+    cleanup() {
+      if [ -n "$probe_dir" ] && [ -d "$probe_dir" ]; then
+        rm -f -- "$probe_dir/write-test" >/dev/null 2>&1 || true
+        rmdir -- "$probe_dir" >/dev/null 2>&1 || true
+      fi
+    }
+    trap cleanup 0 HUP INT TERM
+
+    mkdir -p -- "$target_path"
+    [ -d "$target_path" ]
+    probe_dir=$(mktemp -d "${target_path%/}/.bili-record-2k-permission-check.XXXXXX")
+    probe_payload="bili-record-2k permission probe"
+    printf "%s\\n" "$probe_payload" >"$probe_dir/write-test"
+    [ -s "$probe_dir/write-test" ]
+    [ "$(cat "$probe_dir/write-test")" = "$probe_payload" ]
+    rm -f -- "$probe_dir/write-test"
+    [ ! -e "$probe_dir/write-test" ]
+    rmdir -- "$probe_dir"
+    probe_dir=
+  ' sh "$target_path"
+}
+
+RECORDING_OUTPUT_DIR=$(read_recording_output_dir) || {
+  echo '无法读取已持久化的录像保存目录，安装已停止。' >&2
+  exit 1
+}
+if ! check_recording_directory_access "$RECORDING_OUTPUT_DIR"; then
+  echo "录像保存目录无法由 $SERVICE_USER 创建、写入并删除测试文件：$RECORDING_OUTPUT_DIR" >&2
+  echo "请为 $SERVICE_USER:$SERVICE_GROUP 授予该目录的实际写权限（SMB 挂载请检查 uid/gid、file_mode、dir_mode），然后重新安装。" >&2
+  exit 1
+fi
+echo "录像保存目录权限验证通过（$SERVICE_USER）：$RECORDING_OUTPUT_DIR"
 
 chmod 0755 /usr/bin/bili-record-2k /usr/bin/bili-record-2k-update
 chmod 0755 /usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/linux-update.cjs /usr/lib/bili-record-2k/provision.sh /usr/lib/bili-record-2k/bootstrap-config.cjs

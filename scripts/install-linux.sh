@@ -4,10 +4,24 @@ set -eu
 APP_NAME=BiliRecord2K
 REPOSITORY=${BILI_RECORD_REPOSITORY:-Metahumanz/LiveRecord2k}
 MANIFEST_URL=${BILI_RECORD_MANIFEST_URL:-https://github.com/$REPOSITORY/releases/latest/download/update.json}
-SERVER_HOST=${BILI_RECORD_HOST:-0.0.0.0}
+HOST_WAS_SUPPLIED=0
+PORT_WAS_SUPPLIED=0
+USERNAME_WAS_SUPPLIED=0
+PASSWORD_WAS_SUPPLIED=0
+AUTO_UPDATE_WAS_SUPPLIED=0
+[ "${BILI_RECORD_HOST+x}" = x ] && HOST_WAS_SUPPLIED=1
+[ "${BILI_RECORD_PORT+x}" = x ] && PORT_WAS_SUPPLIED=1
+[ "${BILI_RECORD_AUTH_USERNAME+x}" = x ] && USERNAME_WAS_SUPPLIED=1
+[ "${BILI_RECORD_AUTH_PASSWORD+x}" = x ] && PASSWORD_WAS_SUPPLIED=1
+[ "${BILI_RECORD_AUTO_UPDATE+x}" = x ] && AUTO_UPDATE_WAS_SUPPLIED=1
+SETTINGS_PATH=/var/lib/bili-record-2k/BiliRecord2K/settings.json
+HAS_EXISTING_SETTINGS=0
+[ -f "$SETTINGS_PATH" ] && HAS_EXISTING_SETTINGS=1
+SERVER_HOST=${BILI_RECORD_HOST:-127.0.0.1}
 SERVER_PORT=${BILI_RECORD_PORT:-3263}
 ADMIN_USERNAME=${BILI_RECORD_AUTH_USERNAME:-admin}
 ADMIN_PASSWORD=${BILI_RECORD_AUTH_PASSWORD:-}
+RECORDING_OUTPUT_DIR=${BILI_RECORD_OUTPUT_DIR:-}
 AUTO_UPDATE=${BILI_RECORD_AUTO_UPDATE:-1}
 DOWNLOAD_MIRROR=${BILI_RECORD_DOWNLOAD_MIRROR-https://gh-proxy.com/}
 TEMP_ROOT=
@@ -23,8 +37,10 @@ BiliRecord2K Linux 一键安装器
 可选环境变量：
   BILI_RECORD_AUTH_PASSWORD  非交互安装密码（至少 8 位）
   BILI_RECORD_AUTH_USERNAME  管理用户名，默认 admin
-  BILI_RECORD_HOST           监听地址，默认 0.0.0.0
+  BILI_RECORD_HOST           监听地址；首次交互安装可选择，默认 127.0.0.1
+                             已安装时沿用已保存值；非交互安装可显式设为 0.0.0.0
   BILI_RECORD_PORT           监听端口，默认 3263
+  BILI_RECORD_OUTPUT_DIR     录像保存目录（可选，必须为服务器上的绝对路径）
   BILI_RECORD_AUTO_UPDATE    1 开启自动更新，0 关闭
   BILI_RECORD_MANIFEST_URL   自定义 update.json 地址
   BILI_RECORD_DOWNLOAD_MIRROR
@@ -62,33 +78,41 @@ fi
 command -v systemctl >/dev/null 2>&1 || fail '没有检测到 systemd；请使用支持 systemd 的 Linux 发行版。'
 [ -d /run/systemd/system ] || fail 'systemd 当前没有运行；不能在容器/chroot 中安装这个服务。'
 
-case "$SERVER_HOST" in
-  0.0.0.0|127.0.0.1|localhost|::) ;;
-  *) fail 'BILI_RECORD_HOST 只允许 0.0.0.0、127.0.0.1、localhost 或 ::。' ;;
-esac
-case "$SERVER_PORT" in
-  ''|*[!0-9]*) fail 'BILI_RECORD_PORT 必须是 1 到 65535 的数字。' ;;
-esac
-if [ "$SERVER_PORT" -lt 1 ] || [ "$SERVER_PORT" -gt 65535 ]; then
-  fail 'BILI_RECORD_PORT 必须是 1 到 65535 的数字。'
-fi
-case "$ADMIN_USERNAME" in
-  ''|*[!A-Za-z0-9_.@-]*) fail '管理用户名只能包含字母、数字、点、下划线、@ 和连字符。' ;;
-esac
-case "$AUTO_UPDATE" in
-  0|1) ;;
-  *) fail 'BILI_RECORD_AUTO_UPDATE 只能是 0 或 1。' ;;
-esac
-case "$DOWNLOAD_MIRROR" in
-  ''|direct|off) DOWNLOAD_MIRROR= ;;
-  *[[:space:]]*) fail 'BILI_RECORD_DOWNLOAD_MIRROR 不能包含空白字符。' ;;
-  https://*) ;;
-  *) fail 'BILI_RECORD_DOWNLOAD_MIRROR 必须是 HTTPS 地址，或设置为 direct 关闭。' ;;
-esac
-case "$MANIFEST_URL" in
-  https://*) ;;
-  *) fail 'BILI_RECORD_MANIFEST_URL 必须是 HTTPS 地址。' ;;
-esac
+validate_install_options() {
+  case "$SERVER_HOST" in
+    0.0.0.0|127.0.0.1|localhost|::) ;;
+    *) fail 'BILI_RECORD_HOST 只允许 0.0.0.0、127.0.0.1、localhost 或 ::。' ;;
+  esac
+  case "$SERVER_PORT" in
+    ''|*[!0-9]*) fail 'BILI_RECORD_PORT 必须是 1 到 65535 的数字。' ;;
+  esac
+  if [ "$SERVER_PORT" -lt 1 ] || [ "$SERVER_PORT" -gt 65535 ]; then
+    fail 'BILI_RECORD_PORT 必须是 1 到 65535 的数字。'
+  fi
+  case "$ADMIN_USERNAME" in
+    ''|*[!A-Za-z0-9_.@-]*) fail '管理用户名只能包含字母、数字、点、下划线、@ 和连字符。' ;;
+  esac
+  case "$AUTO_UPDATE" in
+    0|1) ;;
+    *) fail 'BILI_RECORD_AUTO_UPDATE 只能是 0 或 1。' ;;
+  esac
+  if [ -n "$RECORDING_OUTPUT_DIR" ]; then
+    case "$RECORDING_OUTPUT_DIR" in
+      /*) ;;
+      *) fail 'BILI_RECORD_OUTPUT_DIR 必须是服务器上的绝对路径。' ;;
+    esac
+  fi
+  case "$DOWNLOAD_MIRROR" in
+    ''|direct|off) DOWNLOAD_MIRROR= ;;
+    *[[:space:]]*) fail 'BILI_RECORD_DOWNLOAD_MIRROR 不能包含空白字符。' ;;
+    https://*) ;;
+    *) fail 'BILI_RECORD_DOWNLOAD_MIRROR 必须是 HTTPS 地址，或设置为 direct 关闭。' ;;
+  esac
+  case "$MANIFEST_URL" in
+    https://*) ;;
+    *) fail 'BILI_RECORD_MANIFEST_URL 必须是 HTTPS 地址。' ;;
+  esac
+}
 
 read_password() {
   [ -r /dev/tty ] || fail '当前没有交互终端；请设置 BILI_RECORD_AUTH_PASSWORD 后重新运行。'
@@ -116,42 +140,107 @@ read_password() {
   done
 }
 
-if [ -z "$ADMIN_PASSWORD" ]; then
-  read_password
-elif [ "${#ADMIN_PASSWORD}" -lt 8 ]; then
-  fail 'BILI_RECORD_AUTH_PASSWORD 至少需要 8 位。'
-fi
-
 printf '\n[1/6] 检测系统与安装依赖...\n'
 PACKAGE_KIND=tarball
 if command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
   PACKAGE_KIND=deb
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates curl jq openssl ffmpeg fonts-noto-cjk
+  apt-get install -y ca-certificates curl jq openssl python3 ffmpeg fonts-noto-cjk gstreamer1.0-tools gstreamer1.0-plugins-base
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y ca-certificates curl jq openssl tar shadow-utils util-linux fontconfig
+  dnf install -y ca-certificates curl jq openssl python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
   dnf install -y google-noto-sans-cjk-fonts || dnf install -y google-noto-cjk-fonts || \
     fail '当前软件源缺少 Noto Sans CJK 字体，请先启用相应字体软件源。'
   command -v ffmpeg >/dev/null 2>&1 || dnf install -y ffmpeg || fail '当前软件源没有 FFmpeg，请先为发行版启用 FFmpeg 软件源。'
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y ca-certificates curl jq openssl tar shadow-utils util-linux fontconfig
+  yum install -y ca-certificates curl jq openssl python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
   yum install -y google-noto-sans-cjk-fonts || yum install -y google-noto-cjk-fonts || \
     fail '当前软件源缺少 Noto Sans CJK 字体，请先启用相应字体软件源。'
   command -v ffmpeg >/dev/null 2>&1 || yum install -y ffmpeg || fail '当前软件源没有 FFmpeg，请先为发行版启用 FFmpeg 软件源。'
 elif command -v zypper >/dev/null 2>&1; then
-  zypper --non-interactive install ca-certificates curl jq openssl tar shadow ffmpeg noto-sans-cjk-fonts
+  zypper --non-interactive install ca-certificates curl jq openssl python3 tar shadow ffmpeg noto-sans-cjk-fonts gstreamer gstreamer-plugins-base
 elif command -v pacman >/dev/null 2>&1; then
-  pacman -Sy --noconfirm ca-certificates curl jq openssl tar shadow ffmpeg noto-fonts-cjk
+  pacman -Sy --noconfirm ca-certificates curl jq openssl python tar shadow ffmpeg noto-fonts-cjk gstreamer gst-plugins-base
 else
   fail '不支持当前包管理器；请使用 Debian/Ubuntu、Fedora/RHEL、openSUSE 或 Arch Linux。'
 fi
 
-for required_command in curl jq openssl sha256sum ffmpeg tar fc-match; do
+for required_command in curl jq openssl python3 base64 sha256sum ffmpeg tar fc-match; do
   command -v "$required_command" >/dev/null 2>&1 || fail "缺少必要命令：$required_command"
 done
 fc-match -f '%{family}' 'Noto Sans CJK SC' | grep -qi 'Noto Sans CJK SC' || \
   fail '没有检测到可验证的 Noto Sans CJK SC 字体。'
+
+# A reinstall must not silently turn a privately bound, password-protected
+# service into the installer defaults.  Read only the persisted public
+# settings here; the password remains a one-way hash and is preserved unless
+# the caller explicitly supplies BILI_RECORD_AUTH_PASSWORD.
+inherit_existing_settings() {
+  [ "$HAS_EXISTING_SETTINGS" -eq 1 ] || return 0
+  jq -e '(.settings // {}) | type == "object"' "$SETTINGS_PATH" >/dev/null 2>&1 || \
+    fail '已有 settings.json 无法解析，拒绝用默认安装参数覆盖它。'
+  if [ "$HOST_WAS_SUPPLIED" -eq 0 ]; then
+    PERSISTED_HOST=$(jq -r '.settings.serverHost // empty' "$SETTINGS_PATH") || fail '无法读取已有监听地址。'
+    [ -z "$PERSISTED_HOST" ] || SERVER_HOST=$PERSISTED_HOST
+  fi
+  if [ "$PORT_WAS_SUPPLIED" -eq 0 ]; then
+    PERSISTED_PORT=$(jq -r '.settings.serverPort // empty' "$SETTINGS_PATH") || fail '无法读取已有监听端口。'
+    [ -z "$PERSISTED_PORT" ] || SERVER_PORT=$PERSISTED_PORT
+  fi
+  if [ "$USERNAME_WAS_SUPPLIED" -eq 0 ]; then
+    PERSISTED_USERNAME=$(jq -r '.settings.accessUsername // empty' "$SETTINGS_PATH") || fail '无法读取已有管理用户名。'
+    [ -z "$PERSISTED_USERNAME" ] || ADMIN_USERNAME=$PERSISTED_USERNAME
+  fi
+  if [ "$AUTO_UPDATE_WAS_SUPPLIED" -eq 0 ]; then
+    PERSISTED_AUTO_UPDATE=$(jq -r 'if .settings.autoUpdateEnabled == true then "1" elif .settings.autoUpdateEnabled == false then "0" else empty end' "$SETTINGS_PATH") || \
+      fail '无法读取已有自动更新设置。'
+    [ -z "$PERSISTED_AUTO_UPDATE" ] || AUTO_UPDATE=$PERSISTED_AUTO_UPDATE
+  fi
+}
+
+choose_listen_host() {
+  # Preserve an existing WebUI bind address on reinstall, and let automation
+  # supply BILI_RECORD_HOST without ever waiting for a terminal response.
+  [ "$HOST_WAS_SUPPLIED" -eq 0 ] || return 0
+  [ "$HAS_EXISTING_SETTINGS" -eq 0 ] || return 0
+  if [ ! -r /dev/tty ]; then
+    printf '%s\n' '未检测到交互终端，WebUI 将仅监听本机 127.0.0.1:3263；如需外部访问，请设置 BILI_RECORD_HOST=0.0.0.0。' >&2
+    return 0
+  fi
+  while :; do
+    printf '\n请选择 WebUI 监听地址：\n' >/dev/tty
+    printf '  1) 仅本机访问  127.0.0.1:3263（默认，推荐配合 SSH 隧道或反向代理）\n' >/dev/tty
+    printf '  2) 所有网卡    0.0.0.0:3263（局域网/公网直连；请设置密码和防火墙）\n' >/dev/tty
+    printf '请输入 1 或 2 [1]：' >/dev/tty
+    IFS= read -r LISTEN_CHOICE </dev/tty || exit 1
+    case "$LISTEN_CHOICE" in
+      ''|1)
+        SERVER_HOST=127.0.0.1
+        return 0
+        ;;
+      2)
+        SERVER_HOST=0.0.0.0
+        return 0
+        ;;
+      *)
+        printf '请输入 1 或 2。\n' >/dev/tty
+        ;;
+    esac
+  done
+}
+
+inherit_existing_settings
+choose_listen_host
+validate_install_options
+if [ -z "$ADMIN_PASSWORD" ]; then
+  if [ "$HAS_EXISTING_SETTINGS" -eq 1 ] && [ "$PASSWORD_WAS_SUPPLIED" -eq 0 ]; then
+    : # Keep the existing password hash; it cannot and must not be recovered.
+  else
+    read_password
+  fi
+elif [ "${#ADMIN_PASSWORD}" -lt 8 ]; then
+  fail 'BILI_RECORD_AUTH_PASSWORD 至少需要 8 位。'
+fi
 
 MACHINE_ARCH=$(uname -m)
 case "$MACHINE_ARCH" in
@@ -176,9 +265,111 @@ printf '%s\n' \
   'MCowBQYDK2VwAyEAtw1n+yFGBOlnGb0ru4hmM7K7q2YK5jFJ0GnWW5BIiu0=' \
   '-----END PUBLIC KEY-----' >"$PUBLIC_KEY_PATH"
 jq -j -cS '.signed' "$MANIFEST_PATH" >"$SIGNED_PAYLOAD_PATH" || fail '更新清单签名内容无效。'
-jq -r '.signature' "$MANIFEST_PATH" | openssl base64 -d -A >"$SIGNATURE_PATH" || fail '更新清单签名编码无效。'
-openssl pkeyutl -verify -pubin -inkey "$PUBLIC_KEY_PATH" -rawin -in "$SIGNED_PAYLOAD_PATH" -sigfile "$SIGNATURE_PATH" >/dev/null 2>&1 || \
-  fail '更新清单未通过官方 Ed25519 签名验证。'
+jq -r '.signature' "$MANIFEST_PATH" | base64 -d >"$SIGNATURE_PATH" || fail '更新清单签名编码无效。'
+
+# OpenSSL 1.1.1 implements Ed25519 through EVP_DigestVerify, but its
+# pkeyutl utility cannot use Ed25519 at all.  Call the stable EVP API through
+# Python's standard ctypes module so Ubuntu 20.04/L4T can verify exactly the
+# same raw signature without requiring an OpenSSL 3.x command-line feature.
+verify_ed25519_signature() {
+  python3 - "$PUBLIC_KEY_PATH" "$SIGNED_PAYLOAD_PATH" "$SIGNATURE_PATH" <<'PY'
+import ctypes
+import ctypes.util
+import pathlib
+import sys
+
+
+def fail(message):
+    print(f'Ed25519 verification unavailable: {message}', file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load_libcrypto():
+    candidates = []
+    discovered = ctypes.util.find_library('crypto')
+    if discovered:
+        candidates.append(discovered)
+    candidates.extend(('libcrypto.so.3', 'libcrypto.so.1.1', 'libcrypto.so'))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError:
+            continue
+    fail('未找到 libcrypto（需要 OpenSSL 1.1.1 或更高版本）。')
+
+
+public_key_path, message_path, signature_path = map(pathlib.Path, sys.argv[1:4])
+try:
+    public_key = public_key_path.read_bytes()
+    message = message_path.read_bytes()
+    signature = signature_path.read_bytes()
+except OSError as error:
+    fail(str(error))
+if len(signature) != 64:
+    fail('签名长度不是 Ed25519 所需的 64 字节。')
+
+crypto = load_libcrypto()
+crypto.BIO_new_mem_buf.argtypes = (ctypes.c_void_p, ctypes.c_int)
+crypto.BIO_new_mem_buf.restype = ctypes.c_void_p
+crypto.BIO_free.argtypes = (ctypes.c_void_p,)
+crypto.BIO_free.restype = ctypes.c_int
+crypto.PEM_read_bio_PUBKEY.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p)
+crypto.PEM_read_bio_PUBKEY.restype = ctypes.c_void_p
+crypto.EVP_PKEY_free.argtypes = (ctypes.c_void_p,)
+crypto.EVP_PKEY_free.restype = None
+crypto.EVP_MD_CTX_new.argtypes = ()
+crypto.EVP_MD_CTX_new.restype = ctypes.c_void_p
+crypto.EVP_MD_CTX_free.argtypes = (ctypes.c_void_p,)
+crypto.EVP_MD_CTX_free.restype = None
+crypto.EVP_DigestVerifyInit.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+)
+crypto.EVP_DigestVerifyInit.restype = ctypes.c_int
+crypto.EVP_DigestVerify.argtypes = (
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+)
+crypto.EVP_DigestVerify.restype = ctypes.c_int
+
+public_key_buffer = ctypes.create_string_buffer(public_key)
+message_buffer = ctypes.create_string_buffer(message)
+signature_buffer = ctypes.create_string_buffer(signature)
+bio = crypto.BIO_new_mem_buf(public_key_buffer, len(public_key))
+if not bio:
+    fail('无法读取内置公钥。')
+pkey = None
+context = None
+try:
+    pkey = crypto.PEM_read_bio_PUBKEY(bio, None, None, None)
+    if not pkey:
+        fail('内置公钥不是有效的 PEM 公钥。')
+    context = crypto.EVP_MD_CTX_new()
+    if not context:
+        fail('无法创建 Ed25519 验证上下文。')
+    if crypto.EVP_DigestVerifyInit(context, None, None, None, pkey) != 1:
+        fail('当前 libcrypto 不支持 Ed25519 EVP 验证。')
+    if crypto.EVP_DigestVerify(context, signature_buffer, len(signature), message_buffer, len(message)) != 1:
+        fail('签名不匹配。')
+finally:
+    if context:
+        crypto.EVP_MD_CTX_free(context)
+    if pkey:
+        crypto.EVP_PKEY_free(pkey)
+    crypto.BIO_free(bio)
+PY
+}
+verify_ed25519_signature || fail '更新清单未通过官方 Ed25519 签名验证。'
 LATEST_VERSION=$(jq -r '.signed.version' "$MANIFEST_PATH")
 PACKAGE_ENTRY=$(jq -r \
   --arg kind "$PACKAGE_KIND" \
@@ -257,14 +448,25 @@ USERNAME_ESCAPED=$(escape_environment_value "$ADMIN_USERNAME")
 umask 077
 {
   printf '%s\n' 'BILI_RECORD_CONFIG_DIR=/var/lib/bili-record-2k'
-  printf '%s\n' 'BILI_RECORD_OUTPUT_DIR=/var/lib/bili-record-2k/recordings'
+  # Do not overwrite an existing SMB/custom recording root on reinstall.  A
+  # supplied BILI_RECORD_OUTPUT_DIR is explicit; otherwise the default only
+  # applies when there is no persisted settings file yet.
+  if [ -n "$RECORDING_OUTPUT_DIR" ]; then
+    OUTPUT_DIR_ESCAPED=$(escape_environment_value "$RECORDING_OUTPUT_DIR")
+    printf 'BILI_RECORD_OUTPUT_DIR="%s"\n' "$OUTPUT_DIR_ESCAPED"
+  elif [ ! -f "$SETTINGS_PATH" ]; then
+    printf '%s\n' 'BILI_RECORD_OUTPUT_DIR=/var/lib/bili-record-2k/recordings'
+  fi
   printf 'BILI_RECORD_HOST="%s"\n' "$SERVER_HOST"
   printf 'BILI_RECORD_PORT="%s"\n' "$SERVER_PORT"
   printf 'BILI_RECORD_AUTH_USERNAME="%s"\n' "$USERNAME_ESCAPED"
-  printf 'BILI_RECORD_AUTH_PASSWORD="%s"\n' "$PASSWORD_ESCAPED"
+  if [ -n "$ADMIN_PASSWORD" ]; then
+    printf 'BILI_RECORD_AUTH_PASSWORD="%s"\n' "$PASSWORD_ESCAPED"
+  fi
   printf 'BILI_RECORD_AUTO_UPDATE="%s"\n' "$AUTO_UPDATE"
   printf '%s\n' 'BILI_RECORD_MANAGED_UPDATE=1'
   printf '%s\n' 'BILI_RECORD_SYSTEMD=1'
+  printf '%s\n' 'BILI_RECORD_APPLY_BOOTSTRAP=1'
 } >"$ENV_PATH"
 chmod 0600 "$ENV_PATH"
 rm -f /etc/bili-record-2k/initial-admin-password
@@ -289,6 +491,8 @@ printf '\n[6/6] 检查服务状态...\n'
 SERVICE_READY=0
 if [ "$SERVER_HOST" = :: ]; then
   CHECK_URL="http://[::1]:$SERVER_PORT/api/state"
+elif [ "$SERVER_HOST" = localhost ]; then
+  CHECK_URL="http://localhost:$SERVER_PORT/api/state"
 else
   CHECK_URL="http://127.0.0.1:$SERVER_PORT/api/state"
 fi

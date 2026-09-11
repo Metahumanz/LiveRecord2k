@@ -128,7 +128,7 @@ async function writeDebianMetadata(debRoot, { version, debArch }) {
     'Priority: optional',
     `Architecture: ${debArch}`,
     'Maintainer: Metahumanz',
-    'Depends: ffmpeg, ca-certificates, openssl, passwd, util-linux, tar, fontconfig, fonts-noto-cjk',
+    'Depends: ffmpeg, ca-certificates, openssl, passwd, util-linux, tar, fontconfig, fonts-noto-cjk, gstreamer1.0-tools, gstreamer1.0-plugins-base',
     'Homepage: https://github.com/Metahumanz/LiveRecord2k',
     'Description: Bilibili live recording service with a WebUI',
     ' Records live streams and danmaku, and can render danmaku into exported video.',

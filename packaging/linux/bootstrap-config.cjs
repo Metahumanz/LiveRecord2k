@@ -61,18 +61,26 @@ async function migrateBootstrapStore(input, environment) {
   store.segmentCleanups = Array.isArray(store.segmentCleanups) ? store.segmentCleanups : [];
   const settings = store.settings;
   const firstBootstrap = Number(settings.configBootstrapVersion || 0) < 1;
-  if (firstBootstrap) {
+  // The one-click installer writes this one-shot marker together with the
+  // password/listen settings it just collected.  Package upgrades do not set
+  // it, so they retain WebUI changes.  This matters when an existing install
+  // is deliberately reinstalled with a new password or bind address.
+  const applyBootstrap = firstBootstrap || environment.BILI_RECORD_APPLY_BOOTSTRAP === '1';
+  if (applyBootstrap) {
     if (environment.BILI_RECORD_OUTPUT_DIR) settings.outputDir = environment.BILI_RECORD_OUTPUT_DIR;
     if (environment.BILI_RECORD_HOST) settings.serverHost = environment.BILI_RECORD_HOST;
     if (environment.BILI_RECORD_PORT) settings.serverPort = Number(environment.BILI_RECORD_PORT);
     if (environment.BILI_RECORD_AUTH_USERNAME) settings.accessUsername = environment.BILI_RECORD_AUTH_USERNAME;
-    settings.autoUpdateEnabled = environment.BILI_RECORD_AUTO_UPDATE === '1';
-    settings.configBootstrapVersion = 1;
+    if (environment.BILI_RECORD_AUTO_UPDATE) settings.autoUpdateEnabled = environment.BILI_RECORD_AUTO_UPDATE === '1';
+    if (firstBootstrap) settings.configBootstrapVersion = 1;
   }
   const legacyPassword = String(settings.accessPassword || '');
-  const bootstrapPassword = firstBootstrap ? String(environment.BILI_RECORD_AUTH_PASSWORD || '') : '';
+  const bootstrapPassword = applyBootstrap ? String(environment.BILI_RECORD_AUTH_PASSWORD || '') : '';
   const passwordToMigrate = legacyPassword || bootstrapPassword;
-  if (!settings.accessPasswordHash && passwordToMigrate) {
+  // An explicit installer password is a password reset request, even if the
+  // previous settings already contain a hash.  Legacy plaintext is migrated
+  // only when no hash exists.
+  if ((bootstrapPassword || !settings.accessPasswordHash) && passwordToMigrate) {
     if (passwordToMigrate.length < 8) throw new Error('首次或旧版管理密码至少需要 8 位。');
     settings.accessPasswordHash = await hashPassword(passwordToMigrate);
   }
@@ -119,10 +127,11 @@ async function main() {
     if (error.code !== 'ENOENT') throw new Error(`拒绝覆盖无法解析或不安全的 settings.json：${error.message}`);
   }
   const firstBootstrap = Number(store?.settings?.configBootstrapVersion || 0) < 1;
+  const applyBootstrap = firstBootstrap || environment.BILI_RECORD_APPLY_BOOTSTRAP === '1';
   store = await migrateBootstrapStore(store, environment);
   if (storeRaw) await writeAtomic(`${STORE_PATH}.backup`, storeRaw, 0o600);
   await writeAtomic(STORE_PATH, `${JSON.stringify(store, null, 2)}\n`);
-  if (firstBootstrap) {
+  if (applyBootstrap) {
     await sanitizeBootstrapEnvironment(ENV_PATH, environment);
   }
 }

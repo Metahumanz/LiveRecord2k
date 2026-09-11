@@ -32,7 +32,17 @@ const BURN_CODEC_CANDIDATES = [
   { value: 'hevc_qsv', label: 'Intel H.265 硬件编码', kind: 'hardware', vendor: 'intel' },
   { value: 'h264_qsv', label: 'Intel H.264 硬件编码', kind: 'hardware', vendor: 'intel' },
   { value: 'hevc_amf', label: 'AMD H.265 硬件编码', kind: 'hardware', vendor: 'amd' },
-  { value: 'h264_amf', label: 'AMD H.264 硬件编码', kind: 'hardware', vendor: 'amd' }
+  { value: 'h264_amf', label: 'AMD H.264 硬件编码', kind: 'hardware', vendor: 'amd' },
+  // Jetson's encoder is exposed through V4L2.  These FFmpeg codecs are
+  // intentionally probed with an actual encode below: merely finding a DRM
+  // card or nvidia-smi must never mark the backend usable.
+  { value: 'hevc_v4l2m2m', label: 'V4L2 M2M H.265 硬件编码', kind: 'hardware', vendor: 'nvidia', platform: 'linux', backend: 'v4l2m2m' },
+  { value: 'h264_v4l2m2m', label: 'V4L2 M2M H.264 硬件编码', kind: 'hardware', vendor: 'nvidia', platform: 'linux', backend: 'v4l2m2m' },
+  // L4T R35's stock FFmpeg normally has only nvv4l2 decode.  The actual
+  // encoder is exposed through these GStreamer elements, which the service
+  // drives with a streaming raw-video bridge when their self-test succeeds.
+  { value: 'hevc_nvv4l2', label: 'Jetson V4L2 H.265 硬件编码', kind: 'hardware', vendor: 'nvidia', platform: 'linux', backend: 'gstreamer', element: 'nvv4l2h265enc' },
+  { value: 'h264_nvv4l2', label: 'Jetson V4L2 H.264 硬件编码', kind: 'hardware', vendor: 'nvidia', platform: 'linux', backend: 'gstreamer', element: 'nvv4l2h264enc' }
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
 const HARDWARE_DECODER_CANDIDATES = [
@@ -394,8 +404,23 @@ async function detectFfmpegCapabilities(ffmpegPath) {
   const filterNames = parseFfmpegFilterNames(filterProbe.output);
   const burnCodecs = [];
   const unavailableBurnCodecs = [];
+  const gstreamerEncoders = [];
 
   for (const candidate of BURN_CODEC_CANDIDATES) {
+    if (candidate.backend === 'gstreamer') {
+      if (!shouldTestHardwareEncoder(candidate, videoAdapters)) {
+        unavailableBurnCodecs.push({ ...candidate, reason: '当前平台不支持 Jetson GStreamer 编码后端' });
+        continue;
+      }
+      const test = await testJetsonGstreamerEncoder(candidate);
+      if (!test.ok) {
+        unavailableBurnCodecs.push({ ...candidate, reason: test.reason || 'Jetson GStreamer 硬件编码测试未通过' });
+        continue;
+      }
+      burnCodecs.push(candidate);
+      gstreamerEncoders.push(candidate.value);
+      continue;
+    }
     if (!encoderNames.has(candidate.value)) {
       unavailableBurnCodecs.push({ ...candidate, reason: 'ffmpeg 未包含该编码器' });
       continue;
@@ -431,6 +456,7 @@ async function detectFfmpegCapabilities(ffmpegPath) {
     hwaccels,
     hardwareDecoders,
     videoAdapters,
+    gstreamerEncoders,
     cudaAvatarComposite: cudaAvatarComposite.ok,
     cudaAvatarCompositeReason: cudaAvatarComposite.reason || '',
     probedAt: Date.now(),
@@ -758,6 +784,7 @@ function hasVideoAdapterVendor(adapters, vendor) {
 }
 
 function shouldTestHardwareEncoder(candidate, adapters, platform = process.platform) {
+  if (candidate.platform && candidate.platform !== platform) return false;
   return String(platform) !== 'win32' || hasVideoAdapterVendor(adapters, candidate.vendor);
 }
 
@@ -794,6 +821,83 @@ async function testFfmpegEncoder(ffmpegPath, codec) {
     return {
       ok: false,
       reason: result.timedOut ? '硬件编码测试超时' : output || result.error?.message || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+}
+
+async function testJetsonGstreamerEncoder(candidate, options = {}) {
+  const element = String(candidate?.element || '').trim();
+  const codec = String(candidate?.value || '').trim();
+  const platform = String(options.platform || process.platform);
+  if (platform !== 'linux' || !element || !/^(?:h264|hevc)_nvv4l2$/.test(codec)) {
+    return { ok: false, reason: '不是可测试的 Jetson GStreamer 编码器' };
+  }
+  const gstreamerPath = options.gstreamerPath || 'gst-launch-1.0';
+  const inspectPath = options.inspectPath || 'gst-inspect-1.0';
+  const parser = codec.startsWith('hevc_') ? 'h265parse' : 'h264parse';
+  try {
+    const inspected = await runCapturedProcess(inspectPath, [element], {
+      timeoutMs: 5000,
+      maxOutputBytes: 64 * 1024
+    });
+    if (inspected.status !== 0 || inspected.error || inspected.timedOut) {
+      const detail = compactLogLine(`${inspected.stderr || ''}\n${inspected.stdout || ''}`);
+      return {
+        ok: false,
+        reason: inspected.timedOut
+          ? 'GStreamer 编码器检查超时'
+          : detail || inspected.error?.message || `未找到 GStreamer 元素 ${element}`
+      };
+    }
+    // The runtime bridge receives FFmpeg's unframed I420 bytes through
+    // rawvideoparse.  Check it explicitly because a Jetson image can retain
+    // the NVIDIA codec plugin while a minimal GStreamer installation omits
+    // the base raw-parser plugin.
+    const rawParser = await runCapturedProcess(inspectPath, ['rawvideoparse'], {
+      timeoutMs: 5000,
+      maxOutputBytes: 64 * 1024
+    });
+    if (rawParser.status !== 0 || rawParser.error || rawParser.timedOut) {
+      const detail = compactLogLine(`${rawParser.stderr || ''}\n${rawParser.stdout || ''}`);
+      return {
+        ok: false,
+        reason: rawParser.timedOut
+          ? 'GStreamer 原始视频解析器检查超时'
+          : detail || rawParser.error?.message || '未找到 GStreamer 元素 rawvideoparse'
+      };
+    }
+    const result = await runCapturedProcess(
+      gstreamerPath,
+      [
+        '-q',
+        '-e',
+        'videotestsrc',
+        'num-buffers=2',
+        '!',
+        'video/x-raw,format=I420,width=256,height=144,framerate=1/1',
+        '!',
+        'nvvidconv',
+        '!',
+        'video/x-raw(memory:NVMM),format=NV12',
+        '!',
+        element,
+        'bitrate=1000000',
+        '!',
+        parser,
+        '!',
+        'fakesink'
+      ],
+      { timeoutMs: 12000, maxOutputBytes: 128 * 1024 }
+    );
+    if (result.status === 0 && !result.error && !result.timedOut) {
+      return { ok: true, reason: '' };
+    }
+    const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+    return {
+      ok: false,
+      reason: result.timedOut ? 'Jetson GStreamer 硬件编码测试超时' : output || result.error?.message || `GStreamer 退出码 ${result.status}`
     };
   } catch (error) {
     return { ok: false, reason: error.message };
@@ -3246,6 +3350,7 @@ module.exports = {
   hasVideoAdapterVendor,
   shouldTestHardwareEncoder,
   testFfmpegEncoder,
+  testJetsonGstreamerEncoder,
   testFfmpegCudaAvatarComposite,
   normalizeBurnCodec,
   normalizeRoomImageMode,
