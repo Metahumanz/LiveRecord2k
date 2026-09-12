@@ -341,6 +341,50 @@ test('large avatar plans fall back from CUDA compositing without reducing the hi
   assert.equal(service.shouldUseCudaAvatarComposite('libx265', entries(1)), false);
 });
 
+test('CUDA avatar composition failure retries the prebuilt CPU graph', async () => {
+  const service = new LiveRecordService();
+  const attempts = [];
+  let cleanupCount = 0;
+  let fallbackCount = 0;
+  service.log = () => {};
+  service.runFfmpegWithHardwareDecodeFallback = async ({ createArgs }) => {
+    const next = createArgs('cuda');
+    attempts.push(next);
+    if (attempts.length === 1) {
+      const error = new Error('ffmpeg 退出码 -22');
+      error.ffmpegStderr = "[overlay_cuda] Can't overlay yuva420p on nv12";
+      throw error;
+    }
+    return 'cuda';
+  };
+
+  const gpuLayer = {
+    gpuComposite: true,
+    filterScriptPath: 'C:/temp/avatar-layer.ffscript',
+    cpuFilterScriptPath: 'C:/temp/avatar-layer.cpu.ffscript',
+    entries: [{}]
+  };
+  const result = await service.runFfmpegWithCudaAvatarCompositeFallback({
+    avatarLayer: gpuLayer,
+    decoder: { value: 'cuda', label: 'NVIDIA CUDA', kind: 'hardware' },
+    createArgs: (decoder, layer) => ({ decoder, layer }),
+    beforeRetry: async () => {
+      cleanupCount += 1;
+    },
+    onCudaFallback: () => {
+      fallbackCount += 1;
+    }
+  });
+
+  assert.equal(result, 'cuda');
+  assert.equal(cleanupCount, 1);
+  assert.equal(fallbackCount, 1);
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].layer.gpuComposite, true);
+  assert.equal(attempts[1].layer.gpuComposite, false);
+  assert.equal(attempts[1].layer.filterScriptPath, gpuLayer.cpuFilterScriptPath);
+});
+
 test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-delete-source-after-burn-'));
   const sourcePath = path.join(outputDir, 'session.clean.mp4');
