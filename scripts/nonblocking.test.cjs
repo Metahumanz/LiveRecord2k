@@ -996,7 +996,7 @@ test('录像目录权限探测会创建、写入、读取并删除自己的临�
   }
 });
 
-test('录像目录权限探测只执行真实读写操作，不尝试修改挂载目录属主或模式', async () => {
+test('录像目录权限探测会执行创建、写入、读取、重命名和删除，不尝试修改挂载目录属主或模式', async () => {
   const service = new LiveRecordService();
   const outputRoot = path.resolve('simulated-linux-output-root');
   const calls = [];
@@ -1019,6 +1019,9 @@ test('录像目录权限探测只执行真实读写操作，不尝试修改挂�
       calls.push(['readFile', target]);
       return Buffer.from('BiliRecord2K write access probe\n', 'utf8');
     },
+    async rename(source, destination) {
+      calls.push(['rename', source, destination]);
+    },
     async unlink(target) {
       calls.push(['unlink', target]);
     }
@@ -1031,10 +1034,19 @@ test('录像目录权限探测只执行真实读写操作，不尝试修改挂�
 
   assert.equal(available, true);
   const expectedProbePath = path.join(outputRoot, `.bili-record-2k-permission-check-${process.pid}-0123456789abcdef.tmp`);
-  assert.ok(calls.every(([, target]) => target === expectedProbePath));
+  const expectedRenamedProbePath = `${expectedProbePath}.renamed`;
   assert.deepEqual(
-    calls.map(([operation]) => operation),
-    ['open', 'writeFile', 'sync', 'close', 'readFile', 'unlink']
+    calls,
+    [
+      ['open', expectedProbePath, 'wx', 0o600],
+      ['writeFile', expectedProbePath, 'BiliRecord2K write access probe\n'],
+      ['sync', expectedProbePath],
+      ['close', expectedProbePath],
+      ['readFile', expectedProbePath],
+      ['rename', expectedProbePath, expectedRenamedProbePath],
+      ['readFile', expectedRenamedProbePath],
+      ['unlink', expectedRenamedProbePath]
+    ]
   );
 });
 
@@ -1086,6 +1098,48 @@ test('本地 Linux 录像根目录仍规范为服务组 2770，而 CIFS 挂载�
   });
   assert.equal(cifsNormalized, false);
   assert.deepEqual(cifsCalls, []);
+});
+
+test('实际服务用户探针通过时，CIFS 与本地 2770 推荐失败均不阻止保存', async () => {
+  const service = new LiveRecordService();
+  const warnings = [];
+  service.log = (level, message) => warnings.push([level, message]);
+  service.ensureDirectoryReady = async () => true;
+  let probeCalls = 0;
+  service.probeRecordingOutputDirectoryAccess = async () => {
+    probeCalls += 1;
+    return true;
+  };
+
+  const cifsReady = await service.ensureRecordingOutputRootReady('/mnt/cifs/recordings', {
+    platform: 'linux',
+    mount: { mountPoint: '/mnt/cifs', fsType: 'cifs' },
+    fileSystem: {
+      stat: async () => {
+        throw new Error('CIFS 不应尝试 stat/chmod/chown');
+      }
+    },
+    currentUid: 2001,
+    currentGid: 2001,
+    permissionsRequired: true
+  });
+  assert.equal(cifsReady, true);
+
+  const localReady = await service.ensureRecordingOutputRootReady('/srv/shared-recordings', {
+    platform: 'linux',
+    mount: { mountPoint: '/srv', fsType: 'ext4' },
+    fileSystem: {
+      async stat() {
+        return { mode: 0o40770, uid: 1000, gid: 1000, isDirectory: () => true };
+      }
+    },
+    currentUid: 2001,
+    currentGid: 2001,
+    permissionsRequired: true
+  });
+  assert.equal(localReady, true);
+  assert.equal(probeCalls, 2);
+  assert.ok(warnings.some(([, message]) => /属主不是当前服务用户/.test(message)));
 });
 
 test('录像目录权限探测会给 SMB 权限拒绝返回可操作的提示', async () => {
