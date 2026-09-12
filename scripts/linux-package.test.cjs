@@ -649,6 +649,11 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.doesNotMatch(source, /-rawin/);
   assert.match(source, /BILI_RECORD_DOWNLOAD_MIRROR/);
   assert.match(source, /https:\/\/gh-proxy\.com\//);
+  assert.match(source, /download_manifest\(\)/);
+  assert.match(source, /MIRROR_MANIFEST_URL=.*\$MANIFEST_URL/);
+  assert.match(source, /download_manifest "GitHub 镜像 \$DOWNLOAD_MIRROR"/);
+  assert.match(source, /--retry 1 --connect-timeout 10 --max-time 30/);
+  assert.match(source, /正在验证官方 Ed25519 签名/);
   assert.match(source, /MIRROR_PACKAGE_URL=.*\$PACKAGE_URL/);
   assert.match(source, /download_and_verify "GitHub 官方源"/);
   assert.match(source, /--proto '=https' --proto-redir '=https'/);

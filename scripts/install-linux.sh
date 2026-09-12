@@ -45,7 +45,8 @@ BiliRecord2K Linux 一键安装器
   BILI_RECORD_MANIFEST_URL   自定义 update.json 地址
   BILI_RECORD_DOWNLOAD_MIRROR
                              GitHub 下载镜像前缀，默认 https://gh-proxy.com/
-                             设置为 direct、off 或空值可关闭镜像
+                             用于版本清单和官方 Release 安装包；设置为
+                             direct、off 或空值可关闭镜像
 EOF
 }
 
@@ -252,11 +253,52 @@ esac
 TEMP_ROOT=$(mktemp -d /tmp/bili-record-2k-install.XXXXXX)
 MANIFEST_PATH=$TEMP_ROOT/update.json
 
+download_manifest() {
+  manifest_source=$1
+  manifest_url=$2
+  rm -f -- "$MANIFEST_PATH"
+  printf '  尝试从%s获取版本清单...\n' "$manifest_source"
+  # update.json is small.  Fail over promptly instead of spending minutes
+  # retrying a GitHub endpoint that is unreachable from the install host.
+  if ! curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-filesize 2097152 \
+    --retry 1 --connect-timeout 10 --max-time 30 \
+    "$manifest_url" -o "$MANIFEST_PATH"; then
+    printf '  %s获取失败。\n' "$manifest_source" >&2
+    rm -f -- "$MANIFEST_PATH"
+    return 1
+  fi
+  if ! jq -e '.schemaVersion == 3 and .signatureAlgorithm == "ed25519" and (.signature | type == "string") and (.signed.files | type == "array")' \
+    "$MANIFEST_PATH" >/dev/null; then
+    printf '  %s返回的内容不是有效的官方更新清单。\n' "$manifest_source" >&2
+    rm -f -- "$MANIFEST_PATH"
+    return 1
+  fi
+  MANIFEST_DOWNLOAD_SOURCE=$manifest_source
+  return 0
+}
+
 printf '\n[2/6] 获取最新版本清单...\n'
-curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-filesize 2097152 \
-  --retry 3 --connect-timeout 15 --max-time 120 \
-  "$MANIFEST_URL" -o "$MANIFEST_PATH"
-jq -e '.schemaVersion == 3 and .signatureAlgorithm == "ed25519" and (.signature | type == "string") and (.signed.files | type == "array")' "$MANIFEST_PATH" >/dev/null || fail '更新清单缺少官方签名。'
+MANIFEST_DOWNLOADED=0
+case "$MANIFEST_URL" in
+  https://github.com/*) MANIFEST_PRIMARY_SOURCE='GitHub 官方源' ;;
+  *) MANIFEST_PRIMARY_SOURCE='更新清单源' ;;
+esac
+if download_manifest "$MANIFEST_PRIMARY_SOURCE" "$MANIFEST_URL"; then
+  MANIFEST_DOWNLOADED=1
+fi
+if [ "$MANIFEST_DOWNLOADED" -ne 1 ] && [ -n "$DOWNLOAD_MIRROR" ]; then
+  case "$MANIFEST_URL" in
+    https://github.com/*)
+      MIRROR_MANIFEST_URL=${DOWNLOAD_MIRROR%/}/$MANIFEST_URL
+      printf '  %s不可用，自动尝试 GitHub 镜像 %s。\n' "$MANIFEST_PRIMARY_SOURCE" "$DOWNLOAD_MIRROR" >&2
+      if download_manifest "GitHub 镜像 $DOWNLOAD_MIRROR" "$MIRROR_MANIFEST_URL"; then
+        MANIFEST_DOWNLOADED=1
+      fi
+      ;;
+  esac
+fi
+[ "$MANIFEST_DOWNLOADED" -eq 1 ] || fail '版本清单下载失败；请检查网络，或设置 BILI_RECORD_MANIFEST_URL / BILI_RECORD_DOWNLOAD_MIRROR 后重试。'
+printf '  版本清单已获取，来源：%s；正在验证官方 Ed25519 签名。\n' "$MANIFEST_DOWNLOAD_SOURCE"
 PUBLIC_KEY_PATH=$TEMP_ROOT/update-public-key.pem
 SIGNED_PAYLOAD_PATH=$TEMP_ROOT/update-signed.json
 SIGNATURE_PATH=$TEMP_ROOT/update-signature.bin
