@@ -121,6 +121,32 @@ test('merge progress keeps the current segment stage after FFmpeg begins reporti
   assert.match(progress.message, /\d+秒/);
 });
 
+test('FFmpeg progress reports recent rendering speed and uses it for a smoothed ETA', () => {
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({
+      kind: 'burn',
+      label: 'burn',
+      durationSec: 120,
+      sourceFps: 60
+    });
+    now += 4_000;
+    assert.equal(updateFfmpegJobProgress(progress, 'out_time_us=2000000'), true);
+    assert.equal(progress.realtimeFactor, 0.5);
+    assert.equal(progress.renderFps, 30);
+    assert.equal(Math.round(progress.estimatedRemainingSec), 236);
+
+    now += 4_000;
+    assert.equal(updateFfmpegJobProgress(progress, 'out_time_us=4000000'), true);
+    assert.equal(progress.realtimeFactor, 0.5);
+    assert.equal(Math.round(progress.estimatedRemainingSec), 232);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test('structured FFmpeg progress and merge resource waiting remain observable and cancellable', async () => {
   assert.equal(parseFfmpegProgressTime('frame=42\nout_time_us=31500000\nprogress=continue'), 31.5);
 

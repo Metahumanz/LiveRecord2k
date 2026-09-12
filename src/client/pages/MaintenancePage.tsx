@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { Clock3, Download, FolderOpen, HardDrive, Power, RefreshCw, Trash2, Upload } from 'lucide-react';
+import { Clock3, Cpu, Download, FolderOpen, HardDrive, Power, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, PathLine, SettingPanel, Toggle, UpdateProgress } from '../components/common';
 import type { AppSettings, AppState, CleanupScanResult } from '../types';
@@ -445,6 +445,28 @@ export function MaintenancePage({
             value={`${currentCodec?.kind === 'hardware' ? '硬件' : '软件'} ${state.settings.burnCodec}`}
           />
           <PathLine label="不可用硬编" value={unavailableCodecText || '无'} />
+          <div className="maintenance-section">
+            <h3>硬件加速自检</h3>
+            <p className="field-help">使用 90 帧合成画面验证当前编码后端，并单独验证 CUDA 真实头像合成；不会写入录像目录，通常约 5–10 秒。</p>
+            <button
+              className="wide-button fill"
+              type="button"
+              disabled={busy.has('hardware-self-test') || state.hardwareSelfTest?.status === 'running' || hasActiveJobs}
+              onClick={() => run('hardware-self-test', recorder.runHardwareAccelerationSelfTest)}
+            >
+              <Cpu size={18} />
+              {state.hardwareSelfTest?.status === 'running' ? '硬件加速自检中…' : '运行硬件加速自检'}
+            </button>
+            {state.hardwareSelfTest ? (
+              <div className={`inline-status ${['failed', 'unavailable'].includes(state.hardwareSelfTest.status) ? 'error' : ''}`} aria-live="polite">
+                <strong>{state.hardwareSelfTest.message}</strong>
+                <span>编码：{state.hardwareSelfTest.codec || '-'} · {state.hardwareSelfTest.encoderBackend || '-'}</span>
+                <span>解码：{state.hardwareSelfTest.decoderBackend || '-'}</span>
+                <span>头像合成：{state.hardwareSelfTest.avatarCompositeBackend || '-'}</span>
+                {state.hardwareSelfTest.fallbackReason ? <span>回退原因：{state.hardwareSelfTest.fallbackReason}</span> : null}
+              </div>
+            ) : null}
+          </div>
           <PathLine label="更新日志" value={state.update.updateLogPath || ''} />
           <PathLine label="状态文件" value={state.update.statusPath || ''} />
           <PathLine label="下载文件" value={state.update.packagePath || ''} />

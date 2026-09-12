@@ -15,7 +15,9 @@ const {
 } = require('../src/server/shared/helpers.cjs');
 const {
   isJetsonGstreamerCodec,
+  createBurnArgs,
   createBurnRawVideoArgs,
+  createAvatarOverlayFilterScript,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
   runFfmpegToGstreamerJob
@@ -584,6 +586,52 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   assert.ok(muxArgs.includes('/recordings/final.mp4'));
 });
 
+test('Jetson GStreamer keeps CUDA avatar composition independent from the video encoder', () => {
+  const avatarOverlay = {
+    panel: { left: 10, width: 120, height: 180 },
+    filterScriptPath: '/recordings/avatar-layer.ffscript',
+    gpuComposite: true,
+    gpuOutputToCpu: true,
+    entries: [
+      {
+        imagePath: '/recordings/avatar.png',
+        segments: [{ start: 0, end: 2, x1: 18, x2: 18, y1: 28, y2: 28 }]
+      }
+    ]
+  };
+  const script = createAvatarOverlayFilterScript({
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    avatarOverlay,
+    gpuComposite: true,
+    gpuOutputToCpu: true
+  });
+  const rawArgs = createBurnRawVideoArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    avatarOverlay,
+    duration: 2,
+    decoder: 'cuda'
+  });
+  const softwareEncodeArgs = createBurnArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    burnedPath: '/recordings/output.mkv',
+    codec: 'libx265',
+    crf: 24,
+    container: 'mkv',
+    fps: 30,
+    avatarOverlay
+  });
+
+  assert.match(script, /overlay_cuda=/);
+  assert.match(script, /scale_cuda=format=yuv420p,hwdownload,format=yuv420p\[vout\]/);
+  assert.equal(rawArgs[rawArgs.indexOf('-init_hw_device') + 1], 'cuda=br2k_avatar:0');
+  assert.equal(rawArgs[rawArgs.indexOf('-filter_hw_device') + 1], 'br2k_avatar');
+  assert.equal(softwareEncodeArgs[softwareEncodeArgs.indexOf('-init_hw_device') + 1], 'cuda=br2k_avatar:0');
+});
+
 test('FFmpeg-to-GStreamer bridge streams stdout into stdin and clears its cancellable child', async () => {
   const children = [];
   await runFfmpegToGstreamerJob({
@@ -649,6 +697,11 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.doesNotMatch(source, /-rawin/);
   assert.match(source, /BILI_RECORD_DOWNLOAD_MIRROR/);
   assert.match(source, /https:\/\/gh-proxy\.com\//);
+  assert.match(source, /download_manifest\(\)/);
+  assert.match(source, /MIRROR_MANIFEST_URL=.*\$MANIFEST_URL/);
+  assert.match(source, /download_manifest "GitHub 镜像 \$DOWNLOAD_MIRROR"/);
+  assert.match(source, /--retry 1 --connect-timeout 10 --max-time 30/);
+  assert.match(source, /正在验证官方 Ed25519 签名/);
   assert.match(source, /MIRROR_PACKAGE_URL=.*\$PACKAGE_URL/);
   assert.match(source, /download_and_verify "GitHub 官方源"/);
   assert.match(source, /--proto '=https' --proto-redir '=https'/);

@@ -72,6 +72,7 @@ export const recorder: RecorderApi = {
   applyUpdate: () => api<AppState>('/api/update/apply', {}, { timeoutMs: 0 }),
   queueUpdate: () => api<AppState>('/api/update/queue', {}, { timeoutMs: 0 }),
   setStartup: (enabled) => api<AppState>('/api/system/startup', { enabled }),
+  runHardwareAccelerationSelfTest: () => api<AppState>('/api/system/hardware-self-test', {}, { timeoutMs: 30000 }),
   testNotification: () => api<AppState>('/api/system/test-notification', {}),
   testWebhook: () => api<AppState>('/api/system/test-webhook', {}, { timeoutMs: 45000 }),
   shutdown: () => api('/api/system/shutdown', {}),

@@ -788,7 +788,12 @@ function shouldTestHardwareEncoder(candidate, adapters, platform = process.platf
   return String(platform) !== 'win32' || hasVideoAdapterVendor(adapters, candidate.vendor);
 }
 
-async function testFfmpegEncoder(ffmpegPath, codec) {
+async function testFfmpegEncoder(ffmpegPath, codec, options = {}) {
+  const width = Math.max(64, Math.round(Number(options.width) || 256));
+  const height = Math.max(64, Math.round(Number(options.height) || 144));
+  const rate = Math.max(1, Math.round(Number(options.rate) || 1));
+  const frames = Math.max(1, Math.round(Number(options.frames) || 1));
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 10000);
   try {
     const result = await runCapturedProcess(
       ffmpegPath,
@@ -799,9 +804,9 @@ async function testFfmpegEncoder(ffmpegPath, codec) {
         '-f',
         'lavfi',
         '-i',
-        'testsrc2=size=256x144:rate=1',
+        `testsrc2=size=${width}x${height}:rate=${rate}`,
         '-frames:v',
-        '1',
+        String(frames),
         '-an',
         '-c:v',
         codec,
@@ -810,7 +815,7 @@ async function testFfmpegEncoder(ffmpegPath, codec) {
         '-'
       ],
       {
-        timeoutMs: 10000,
+        timeoutMs,
         maxOutputBytes: 128 * 1024
       }
     );
@@ -919,13 +924,17 @@ async function testFfmpegCudaAvatarComposite(ffmpegPath) {
         '-f',
         'lavfi',
         '-i',
-        'color=c=black:s=64x64:r=1:d=1',
+        // Production recordings frequently arrive at the ASS stage as NV12.
+        // Exercise that conversion explicitly: testing color's default
+        // YUV420P alone would miss the overlay_cuda incompatibility that this
+        // probe is meant to prevent.
+        'color=c=black:s=64x64:r=1:d=1,format=nv12',
         '-f',
         'lavfi',
         '-i',
         'color=c=white@0.5:s=16x16:r=1:d=1,format=rgba',
         '-filter_complex',
-        '[0:v]hwupload_cuda[base];[1:v]hwupload_cuda[avatar];[base][avatar]overlay_cuda=x=8:y=8,scale_cuda=format=yuv420p[out]',
+        '[0:v]format=yuv420p,hwupload_cuda[base];[1:v]hwupload_cuda[avatar];[base][avatar]overlay_cuda=x=8:y=8,scale_cuda=format=yuv420p[out]',
         '-map',
         '[out]',
         '-frames:v',
@@ -1193,6 +1202,44 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   });
 }
 
+const ffmpegJobProgressSamples = new WeakMap();
+const FFMPEG_PROGRESS_SAMPLE_WINDOW_MS = 90_000;
+const FFMPEG_PROGRESS_SAMPLE_LIMIT = 24;
+
+function resetFfmpegJobProgressRate(progress) {
+  if (!progress || typeof progress !== 'object') return;
+  ffmpegJobProgressSamples.set(progress, [{ at: Date.now(), timeSec: Math.max(0, Number(progress.currentTimeSec) || 0) }]);
+  progress.renderFps = null;
+  progress.realtimeFactor = null;
+}
+
+function updateFfmpegJobProgressRate(progress, currentTimeSec, now) {
+  let samples = ffmpegJobProgressSamples.get(progress);
+  if (!samples) {
+    samples = [{ at: Number(progress.workStartedAt || progress.startedAt || now), timeSec: Math.max(0, Number(progress.currentTimeSec) || 0) }];
+  }
+  const lastSample = samples[samples.length - 1];
+  // A retry starts a new FFmpeg process at zero. Do not blend it with the
+  // failed attempt, otherwise its ETA is absurdly optimistic for minutes.
+  if (lastSample && currentTimeSec + 0.05 < lastSample.timeSec) {
+    samples = [{ at: now, timeSec: Math.max(0, currentTimeSec) }];
+  } else if (!lastSample || currentTimeSec > lastSample.timeSec + 0.02 || now - lastSample.at >= 1000) {
+    samples.push({ at: now, timeSec: Math.max(0, currentTimeSec) });
+  }
+  const cutoff = now - FFMPEG_PROGRESS_SAMPLE_WINDOW_MS;
+  samples = samples.filter((sample) => sample.at >= cutoff).slice(-FFMPEG_PROGRESS_SAMPLE_LIMIT);
+  ffmpegJobProgressSamples.set(progress, samples);
+  if (samples.length < 2) return null;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const elapsedSec = Math.max(0, (last.at - first.at) / 1000);
+  const mediaSec = Math.max(0, last.timeSec - first.timeSec);
+  if (elapsedSec < 3 || mediaSec < 0.25) return null;
+  const realtimeFactor = mediaSec / elapsedSec;
+  if (!Number.isFinite(realtimeFactor) || realtimeFactor <= 0) return null;
+  return realtimeFactor;
+}
+
 function createFfmpegJobProgress({
   kind,
   label,
@@ -1203,11 +1250,14 @@ function createFfmpegJobProgress({
   codecKind,
   decoder,
   decoderKind,
-  decoderLabel
+  decoderLabel,
+  sourceFps,
+  encoderBackend,
+  avatarCompositeBackend
 }) {
   const now = Date.now();
   const duration = Number(durationSec || 0);
-  return {
+  const progress = {
     id: `${kind}-${now}-${Math.random().toString(36).slice(2, 8)}`,
     kind,
     status: 'running',
@@ -1219,14 +1269,22 @@ function createFfmpegJobProgress({
     decoder: decoder || undefined,
     decoderKind: decoderKind || undefined,
     decoderLabel: decoderLabel || undefined,
+    sourceFps: Number.isFinite(Number(sourceFps)) && Number(sourceFps) > 0 ? Number(sourceFps) : undefined,
+    encoderBackend: encoderBackend || undefined,
+    avatarCompositeBackend: avatarCompositeBackend || undefined,
+    fallbackReason: undefined,
     startedAt: now,
     updatedAt: now,
     currentTimeSec: 0,
     durationSec: Number.isFinite(duration) && duration > 0 ? duration : 0,
     estimatedRemainingSec: null,
+    renderFps: null,
+    realtimeFactor: null,
     percent: Number.isFinite(duration) && duration > 0 ? 0 : null,
     message: '准备中'
   };
+  resetFfmpegJobProgressRate(progress);
+  return progress;
 }
 
 function updateFfmpegJobProgress(progress, text) {
@@ -1246,13 +1304,14 @@ function updateFfmpegJobProgress(progress, text) {
   if (!percentChanged && now - Number(progress.updatedAt || 0) < 500) {
     return false;
   }
-  const elapsedSec = Math.max(0, (now - Number(progress.workStartedAt || progress.startedAt || now)) / 1000);
   const processedSec = Math.max(0, currentTimeSec);
   const remainingSec = duration > 0 ? Math.max(0, duration - processedSec) : 0;
+  const realtimeFactor = updateFfmpegJobProgressRate(progress, processedSec, now);
   progress.currentTimeSec = Math.max(0, currentTimeSec);
   progress.percent = percent;
-  progress.estimatedRemainingSec =
-    duration > 0 && processedSec >= 1 && elapsedSec >= 1 ? remainingSec / Math.max(processedSec / elapsedSec, 0.001) : null;
+  progress.realtimeFactor = realtimeFactor;
+  progress.renderFps = realtimeFactor && Number(progress.sourceFps || 0) > 0 ? realtimeFactor * Number(progress.sourceFps) : null;
+  progress.estimatedRemainingSec = duration > 0 && realtimeFactor ? remainingSec / realtimeFactor : null;
   progress.updatedAt = now;
   const progressText =
     duration > 0
@@ -3376,6 +3435,7 @@ module.exports = {
   formatFfmpegSeconds,
   runFfmpegJob,
   createFfmpegJobProgress,
+  resetFfmpegJobProgressRate,
   updateFfmpegJobProgress,
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,

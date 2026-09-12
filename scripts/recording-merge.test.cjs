@@ -875,7 +875,7 @@ test('NVIDIA avatar composite keeps the full visual timeline on CUDA', () => {
     avatarOverlay
   });
 
-  assert.match(script, /ass='C\\:\/temp\/overlay\.ass',hwupload_cuda\[avatar_layer_0\]/);
+  assert.match(script, /ass='C\\:\/temp\/overlay\.ass',format=yuv420p,hwupload_cuda\[avatar_layer_0\]/);
   assert.match(script, /overlay_cuda=/);
   assert.match(script, /overlay_cuda=x='[^']*\\,18\\,18\)/, 'CUDA uses full-canvas avatar coordinates');
   assert.match(script, /scale_cuda=format=yuv420p\[vout\]/);
