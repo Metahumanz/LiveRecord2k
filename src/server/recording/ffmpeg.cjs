@@ -441,7 +441,12 @@ function createAvatarOverlayFilterScript({
         inputTrimStartSec,
         inputTrimEndSec,
         preserveSourceFrameTiming
-      })},hwupload_cuda[avatar_layer_0]`
+      // ASS rendering commonly preserves the source NV12 format.  CUDA's
+      // overlay filter cannot composite the alpha avatar upload (YUVA420P)
+      // directly over that NV12 surface, even though both are valid CUDA
+      // frames.  Normalize the rendered main layer before uploading so the
+      // two CUDA inputs use the YUV420 family expected by overlay_cuda.
+      })},format=yuv420p,hwupload_cuda[avatar_layer_0]`
       : `[0:v]${createBurnVideoFilter(assPath, fps, {
           timelineOffset: sourceClockOffset,
           skipInitialKeyframeGuard,
