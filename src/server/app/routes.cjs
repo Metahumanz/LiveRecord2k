@@ -176,6 +176,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/update/apply': () => service.applyUpdate(),
     '/api/update/queue': () => service.queueUpdateAfterJobs(),
     '/api/system/startup': () => service.setStartup(body.enabled),
+    '/api/system/hardware-self-test': () => service.runHardwareAccelerationSelfTest(),
     '/api/system/test-notification': () => service.testNotification(),
     '/api/system/test-webhook': () => service.testWebhook(),
     '/api/system/shutdown': () => service.requestShutdown()

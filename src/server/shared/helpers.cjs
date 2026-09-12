@@ -788,7 +788,12 @@ function shouldTestHardwareEncoder(candidate, adapters, platform = process.platf
   return String(platform) !== 'win32' || hasVideoAdapterVendor(adapters, candidate.vendor);
 }
 
-async function testFfmpegEncoder(ffmpegPath, codec) {
+async function testFfmpegEncoder(ffmpegPath, codec, options = {}) {
+  const width = Math.max(64, Math.round(Number(options.width) || 256));
+  const height = Math.max(64, Math.round(Number(options.height) || 144));
+  const rate = Math.max(1, Math.round(Number(options.rate) || 1));
+  const frames = Math.max(1, Math.round(Number(options.frames) || 1));
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 10000);
   try {
     const result = await runCapturedProcess(
       ffmpegPath,
@@ -799,9 +804,9 @@ async function testFfmpegEncoder(ffmpegPath, codec) {
         '-f',
         'lavfi',
         '-i',
-        'testsrc2=size=256x144:rate=1',
+        `testsrc2=size=${width}x${height}:rate=${rate}`,
         '-frames:v',
-        '1',
+        String(frames),
         '-an',
         '-c:v',
         codec,
@@ -810,7 +815,7 @@ async function testFfmpegEncoder(ffmpegPath, codec) {
         '-'
       ],
       {
-        timeoutMs: 10000,
+        timeoutMs,
         maxOutputBytes: 128 * 1024
       }
     );

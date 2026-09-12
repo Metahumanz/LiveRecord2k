@@ -90,6 +90,7 @@ const {
   detectVideoAdapterVendor,
   hasVideoAdapterVendor,
   testFfmpegEncoder,
+  testFfmpegCudaAvatarComposite,
   normalizeBurnCodec,
   normalizeRoomImageMode,
   normalizeBurnOverlayMode,
@@ -1046,6 +1047,18 @@ class LiveRecordService {
     this.pathPickerStarting = false;
     this.startupEnabled = false;
     this.outputDiskSpace = null;
+    this.hardwareSelfTest = {
+      status: 'idle',
+      message: '尚未运行硬件加速自检。',
+      startedAt: 0,
+      completedAt: 0,
+      codec: '',
+      encoderBackend: '',
+      decoderBackend: '',
+      avatarCompositeBackend: '',
+      fallbackReason: ''
+    };
+    this.hardwareSelfTestPromise = null;
     this.accessAuth = new AccessAuthManager();
     this.updateState = {
       status: 'idle',
@@ -1721,6 +1734,7 @@ class LiveRecordService {
       update: this.getPublicUpdateState(),
       ffmpegPath: this.ffmpegPath,
       ffmpegCapabilities: this.ffmpegCapabilities,
+      hardwareSelfTest: { ...this.hardwareSelfTest },
       exportProgress: this.exportProgress ? { ...this.exportProgress } : null,
       exportQueue: this.exportQueue.map((item) => this.getPublicExportQueueItem(item)),
       burnQueue: this.burnQueue.map((item) => this.getPublicBurnQueueItem(item)),
@@ -2090,6 +2104,7 @@ class LiveRecordService {
       update: this.getPublicUpdateState(),
       ffmpegPath: this.ffmpegPath,
       ffmpegCapabilities: this.ffmpegCapabilities,
+      hardwareSelfTest: { ...this.hardwareSelfTest },
       currentPort: this.currentPort || DEFAULT_PORT,
       currentHost: this.currentHost || DEFAULT_HOST,
       platform: UI_PLATFORM,
@@ -10318,6 +10333,126 @@ try {
   scheduleAutomaticUpdateCheck(delayMs = AUTO_UPDATE_INTERVAL_MS) {
     return this.updateService.scheduleAutomaticUpdateCheck(delayMs);
   }
+
+  async runJetsonGstreamerBridgeSelfTest(codecInfo) {
+    const codec = String(codecInfo?.value || '').trim();
+    const gstreamerArgs = createJetsonGstreamerEncodeArgs({
+      codec,
+      width: 320,
+      height: 180,
+      fps: 30,
+      quality: 28,
+      outputPath: '/dev/null'
+    });
+    // Use fakesink: this validates the same FFmpeg raw-I420 to nvv4l2 bridge
+    // used by a burn without leaving an elementary stream on disk.
+    gstreamerArgs.splice(gstreamerArgs.length - 3, 3, '!', 'fakesink');
+    try {
+      await runFfmpegToGstreamerJob({
+        ffmpegPath: this.ffmpegPath,
+        ffmpegArgs: [
+          '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30',
+          '-frames:v', '90', '-an', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', 'pipe:1'
+        ],
+        gstreamerArgs,
+        timeoutMs: 10000
+      });
+      return { ok: true, reason: '' };
+    } catch (error) {
+      return { ok: false, reason: compactLogLine(error?.message || String(error)) };
+    }
+  }
+
+  async runHardwareAccelerationSelfTest() {
+    if (this.hardwareSelfTestPromise) {
+      throw businessError('HARDWARE_SELF_TEST_RUNNING', '硬件加速自检正在运行，请稍候。', 409);
+    }
+    if (this.hasActiveJobs()) {
+      throw businessError('HARDWARE_SELF_TEST_BUSY', '当前有录制或媒体任务，硬件加速自检不会抢占 GPU；请在任务结束后再试。', 409);
+    }
+
+    const run = async () => {
+      await this.waitForRuntimeCapabilities();
+      const codec = this.chooseBurnCodec(this.settings.burnCodec);
+      const codecInfo = this.getBurnCodecInfo(codec);
+      const decoder = (this.ffmpegCapabilities.hardwareDecoders || [])[0];
+      const startedAt = Date.now();
+      this.hardwareSelfTest = {
+        status: 'running',
+        message: '正在执行约 5–10 秒的编码、合成链路自检…',
+        startedAt,
+        completedAt: 0,
+        codec,
+        encoderBackend: this.getEncoderBackendLabel(codecInfo),
+        decoderBackend: decoder ? `${decoder.label}（能力已探测；真实解码取决于源视频）` : 'CPU（未探测到可用硬件解码）',
+        avatarCompositeBackend: '正在测试 CUDA 头像合成',
+        fallbackReason: ''
+      };
+      this.log(
+        'info',
+        `开始硬件加速自检：选中的编码器 ${codec}，实际后端 ${this.hardwareSelfTest.encoderBackend}，解码后端 ${this.hardwareSelfTest.decoderBackend}。`
+      );
+      this.markSystemDirty();
+
+      if (codecInfo.kind !== 'hardware') {
+        this.hardwareSelfTest = {
+          ...this.hardwareSelfTest,
+          status: 'unavailable',
+          completedAt: Date.now(),
+          avatarCompositeBackend: this.ffmpegCapabilities.cudaAvatarComposite ? 'CUDA 头像合成可用' : 'CPU 头像合成（CUDA 不可用）',
+          message: '当前没有选中可用的硬件编码器；请先在设置中选择已通过能力探测的硬编。',
+          fallbackReason: '当前使用软件编码。'
+        };
+        this.log('warn', `硬件加速自检未执行编码：${this.hardwareSelfTest.message}`);
+        this.markSystemDirty();
+        return this.getState();
+      }
+
+      const encoderTest = codecInfo.backend === 'gstreamer'
+        ? await this.runJetsonGstreamerBridgeSelfTest(codecInfo)
+        : await testFfmpegEncoder(this.ffmpegPath, codec, {
+            width: 320,
+            height: 180,
+            rate: 30,
+            frames: 90,
+            timeoutMs: 10000
+          });
+      const avatarTest = await testFfmpegCudaAvatarComposite(this.ffmpegPath);
+      const fallbackReason = [
+        encoderTest.ok ? '' : `编码自检失败：${encoderTest.reason || '未知原因'}`,
+        avatarTest.ok ? '' : `CUDA 头像合成不可用，运行时将使用 CPU：${avatarTest.reason || '未知原因'}`
+      ].filter(Boolean).join('；');
+      const encoderPassed = Boolean(encoderTest.ok);
+      this.hardwareSelfTest = {
+        ...this.hardwareSelfTest,
+        status: encoderPassed ? (avatarTest.ok ? 'completed' : 'degraded') : 'failed',
+        completedAt: Date.now(),
+        avatarCompositeBackend: avatarTest.ok ? 'CUDA 头像合成' : 'CPU 头像合成（CUDA 自检未通过）',
+        fallbackReason,
+        message: encoderPassed
+          ? avatarTest.ok
+            ? '硬件编码和 CUDA 头像合成自检通过。'
+            : '硬件编码自检通过；CUDA 头像合成未通过，将自动使用 CPU 头像合成。'
+          : '硬件编码自检未通过；不会将此结果伪装为可用硬编。'
+      };
+      this.log(
+        encoderPassed ? (avatarTest.ok ? 'success' : 'warn') : 'error',
+        `硬件加速自检结果：${this.hardwareSelfTest.message} 编码器 ${codec}；实际后端 ${this.hardwareSelfTest.encoderBackend}；头像合成 ${this.hardwareSelfTest.avatarCompositeBackend}${
+          fallbackReason ? `；原因：${fallbackReason}` : ''
+        }`
+      );
+      this.markSystemDirty();
+      return this.getState();
+    };
+
+    this.hardwareSelfTestPromise = run();
+    try {
+      return await this.hardwareSelfTestPromise;
+    } finally {
+      this.hardwareSelfTestPromise = null;
+    }
+  }
+
   hasActiveJobs() {
     return (
       this.mediaJobs.hasActive() ||

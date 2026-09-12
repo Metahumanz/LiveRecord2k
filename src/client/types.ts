@@ -303,6 +303,18 @@ export type FfmpegJobProgress = {
   message?: string;
 };
 
+export type HardwareSelfTest = {
+  status: 'idle' | 'running' | 'completed' | 'degraded' | 'failed' | 'unavailable';
+  message: string;
+  startedAt: number;
+  completedAt: number;
+  codec: string;
+  encoderBackend: string;
+  decoderBackend: string;
+  avatarCompositeBackend: string;
+  fallbackReason: string;
+};
+
 export type ExportQueueItem = {
   id: string;
   label: string;
@@ -399,6 +411,7 @@ export type AppState = {
   update: UpdateState;
   ffmpegPath?: string;
   ffmpegCapabilities?: FfmpegCapabilities;
+  hardwareSelfTest?: HardwareSelfTest;
   exportProgress?: FfmpegJobProgress | null;
   exportQueue?: ExportQueueItem[];
   burnQueue?: BurnQueueItem[];
@@ -481,6 +494,7 @@ export type RecorderApi = {
   applyUpdate: () => Promise<AppState>;
   queueUpdate: () => Promise<AppState>;
   setStartup: (enabled: boolean) => Promise<AppState>;
+  runHardwareAccelerationSelfTest: () => Promise<AppState>;
   testNotification: () => Promise<AppState>;
   testWebhook: () => Promise<AppState>;
   shutdown: () => Promise<void>;

@@ -49,6 +49,19 @@ test('Linux hardware encoders are decided by the real FFmpeg probe even when ada
   assert.equal(shouldTestHardwareEncoder(candidate, [{ vendor: 'nvidia' }], 'win32'), true);
 });
 
+test('硬件加速自检在未选择硬编时返回明确的不可用状态且不启动转码', async () => {
+  const service = new LiveRecordService();
+  service.waitForRuntimeCapabilities = async () => {};
+  service.settings.burnCodec = 'libx265';
+
+  const state = await service.runHardwareAccelerationSelfTest();
+
+  assert.equal(state.hardwareSelfTest.status, 'unavailable');
+  assert.equal(state.hardwareSelfTest.codec, 'libx265');
+  assert.match(state.hardwareSelfTest.message, /没有选中可用的硬件编码器/);
+  assert.match(state.hardwareSelfTest.fallbackReason, /软件编码/);
+});
+
 test('媒体资源计划区分录制写入、轻量预览和高负载转码', () => {
   const service = new LiveRecordService();
   assert.deepEqual(service.getRecordingMediaResourcePlan(), {
