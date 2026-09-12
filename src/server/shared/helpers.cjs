@@ -919,13 +919,17 @@ async function testFfmpegCudaAvatarComposite(ffmpegPath) {
         '-f',
         'lavfi',
         '-i',
-        'color=c=black:s=64x64:r=1:d=1',
+        // Production recordings frequently arrive at the ASS stage as NV12.
+        // Exercise that conversion explicitly: testing color's default
+        // YUV420P alone would miss the overlay_cuda incompatibility that this
+        // probe is meant to prevent.
+        'color=c=black:s=64x64:r=1:d=1,format=nv12',
         '-f',
         'lavfi',
         '-i',
         'color=c=white@0.5:s=16x16:r=1:d=1,format=rgba',
         '-filter_complex',
-        '[0:v]hwupload_cuda[base];[1:v]hwupload_cuda[avatar];[base][avatar]overlay_cuda=x=8:y=8,scale_cuda=format=yuv420p[out]',
+        '[0:v]format=yuv420p,hwupload_cuda[base];[1:v]hwupload_cuda[avatar];[base][avatar]overlay_cuda=x=8:y=8,scale_cuda=format=yuv420p[out]',
         '-map',
         '[out]',
         '-frames:v',
