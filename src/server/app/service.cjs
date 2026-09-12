@@ -114,6 +114,7 @@ const {
   formatFfmpegSeconds,
   runFfmpegJob,
   createFfmpegJobProgress,
+  resetFfmpegJobProgressRate,
   updateFfmpegJobProgress,
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
@@ -742,7 +743,7 @@ function isFfmpegCudaAvatarCompositeError(error) {
   // bundled FFmpeg/NVIDIA builds.  This is a filter-composition failure, not
   // a decoder or NVENC failure, so it needs a CPU-overlay retry instead of
   // the ordinary hardware-decoder fallback.
-  return /(?:overlay_cuda[^\n]*(?:can't overlay|cannot overlay|failed to configure output pad)|(?:can't|cannot) overlay\s+\w+\s+on\s+\w+)/i.test(
+  return /(?:(?:overlay_cuda|hwupload_cuda|scale_cuda)[^\n]*(?:can't|cannot|failed|error)|(?:can't|cannot) overlay\s+\w+\s+on\s+\w+)/i.test(
     detail
   );
 }
@@ -1170,7 +1171,11 @@ class LiveRecordService {
     ]);
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
-    this.log('info', `当前弹幕版编码：${this.getBurnCodecInfo(this.settings.burnCodec).label}（${this.settings.burnCodec}）`);
+    const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
+    this.log(
+      'info',
+      `当前弹幕版编码：${selectedCodec.label}（选中的编码器 ${this.settings.burnCodec}，实际后端 ${this.getEncoderBackendLabel(selectedCodec)}）`
+    );
     const hardwareDecoderSummary = ['h264', 'hevc']
       .map((codec) => {
         const labels = [
@@ -1190,7 +1195,7 @@ class LiveRecordService {
     this.log(
       this.ffmpegCapabilities.cudaAvatarComposite ? 'info' : 'warn',
       this.ffmpegCapabilities.cudaAvatarComposite
-        ? '真实头像透明图层将使用 NVIDIA CUDA 合成。'
+        ? '已验证 NVIDIA CUDA 真实头像合成链路；它独立于视频编码后端，Jetson GStreamer 编码同样可使用。'
         : `真实头像透明图层将使用 CPU 合成${
             this.ffmpegCapabilities.cudaAvatarCompositeReason ? `：${this.ffmpegCapabilities.cudaAvatarCompositeReason}` : ''
           }`
@@ -1425,6 +1430,47 @@ class LiveRecordService {
     );
   }
 
+  getEncoderBackendLabel(codecInfo) {
+    const codec = String(codecInfo?.value || '').trim();
+    const encoderLabel = String(codecInfo?.element || '').trim();
+    if (codecInfo?.backend === 'gstreamer') {
+      return `Jetson ${isHevcCodec(codec) ? 'H.265' : 'H.264'} 硬编（GStreamer ${encoderLabel || codec}）`;
+    }
+    if (codecInfo?.backend === 'v4l2m2m') {
+      return `V4L2 M2M ${isHevcCodec(codec) ? 'H.265' : 'H.264'} 硬编（FFmpeg ${codec}）`;
+    }
+    if (codec.includes('nvenc')) return `NVIDIA NVENC（FFmpeg ${codec}）`;
+    if (codec.includes('qsv')) return `Intel QSV（FFmpeg ${codec}）`;
+    if (codec.includes('amf')) return `AMD AMF（FFmpeg ${codec}）`;
+    return codecInfo?.kind === 'hardware' ? `硬件编码（FFmpeg ${codec || '未知'}）` : `软件编码（FFmpeg ${codec || '未知'}）`;
+  }
+
+  getAvatarCompositeBackendLabel(avatarLayer, avatarMode) {
+    if (avatarLayer?.gpuComposite) {
+      return avatarLayer.gpuOutputToCpu ? 'CUDA 头像合成（回传 CPU 编码链路）' : 'CUDA 头像合成';
+    }
+    if (avatarLayer?.chunked && this.ffmpegCapabilities?.cudaAvatarComposite) {
+      return avatarLayer.gpuOutputToCpu ? 'CUDA/CPU 分段头像合成（回传 CPU 编码链路）' : 'CUDA/CPU 分段头像合成';
+    }
+    if (Array.isArray(avatarLayer?.entries) && avatarLayer.entries.length) return 'CPU 头像合成';
+    return avatarMode === 'off' ? '真实头像关闭' : '通用头像';
+  }
+
+  setProgressFallback(progress, reason, options = {}) {
+    if (!progress) return;
+    progress.fallbackReason = String(reason || '').trim() || undefined;
+    if (options.avatarCompositeBackend) progress.avatarCompositeBackend = options.avatarCompositeBackend;
+    if (options.reset) {
+      progress.workStartedAt = Date.now();
+      progress.currentTimeSec = 0;
+      progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
+      progress.estimatedRemainingSec = null;
+      resetFfmpegJobProgressRate(progress);
+    }
+    if (options.message) progress.message = options.message;
+    progress.updatedAt = Date.now();
+  }
+
   getPreviewCodec() {
     const available = new Set(this.getAvailableBurnCodecs());
     // The Jetson GStreamer bridge is used for burn/export jobs, where it can
@@ -1498,17 +1544,17 @@ class LiveRecordService {
       progress.currentTimeSec = 0;
       progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
       progress.estimatedRemainingSec = null;
+      resetFfmpegJobProgressRate(progress);
       if (options.message) progress.message = options.message;
     }
     progress.updatedAt = Date.now();
   }
 
-  shouldUseCudaAvatarComposite(codec, avatarPlan) {
+  shouldUseCudaAvatarComposite(_codec, avatarPlan) {
     const entryCount = Array.isArray(avatarPlan?.entries) ? avatarPlan.entries.length : 0;
     return Boolean(
       entryCount > 0 &&
         entryCount <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
-        String(codec || '').includes('nvenc') &&
         this.ffmpegCapabilities?.cudaAvatarComposite
     );
   }
@@ -8444,6 +8490,10 @@ try {
       };
       const filterScriptPath = path.join(workingDir, 'avatar-layer.ffscript');
       const gpuComposite = Boolean(options.gpuComposite);
+      // CUDA can stay on-device only for an NVENC encode. Jetson's GStreamer
+      // bridge (and all other encoders) consume system-memory I420, so retain
+      // CUDA compositing but explicitly download the finished frame.
+      const gpuOutputToCpu = Boolean(options.gpuOutputToCpu);
       const cpuFilterScriptPath = gpuComposite ? path.join(workingDir, 'avatar-layer.cpu.ffscript') : '';
       const chunkDuration = !gpuComposite && entries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES ? AVATAR_OVERLAY_CHUNK_SECONDS : 0;
       if (!chunkDuration) {
@@ -8453,6 +8503,7 @@ try {
             fps: options.fps,
             avatarOverlay: overlay,
             gpuComposite: useGpuComposite,
+            gpuOutputToCpu: useGpuComposite && gpuOutputToCpu,
             duration: options.duration,
             timelineOffset: options.timelineOffset,
             leadingVideoPaddingSec: options.leadingVideoPaddingSec,
@@ -8481,7 +8532,7 @@ try {
         'info',
         `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
           avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
-          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? '，NVIDIA CUDA 合成，已预置 CPU 回退。' : chunkDuration ? '，按时间分段合成（按段选择 CUDA/CPU）。' : '。'}`
+          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? `，NVIDIA CUDA 合成${gpuOutputToCpu ? '后回传 CPU 编码链路' : ''}，已预置 CPU 回退。` : chunkDuration ? '，按时间分段合成（按段选择 CUDA/CPU）。' : '。'}`
       );
       return {
         ...overlay,
@@ -8489,6 +8540,7 @@ try {
         cpuFilterScriptPath,
         temporaryDir: workingDir,
         gpuComposite,
+        gpuOutputToCpu,
         chunked: Boolean(chunkDuration),
         chunkDuration
       };
@@ -8581,6 +8633,35 @@ try {
     }
   }
 
+  async runJetsonGstreamerWithCudaAvatarCompositeFallback({
+    avatarLayer,
+    createTranscode,
+    beforeRetry,
+    onCudaFallback,
+    label = 'Jetson 媒体处理'
+  } = {}) {
+    if (typeof createTranscode !== 'function') {
+      throw new Error('Jetson CUDA 头像回退缺少媒体处理参数。');
+    }
+    try {
+      return await createTranscode(avatarLayer);
+    } catch (error) {
+      const cpuAvatarLayer = createCpuAvatarCompositeFallbackLayer(avatarLayer);
+      if (error?.code === 'BR2K_MEDIA_CANCELLED' || !cpuAvatarLayer || !isFfmpegCudaAvatarCompositeError(error)) {
+        throw error;
+      }
+      this.log(
+        'warn',
+        `${label} 的 CUDA 真实头像合成不兼容当前 FFmpeg，保留 Jetson GStreamer 硬编并改用 CPU 头像合成重试：${compactLogLine(
+          error.message
+        )}`
+      );
+      await beforeRetry?.();
+      onCudaFallback?.();
+      return createTranscode(cpuAvatarLayer);
+    }
+  }
+
   // L4T R35 exposes the Jetson hardware encoder through GStreamer rather
   // than the stock FFmpeg binary.  Keep FFmpeg for decoding, ASS/avatar
   // rendering and final muxing, then bridge its raw I420 output directly to
@@ -8621,6 +8702,10 @@ try {
       outputPath,
       preview
     });
+    this.log(
+      'info',
+      `${label}：选中的编码器 ${codec}，实际后端 Jetson GStreamer ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}；FFmpeg 负责解码/滤镜，原始 I420 流式送入硬编。`
+    );
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     const run = async (nextDecoder) => {
       await fsp.rm(outputPath, { force: true }).catch(() => {});
@@ -8680,6 +8765,7 @@ try {
     onProgress,
     onStage,
     onDecoderFallback,
+    onCudaAvatarFallback,
     label = '头像分段烧录',
     isCancelled
   } = {}) {
@@ -8699,9 +8785,7 @@ try {
     const chunkDurations = [];
     const scriptPaths = [];
     let activeDecoder = decoder;
-    let cudaAvatarCompositeEnabled = Boolean(
-      String(codec || '').includes('nvenc') && this.ffmpegCapabilities?.cudaAvatarComposite
-    );
+    let cudaAvatarCompositeEnabled = Boolean(this.ffmpegCapabilities?.cudaAvatarComposite);
     const concatPath = path.join(temporaryDir, 'avatar-chunks.ffconcat');
     let completedDuration = 0;
     const cancellationError = () => {
@@ -8767,7 +8851,8 @@ try {
           inputTrimStartSec: chunkSeekPrerollSec,
           inputTrimEndSec: chunkInputTrimEndSec,
           preserveSourceFrameTiming: true,
-          gpuComposite: useCudaForChunk
+          gpuComposite: useCudaForChunk,
+          gpuOutputToCpu: useCudaForChunk && Boolean(avatarLayer?.gpuOutputToCpu)
         });
         if (!script) throw new Error(`头像分段 ${chunkIndex + 1} 没有生成有效滤镜。`);
         await fsp.writeFile(scriptPath, script, 'utf8');
@@ -8865,6 +8950,7 @@ try {
               error.message
             )}`
           );
+          onCudaAvatarFallback?.();
           onStage?.(`正在烧录头像分段 ${chunkIndex + 1}（CPU 头像合成回退）`);
           const cpuScript = createAvatarOverlayChunkFilterScript({
             assPath,
@@ -8884,15 +8970,58 @@ try {
           await fsp.writeFile(scriptPath, cpuScript, 'utf8');
           await fsp.rm(chunkPath, { force: true }).catch(() => {});
           chunkAvatarLayer = { ...chunkAvatarLayer, gpuComposite: false };
-          usedDecoder = await this.runFfmpegWithHardwareDecodeFallback({
-            decoder: activeDecoder,
-            createArgs: createChunkBurnArgs,
-            onStderr: reportStderr,
-            onChild,
-            beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
-            onFallback: onDecoderFallback,
-            label: `${label} ${chunkIndex + 1}（CPU 头像合成）`
-          });
+          usedDecoder = isJetsonGstreamerCodec(codec)
+            ? await this.runJetsonGstreamerTranscode({
+                codec,
+                quality: crf,
+                width: avatarLayer?.videoWidth,
+                height: avatarLayer?.videoHeight,
+                fps,
+                encodedVideoPath: encodedChunkPath,
+                createRawArgs: (nextDecoder) =>
+                  createBurnRawVideoArgs({
+                    cleanPath,
+                    assPath,
+                    fps,
+                    avatarOverlay: chunkAvatarLayer,
+                    startTime: chunkStart,
+                    duration: chunkLength,
+                    inputSeek: true,
+                    inputSeekPrerollSec: chunkSeekPrerollSec,
+                    inputTrimStartSec: chunkSeekPrerollSec,
+                    inputTrimEndSec: chunkInputTrimEndSec,
+                    timelineOffset: chunkTimelineOffset,
+                    leadingVideoPaddingSec: chunkVideoPaddingSec,
+                    decoder: nextDecoder
+                  }),
+                createMuxArgs: () =>
+                  createBurnEncodedVideoMuxArgs({
+                    encodedVideoPath: encodedChunkPath,
+                    cleanPath,
+                    outputPath: chunkPath,
+                    codec,
+                    fps,
+                    startTime: chunkStart,
+                    duration: chunkLength,
+                    container: 'mkv',
+                    includeAudio: false
+                  }),
+                decoder: activeDecoder,
+                onStderr: reportStderr,
+                onChild,
+                beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
+                onFallback: onDecoderFallback,
+                label: `${label} ${chunkIndex + 1}（CPU 头像合成）`
+              })
+            : await this.runFfmpegWithHardwareDecodeFallback({
+                decoder: activeDecoder,
+                createArgs: createChunkBurnArgs,
+                onStderr: reportStderr,
+                onChild,
+                beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
+                onFallback: onDecoderFallback,
+                label: `${label} ${chunkIndex + 1}（CPU 头像合成）`
+              });
         }
         activeDecoder = usedDecoder;
         // A short, static chunk can legitimately be smaller than the final
@@ -9006,6 +9135,7 @@ try {
       await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
       const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
       const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(burnCodec, assets.avatarPlan);
+      const gpuAvatarOutputToCpu = !String(burnCodec || '').includes('nvenc');
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         recording,
         assPath: assets.assPath,
@@ -9016,6 +9146,7 @@ try {
         outputDuration: durationSec,
         label: `${roomLabel(room)} 烧录`,
         gpuComposite: gpuAvatarComposite,
+        gpuOutputToCpu: gpuAvatarOutputToCpu,
         isCancelled: () => this.burnCancelRequests.has(room.id)
       });
       const progress = createFfmpegJobProgress({
@@ -9028,7 +9159,10 @@ try {
         codecKind: codecInfo.kind,
         decoder: decoderInfo.value,
         decoderKind: decoderInfo.kind,
-        decoderLabel: decoderInfo.label
+        decoderLabel: decoderInfo.label,
+        sourceFps: burnFps,
+        encoderBackend: this.getEncoderBackendLabel(codecInfo),
+        avatarCompositeBackend: this.getAvatarCompositeBackendLabel(avatarLayer, avatarMode)
       });
       room.burning = true;
       room.burnProgress = progress;
@@ -9041,11 +9175,12 @@ try {
         'info',
         `${roomLabel(room)} 正在生成有弹幕版：${path.basename(burnedPath)}（${overlayModeLabel(
           overlayMode
-        )}，${danmakuDisplayAreaLabel(danmakuArea)}，样式 ${stylePreset}，${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${
-          codecInfo.label
-        }，${decoderInfo.kind === 'hardware' ? `${decoderInfo.label} 硬件解码` : 'CPU 解码'}，真实头像 ${burnAvatarModeLabel(avatarMode)}${
-          avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''
-        }${assets.playWidth > 0 && assets.playHeight > 0 ? `，${assets.playWidth}x${assets.playHeight}${assets.portrait ? ' 竖屏适配' : ''}` : ''}）`
+        )}，${danmakuDisplayAreaLabel(danmakuArea)}，样式 ${stylePreset}，选中的编码器 ${burnCodec}，实际后端 ${this.getEncoderBackendLabel(
+          codecInfo
+        )}，解码后端 ${decoderInfo.kind === 'hardware' ? decoderInfo.label : 'CPU'}，头像合成后端 ${this.getAvatarCompositeBackendLabel(
+          avatarLayer,
+          avatarMode
+        )}${assets.playWidth > 0 && assets.playHeight > 0 ? `，${assets.playWidth}x${assets.playHeight}${assets.portrait ? ' 竖屏适配' : ''}` : ''}）`
       );
       if (this.settings.notifyBurnStarted) {
         this.notify('开始烧录弹幕版', `${roomLabel(room)} 正在生成 ${path.basename(burnedPath)}`, 'burn.started', {
@@ -9176,6 +9311,13 @@ try {
               onStage: setBurnStage,
               onDecoderFallback: () => {
                 this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
+                this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码。');
+                this.markRoomDirty(room.id);
+              },
+              onCudaAvatarFallback: () => {
+                this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+                  avatarCompositeBackend: 'CPU 头像合成'
+                });
                 this.markRoomDirty(room.id);
               },
               label: `${roomLabel(room)} 头像分段烧录`,
@@ -9206,16 +9348,16 @@ try {
                 { value: 'software', label: 'CPU', kind: 'software' },
                 { reset: true, message: '硬件解码不兼容，正在使用 CPU 解码重新烧录' }
               );
+              this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码。');
               this.markRoomDirty(room.id);
             };
             const onCudaAvatarCompositeFallback = () => {
               if (room.burnProgress?.id === progress.id) {
-                progress.workStartedAt = Date.now();
-                progress.currentTimeSec = 0;
-                progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
-                progress.estimatedRemainingSec = null;
-                progress.message = 'CUDA 头像合成不兼容，正在使用 CPU 头像合成重新烧录';
-                progress.updatedAt = Date.now();
+                this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+                  reset: true,
+                  message: 'CUDA 头像合成不兼容，正在使用 CPU 头像合成重新烧录',
+                  avatarCompositeBackend: 'CPU 头像合成'
+                });
               }
               this.markRoomDirty(room.id);
             };
@@ -9223,44 +9365,51 @@ try {
               const encodedVideoPath = `${burnedTmpPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
                 isHevcCodec(burnCodec) ? 'h265' : 'h264'
               }`;
-              await this.runJetsonGstreamerTranscode({
-                codec: burnCodec,
-                quality: burnCrf,
-                width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
-                height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
-                fps: burnFps,
-                encodedVideoPath,
-                createRawArgs: (decoder) =>
-                  createBurnRawVideoArgs({
-                    cleanPath: burnSourcePath,
-                    assPath: assets.assPath,
-                    fps: burnFps,
-                    avatarOverlay: avatarLayer,
-                    startTime: 0,
-                    duration: durationSec,
-                    timelineOffset: burnTimeline.videoClockStartSec,
-                    leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-                    decoder
-                  }),
-                createMuxArgs: () =>
-                  createBurnEncodedVideoMuxArgs({
-                    encodedVideoPath,
-                    cleanPath: burnSourcePath,
-                    outputPath: burnedTmpPath,
+              await this.runJetsonGstreamerWithCudaAvatarCompositeFallback({
+                avatarLayer,
+                createTranscode: (nextAvatarLayer) =>
+                  this.runJetsonGstreamerTranscode({
                     codec: burnCodec,
+                    quality: burnCrf,
+                    width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                    height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
                     fps: burnFps,
-                    startTime: 0,
-                    duration: durationSec,
-                    container: getContainerFromPath(burnedPath),
-                    leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
-                    includeAudio: Boolean(mediaInfo.audioInfo),
-                    copyAudio: copySourceAudio
+                    encodedVideoPath,
+                    createRawArgs: (decoder) =>
+                      createBurnRawVideoArgs({
+                        cleanPath: burnSourcePath,
+                        assPath: assets.assPath,
+                        fps: burnFps,
+                        avatarOverlay: nextAvatarLayer,
+                        startTime: 0,
+                        duration: durationSec,
+                        timelineOffset: burnTimeline.videoClockStartSec,
+                        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+                        decoder
+                      }),
+                    createMuxArgs: () =>
+                      createBurnEncodedVideoMuxArgs({
+                        encodedVideoPath,
+                        cleanPath: burnSourcePath,
+                        outputPath: burnedTmpPath,
+                        codec: burnCodec,
+                        fps: burnFps,
+                        startTime: 0,
+                        duration: durationSec,
+                        container: getContainerFromPath(burnedPath),
+                        leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
+                        includeAudio: Boolean(mediaInfo.audioInfo),
+                        copyAudio: copySourceAudio
+                      }),
+                    decoder: decoderInfo,
+                    onStderr: handleBurnStderr,
+                    onChild: (child) => this.burnSessions.set(room.id, child),
+                    beforeRetry: () => fsp.rm(burnedTmpPath, { force: true }).catch(() => {}),
+                    onFallback: onDecoderFallback,
+                    label: `${roomLabel(room)} Jetson 烧录`
                   }),
-                decoder: decoderInfo,
-                onStderr: handleBurnStderr,
-                onChild: (child) => this.burnSessions.set(room.id, child),
                 beforeRetry: () => fsp.rm(burnedTmpPath, { force: true }).catch(() => {}),
-                onFallback: onDecoderFallback,
+                onCudaFallback: onCudaAvatarCompositeFallback,
                 label: `${roomLabel(room)} Jetson 烧录`
               });
             } else {
@@ -9672,9 +9821,12 @@ try {
       roomId: recording.roomId || undefined,
       codec: codecInfo?.value,
       codecKind: codecInfo?.kind,
-      decoder: mode === 'burn' ? decoderInfo.value : undefined,
-      decoderKind: mode === 'burn' ? decoderInfo.kind : undefined,
-      decoderLabel: mode === 'burn' ? decoderInfo.label : undefined
+        decoder: mode === 'burn' ? decoderInfo.value : undefined,
+        decoderKind: mode === 'burn' ? decoderInfo.kind : undefined,
+        decoderLabel: mode === 'burn' ? decoderInfo.label : undefined,
+        sourceFps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
+        encoderBackend: codecInfo ? this.getEncoderBackendLabel(codecInfo) : '直接封装',
+        avatarCompositeBackend: mode === 'burn' ? '正在准备真实头像' : undefined
     });
     const setExportStage = (stage) => {
       if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
@@ -9746,6 +9898,7 @@ try {
       assPath = assets.assPath;
       const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
       const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(burnCodec, assets.avatarPlan);
+      const gpuAvatarOutputToCpu = !String(burnCodec || '').includes('nvenc');
       burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
       copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       setExportStage('正在准备真实头像');
@@ -9760,8 +9913,11 @@ try {
         skipInitialKeyframeGuard: true,
         label: '烧录片段导出',
         gpuComposite: gpuAvatarComposite,
+        gpuOutputToCpu: gpuAvatarOutputToCpu,
         isCancelled: () => this.exportCancelRequested
       });
+      progress.avatarCompositeBackend = this.getAvatarCompositeBackendLabel(avatarLayer, avatarMode);
+      progress.updatedAt = Date.now();
       throwIfExportCancelled();
       if (!avatarLayer?.chunked) {
         createBurnExportArgs = (decoder, nextAvatarLayer = avatarLayer) =>
@@ -9796,12 +9952,13 @@ try {
     this.log(
       'info',
       `开始导出${mode === 'clean' ? '纯净' : '烧录'}片段：${path.basename(outputPath)}${
-        codecInfo ? `（${codecInfo.kind === 'hardware' ? '硬件' : '软件'}编码 ${codecInfo.label}）` : ''
+        codecInfo ? `（选中的编码器 ${burnCodec}，实际后端 ${this.getEncoderBackendLabel(codecInfo)}）` : ''
       }${
         mode === 'burn'
-          ? `，${decoderInfo.kind === 'hardware' ? `${decoderInfo.label} 硬件解码` : 'CPU 解码'}，真实头像 ${burnAvatarModeLabel(
+          ? `，解码后端 ${decoderInfo.kind === 'hardware' ? decoderInfo.label : 'CPU'}，头像合成后端 ${this.getAvatarCompositeBackendLabel(
+              avatarLayer,
               avatarMode
-            )}${avatarLayer?.gpuComposite ? '，CUDA 图层合成' : ''}`
+            )}`
           : ''
       }`
     );
@@ -9849,6 +10006,13 @@ try {
           onStage: setExportStage,
           onDecoderFallback: () => {
             this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
+            this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码。');
+            this.emitState('mediaJob');
+          },
+          onCudaAvatarFallback: () => {
+            this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+              avatarCompositeBackend: 'CPU 头像合成'
+            });
             this.emitState('mediaJob');
           },
           label: '烧录片段头像分段',
@@ -9861,16 +10025,16 @@ try {
             { value: 'software', label: 'CPU', kind: 'software' },
             { reset: true, message: '硬件解码不兼容，正在使用 CPU 解码重新导出' }
           );
+          this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码。');
           this.emitState('mediaJob');
         };
         const onCudaAvatarCompositeFallback = () => {
           if (this.exportProgress?.id === progress.id) {
-            progress.workStartedAt = Date.now();
-            progress.currentTimeSec = 0;
-            progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
-            progress.estimatedRemainingSec = null;
-            progress.message = 'CUDA 头像合成不兼容，正在使用 CPU 头像合成重新导出';
-            progress.updatedAt = Date.now();
+            this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+              reset: true,
+              message: 'CUDA 头像合成不兼容，正在使用 CPU 头像合成重新导出',
+              avatarCompositeBackend: 'CPU 头像合成'
+            });
           }
           this.emitState('mediaJob');
         };
@@ -9878,45 +10042,52 @@ try {
           const encodedVideoPath = `${temporaryOutputPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
             isHevcCodec(burnCodec) ? 'h265' : 'h264'
           }`;
-          await this.runJetsonGstreamerTranscode({
-            codec: burnCodec,
-            quality: burnCrf,
-            width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
-            height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
-            fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
-            encodedVideoPath,
-            createRawArgs: (decoder) =>
-              createBurnRawVideoArgs({
-                cleanPath: recording.cleanPath,
-                assPath,
-                fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
-                avatarOverlay: avatarLayer,
-                startTime,
-                duration,
-                inputSeek: true,
-                timelineOffset: burnTimeline.videoClockStartSec,
-                leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-                decoder
-              }),
-            createMuxArgs: () =>
-              createBurnEncodedVideoMuxArgs({
-                encodedVideoPath,
-                cleanPath: recording.cleanPath,
-                outputPath: temporaryOutputPath,
+          await this.runJetsonGstreamerWithCudaAvatarCompositeFallback({
+            avatarLayer,
+            createTranscode: (nextAvatarLayer) =>
+              this.runJetsonGstreamerTranscode({
                 codec: burnCodec,
+                quality: burnCrf,
+                width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
                 fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
-                startTime,
-                duration,
-                container: outputContainer,
-                leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
-                includeAudio: Boolean(mediaInfo.audioInfo),
-                copyAudio: copySourceAudio
+                encodedVideoPath,
+                createRawArgs: (decoder) =>
+                  createBurnRawVideoArgs({
+                    cleanPath: recording.cleanPath,
+                    assPath,
+                    fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
+                    avatarOverlay: nextAvatarLayer,
+                    startTime,
+                    duration,
+                    inputSeek: true,
+                    timelineOffset: burnTimeline.videoClockStartSec,
+                    leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+                    decoder
+                  }),
+                createMuxArgs: () =>
+                  createBurnEncodedVideoMuxArgs({
+                    encodedVideoPath,
+                    cleanPath: recording.cleanPath,
+                    outputPath: temporaryOutputPath,
+                    codec: burnCodec,
+                    fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
+                    startTime,
+                    duration,
+                    container: outputContainer,
+                    leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
+                    includeAudio: Boolean(mediaInfo.audioInfo),
+                    copyAudio: copySourceAudio
+                  }),
+                decoder: decoderInfo,
+                onStderr: handleExportStderr,
+                onChild,
+                beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+                onFallback: onDecoderFallback,
+                label: 'Jetson 烧录片段导出'
               }),
-            decoder: decoderInfo,
-            onStderr: handleExportStderr,
-            onChild,
             beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
-            onFallback: onDecoderFallback,
+            onCudaFallback: onCudaAvatarCompositeFallback,
             label: 'Jetson 烧录片段导出'
           });
         } else {

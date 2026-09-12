@@ -142,11 +142,16 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const codecLabel = progress.codec
     ? `${progress.codecKind === 'hardware' ? '硬件' : '软件'}编码 ${progress.codec}`
     : '';
+  const encoderBackendLabel = progress.encoderBackend || codecLabel;
   const decoderLabel = progress.decoder
     ? progress.decoderKind === 'hardware'
       ? `硬件解码 ${progress.decoderLabel || progress.decoder}`
       : 'CPU 解码'
     : '';
+  const renderFps = Number(progress.renderFps);
+  const renderFpsLabel = Number.isFinite(renderFps) && renderFps > 0 ? `渲染 ${renderFps.toFixed(renderFps >= 10 ? 1 : 2)} fps` : '';
+  const realtimeFactor = Number(progress.realtimeFactor);
+  const realtimeLabel = Number.isFinite(realtimeFactor) && realtimeFactor > 0 ? `${realtimeFactor.toFixed(2)}×实时` : '';
   const statusLabel =
     progress.status === 'completed'
       ? '完成'
@@ -174,8 +179,12 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         {[
           progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度'),
           hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : '',
+          renderFpsLabel,
+          realtimeLabel,
+          progress.avatarCompositeBackend || '',
+          progress.fallbackReason ? `回退：${progress.fallbackReason}` : '',
           decoderLabel,
-          codecLabel
+          encoderBackendLabel
         ]
           .filter(Boolean)
           .join(' · ')}

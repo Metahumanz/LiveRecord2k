@@ -399,6 +399,7 @@ function createAvatarOverlayFilterScript({
   fps,
   avatarOverlay,
   gpuComposite = false,
+  gpuOutputToCpu = false,
   duration,
   chunkDuration,
   timelineOffset = 0,
@@ -494,8 +495,8 @@ function createAvatarOverlayFilterScript({
   }
   filters.push(
     gpuComposite
-      ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
-          usesExplicitLeadingPadding ? ',hwdownload,format=yuv420p' : ''
+        ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
+          usesExplicitLeadingPadding || gpuOutputToCpu ? ',hwdownload,format=yuv420p' : ''
         }${outputClockFilter}${outputLabel}`
       : `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
           `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${outputLabel}`
@@ -532,7 +533,8 @@ function createAvatarOverlayChunkFilterScript({
   inputTrimStartSec = 0,
   inputTrimEndSec = 0,
   preserveSourceFrameTiming = true,
-  gpuComposite = false
+  gpuComposite = false,
+  gpuOutputToCpu = false
 } = {}) {
   const start = Math.max(0, Number(chunkStart) || 0);
   const end = Number(chunkEnd);
@@ -569,6 +571,7 @@ function createAvatarOverlayChunkFilterScript({
     fps,
     avatarOverlay: { ...(avatarOverlay || {}), entries },
     gpuComposite,
+    gpuOutputToCpu,
     timelineOffset: sourceClockOffset,
     resetOutputTimestamps: true,
     leadingVideoPaddingSec,
@@ -678,7 +681,7 @@ function createBurnArgs({
   const inputSeekStart = Math.max(0, Number(startTime) - inputSeekPreroll);
   const hasFilterScript = Boolean(String(avatarOverlay?.filterScriptPath || '').trim());
   const avatarEntries = hasFilterScript ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
-  const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite && String(codec || '').includes('nvenc'));
+  const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite);
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   if (gpuAvatarComposite) {
     args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
@@ -793,8 +796,15 @@ function createBurnRawVideoArgs({
     : 0;
   const inputSeekStart = Math.max(0, Number(startTime) - inputSeekPreroll);
   const hasFilterScript = Boolean(String(avatarOverlay?.filterScriptPath || '').trim());
+  const avatarEntries = hasFilterScript ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
+  const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite);
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
-  appendHardwareDecodeInputArgs(args, decoder);
+  if (gpuAvatarComposite) {
+    args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
+  }
+  appendHardwareDecodeInputArgs(args, decoder, {
+    device: gpuAvatarComposite && decoder === 'cuda' ? 'br2k_avatar' : ''
+  });
   if (inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(inputSeekStart));
   args.push('-i', cleanPath);
   if (!inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
@@ -1070,7 +1080,8 @@ function runFfmpegToGstreamerJob({
   gstreamerArgs,
   onFfmpegStderr,
   onGstreamerStderr,
-  onChild
+  onChild,
+  timeoutMs = 0
 }) {
   return new Promise((resolve, reject) => {
     let ffmpeg = null;
@@ -1080,6 +1091,8 @@ function runFfmpegToGstreamerJob({
     let ffmpegResult = { code: null, signal: '', error: null, stderr: '' };
     let gstreamerResult = { code: null, signal: '', error: null, stderr: '' };
     let settled = false;
+    const timeout = Math.max(0, Number(timeoutMs) || 0);
+    let timeoutTimer = null;
 
     const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim().slice(-4000);
     const stop = (child) => {
@@ -1091,6 +1104,7 @@ function runFfmpegToGstreamerJob({
     const finish = () => {
       if (settled || !ffmpegClosed || !gstreamerClosed) return;
       settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       onChild?.(null);
       if (ffmpegResult.code === 0 && !ffmpegResult.error && gstreamerResult.code === 0 && !gstreamerResult.error) {
         resolve();
@@ -1122,6 +1136,17 @@ function runFfmpegToGstreamerJob({
       gstreamer.stdin.on('error', () => {
         stop(ffmpeg);
       });
+      if (timeout) {
+        timeoutTimer = setTimeout(() => {
+          const error = new Error(`Jetson GStreamer 编码超时（${timeout}ms）`);
+          error.code = 'BR2K_MEDIA_TIMEOUT';
+          ffmpegResult.error = ffmpegResult.error || error;
+          gstreamerResult.error = gstreamerResult.error || error;
+          stop(ffmpeg);
+          stop(gstreamer);
+        }, timeout);
+        timeoutTimer.unref?.();
+      }
     } catch (error) {
       onChild?.(null);
       reject(error);

@@ -285,12 +285,18 @@ export type FfmpegJobProgress = {
   decoder?: string;
   decoderKind?: 'software' | 'hardware';
   decoderLabel?: string;
+  sourceFps?: number;
+  encoderBackend?: string;
+  avatarCompositeBackend?: string;
+  fallbackReason?: string;
   startedAt: number;
   workStartedAt?: number;
   updatedAt: number;
   currentTimeSec?: number;
   durationSec?: number;
   estimatedRemainingSec?: number | null;
+  renderFps?: number | null;
+  realtimeFactor?: number | null;
   stageLabel?: string;
   stageStartedAt?: number;
   percent?: number | null;

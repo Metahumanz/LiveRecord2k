@@ -338,7 +338,8 @@ test('large avatar plans fall back from CUDA compositing without reducing the hi
 
   assert.equal(service.shouldUseCudaAvatarComposite('hevc_nvenc', entries(48)), true);
   assert.equal(service.shouldUseCudaAvatarComposite('hevc_nvenc', entries(49)), false);
-  assert.equal(service.shouldUseCudaAvatarComposite('libx265', entries(1)), false);
+  assert.equal(service.shouldUseCudaAvatarComposite('hevc_nvv4l2', entries(1)), true);
+  assert.equal(service.shouldUseCudaAvatarComposite('libx265', entries(1)), true);
 });
 
 test('CUDA avatar composition failure retries the prebuilt CPU graph', async () => {
