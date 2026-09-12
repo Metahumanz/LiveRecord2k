@@ -965,68 +965,76 @@ test('Windows installer does not launch a legacy tray executable while the app i
   }
 });
 
-test(
-  'Linux normalizes only the configured recording root and leaves historical contents untouched',
-  { skip: process.platform !== 'linux' },
-  async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-output-root-mode-'));
-    const outputRoot = path.join(tempDir, 'custom-output');
-    const historicalDir = path.join(outputRoot, 'historical-recording');
-    const historicalFile = path.join(historicalDir, 'old.clean.mkv');
-    const service = new LiveRecordService();
-    try {
-      await fsp.mkdir(historicalDir, { recursive: true, mode: 0o700 });
-      await fsp.writeFile(historicalFile, 'history', { mode: 0o600 });
-      await fsp.chmod(outputRoot, 0o700);
-      await fsp.chmod(historicalDir, 0o700);
-      await fsp.chmod(historicalFile, 0o600);
+test('录像目录权限探测会创建、写入、读取并删除自己的临时文件，不触碰历史内容', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-output-access-'));
+  const outputRoot = path.join(tempDir, 'custom-output');
+  const historicalDir = path.join(outputRoot, 'historical-recording');
+  const historicalFile = path.join(historicalDir, 'old.clean.mkv');
+  const service = new LiveRecordService();
+  try {
+    await fsp.mkdir(historicalDir, { recursive: true });
+    await fsp.writeFile(historicalFile, 'history');
 
-      const changed = await service.normalizeLinuxRecordingRootPermissions(outputRoot);
-
-      assert.equal(changed, true);
-      assert.equal((await fsp.stat(outputRoot)).mode & 0o7777, 0o2770);
-      assert.equal((await fsp.stat(historicalDir)).mode & 0o7777, 0o700);
-      assert.equal((await fsp.stat(historicalFile)).mode & 0o7777, 0o600);
-    } finally {
-      await fsp.rm(tempDir, { recursive: true, force: true });
-    }
+    assert.equal(await service.probeRecordingOutputDirectoryAccess(outputRoot), true);
+    assert.equal(await fsp.readFile(historicalFile, 'utf8'), 'history');
+    assert.deepEqual(await fsp.readdir(outputRoot), ['historical-recording']);
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
   }
-);
+});
 
-test('Linux recording root permission normalization targets only the configured root node', async () => {
+test('录像目录权限探测只执行真实读写操作，不尝试修改挂载目录属主或模式', async () => {
   const service = new LiveRecordService();
   const outputRoot = path.resolve('simulated-linux-output-root');
-  let mode = 0o700;
-  let gid = 2002;
   const calls = [];
   const fileSystem = {
-    async stat(target) {
-      calls.push(['stat', target]);
-      return { mode, uid: 1001, gid, isDirectory: () => true };
+    async open(target, flags, mode) {
+      calls.push(['open', target, flags, mode]);
+      return {
+        async writeFile(payload) {
+          calls.push(['writeFile', target, Buffer.from(payload).toString('utf8')]);
+        },
+        async sync() {
+          calls.push(['sync', target]);
+        },
+        async close() {
+          calls.push(['close', target]);
+        }
+      };
     },
-    async chown(target, uid, nextGid) {
-      calls.push(['chown', target, uid, nextGid]);
-      gid = nextGid;
+    async readFile(target) {
+      calls.push(['readFile', target]);
+      return Buffer.from('BiliRecord2K write access probe\n', 'utf8');
     },
-    async chmod(target, nextMode) {
-      calls.push(['chmod', target, nextMode]);
-      mode = nextMode;
+    async unlink(target) {
+      calls.push(['unlink', target]);
     }
   };
 
-  const changed = await service.normalizeLinuxRecordingRootPermissions(outputRoot, {
-    platform: 'linux',
-    currentUid: 1001,
-    currentGid: 2001,
-    fileSystem
+  const available = await service.probeRecordingOutputDirectoryAccess(outputRoot, {
+    fileSystem,
+    randomBytes: () => Buffer.from('0123456789abcdef', 'hex')
   });
 
-  assert.equal(changed, true);
-  assert.equal(mode, 0o2770);
-  assert.equal(gid, 2001);
-  assert.ok(calls.every(([, target]) => target === outputRoot));
+  assert.equal(available, true);
+  const expectedProbePath = path.join(outputRoot, `.bili-record-2k-permission-check-${process.pid}-0123456789abcdef.tmp`);
+  assert.ok(calls.every(([, target]) => target === expectedProbePath));
   assert.deepEqual(
     calls.map(([operation]) => operation),
-    ['stat', 'chown', 'chmod', 'stat']
+    ['open', 'writeFile', 'sync', 'close', 'readFile', 'unlink']
+  );
+});
+
+test('录像目录权限探测会给 SMB 权限拒绝返回可操作的提示', async () => {
+  const service = new LiveRecordService();
+  const denied = new Error('EACCES: permission denied');
+  denied.code = 'EACCES';
+
+  await assert.rejects(
+    service.probeRecordingOutputDirectoryAccess('/mnt/recordings', {
+      fileSystem: { open: async () => Promise.reject(denied) },
+      randomBytes: () => Buffer.from('0123456789abcdef', 'hex')
+    }),
+    /SMB 挂载的 uid\/gid、dir_mode\/file_mode/
   );
 });

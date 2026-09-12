@@ -152,11 +152,20 @@ class SettingsService {
       throw this.businessError('INVALID_SETTINGS', '监听 0.0.0.0/:: 前必须先在持久化配置中设置至少 8 位远程访问密码。', 400);
     }
     const outputDirChanged = oldOutputDir !== normalizedSettings.outputDir;
-    const outputReady = await owner.ensureRecordingOutputRootReady(normalizedSettings.outputDir, {
-      label: '录像保存目录',
-      allowUnavailable: !outputDirChanged,
-      permissionsRequired: outputDirChanged
-    });
+    let outputReady;
+    try {
+      outputReady = await owner.ensureRecordingOutputRootReady(normalizedSettings.outputDir, {
+        label: '录像保存目录',
+        allowUnavailable: !outputDirChanged,
+        permissionsRequired: outputDirChanged
+      });
+    } catch (error) {
+      throw this.businessError(
+        'OUTPUT_DIR_NOT_WRITABLE',
+        error?.message || '录像保存目录无法由当前服务用户读写。',
+        400
+      );
+    }
 
     // Persist the candidate first.  Until this succeeds, the current settings
     // must remain the source of truth for authentication, SSE clients and room

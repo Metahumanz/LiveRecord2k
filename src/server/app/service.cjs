@@ -2332,61 +2332,53 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
     throw new Error(`${label}${reason}：${resolved}`);
   }
 
-  async normalizeLinuxRecordingRootPermissions(directoryPath, options = {}) {
-    const runtimePlatform = String(options.platform || process.platform);
-    if (runtimePlatform !== 'linux') {
-      return false;
-    }
+  async probeRecordingOutputDirectoryAccess(directoryPath, options = {}) {
     const fileSystem = options.fileSystem || fsp;
     const resolved = path.resolve(String(directoryPath || '').trim());
     const label = String(options.label || '录像保存根目录');
     const filesystemRoot = path.parse(resolved).root;
     if (resolved === filesystemRoot) {
-      throw new Error(`${label}不能直接使用文件系统根目录，已拒绝修改其权限：${resolved}`);
+      throw new Error(`${label}不能直接使用文件系统根目录：${resolved}`);
     }
-    const currentUid = Number.isInteger(options.currentUid)
-      ? options.currentUid
-      : typeof process.getuid === 'function'
-        ? process.getuid()
-        : null;
-    const currentGid = Number.isInteger(options.currentGid)
-      ? options.currentGid
-      : typeof process.getgid === 'function'
-        ? process.getgid()
-        : null;
-    const initialStat = await fileSystem.stat(resolved);
-    if (!initialStat.isDirectory()) {
-      throw new Error(`${label}指向了文件而不是文件夹：${resolved}`);
-    }
-    const initialMode = initialStat.mode & 0o7777;
-    const groupMatches = currentGid === null || initialStat.gid === currentGid;
-    if (initialMode === 0o2770 && groupMatches) {
-      return false;
-    }
-    if (currentUid !== null && initialStat.uid !== currentUid) {
-      throw new Error(
-        `${label}不属于当前服务用户，无法安全规范为当前服务组的 2770：${resolved}。` +
-          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
-      );
-    }
+    const randomBytes = options.randomBytes || crypto.randomBytes;
+    const probeName = `.bili-record-2k-permission-check-${process.pid}-${Buffer.from(randomBytes(12)).toString('hex')}.tmp`;
+    const probePath = path.join(resolved, probeName);
+    const payload = Buffer.from('BiliRecord2K write access probe\n', 'utf8');
+    let handle = null;
+    let probeCreated = false;
     try {
-      if (currentGid !== null && initialStat.gid !== currentGid) {
-        await fileSystem.chown(resolved, initialStat.uid, currentGid);
+      // A mount can report free space while denying the service account write
+      // access.  Do not chmod/chown a user-selected root: SMB/CIFS commonly
+      // rejects those operations and its ownership is controlled by mount options.
+      handle = await fileSystem.open(probePath, 'wx', 0o600);
+      probeCreated = true;
+      await handle.writeFile(payload);
+      if (typeof handle.sync === 'function') {
+        await handle.sync();
       }
-      await fileSystem.chmod(resolved, 0o2770);
-      const normalizedStat = await fileSystem.stat(resolved);
-      const normalizedMode = normalizedStat.mode & 0o7777;
-      if (normalizedMode !== 0o2770 || (currentGid !== null && normalizedStat.gid !== currentGid)) {
-        throw new Error(`实际权限为 ${normalizedMode.toString(8)}，属组 ID 为 ${normalizedStat.gid}`);
+      await handle.close();
+      handle = null;
+      const actualPayload = Buffer.from(await fileSystem.readFile(probePath));
+      if (!actualPayload.equals(payload)) {
+        throw new Error('写入后读取到的测试内容不一致');
       }
+      await fileSystem.unlink(probePath);
+      probeCreated = false;
+      return true;
     } catch (error) {
       throw new Error(
-        `${label}无法规范为当前服务组的 2770：${resolved}（${error.message}）。` +
-          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
+        `${label}无法由当前服务用户创建、写入、读取和删除测试文件：${resolved}` +
+          `（${compactLogLine(error?.message || String(error))}）。` +
+          '请检查 SMB 挂载的 uid/gid、dir_mode/file_mode，确保运行 BiliRecord2K 的服务用户具有读写权限。'
       );
+    } finally {
+      if (handle) {
+        await handle.close().catch(() => {});
+      }
+      if (probeCreated) {
+        await fileSystem.unlink(probePath).catch(() => {});
+      }
     }
-    this.log('info', `已将录像保存根目录规范为当前服务组的 2770（仅目录本身，不递归处理历史录像）：${resolved}`);
-    return true;
   }
 
   async ensureRecordingOutputRootReady(directoryPath, options = {}) {
@@ -2395,7 +2387,7 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
       return false;
     }
     try {
-      await this.normalizeLinuxRecordingRootPermissions(directoryPath, options);
+      await this.probeRecordingOutputDirectoryAccess(directoryPath, options);
     } catch (error) {
       if (options.permissionsRequired === false) {
         this.log('warn', error.message);

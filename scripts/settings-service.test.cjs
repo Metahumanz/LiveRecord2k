@@ -153,7 +153,7 @@ test('轮询间隔变化时只重启正在监听的房间', async () => {
   assert.deepEqual(restartedRoomIds, ['monitoring-room']);
 });
 
-test('输出目录校验失败时不会保存候选设置', async () => {
+test('输出目录校验失败时不会保存候选设置，并向 UI 返回可显示的业务错误', async () => {
   const service = new LiveRecordService();
   const originalSettings = service.settings;
   let saveCalls = 0;
@@ -166,7 +166,11 @@ test('输出目录校验失败时不会保存候选设置', async () => {
 
   await assert.rejects(
     service.saveSettings({ outputDir: 'X:\\unavailable-recordings' }),
-    /输出目录不可用/
+    {
+      code: 'OUTPUT_DIR_NOT_WRITABLE',
+      statusCode: 400,
+      message: /输出目录不可用/
+    }
   );
 
   assert.equal(saveCalls, 0);
