@@ -440,11 +440,15 @@ const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.val
 // the service-account read/write probe as their authority instead.
 const NON_POSIX_RECORDING_FILESYSTEM_TYPES = new Set([
   'cifs',
+  'smbfs',
   'smb3',
   'nfs',
   'nfs4',
   '9p',
   'afpfs',
+  'ceph',
+  'glusterfs',
+  'lustre',
   'davfs',
   'sshfs',
   'fuseblk'
@@ -2477,13 +2481,16 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
     const randomBytes = options.randomBytes || crypto.randomBytes;
     const probeName = `.bili-record-2k-permission-check-${process.pid}-${Buffer.from(randomBytes(12)).toString('hex')}.tmp`;
     const probePath = path.join(resolved, probeName);
+    const renamedProbePath = path.join(resolved, `${probeName}.renamed`);
     const payload = Buffer.from('BiliRecord2K write access probe\n', 'utf8');
     let handle = null;
     let probeCreated = false;
+    let probeRenamed = false;
     try {
       // A mount can report free space while denying the service account write
-      // access. This remains the final check even after a local POSIX root was
-      // normalized, and is the only authority for CIFS/NFS/FUSE mounts.
+      // access. The service-account probe is the final admission criterion;
+      // local POSIX 2770 normalization is only a recommendation, while
+      // CIFS/NFS/FUSE and other network mounts rely on this probe exclusively.
       handle = await fileSystem.open(probePath, 'wx', 0o600);
       probeCreated = true;
       await handle.writeFile(payload);
@@ -2496,12 +2503,18 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
       if (!actualPayload.equals(payload)) {
         throw new Error('写入后读取到的测试内容不一致');
       }
-      await fileSystem.unlink(probePath);
+      await fileSystem.rename(probePath, renamedProbePath);
+      probeRenamed = true;
+      const renamedPayload = Buffer.from(await fileSystem.readFile(renamedProbePath));
+      if (!renamedPayload.equals(payload)) {
+        throw new Error('重命名后读取到的测试内容不一致');
+      }
+      await fileSystem.unlink(renamedProbePath);
       probeCreated = false;
       return true;
     } catch (error) {
       throw new Error(
-        `${label}无法由当前服务用户创建、写入、读取和删除测试文件：${resolved}` +
+        `${label}无法由当前服务用户创建、写入、读取、重命名和删除测试文件：${resolved}` +
           `（${compactLogLine(error?.message || String(error))}）。` +
           '请检查 SMB 挂载的 uid/gid、dir_mode/file_mode，确保运行 BiliRecord2K 的服务用户具有读写权限。'
       );
@@ -2510,7 +2523,7 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
         await handle.close().catch(() => {});
       }
       if (probeCreated) {
-        await fileSystem.unlink(probePath).catch(() => {});
+        await fileSystem.unlink(probeRenamed ? renamedProbePath : probePath).catch(() => {});
       }
     }
   }
@@ -2573,22 +2586,23 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
       : typeof process.getgid === 'function'
         ? process.getgid()
         : null;
-    const initialStat = await fileSystem.stat(resolved);
-    if (!initialStat.isDirectory()) {
-      throw new Error(`${label}指向了文件而不是文件夹：${resolved}`);
-    }
-    const initialMode = initialStat.mode & 0o7777;
-    const groupMatches = currentGid === null || initialStat.gid === currentGid;
-    if (initialMode === 0o2770 && groupMatches) {
-      return false;
-    }
-    if (currentUid !== null && initialStat.uid !== currentUid) {
-      throw new Error(
-        `${label}不属于当前服务用户，无法安全规范为当前服务组的 2770：${resolved}。` +
-          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
-      );
-    }
     try {
+      const initialStat = await fileSystem.stat(resolved);
+      if (!initialStat.isDirectory()) {
+        throw new Error(`${label}指向了文件而不是文件夹：${resolved}`);
+      }
+      const initialMode = initialStat.mode & 0o7777;
+      const groupMatches = currentGid === null || initialStat.gid === currentGid;
+      if (initialMode === 0o2770 && groupMatches) {
+        return false;
+      }
+      if (currentUid !== null && initialStat.uid !== currentUid) {
+        this.log(
+          'warn',
+          `${label}的属主不是当前服务用户，跳过本地 POSIX 2770 推荐规范；将以实际创建、写入、读取、重命名和删除探针为准：${resolved}`
+        );
+        return false;
+      }
       if (currentGid !== null && initialStat.gid !== currentGid) {
         await fileSystem.chown(resolved, initialStat.uid, currentGid);
       }
@@ -2599,12 +2613,14 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
         throw new Error(`实际权限为 ${normalizedMode.toString(8)}，属组 ID 为 ${normalizedStat.gid}`);
       }
     } catch (error) {
-      throw new Error(
-        `${label}无法规范为当前服务组的 2770：${resolved}（${error.message}）。` +
-          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
+      this.log(
+        'warn',
+        `${label}未能应用本地 POSIX 2770 推荐规范：${resolved}（${compactLogLine(error?.message || String(error))}）。` +
+          '将以实际创建、写入、读取、重命名和删除探针为最终准入条件。'
       );
+      return false;
     }
-    this.log('info', `已将录像保存根目录规范为当前服务组的 2770（仅目录本身，不递归处理历史录像）：${resolved}`);
+    this.log('info', `已将本地 POSIX 录像保存根目录建议规范为当前服务组的 2770（仅目录本身，不递归处理历史录像）：${resolved}`);
     return true;
   }
 
@@ -2629,11 +2645,10 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
       throw error;
     }
     if (normalizationError) {
-      if (options.permissionsRequired === false) {
-        this.log('warn', normalizationError.message);
-        return true;
-      }
-      throw normalizationError;
+      this.log(
+        'warn',
+        `${compactLogLine(normalizationError?.message || String(normalizationError))}；实际服务用户读写探针已通过，不阻止保存。`
+      );
     }
     return true;
   }
