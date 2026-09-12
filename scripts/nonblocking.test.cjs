@@ -1025,6 +1025,56 @@ test('录像目录权限探测只执行真实读写操作，不尝试修改挂�
   );
 });
 
+test('本地 Linux 录像根目录仍规范为服务组 2770，而 CIFS 挂载仅依赖实际读写探针', async () => {
+  const service = new LiveRecordService();
+  const calls = [];
+  const state = { mode: 0o40750, uid: 1001, gid: 1000 };
+  const localFileSystem = {
+    async stat() {
+      calls.push('stat');
+      return {
+        ...state,
+        isDirectory: () => true
+      };
+    },
+    async chown(_target, uid, gid) {
+      calls.push('chown');
+      state.uid = uid;
+      state.gid = gid;
+    },
+    async chmod(_target, mode) {
+      calls.push('chmod');
+      state.mode = (state.mode & ~0o7777) | mode;
+    }
+  };
+  const localNormalized = await service.normalizeLinuxRecordingRootPermissions('/srv/br2k', {
+    platform: 'linux',
+    mount: { mountPoint: '/srv', fsType: 'ext4' },
+    fileSystem: localFileSystem,
+    currentUid: 1001,
+    currentGid: 2000
+  });
+  assert.equal(localNormalized, true);
+  assert.deepEqual(calls, ['stat', 'chown', 'chmod', 'stat']);
+  assert.equal(state.mode & 0o7777, 0o2770);
+  assert.equal(state.gid, 2000);
+
+  const cifsCalls = [];
+  const cifsNormalized = await service.normalizeLinuxRecordingRootPermissions('/mnt/cifs/br2k', {
+    platform: 'linux',
+    mount: { mountPoint: '/mnt/cifs', fsType: 'cifs' },
+    fileSystem: {
+      stat: async () => cifsCalls.push('stat'),
+      chmod: async () => cifsCalls.push('chmod'),
+      chown: async () => cifsCalls.push('chown')
+    },
+    currentUid: 1001,
+    currentGid: 2000
+  });
+  assert.equal(cifsNormalized, false);
+  assert.deepEqual(cifsCalls, []);
+});
+
 test('录像目录权限探测会给 SMB 权限拒绝返回可操作的提示', async () => {
   const service = new LiveRecordService();
   const denied = new Error('EACCES: permission denied');

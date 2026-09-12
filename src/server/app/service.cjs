@@ -432,6 +432,56 @@ const BURN_CODEC_CANDIDATES = [
   { value: 'h264_nvv4l2', label: 'Jetson V4L2 H.264 硬件编码', kind: 'hardware', vendor: 'nvidia', platform: 'linux', backend: 'gstreamer', element: 'nvv4l2h264enc' }
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
+// Ownership and mode bits on network and FUSE filesystems are often a view
+// synthesized by their mount driver.  A successful chmod(2) is not a useful
+// signal there (and CIFS commonly rejects it altogether), so those mounts use
+// the service-account read/write probe as their authority instead.
+const NON_POSIX_RECORDING_FILESYSTEM_TYPES = new Set([
+  'cifs',
+  'smb3',
+  'nfs',
+  'nfs4',
+  '9p',
+  'afpfs',
+  'davfs',
+  'sshfs',
+  'fuseblk'
+]);
+
+function decodeLinuxMountInfoPath(value) {
+  return String(value || '').replace(/\\([0-7]{3})/g, (_match, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
+}
+
+function normalizeLinuxMountPath(value) {
+  const normalized = path.posix.normalize(String(value || '/').replace(/\\/g, '/'));
+  return normalized === '.' ? '/' : normalized;
+}
+
+function findLinuxMountForPath(mountInfo, targetPath) {
+  const target = normalizeLinuxMountPath(targetPath);
+  const candidates = [];
+  for (const rawLine of String(mountInfo || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const fields = line.split(' ');
+    const separator = fields.indexOf('-');
+    if (separator < 6 || !fields[4] || !fields[separator + 1]) continue;
+    const mountPoint = normalizeLinuxMountPath(decodeLinuxMountInfoPath(fields[4]));
+    const matches = mountPoint === '/' || target === mountPoint || target.startsWith(`${mountPoint.replace(/\/$/, '')}/`);
+    if (!matches) continue;
+    candidates.push({
+      mountPoint,
+      fsType: String(fields[separator + 1] || '').toLowerCase(),
+      source: decodeLinuxMountInfoPath(fields[separator + 2] || '')
+    });
+  }
+  return candidates.sort((left, right) => right.mountPoint.length - left.mountPoint.length)[0] || null;
+}
+
+function isNonPosixRecordingMount(mount) {
+  const type = String(mount?.fsType || '').toLowerCase();
+  return NON_POSIX_RECORDING_FILESYSTEM_TYPES.has(type) || type === 'fuse' || type.startsWith('fuse.');
+}
 const SETTINGS_UPDATE_KEYS = new Set([
   'outputDir',
   'cookie',
@@ -2371,8 +2421,8 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
     let probeCreated = false;
     try {
       // A mount can report free space while denying the service account write
-      // access.  Do not chmod/chown a user-selected root: SMB/CIFS commonly
-      // rejects those operations and its ownership is controlled by mount options.
+      // access. This remains the final check even after a local POSIX root was
+      // normalized, and is the only authority for CIFS/NFS/FUSE mounts.
       handle = await fileSystem.open(probePath, 'wx', 0o600);
       probeCreated = true;
       await handle.writeFile(payload);
@@ -2404,10 +2454,109 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
     }
   }
 
+  async getLinuxRecordingRootMount(directoryPath, options = {}) {
+    const runtimePlatform = String(options.platform || process.platform);
+    if (runtimePlatform !== 'linux') return null;
+    if (options.mount && typeof options.mount === 'object') {
+      return {
+        mountPoint: String(options.mount.mountPoint || ''),
+        fsType: String(options.mount.fsType || '').toLowerCase(),
+        source: String(options.mount.source || '')
+      };
+    }
+    let mountInfo = options.mountInfo;
+    if (mountInfo === undefined) {
+      try {
+        mountInfo = await fsp.readFile('/proc/self/mountinfo', 'utf8');
+      } catch {
+        return null;
+      }
+    }
+    return findLinuxMountForPath(mountInfo, path.resolve(String(directoryPath || '').trim()));
+  }
+
+  async normalizeLinuxRecordingRootPermissions(directoryPath, options = {}) {
+    const runtimePlatform = String(options.platform || process.platform);
+    if (runtimePlatform !== 'linux') return false;
+    const fileSystem = options.fileSystem || fsp;
+    const resolved = path.resolve(String(directoryPath || '').trim());
+    const label = String(options.label || '录像保存根目录');
+    const filesystemRoot = path.parse(resolved).root;
+    if (resolved === filesystemRoot) {
+      throw new Error(`${label}不能直接使用文件系统根目录，已拒绝修改其权限：${resolved}`);
+    }
+
+    const mount = await this.getLinuxRecordingRootMount(resolved, options);
+    if (!mount) {
+      // Failing safe is important here: an unrecognised mount can be a remote
+      // filesystem, and the access probe below still validates the only thing
+      // that matters to the service account.
+      this.log('warn', `${label}无法识别 Linux 挂载类型，未修改属主或模式，将以实际读写探针为准：${resolved}`);
+      return false;
+    }
+    if (isNonPosixRecordingMount(mount)) {
+      this.log(
+        'info',
+        `${label}位于 ${mount.fsType || '未知'} 挂载（${mount.mountPoint || resolved}），跳过 POSIX 2770 规范化，以实际读写探针为准。`
+      );
+      return false;
+    }
+
+    const currentUid = Number.isInteger(options.currentUid)
+      ? options.currentUid
+      : typeof process.getuid === 'function'
+        ? process.getuid()
+        : null;
+    const currentGid = Number.isInteger(options.currentGid)
+      ? options.currentGid
+      : typeof process.getgid === 'function'
+        ? process.getgid()
+        : null;
+    const initialStat = await fileSystem.stat(resolved);
+    if (!initialStat.isDirectory()) {
+      throw new Error(`${label}指向了文件而不是文件夹：${resolved}`);
+    }
+    const initialMode = initialStat.mode & 0o7777;
+    const groupMatches = currentGid === null || initialStat.gid === currentGid;
+    if (initialMode === 0o2770 && groupMatches) {
+      return false;
+    }
+    if (currentUid !== null && initialStat.uid !== currentUid) {
+      throw new Error(
+        `${label}不属于当前服务用户，无法安全规范为当前服务组的 2770：${resolved}。` +
+          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
+      );
+    }
+    try {
+      if (currentGid !== null && initialStat.gid !== currentGid) {
+        await fileSystem.chown(resolved, initialStat.uid, currentGid);
+      }
+      await fileSystem.chmod(resolved, 0o2770);
+      const normalizedStat = await fileSystem.stat(resolved);
+      const normalizedMode = normalizedStat.mode & 0o7777;
+      if (normalizedMode !== 0o2770 || (currentGid !== null && normalizedStat.gid !== currentGid)) {
+        throw new Error(`实际权限为 ${normalizedMode.toString(8)}，属组 ID 为 ${normalizedStat.gid}`);
+      }
+    } catch (error) {
+      throw new Error(
+        `${label}无法规范为当前服务组的 2770：${resolved}（${error.message}）。` +
+          '请只修改该目录节点的属组和权限，不要递归处理历史录像。'
+      );
+    }
+    this.log('info', `已将录像保存根目录规范为当前服务组的 2770（仅目录本身，不递归处理历史录像）：${resolved}`);
+    return true;
+  }
+
   async ensureRecordingOutputRootReady(directoryPath, options = {}) {
     const ready = await this.ensureDirectoryReady(directoryPath, options);
     if (!ready) {
       return false;
+    }
+    let normalizationError = null;
+    try {
+      await this.normalizeLinuxRecordingRootPermissions(directoryPath, options);
+    } catch (error) {
+      normalizationError = error;
     }
     try {
       await this.probeRecordingOutputDirectoryAccess(directoryPath, options);
@@ -2417,6 +2566,13 @@ $target = $env:BR2K_CREATE_DIRECTORY_TARGET
         return true;
       }
       throw error;
+    }
+    if (normalizationError) {
+      if (options.permissionsRequired === false) {
+        this.log('warn', normalizationError.message);
+        return true;
+      }
+      throw normalizationError;
     }
     return true;
   }
