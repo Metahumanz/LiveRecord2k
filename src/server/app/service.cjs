@@ -43,6 +43,8 @@ const {
   createClipCopyArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
+  createNormalizeRawVideoArgs,
+  createNormalizeEncodedVideoMuxArgs,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
   assertSafeMergeTargetProfile,
@@ -737,7 +739,7 @@ function isFfmpegVideoDecodeError(error) {
 
 function isFfmpegHardwareDecodeError(error) {
   const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
-  return /(?:hwaccel|hardware accelerator|hardware decoding|no device available for decoder|device setup failed|failed setup for format|failed to initialise|failed to initialize|error while decoding|failed to decode|decoder.*(?:failed|error)|cuvid|nvdec|d3d11va|dxva2|qsv.*(?:decode|device|session)|vaapi.*(?:decode|device|display)|cannot load nvcuda|cuda_error|unsupported.*(?:surface|pixel format))/i.test(
+  return /(?:hwaccel|hardware accelerator|hardware decoding|no device available for decoder|device setup failed|failed setup for format|failed to initialise|failed to initialize|error while decoding|failed to decode|decoder.*(?:failed|error)|cuvid|nvdec|nvv4l2|v4l2m2m|d3d11va|dxva2|qsv.*(?:decode|device|session)|vaapi.*(?:decode|device|display)|cannot load nvcuda|cuda_error|unsupported.*(?:surface|pixel format))/i.test(
     detail
   );
 }
@@ -878,28 +880,45 @@ function getMergeSegmentTimingAssessment(recording, hasAudio) {
   if (status === 'broken') {
     return { known: true, requiresNormalization: true, reason: '分段时间轴已标记为异常' };
   }
-  if (status === 'warning') {
-    return { known: true, requiresNormalization: true, reason: '分段时间轴存在警告' };
-  }
-  if (timeline.timingSafeForCopy === false) {
-    return { known: true, requiresNormalization: true, reason: '分段音画时长不适合无损拼接' };
-  }
   const durationDelta = finiteTimelineValue(timeline.avDeltaSec);
   const startDelta = deriveTimelineBoundaryDelta(timeline, 'Start');
   const endDelta = deriveTimelineBoundaryDelta(timeline, 'End');
+  const warnings = Array.isArray(timeline.warnings) ? timeline.warnings.join('；') : String(timeline.warnings || '');
+  const hardPacketRisk =
+    timeline.videoDtsMonotonic === false ||
+    timeline.audioDtsMonotonic === false ||
+    Number(timeline.corruptPacketCount || 0) > 0 ||
+    /(?:PTS 大幅回退|DTS 回退|损坏|时间戳异常|non[- ]?monoton)/i.test(warnings);
+  if (hardPacketRisk) {
+    return { known: true, requiresNormalization: true, reason: '分段存在损坏包或非单调时间戳' };
+  }
   if (durationDelta !== null && Math.abs(durationDelta) > MERGE_AV_DURATION_TOLERANCE_SEC) {
     return { known: true, requiresNormalization: true, reason: '音画时长相差 ' + durationDelta.toFixed(3) + 's' };
   }
-  if (startDelta !== null && Math.abs(startDelta) > MERGE_AV_BOUNDARY_TOLERANCE_SEC) {
-    return { known: true, requiresNormalization: true, reason: '音画起始相差 ' + startDelta.toFixed(3) + 's' };
+  if (durationDelta === null) {
+    return { known: false, requiresNormalization: true, reason: '缺少可验证的音画时长信息' };
   }
-  if (endDelta !== null && Math.abs(endDelta) > MERGE_AV_BOUNDARY_TOLERANCE_SEC) {
-    return { known: true, requiresNormalization: true, reason: '音画末尾相差 ' + endDelta.toFixed(3) + 's' };
-  }
-  if (durationDelta === null || startDelta === null || endDelta === null || status !== 'healthy') {
-    return { known: false, requiresNormalization: true, reason: '音画边界信息不完整，需重新校验' };
-  }
-  return { known: true, requiresNormalization: false, reason: '' };
+  // A start/end PTS origin difference is retained for burn filters, but is
+  // not proof of a user-visible A/V drift. Older versions persisted it as
+  // timingSafeForCopy=false, so explicitly treat this shape as advisory and
+  // verify the final copy-concat once instead of eagerly normalizing hours of
+  // otherwise synchronous media.
+  const hasBoundaryOffset =
+    (startDelta !== null && Math.abs(startDelta) > MERGE_AV_BOUNDARY_TOLERANCE_SEC) ||
+    (endDelta !== null && Math.abs(endDelta) > MERGE_AV_BOUNDARY_TOLERANCE_SEC);
+  const advisoryReason = hasBoundaryOffset
+    ? `保留源 PTS 起点/终点偏移（起始 ${startDelta === null ? '-' : startDelta.toFixed(3)}s，末尾 ${
+        endDelta === null ? '-' : endDelta.toFixed(3)
+      }s），将无损拼接后复验`
+    : status === 'warning' || timeline.timingSafeForCopy === false
+      ? '时间轴存在非致命提示，将无损拼接后复验'
+      : '';
+  return {
+    known: true,
+    requiresNormalization: false,
+    requiresPostMergeVerification: Boolean(advisoryReason),
+    reason: advisoryReason
+  };
 }
 
 function getMergeSegmentVideoDurationSec(timingInfo, mediaInfo, segment, nextSegment) {
@@ -1450,8 +1469,11 @@ class LiveRecordService {
   getEncoderBackendLabel(codecInfo) {
     const codec = String(codecInfo?.value || '').trim();
     const encoderLabel = String(codecInfo?.element || '').trim();
+    const converter = String(codecInfo?.converter || '').trim();
     if (codecInfo?.backend === 'gstreamer') {
-      return `Jetson ${isHevcCodec(codec) ? 'H.265' : 'H.264'} 硬编（GStreamer ${encoderLabel || codec}）`;
+      return `Jetson ${isHevcCodec(codec) ? 'H.265' : 'H.264'} 硬编（GStreamer ${encoderLabel || codec}${
+        converter ? ` + ${converter}` : ''
+      }）`;
     }
     if (codecInfo?.backend === 'v4l2m2m') {
       return `V4L2 M2M ${isHevcCodec(codec) ? 'H.265' : 'H.264'} 硬编（FFmpeg ${codec}）`;
@@ -1510,13 +1532,31 @@ class LiveRecordService {
     );
     if (!available.length) return software;
     const codec = String(encoderCodec || '');
-    const preference = codec.includes('nvenc')
+    const preference = codec.includes('nvv4l2')
+      ? [
+          sourceCodec === 'hevc' ? 'hevc_nvv4l2dec' : 'h264_nvv4l2dec',
+          sourceCodec === 'hevc' ? 'hevc_v4l2m2m' : 'h264_v4l2m2m',
+          'cuda',
+          'qsv',
+          'vaapi',
+          'd3d11va',
+          'dxva2'
+        ]
+      : codec.includes('nvenc')
       ? ['cuda', 'd3d11va', 'dxva2', 'qsv', 'vaapi']
       : codec.includes('qsv')
         ? ['qsv', 'd3d11va', 'dxva2', 'vaapi', 'cuda']
         : codec.includes('amf')
           ? ['d3d11va', 'dxva2', 'vaapi', 'cuda', 'qsv']
-          : ['cuda', 'qsv', 'd3d11va', 'dxva2', 'vaapi'];
+          : [
+              'cuda',
+              'qsv',
+              'vaapi',
+              'd3d11va',
+              'dxva2',
+              sourceCodec === 'hevc' ? 'hevc_nvv4l2dec' : 'h264_nvv4l2dec',
+              sourceCodec === 'hevc' ? 'hevc_v4l2m2m' : 'h264_v4l2m2m'
+            ];
     const selected = preference.map((value) => available.find((decoder) => decoder.value === value)).find(Boolean);
     return selected ? { ...selected, kind: 'hardware' } : software;
   }
@@ -1627,6 +1667,12 @@ class LiveRecordService {
       mergeGroup: String(recording.mergeGroup || ''),
       mergeSequence: Number(recording.mergeSequence || 0),
       mergeOutputPath: String(recording.mergeOutputPath || ''),
+      segmentTargetDurationSec: Number(
+        recording.segmentTargetDurationSec ||
+          recording.streamMetadata?.configuredSegmentDurationSec ||
+          recording.streamMetadata?.segmentTargetDurationSec ||
+          0
+      ),
       segmentReason: String(recording.segmentReason || 'initial'),
       diagnosticsPath: String(recording.diagnosticsPath || ''),
       mergedFrom: Array.isArray(recording.mergedFrom) ? recording.mergedFrom.map(String) : undefined,
@@ -1686,6 +1732,74 @@ class LiveRecordService {
   getSegmentDurationSec(minutes = this.settings.segmentMinutes) {
     const value = Number(minutes || 0);
     return Number.isFinite(value) && value > 0 ? value * 60 : 0;
+  }
+
+  getRecordingSegmentTargetDurationSec(recording) {
+    const candidates = [
+      recording?.segmentTargetDurationSec,
+      recording?.streamMetadata?.configuredSegmentDurationSec,
+      recording?.streamMetadata?.segmentTargetDurationSec
+    ];
+    for (const value of candidates) {
+      const duration = Number(value || 0);
+      if (Number.isFinite(duration) && duration > 0) return duration;
+    }
+    // Older sidecars did not persist the configured target. Fall back to the
+    // current setting so existing one-hour segments immediately become hard
+    // boundaries after upgrading.
+    return this.getSegmentDurationSec();
+  }
+
+  isRecordingAtSegmentBoundary(recording) {
+    const targetDurationSec = this.getRecordingSegmentTargetDurationSec(recording);
+    const recordedDurationSec = Math.max(
+      0,
+      Number(getSegmentDurationForMerge(recording) || recording?.durationSec || 0)
+    );
+    if (!targetDurationSec || !recordedDurationSec) return false;
+    // A graceful rotate can land a few seconds before the nominal limit.
+    // Do not merge it merely because FFmpeg closed on the keyframe just ahead
+    // of the exact 60-minute timestamp.
+    const toleranceSec = Math.max(2, Math.min(10, targetDurationSec * 0.01));
+    return recordedDurationSec >= targetDurationSec - toleranceSec;
+  }
+
+  getPartialReconnectClusters(segments) {
+    const clusters = [];
+    let current = [];
+    for (const segment of segments || []) {
+      if (this.isRecordingAtSegmentBoundary(segment)) {
+        if (current.length) clusters.push(current);
+        current = [];
+        continue;
+      }
+      current.push(segment);
+    }
+    if (current.length) clusters.push(current);
+    return clusters.filter((cluster) => cluster.length >= 2);
+  }
+
+  selectPartialReconnectCluster(segments, fallbackRecording) {
+    const clusters = this.getPartialReconnectClusters(segments);
+    if (!clusters.length) return [];
+    const fallbackPath = String(fallbackRecording?.cleanPath || '');
+    if (fallbackPath) {
+      const matching = clusters.find((cluster) => cluster.some((segment) => segment.cleanPath === fallbackPath));
+      return matching || [];
+    }
+    return clusters.at(-1) || [];
+  }
+
+  getReconnectMergeOutputPath(allSegments, mergeSegments) {
+    const first = mergeSegments?.[0];
+    if (!first) return '';
+    // A group may contain multiple reconnect clusters separated by ordinary
+    // completed segments. Only the first cluster owns the legacy group output;
+    // later clusters receive an output next to their own first source.
+    if (first === allSegments?.[0]) {
+      return first.mergeOutputPath || deriveSiblingPath(first.cleanPath, 'merged');
+    }
+    return deriveSiblingPath(first.cleanPath, 'merged');
   }
 
   async resolveRecordingDuration(recording, mediaInfo = {}, fallbackDurationSec = 0) {
@@ -1829,6 +1943,7 @@ class LiveRecordService {
       mergeGroup: session.mergeGroup,
       mergeSequence: session.mergeSequence,
       mergeOutputPath: session.mergeOutputPath,
+      segmentTargetDurationSec: Number(session.segmentDurationSec || 0),
       segmentReason: session.segmentReason || 'initial',
       diagnosticsPath: session.diagnosticsPath || '',
       recordingState: session.state || 'connecting',
@@ -4566,6 +4681,7 @@ try {
         mergeGroup,
         mergeSequence,
         mergeOutputPath,
+        segmentTargetDurationSec: segmentDurationSec,
         segmentReason,
         diagnosticsPath,
         eventCount: 0,
@@ -4666,6 +4782,7 @@ try {
         mergeGroup,
         mergeSequence,
         mergeOutputPath,
+        segmentTargetDurationSec: segmentDurationSec,
         segmentReason,
         diagnosticsPath,
         recordingState: session.state,
@@ -5944,6 +6061,8 @@ try {
       firstVideoPts: timelineHealth?.firstVideoPts ?? null,
       firstAudioPts: timelineHealth?.firstAudioPts ?? null,
       segmentDurationSec: actualDurationSec,
+      configuredSegmentDurationSec: Number(session.segmentDurationSec || 0),
+      segmentTargetDurationSec: Number(session.segmentDurationSec || 0),
       reconnectReason: session.segmentReason || 'initial'
     };
     const danmakuDurationSec = await readDanmakuDurationSec(session.danmakuPath).catch(() => 0);
@@ -6382,17 +6501,16 @@ try {
       groups.set(groupId, group);
     }
     const candidates = [...groups.entries()]
-      .map(([mergeGroup, segments]) => ({
-        mergeGroup,
-        segments: segments.sort((left, right) => {
+      .flatMap(([mergeGroup, groupSegments]) => {
+        const allSegments = groupSegments.sort((left, right) => {
           const sequenceDiff = Number(left.mergeSequence || 0) - Number(right.mergeSequence || 0);
           return sequenceDiff || Number(left.startedAt || 0) - Number(right.startedAt || 0);
-        })
-      }))
-      .filter((candidate) => candidate.segments.length >= 2)
+        });
+        return this.getPartialReconnectClusters(allSegments).map((segments) => ({ mergeGroup, allSegments, segments }));
+      })
       .sort((left, right) => Number(right.segments.at(-1)?.startedAt || 0) - Number(left.segments.at(-1)?.startedAt || 0));
     for (const candidate of candidates) {
-      const outputPath = candidate.segments[0].mergeOutputPath || deriveSiblingPath(candidate.segments[0].cleanPath, 'merged');
+      const outputPath = this.getReconnectMergeOutputPath(candidate.allSegments, candidate.segments);
       if (await isExistingFile(outputPath)) continue;
       const exists = await Promise.all(candidate.segments.map((segment) => isExistingFile(segment.cleanPath)));
       if (!exists.every(Boolean)) continue;
@@ -6756,19 +6874,26 @@ try {
       .filter((recording) => recording.valid !== false)
       .filter((recording) => recording.cleanPath && recording.cleanPath !== recording.mergeOutputPath);
     const segmentExists = await Promise.all(segmentCandidates.map((recording) => isExistingFile(recording.cleanPath)));
-    const segments = segmentCandidates
+    const allSegments = segmentCandidates
       .filter((_recording, index) => segmentExists[index])
       .sort((a, b) => {
         const sequenceDiff = Number(a.mergeSequence || 0) - Number(b.mergeSequence || 0);
         return sequenceDiff || Number(a.startedAt || 0) - Number(b.startedAt || 0);
       });
+    const segments = this.selectPartialReconnectCluster(allSegments, fallbackRecording);
     if (segments.length < 2) {
+      if (allSegments.length >= 2) {
+        this.log(
+          'info',
+          `${roomLabel(room)} 分段规则：达到设定时长的录像将保留为独立文件；仅连续的未满时长续录片段才会自动合并。`
+        );
+      }
       return fallbackRecording;
     }
 
     room.recordingState = 'merging';
 
-    const outputPath = segments[0].mergeOutputPath || deriveSiblingPath(segments[0].cleanPath, 'merged');
+    const outputPath = this.getReconnectMergeOutputPath(allSegments, segments);
     const container = getContainerFromPath(outputPath);
     const tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
     const concatPath = replaceExtension(outputPath, '.concat.txt');
@@ -6899,6 +7024,11 @@ try {
     const timingIssueSummary = timingAssessments
       .map((assessment, index) => (assessment.requiresNormalization ? '#' + (index + 1) + ' ' + assessment.reason : ''))
       .filter(Boolean);
+    const timingAdvisorySummary = timingAssessments
+      .map((assessment, index) =>
+        assessment.requiresPostMergeVerification ? '#' + (index + 1) + ' ' + assessment.reason : ''
+      )
+      .filter(Boolean);
     const requiresTranscode = streamSpecsChanged || timingRequiresNormalization;
     // Tracks whether this merge has already used the timestamp-preserving
     // normalizer. A copy concat that fails final timing validation gets one
@@ -6910,12 +7040,19 @@ try {
     ]
       .filter(Boolean)
       .join('；');
+    if (timingAdvisorySummary.length) {
+      this.log(
+        'info',
+        `${roomLabel(room)} 分段时间轴提示：${timingAdvisorySummary.join('；')}。仅 PTS 起点偏移不会再触发规范化重编码。`
+      );
+    }
     assertSafeMergeTargetProfile(segmentMediaInfos, targetVideoInfo, { requiresVideoTranscode: requiresTranscode });
     await this.waitForRuntimeCapabilities();
     const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
     mergeEncoderPlan.requiresTranscode = requiresTranscode;
     progress.codec = mergeEncoderPlan.preferred;
     progress.codecKind = mergeEncoderPlan.preferred.includes('libx') ? 'software' : 'hardware';
+    progress.encoderBackend = this.getEncoderBackendLabel(this.getBurnCodecInfo(mergeEncoderPlan.preferred));
     const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
     const sourceBytes = segmentFileSizes.reduce((sum, fileSize) => sum + Number(fileSize || 0), 0);
     const targetPixels = Number(targetVideoInfo.width || 0) * Number(targetVideoInfo.height || 0);
@@ -7045,7 +7182,7 @@ try {
         firstProgressHeartbeat.unref?.();
         try {
           try {
-            await runFfmpegJob(this.ffmpegPath, args, (line) => {
+            const onStderr = (line) => {
               const now = Date.now();
               const processedSec = parseFfmpegProgressTime(line);
               if (Number.isFinite(processedSec) && processedSec > lastMediaProgressSec + 0.0001) {
@@ -7095,26 +7232,32 @@ try {
               } else if (/error|failed|invalid/i.test(line)) {
                 this.log('warn', `${roomLabel(room)} 合并：${compactLogLine(line)}`);
               }
-            }, {
-              onChild: (nextChild) => {
-                child = nextChild;
-                this.mergeProcesses.set(room.id, nextChild);
-              },
-              progressStallTimeoutMs: MERGE_PROGRESS_STALL_TIMEOUT_MS,
-              progressValueFromText: parseFfmpegProgressTime,
-              onNoProgress: (watchdogError) => {
-                const message = `${stageLabel}连续 ${Math.ceil(
-                  MERGE_PROGRESS_STALL_TIMEOUT_MS / 1000
-                )} 秒没有媒体进度，已终止；源分段会保留并自动重试。`;
-                watchdogError.message = message;
-                if (room.mergeProgress?.id === progress.id) {
-                  room.mergeProgress.message = message;
-                  room.mergeProgress.updatedAt = Date.now();
+            };
+            const onChild = (nextChild) => {
+              child = nextChild;
+              if (nextChild) this.mergeProcesses.set(room.id, nextChild);
+            };
+            if (typeof options.run === 'function') {
+              await options.run(onStderr, onChild);
+            } else {
+              await runFfmpegJob(this.ffmpegPath, args, onStderr, {
+                onChild,
+                progressStallTimeoutMs: MERGE_PROGRESS_STALL_TIMEOUT_MS,
+                progressValueFromText: parseFfmpegProgressTime,
+                onNoProgress: (watchdogError) => {
+                  const message = `${stageLabel}连续 ${Math.ceil(
+                    MERGE_PROGRESS_STALL_TIMEOUT_MS / 1000
+                  )} 秒没有媒体进度，已终止；源分段会保留并自动重试。`;
+                  watchdogError.message = message;
+                  if (room.mergeProgress?.id === progress.id) {
+                    room.mergeProgress.message = message;
+                    room.mergeProgress.updatedAt = Date.now();
+                  }
+                  this.log('error', `${roomLabel(room)} ${message}`);
+                  this.markRoomDirty(room.id);
                 }
-                this.log('error', `${roomLabel(room)} ${message}`);
-                this.markRoomDirty(room.id);
-              }
-            });
+              });
+            }
           } catch (error) {
             throw forcedFfmpegError || error;
           }
@@ -7132,6 +7275,7 @@ try {
         if (room.mergeProgress?.id === progress.id) {
           room.mergeProgress.codec = videoCodec;
           room.mergeProgress.codecKind = videoCodec.includes('libx') ? 'software' : 'hardware';
+          room.mergeProgress.encoderBackend = this.getEncoderBackendLabel(this.getBurnCodecInfo(videoCodec));
           room.mergeProgress.updatedAt = Date.now();
           this.markRoomDirty(room.id);
         }
@@ -7184,27 +7328,80 @@ try {
               this.markRoomDirty(room.id);
             }
             await fsp.rm(normalizedPath, { force: true });
-            await runMergeFfmpeg(
-              createNormalizeSegmentArgs({
-                inputPath: segments[index].cleanPath,
-                outputPath: normalizedPath,
-                container: 'mkv',
-                durationSec: sourceDurationSec,
-                hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
-                targetVideoInfo,
-                videoCodec,
-                softwareThreads: mergeSoftwareThreads,
-                decoder,
-                decoderThreads,
-                recoverySeekSec,
-                timelineAlignment
-              }),
-              {
-                progressOffsetSec,
-                stageLabel,
-                segmentDurationSec: sourceDurationSec
-              }
-            );
+            const normalizeOptions = {
+              progressOffsetSec,
+              stageLabel,
+              segmentDurationSec: sourceDurationSec
+            };
+            if (isJetsonGstreamerCodec(videoCodec)) {
+              const encodedVideoPath = path.join(
+                normalizeTempDir,
+                `${String(index + 1).padStart(3, '0')}.normalized.${isHevcCodec(videoCodec) ? 'h265' : 'h264'}`
+              );
+              await runMergeFfmpeg(null, {
+                ...normalizeOptions,
+                run: (onStderr, onChild) =>
+                  this.runJetsonGstreamerTranscode({
+                    codec: videoCodec,
+                    quality: isHevcCodec(videoCodec) ? 24 : 20,
+                    width: targetVideoInfo.width,
+                    height: targetVideoInfo.height,
+                    fps: targetVideoInfo.fps || segmentMediaInfos[index]?.videoInfo?.fps || 30,
+                    encodedVideoPath,
+                    decoder,
+                    createRawArgs: (nextDecoder) =>
+                      createNormalizeRawVideoArgs({
+                        inputPath: segments[index].cleanPath,
+                        durationSec: sourceDurationSec,
+                        targetVideoInfo,
+                        decoder: nextDecoder,
+                        decoderThreads,
+                        recoverySeekSec,
+                        timelineAlignment
+                      }),
+                    createMuxArgs: () =>
+                      createNormalizeEncodedVideoMuxArgs({
+                        encodedVideoPath,
+                        inputPath: segments[index].cleanPath,
+                        outputPath: normalizedPath,
+                        codec: videoCodec,
+                        fps: targetVideoInfo.fps || segmentMediaInfos[index]?.videoInfo?.fps || 30,
+                        container: 'mkv',
+                        durationSec: sourceDurationSec,
+                        hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
+                        timelineAlignment
+                      }),
+                    onStderr,
+                    onChild,
+                    onFallback: () => {
+                      this.setProgressDecoder(room.mergeProgress, {
+                        value: 'software',
+                        label: 'CPU',
+                        kind: 'software'
+                      });
+                    },
+                    label: `${roomLabel(room)} ${stageLabel}`
+                  })
+              });
+            } else {
+              await runMergeFfmpeg(
+                createNormalizeSegmentArgs({
+                  inputPath: segments[index].cleanPath,
+                  outputPath: normalizedPath,
+                  container: 'mkv',
+                  durationSec: sourceDurationSec,
+                  hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
+                  targetVideoInfo,
+                  videoCodec,
+                  softwareThreads: mergeSoftwareThreads,
+                  decoder,
+                  decoderThreads,
+                  recoverySeekSec,
+                  timelineAlignment
+                }),
+                normalizeOptions
+              );
+            }
           };
           try {
             await runNormalizeAttempt({
@@ -7485,6 +7682,7 @@ try {
         mergeGroup: groupId,
         mergeSequence: 0,
         mergeOutputPath: outputPath,
+        segmentTargetDurationSec: this.getRecordingSegmentTargetDurationSec(segments[0]),
         segmentReason: 'merged',
         diagnosticsPath: segments[0].diagnosticsPath || '',
         mergedFrom: segments.map((segment) => segment.cleanPath),
@@ -7638,6 +7836,7 @@ try {
       mergeGroup: String(recording.mergeGroup || ''),
       mergeSequence: Number(recording.mergeSequence || 0),
       mergeOutputPath: toMetadataRelativePath(recording.mergeOutputPath),
+      segmentTargetDurationSec: Number(recording.segmentTargetDurationSec || 0),
       avatarManifestPath: toMetadataRelativePath(
         recording.avatarManifestPath || deriveAvatarManifestPath(cleanPath)
       ),
@@ -7677,6 +7876,7 @@ try {
       mergeGroup: session.mergeGroup,
       mergeSequence: Number(session.mergeSequence || 0),
       mergeOutputPath: path.basename(session.mergeOutputPath || ''),
+      segmentTargetDurationSec: Number(session.segmentDurationSec || 0),
       segmentReason: session.segmentReason || 'initial',
       danmakuPath: path.basename(session.danmakuPath || ''),
       avatarManifestPath: path.basename(session.avatarManifestPath || deriveAvatarManifestPath(session.cleanPath)),
@@ -7882,6 +8082,12 @@ try {
           mergeOutputPath: metadata?.mergeOutputPath
             ? path.resolve(directory, path.basename(metadata.mergeOutputPath))
             : '',
+          segmentTargetDurationSec: Number(
+            metadata?.segmentTargetDurationSec ||
+              metadata?.streamMetadata?.configuredSegmentDurationSec ||
+              metadata?.streamMetadata?.segmentTargetDurationSec ||
+              0
+          ),
           segmentReason: 'crash-recovery',
           diagnosticsPath: metadata?.diagnosticsPath ? path.resolve(directory, path.basename(metadata.diagnosticsPath)) : path.join(directory, 'diagnostics.json'),
           durationSec: Number(recoveredInfo.durationSec || timelineHealth.videoDurationSec || 0),
@@ -7921,6 +8127,7 @@ try {
             segmentReason: 'crash-recovery',
             outputDir: path.dirname(recording.cleanPath),
             outputContainer: getContainerFromPath(recording.cleanPath),
+            segmentDurationSec: this.getRecordingSegmentTargetDurationSec(recording),
             mergeGroup: recording.mergeGroup,
             mergeSequence: Number(recording.mergeSequence || 0) + 1,
             mergeOutputPath: recording.mergeOutputPath
@@ -8723,6 +8930,7 @@ try {
     }
     const outputPath = String(encodedVideoPath || '').trim();
     if (!outputPath) throw new Error('Jetson GStreamer 编码缺少临时视频文件路径。');
+    const codecInfo = this.getBurnCodecInfo(codec);
     const gstreamerArgs = createJetsonGstreamerEncodeArgs({
       codec,
       width,
@@ -8730,11 +8938,12 @@ try {
       fps,
       quality,
       outputPath,
-      preview
+      preview,
+      converter: codecInfo.converter
     });
     this.log(
       'info',
-      `${label}：选中的编码器 ${codec}，实际后端 Jetson GStreamer ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}；FFmpeg 负责解码/滤镜，原始 I420 流式送入硬编。`
+      `${label}：选中的编码器 ${codec}，实际后端 Jetson GStreamer ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}（${codecInfo.converter || 'nvvidconv'}）；FFmpeg 负责解码/滤镜，原始 I420 流式送入硬编。`
     );
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     const run = async (nextDecoder) => {
@@ -10328,10 +10537,10 @@ try {
     const hardwareCandidates = highChroma || bitDepth > 10
       ? []
       : hevc
-      ? ['hevc_nvenc', 'hevc_v4l2m2m', 'hevc_qsv', 'hevc_amf']
+      ? ['hevc_nvenc', 'hevc_nvv4l2', 'hevc_v4l2m2m', 'hevc_qsv', 'hevc_amf']
       : tenBit
         ? []
-        : ['h264_nvenc', 'h264_v4l2m2m', 'h264_qsv', 'h264_amf'];
+        : ['h264_nvenc', 'h264_nvv4l2', 'h264_v4l2m2m', 'h264_qsv', 'h264_amf'];
     const hardware = hardwareCandidates.find((codec) => available.has(codec)) || '';
     const software = hevc ? 'libx265' : 'libx264';
     return { preferred: hardware || software, fallback: hardware ? software : '', software, tenBit };
@@ -10357,7 +10566,8 @@ try {
       height: 180,
       fps: 30,
       quality: 28,
-      outputPath: '/dev/null'
+      outputPath: '/dev/null',
+      converter: codecInfo?.converter
     });
     // Use fakesink: this validates the same FFmpeg raw-I420 to nvv4l2 bridge
     // used by a burn without leaving an elementary stream on disk.

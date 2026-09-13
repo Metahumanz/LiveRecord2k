@@ -20,6 +20,9 @@ const {
   createAvatarOverlayFilterScript,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
+  createNormalizeRawVideoArgs,
+  createNormalizeEncodedVideoMuxArgs,
+  createNormalizeSegmentArgs,
   runFfmpegToGstreamerJob
 } = require('../src/server/recording/ffmpeg.cjs');
 const {
@@ -573,6 +576,18 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   assert.ok(gstreamerArgs.includes('nvvidconv'));
   assert.ok(gstreamerArgs.includes('framerate=2997/100'));
 
+  const newerStackGstreamerArgs = createJetsonGstreamerEncodeArgs({
+    codec: 'hevc_nvv4l2',
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    quality: 24,
+    outputPath: '/recordings/temporary.h265',
+    converter: 'nvvideoconvert'
+  });
+  assert.ok(newerStackGstreamerArgs.includes('nvvideoconvert'));
+  assert.ok(newerStackGstreamerArgs.includes('nvv4l2h265enc'));
+
   const muxArgs = createBurnEncodedVideoMuxArgs({
     encodedVideoPath: '/recordings/temporary.h264',
     cleanPath: '/recordings/source.mkv',
@@ -584,6 +599,41 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   });
   assert.ok(muxArgs.includes('copy'));
   assert.ok(muxArgs.includes('/recordings/final.mp4'));
+
+  const jetsonDecodeArgs = createNormalizeSegmentArgs({
+    inputPath: '/recordings/source.mkv',
+    outputPath: '/recordings/normalized.mkv',
+    container: 'mkv',
+    durationSec: 12,
+    hasAudio: true,
+    targetVideoInfo: { width: 1920, height: 1080, fps: 30, codec: 'h264', pixelFormat: 'yuv420p' },
+    videoCodec: 'h264_nvv4l2',
+    decoder: 'h264_nvv4l2dec'
+  });
+  assert.equal(jetsonDecodeArgs[jetsonDecodeArgs.indexOf('-c:v') + 1], 'h264_nvv4l2dec');
+  assert.equal(jetsonDecodeArgs.includes('-hwaccel'), false);
+
+  const m2mDecodeArgs = createNormalizeRawVideoArgs({
+    inputPath: '/recordings/source.mkv',
+    durationSec: 12,
+    targetVideoInfo: { width: 1920, height: 1080, fps: 30 },
+    decoder: 'h264_v4l2m2m'
+  });
+  assert.equal(m2mDecodeArgs[m2mDecodeArgs.indexOf('-c:v') + 1], 'h264_v4l2m2m');
+  assert.ok(m2mDecodeArgs.includes('rawvideo'));
+
+  const normalizeMuxArgs = createNormalizeEncodedVideoMuxArgs({
+    encodedVideoPath: '/recordings/temporary.h264',
+    inputPath: '/recordings/source.mkv',
+    outputPath: '/recordings/normalized.mkv',
+    codec: 'h264_nvv4l2',
+    fps: 30,
+    container: 'mkv',
+    durationSec: 12,
+    hasAudio: true
+  });
+  assert.ok(normalizeMuxArgs.includes('[aout]'));
+  assert.ok(normalizeMuxArgs.includes('/recordings/normalized.mkv'));
 });
 
 test('Jetson GStreamer keeps CUDA avatar composition independent from the video encoder', () => {
@@ -693,6 +743,8 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(source, /EVP_DigestVerify/);
   assert.match(source, /python3/);
   assert.match(source, /gstreamer1\.0-plugins-base/);
+  assert.match(source, /gstreamer1\.0-plugins-good/);
+  assert.match(source, /gst-inspect-1\.0 nvv4l2h264enc/);
   assert.doesNotMatch(source, /pkeyutl -verify/);
   assert.doesNotMatch(source, /-rawin/);
   assert.match(source, /BILI_RECORD_DOWNLOAD_MIRROR/);

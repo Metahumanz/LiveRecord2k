@@ -45,12 +45,55 @@ const BURN_CODEC_CANDIDATES = [
   { value: 'h264_nvv4l2', label: 'Jetson V4L2 H.264 硬件编码', kind: 'hardware', vendor: 'nvidia', platform: 'linux', backend: 'gstreamer', element: 'nvv4l2h264enc' }
 ];
 const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.value));
+// JetPack images expose the NVIDIA memory converter under different element
+// names.  R35 commonly ships nvvidconv, while newer stacks may provide
+// nvvideoconvert instead.  A real pipeline test below chooses one; do not
+// make the OS release itself a proxy for its multimedia stack.
+const JETSON_GSTREAMER_CONVERTERS = ['nvvidconv', 'nvvideoconvert'];
 const HARDWARE_DECODER_CANDIDATES = [
   { value: 'cuda', label: 'NVIDIA CUDA', vendor: 'nvidia' },
   { value: 'qsv', label: 'Intel Quick Sync', vendor: 'intel' },
   { value: 'd3d11va', label: 'Direct3D 11', platform: 'win32' },
   { value: 'dxva2', label: 'DirectX VA2', platform: 'win32' },
-  { value: 'vaapi', label: 'VA-API', platform: 'linux', vendors: ['intel', 'amd'] }
+  { value: 'vaapi', label: 'VA-API', platform: 'linux', vendors: ['intel', 'amd'] },
+  // Jetson's L4T FFmpeg exposes the NVIDIA decoder as a codec rather than a
+  // `-hwaccel` device.  Probe the actual decoder on a matching small sample;
+  // a Jetson image can list CUDA in `-hwaccels` while still lacking this
+  // V4L2 decode path.
+  {
+    value: 'h264_nvv4l2dec',
+    label: 'Jetson V4L2 H.264 硬件解码',
+    vendor: 'nvidia',
+    platform: 'linux',
+    codec: 'h264',
+    directDecoder: true
+  },
+  {
+    value: 'hevc_nvv4l2dec',
+    label: 'Jetson V4L2 H.265 硬件解码',
+    vendor: 'nvidia',
+    platform: 'linux',
+    codec: 'hevc',
+    directDecoder: true
+  },
+  // Some Ubuntu 22.04/24.04 FFmpeg builds expose the same V4L2 hardware as
+  // the generic M2M decoder instead of NVIDIA's nvv4l2 name. Do not assume a
+  // Jetson release here: the matching real decode probe decides whether this
+  // path is offered.
+  {
+    value: 'h264_v4l2m2m',
+    label: 'V4L2 M2M H.264 硬件解码',
+    platform: 'linux',
+    codec: 'h264',
+    directDecoder: true
+  },
+  {
+    value: 'hevc_v4l2m2m',
+    label: 'V4L2 M2M H.265 硬件解码',
+    platform: 'linux',
+    codec: 'hevc',
+    directDecoder: true
+  }
 ];
 const APP_ROOT = getAppRoot();
 const APP_VERSION = getAppVersion();
@@ -417,7 +460,7 @@ async function detectFfmpegCapabilities(ffmpegPath) {
         unavailableBurnCodecs.push({ ...candidate, reason: test.reason || 'Jetson GStreamer 硬件编码测试未通过' });
         continue;
       }
-      burnCodecs.push(candidate);
+      burnCodecs.push({ ...candidate, converter: test.converter || JETSON_GSTREAMER_CONVERTERS[0] });
       gstreamerEncoders.push(candidate.value);
       continue;
     }
@@ -465,8 +508,10 @@ async function detectFfmpegCapabilities(ffmpegPath) {
 }
 
 function shouldTestHardwareDecoder(candidate, hwaccels, adapters, platform = process.platform) {
-  if (!hwaccels.includes(candidate.value)) return false;
   if (candidate.platform && candidate.platform !== platform) return false;
+  // nvv4l2dec is selected with `-c:v`, not `-hwaccel`, so it is absent from
+  // FFmpeg's hwaccel list. The following real decode probe is its authority.
+  if (!candidate.directDecoder && !hwaccels.includes(candidate.value)) return false;
   if (candidate.vendor && platform === 'win32' && !hasVideoAdapterVendor(adapters, candidate.vendor)) return false;
   if (
     Array.isArray(candidate.vendors) &&
@@ -513,16 +558,16 @@ async function createHardwareDecodeProbeSample(ffmpegPath, sourceCodec, outputPa
   return result.status === 0 && !result.error && !result.timedOut;
 }
 
-async function testFfmpegHardwareDecoder(ffmpegPath, accelerator, inputPath) {
+async function testFfmpegHardwareDecoder(ffmpegPath, accelerator, inputPath, options = {}) {
   try {
+    const inputArgs = options.directDecoder ? ['-c:v', accelerator] : ['-hwaccel', accelerator];
     const result = await runCapturedProcess(
       ffmpegPath,
       [
         '-hide_banner',
         '-loglevel',
         'error',
-        '-hwaccel',
-        accelerator,
+        ...inputArgs,
         '-i',
         inputPath,
         '-frames:v',
@@ -574,7 +619,10 @@ async function detectFfmpegHardwareDecoders(ffmpegPath, options = {}) {
     }
     for (const candidate of candidates) {
       for (const [codec, samplePath] of samples) {
-        const result = await testFfmpegHardwareDecoder(ffmpegPath, candidate.value, samplePath);
+        if (candidate.codec && candidate.codec !== codec) continue;
+        const result = await testFfmpegHardwareDecoder(ffmpegPath, candidate.value, samplePath, {
+          directDecoder: Boolean(candidate.directDecoder)
+        });
         if (result.ok) {
           supported.push({
             value: candidate.value,
@@ -842,6 +890,14 @@ async function testJetsonGstreamerEncoder(candidate, options = {}) {
   const gstreamerPath = options.gstreamerPath || 'gst-launch-1.0';
   const inspectPath = options.inspectPath || 'gst-inspect-1.0';
   const parser = codec.startsWith('hevc_') ? 'h265parse' : 'h264parse';
+  const requestedConverters = Array.isArray(options.converters)
+    ? options.converters
+    : options.converter
+      ? [options.converter]
+      : JETSON_GSTREAMER_CONVERTERS;
+  const converters = [...new Set(requestedConverters.map((value) => String(value || '').trim()))].filter((value) =>
+    JETSON_GSTREAMER_CONVERTERS.includes(value)
+  );
   try {
     const inspected = await runCapturedProcess(inspectPath, [element], {
       timeoutMs: 5000,
@@ -873,36 +929,53 @@ async function testJetsonGstreamerEncoder(candidate, options = {}) {
           : detail || rawParser.error?.message || '未找到 GStreamer 元素 rawvideoparse'
       };
     }
-    const result = await runCapturedProcess(
-      gstreamerPath,
-      [
-        '-q',
-        '-e',
-        'videotestsrc',
-        'num-buffers=2',
-        '!',
-        'video/x-raw,format=I420,width=256,height=144,framerate=1/1',
-        '!',
-        'nvvidconv',
-        '!',
-        'video/x-raw(memory:NVMM),format=NV12',
-        '!',
-        element,
-        'bitrate=1000000',
-        '!',
-        parser,
-        '!',
-        'fakesink'
-      ],
-      { timeoutMs: 12000, maxOutputBytes: 128 * 1024 }
-    );
-    if (result.status === 0 && !result.error && !result.timedOut) {
-      return { ok: true, reason: '' };
+    let lastFailure = '';
+    for (const converter of converters) {
+      const converterInspection = await runCapturedProcess(inspectPath, [converter], {
+        timeoutMs: 5000,
+        maxOutputBytes: 64 * 1024
+      });
+      if (converterInspection.status !== 0 || converterInspection.error || converterInspection.timedOut) {
+        const detail = compactLogLine(`${converterInspection.stderr || ''}\n${converterInspection.stdout || ''}`);
+        lastFailure = detail || converterInspection.error?.message || `未找到 GStreamer 元素 ${converter}`;
+        continue;
+      }
+      const result = await runCapturedProcess(
+        gstreamerPath,
+        [
+          '-q',
+          '-e',
+          'videotestsrc',
+          'num-buffers=2',
+          '!',
+          'video/x-raw,format=I420,width=256,height=144,framerate=1/1',
+          '!',
+          converter,
+          '!',
+          'video/x-raw(memory:NVMM),format=NV12',
+          '!',
+          element,
+          'bitrate=1000000',
+          '!',
+          parser,
+          '!',
+          'fakesink'
+        ],
+        { timeoutMs: 12000, maxOutputBytes: 128 * 1024 }
+      );
+      if (result.status === 0 && !result.error && !result.timedOut) {
+        return { ok: true, reason: '', converter };
+      }
+      const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+      lastFailure = result.timedOut
+        ? `${converter} 硬件编码测试超时`
+        : `${converter}: ${output || result.error?.message || `GStreamer 退出码 ${result.status}`}`;
     }
-    const output = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
     return {
       ok: false,
-      reason: result.timedOut ? 'Jetson GStreamer 硬件编码测试超时' : output || result.error?.message || `GStreamer 退出码 ${result.status}`
+      reason:
+        lastFailure ||
+        `未找到可用的 Jetson 图像转换器（${JETSON_GSTREAMER_CONVERTERS.join(' / ')}）`
     };
   } catch (error) {
     return { ok: false, reason: error.message };
@@ -1752,11 +1825,15 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
     Number.isFinite(firstAudioPts) && Number.isFinite(firstVideoPts) ? Number(firstAudioPts) - Number(firstVideoPts) : null;
   const avEndDeltaSec =
     Number.isFinite(lastAudioPts) && Number.isFinite(lastVideoPts) ? Number(lastAudioPts) - Number(lastVideoPts) : null;
-  // AAC priming and a few reordered video frames can legitimately move a
-  // boundary by a handful of milliseconds.  Larger offsets mean a copy-concat
-  // would preserve a visibly out-of-sync source segment.
+  // Packet PTS origins are not a sync verdict by themselves. Live fMP4/HLS
+  // segments commonly start audio at zero while the first decodable video
+  // keyframe has a later PTS; forcing a re-encode from that offset alone both
+  // wastes hours on Jetson and can introduce an audible discontinuity. Keep
+  // it as an advisory for filter-based burns, while duration drift and packet
+  // monotonicity remain the copy-concat safety criteria.
   const avBoundaryToleranceSec = Math.max(0.12, Number(timingInfo.videoReorderAllowanceSec || 0) + 0.08);
   const warnings = [];
+  const advisories = [];
   if (!video.packetCount) warnings.push('没有检测到视频包');
   if (mediaInfo.audioInfo && !audio?.packetCount) warnings.push('没有检测到音频包');
   if (video.ptsMaxBackwardSec > 0.75) warnings.push(`视频 PTS 大幅回退 ${video.ptsBackwardCount} 次`);
@@ -1769,10 +1846,10 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
   if (copyWarnings.corruptPacketCount) warnings.push(`完整流扫描发现损坏包警告 ${copyWarnings.corruptPacketCount} 次`);
   if (Math.abs(Number(timingInfo.avDeltaSec || 0)) > 0.08) warnings.push(`A/V 时长差 ${timingInfo.avDeltaSec.toFixed(3)}s`);
   if (avStartDeltaSec !== null && Math.abs(avStartDeltaSec) > avBoundaryToleranceSec) {
-    warnings.push(`A/V 起始偏差 ${avStartDeltaSec.toFixed(3)}s`);
+    advisories.push(`A/V 起始 PTS 偏移 ${avStartDeltaSec.toFixed(3)}s`);
   }
   if (avEndDeltaSec !== null && Math.abs(avEndDeltaSec) > avBoundaryToleranceSec) {
-    warnings.push(`A/V 末尾偏差 ${avEndDeltaSec.toFixed(3)}s`);
+    advisories.push(`A/V 末尾 PTS 偏移 ${avEndDeltaSec.toFixed(3)}s`);
   }
   const broken =
     !video.packetCount ||
@@ -1782,11 +1859,8 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
     copyWarnings.nonMonotonicCount > 0;
   const timingSafeForCopy =
     Boolean(timingInfo.timingSafeForCopy) &&
-    (!mediaInfo.audioInfo ||
-      (avStartDeltaSec !== null &&
-        avEndDeltaSec !== null &&
-        Math.abs(avStartDeltaSec) <= avBoundaryToleranceSec &&
-        Math.abs(avEndDeltaSec) <= avBoundaryToleranceSec));
+    !broken &&
+    !copyWarnings.corruptPacketCount;
   return {
     ...timingInfo,
     firstVideoPts,
@@ -1808,6 +1882,7 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
       Number(video.decodeErrorCount || 0) + Number(audio?.decodeErrorCount || 0) + Number(copyWarnings.corruptPacketCount || 0),
     packetAuditMode: 'leading-and-trailing-sample-plus-full-copy-scan',
     timingSafeForCopy,
+    timingAdvisories: advisories,
     timelineHealth: broken ? 'broken' : warnings.length ? 'warning' : 'healthy',
     warnings
   };
@@ -2427,6 +2502,12 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         mergeGroup: String(metadata?.mergeGroup || ''),
         mergeSequence: Number(metadata?.mergeSequence || 0),
         mergeOutputPath: resolveMetadataRelativePath(metadata?.mergeOutputPath),
+        segmentTargetDurationSec: Number(
+          metadata?.segmentTargetDurationSec ||
+            metadata?.streamMetadata?.configuredSegmentDurationSec ||
+            metadata?.streamMetadata?.segmentTargetDurationSec ||
+            0
+        ),
         mergedFrom,
         cleanupId: String(metadata?.cleanupId || ''),
         segmentReason: String(metadata?.segmentReason || 'initial'),
