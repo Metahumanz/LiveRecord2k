@@ -14,6 +14,8 @@ const {
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
+  createPreviewHlsArgs,
+  createBoundedEvenScaleFilter,
   writeConcatFile,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
@@ -114,7 +116,8 @@ test('mixed segment specifications select the highest resolution and require tra
     videoCodec: 'libx265'
   });
   const filter = args[args.indexOf('-filter_complex') + 1];
-  assert.match(filter, /scale=w=3840:h=2160/);
+  assert.match(filter, /scale=w=trunc\(min\(3840\/iw\\,2160\/ih\)\*iw\/2\)\*2/);
+  assert.doesNotMatch(filter, /force_divisible_by/);
   assert.match(filter, /aresample=48000,asetpts=PTS-STARTPTS,apad,atrim=duration=1/);
   assert.doesNotMatch(filter, /async=1|fps=/, 'merge normalization must preserve the source clocks');
   assert.match(filter, /anullsrc=r=48000:cl=stereo/);
@@ -132,7 +135,8 @@ test('mixed segment specifications select the highest resolution and require tra
   });
   const normalizeFilter = normalizeArgs[normalizeArgs.indexOf('-filter_complex') + 1];
   assert.equal(normalizeArgs.filter((arg) => arg === '-i').length, 1);
-  assert.match(normalizeFilter, /scale=w=3840:h=2160/);
+  assert.match(normalizeFilter, /scale=w=trunc\(min\(3840\/iw\\,2160\/ih\)\*iw\/2\)\*2/);
+  assert.doesNotMatch(normalizeFilter, /force_divisible_by/);
   assert.match(normalizeFilter, /anullsrc=r=48000:cl=stereo/);
   assert.doesNotMatch(normalizeFilter, /concat=n=/);
   assert.equal(normalizeArgs[normalizeArgs.indexOf('-filter_threads') + 1], '1');
@@ -189,6 +193,44 @@ test('mixed segment specifications select the highest resolution and require tra
     ]),
     true
   );
+});
+
+test('旧版 FFmpeg 兼容缩放不依赖 force_divisible_by，并保持偶数输出尺寸', async () => {
+  const scaleFilter = createBoundedEvenScaleFilter(1280, 720);
+  assert.equal(
+    scaleFilter,
+    'scale=w=trunc(min(1280/iw\\,720/ih)*iw/2)*2:h=trunc(min(1280/iw\\,720/ih)*ih/2)*2'
+  );
+  assert.doesNotMatch(scaleFilter, /force_divisible_by/);
+
+  const previewArgs = createPreviewHlsArgs({
+    inputPath: 'source.mp4',
+    playlistPath: 'preview.m3u8',
+    segmentPattern: 'preview-%03d.ts'
+  });
+  assert.equal(previewArgs[previewArgs.indexOf('-vf') + 1], `${scaleFilter},format=yuv420p`);
+
+  const result = await runCapturedProcess(
+    ffmpegPath,
+    [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'testsrc=size=1919x1079:rate=1',
+      '-frames:v',
+      '1',
+      '-vf',
+      `${scaleFilter},format=yuv420p`,
+      '-f',
+      'null',
+      '-'
+    ],
+    { timeoutMs: 20_000 }
+  );
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('safe merge profiles refuse silent HDR, bit-depth, and chroma degradation', () => {

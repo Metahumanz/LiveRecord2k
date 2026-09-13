@@ -1030,7 +1030,7 @@ function createPreviewHlsArgs({ inputPath, playlistPath, segmentPattern, codec =
     '-map',
     '0:a?',
     '-vf',
-    'scale=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p',
+    `${createBoundedEvenScaleFilter(1280, 720)},format=yuv420p`,
     '-c:v',
     codec
   );
@@ -1363,7 +1363,7 @@ function createNormalizeSegmentArgs({
       : '';
   const filters = [
     `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
-      `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
+      `${createBoundedEvenScaleFilter(width, height)},` +
       `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=${pixelFormat}` +
       `${videoPaddingFilter}[vout]`
   ];
@@ -1433,7 +1433,7 @@ function createConcatTranscodeArgs({ segments, outputPath, container, targetVide
     const audioPaddingFilter = leadingAudioPaddingMs > 0 ? `adelay=${leadingAudioPaddingMs}:all=1,` : '';
     filters.push(
       `[${index}:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
-        `scale=w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,` +
+        `${createBoundedEvenScaleFilter(width, height)},` +
         `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=${pixelFormat}` +
         `${videoPaddingFilter}[v${index}]`
     );
@@ -1572,6 +1572,20 @@ function makeEvenDimension(value) {
   return dimension > 0 ? dimension - (dimension % 2) : 0;
 }
 
+function createBoundedEvenScaleFilter(width, height) {
+  const targetWidth = makeEvenDimension(width);
+  const targetHeight = makeEvenDimension(height);
+  if (targetWidth < 2 || targetHeight < 2) {
+    throw new Error('缩放滤镜缺少有效的偶数目标分辨率。');
+  }
+  // Jetson Ubuntu 20.04 ships an FFmpeg whose scale filter does not support
+  // force_divisible_by. Calculate the same aspect-preserving bounding-box
+  // scale explicitly, then round both dimensions down to even values. The
+  // escaped comma is required inside FFmpeg's min() expression.
+  const scaleRatio = `min(${targetWidth}/iw\\,${targetHeight}/ih)`;
+  return `scale=w=trunc(${scaleRatio}*iw/2)*2:h=trunc(${scaleRatio}*ih/2)*2`;
+}
+
 function normalizeMergeFps(value) {
   const fps = Number(value);
   if (!Number.isFinite(fps) || fps <= 0) {
@@ -1672,6 +1686,7 @@ module.exports = {
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
   createConcatTranscodeArgs,
+  createBoundedEvenScaleFilter,
   selectHighestResolutionVideoInfo,
   shouldTranscodeConcat,
   assertSafeMergeTargetProfile,
