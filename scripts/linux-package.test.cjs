@@ -682,6 +682,61 @@ test('Jetson GStreamer keeps CUDA avatar composition independent from the video 
   assert.equal(softwareEncodeArgs[softwareEncodeArgs.indexOf('-init_hw_device') + 1], 'cuda=br2k_avatar:0');
 });
 
+test('non-CUDA GPU final blend keeps avatar motion in a capped CPU side panel', () => {
+  const avatarOverlay = {
+    panel: { left: 10, width: 120, height: 180 },
+    filterScriptPath: '/recordings/avatar-layer.ffscript',
+    gpuComposite: true,
+    gpuCompositeBackend: 'vulkan',
+    gpuOutputToCpu: true,
+    compositeFps: 24,
+    entries: [
+      {
+        imagePath: '/recordings/avatar.png',
+        segments: [{ start: 0, end: 2, x1: 18, x2: 42, y1: 28, y2: 28 }]
+      }
+    ]
+  };
+  const script = createAvatarOverlayFilterScript({
+    assPath: '/recordings/danmaku.ass',
+    fps: 60,
+    avatarOverlay,
+    gpuComposite: true,
+    gpuCompositeBackend: 'vulkan',
+    gpuOutputToCpu: true
+  });
+  const vulkanArgs = createBurnArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    burnedPath: '/recordings/output.mkv',
+    codec: 'libx265',
+    crf: 24,
+    container: 'mkv',
+    fps: 60,
+    avatarOverlay
+  });
+  const vaapiArgs = createBurnArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    burnedPath: '/recordings/output-vaapi.mkv',
+    codec: 'libx265',
+    crf: 24,
+    container: 'mkv',
+    fps: 60,
+    avatarOverlay: {
+      ...avatarOverlay,
+      gpuCompositeBackend: 'vaapi',
+      gpuCompositeDevice: '/dev/dri/renderD128'
+    }
+  });
+
+  assert.match(script, /color=c=black@0\.0:s=120x180:r=24/);
+  assert.match(script, /overlay=x='if\(between\(t/);
+  assert.match(script, /overlay_vulkan=x=10:y=0,hwdownload,format=yuva420p,format=yuv420p\[vout\]/);
+  assert.equal(vulkanArgs[vulkanArgs.indexOf('-init_hw_device') + 1], 'vulkan=br2k_avatar:0');
+  assert.equal(vaapiArgs[vaapiArgs.indexOf('-init_hw_device') + 1], 'vaapi=br2k_avatar:/dev/dri/renderD128');
+});
+
 test('FFmpeg-to-GStreamer bridge streams stdout into stdin and clears its cancellable child', async () => {
   const children = [];
   await runFfmpegToGstreamerJob({

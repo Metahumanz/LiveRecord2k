@@ -50,6 +50,38 @@ const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.val
 // nvvideoconvert instead.  A real pipeline test below chooses one; do not
 // make the OS release itself a proxy for its multimedia stack.
 const JETSON_GSTREAMER_CONVERTERS = ['nvvidconv', 'nvvideoconvert'];
+// CUDA is able to retain every avatar overlay on-device.  Other GPU APIs
+// do not consistently support our time-varying per-avatar expressions, but
+// can still accelerate the expensive final alpha blend between the full
+// ASS-rendered frame and the small, CPU-generated avatar panel.
+const AVATAR_COMPOSITE_BACKENDS = [
+  {
+    value: 'cuda',
+    label: 'NVIDIA CUDA 真实头像合成',
+    mode: 'full',
+    filters: ['hwupload_cuda', 'overlay_cuda', 'scale_cuda']
+  },
+  {
+    value: 'vaapi',
+    label: 'VA-API 透明图层最终合成',
+    mode: 'final-blend',
+    platform: 'linux',
+    requiresRenderDevice: true,
+    filters: ['hwupload', 'hwdownload', 'overlay_vaapi']
+  },
+  {
+    value: 'vulkan',
+    label: 'Vulkan 透明图层最终合成',
+    mode: 'final-blend',
+    filters: ['hwupload', 'hwdownload', 'overlay_vulkan']
+  },
+  {
+    value: 'opencl',
+    label: 'OpenCL 透明图层最终合成',
+    mode: 'final-blend',
+    filters: ['hwupload', 'hwdownload', 'overlay_opencl']
+  }
+];
 const HARDWARE_DECODER_CANDIDATES = [
   { value: 'cuda', label: 'NVIDIA CUDA', vendor: 'nvidia' },
   { value: 'qsv', label: 'Intel Quick Sync', vendor: 'intel' },
@@ -435,6 +467,171 @@ function mergeCommandCounts(items) {
   return merged;
 }
 
+function findVaapiRenderDevice() {
+  if (process.platform !== 'linux') return '';
+  try {
+    const device = fs
+      .readdirSync('/dev/dri', { withFileTypes: true })
+      .filter((entry) => entry.isCharacterDevice?.() || entry.isFile?.() || entry.isSymbolicLink?.())
+      .map((entry) => entry.name)
+      .filter((name) => /^renderD\d+$/.test(name))
+      .sort()[0];
+    return device ? path.join('/dev/dri', device) : '';
+  } catch {
+    return '';
+  }
+}
+
+function getAvatarCompositeFilterGraph(backend) {
+  switch (backend) {
+    case 'vaapi':
+      return [
+        '[0:v]format=nv12,hwupload[base]',
+        '[1:v]format=yuva420p,hwupload[avatar]',
+        '[base][avatar]overlay_vaapi=x=8:y=8,hwdownload,format=nv12,format=yuv420p[out]'
+      ].join(';');
+    case 'vulkan':
+      return [
+        '[0:v]format=yuva420p,hwupload[base]',
+        '[1:v]format=yuva420p,hwupload[avatar]',
+        '[base][avatar]overlay_vulkan=x=8:y=8,hwdownload,format=yuva420p,format=yuv420p[out]'
+      ].join(';');
+    case 'opencl':
+      return [
+        '[0:v]format=yuva420p,hwupload[base]',
+        '[1:v]format=yuva420p,hwupload[avatar]',
+        '[base][avatar]overlay_opencl=x=8:y=8:eof_action=pass:repeatlast=0,hwdownload,format=yuva420p,format=yuv420p[out]'
+      ].join(';');
+    default:
+      return '';
+  }
+}
+
+function getAvatarCompositeDeviceSpec(backend, deviceName, options = {}) {
+  const name = String(deviceName || 'br2k_avatar_probe').trim() || 'br2k_avatar_probe';
+  if (backend === 'vaapi') {
+    const renderDevice = String(options.renderDevice || options.device || '').trim();
+    return renderDevice ? `vaapi=${name}:${renderDevice}` : '';
+  }
+  if (backend === 'vulkan') return `vulkan=${name}:0`;
+  if (backend === 'opencl') return `opencl=${name}`;
+  return '';
+}
+
+function isSoftwareAvatarCompositeDevice(output) {
+  // Vulkan/OpenCL can silently select llvmpipe, lavapipe, SwiftShader or a
+  // CPU OpenCL runtime. Those paths are useful for compatibility testing,
+  // but presenting them as an acceleration backend would make rendering
+  // slower on many low-power machines.
+  return /(?:llvmpipe|lavapipe|swiftshader|software rasterizer|\bpocl\b|portable computing language|\bcpu(?:\s+opencl|\s+device| runtime)\b)/i.test(
+    String(output || '')
+  );
+}
+
+async function testFfmpegAvatarCompositeBackend(ffmpegPath, backend, options = {}) {
+  const value = String(typeof backend === 'string' ? backend : backend?.value || '').trim().toLowerCase();
+  if (value === 'cuda') return testFfmpegCudaAvatarComposite(ffmpegPath);
+  const candidate = AVATAR_COMPOSITE_BACKENDS.find((item) => item.value === value);
+  if (!candidate) return { ok: false, reason: `不支持的头像合成后端：${value || '未知'}` };
+  const deviceName = 'br2k_avatar_probe';
+  const deviceSpec = getAvatarCompositeDeviceSpec(value, deviceName, options);
+  if (!deviceSpec) {
+    return { ok: false, reason: value === 'vaapi' ? '未找到 VA-API render 节点' : '无法初始化 GPU 设备' };
+  }
+  const filterGraph = getAvatarCompositeFilterGraph(value);
+  try {
+    const result = await runCapturedProcess(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'verbose',
+        '-init_hw_device',
+        deviceSpec,
+        '-filter_hw_device',
+        deviceName,
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=black:s=64x64:r=1:d=1,format=yuv420p',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=white@0.5:s=16x16:r=1:d=1,format=rgba',
+        '-filter_complex',
+        filterGraph,
+        '-map',
+        '[out]',
+        '-frames:v',
+        '1',
+        '-f',
+        'null',
+        '-'
+      ],
+      { timeoutMs: 10000, maxOutputBytes: 128 * 1024 }
+    );
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`;
+    if (result.status === 0 && !result.error) {
+      if (isSoftwareAvatarCompositeDevice(output)) {
+        return { ok: false, reason: '检测到软件 Vulkan/OpenCL 设备，不将其作为 GPU 加速后端' };
+      }
+      return { ok: true, reason: '' };
+    }
+    const detail = compactLogLine(output);
+    return {
+      ok: false,
+      reason: result.timedOut
+        ? `${candidate.label}测试超时`
+        : detail || result.error?.message || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+}
+
+async function detectFfmpegAvatarCompositeBackend(ffmpegPath, { hwaccels = [], filterNames = new Set() } = {}) {
+  const attempts = [];
+  let cudaReason = '';
+  for (const candidate of AVATAR_COMPOSITE_BACKENDS) {
+    if (candidate.platform && candidate.platform !== process.platform) continue;
+    if (candidate.value === 'cuda' && !hwaccels.includes('cuda')) {
+      cudaReason = '未检测到可用的 CUDA 透明图层合成链路';
+      attempts.push(`${candidate.label}：${cudaReason}`);
+      continue;
+    }
+    const missingFilter = candidate.filters.find((filter) => !filterNames.has(filter));
+    if (missingFilter) {
+      const reason = `ffmpeg 未包含滤镜 ${missingFilter}`;
+      if (candidate.value === 'cuda') cudaReason = reason;
+      attempts.push(`${candidate.label}：${reason}`);
+      continue;
+    }
+    const renderDevice = candidate.requiresRenderDevice ? findVaapiRenderDevice() : '';
+    const probe = await testFfmpegAvatarCompositeBackend(ffmpegPath, candidate, { renderDevice });
+    if (probe.ok) {
+      return {
+        backend: {
+          value: candidate.value,
+          label: candidate.label,
+          mode: candidate.mode,
+          ...(renderDevice ? { device: renderDevice } : {})
+        },
+        reason: '',
+        cudaReason
+      };
+    }
+    if (candidate.value === 'cuda') cudaReason = probe.reason || 'CUDA 透明图层测试未通过';
+    attempts.push(`${candidate.label}：${probe.reason || '测试未通过'}`);
+  }
+  return {
+    backend: null,
+    reason: attempts.length
+      ? `未检测到可用的 GPU 透明图层合成链路（${attempts.join('；')}）`
+      : '未检测到可用的 GPU 透明图层合成链路',
+    cudaReason
+  };
+}
+
 async function detectFfmpegCapabilities(ffmpegPath) {
   const [encoderProbe, hwaccelProbe, filterProbe, videoAdapters] = await Promise.all([
     runFfmpegProbe(ffmpegPath, ['-hide_banner', '-encoders']),
@@ -482,11 +679,10 @@ async function detectFfmpegCapabilities(ffmpegPath) {
     burnCodecs.push(candidate);
   }
 
-  const cudaAvatarComposite =
-    hwaccels.includes('cuda') &&
-    ['hwupload_cuda', 'overlay_cuda', 'scale_cuda'].every((filter) => filterNames.has(filter))
-      ? await testFfmpegCudaAvatarComposite(ffmpegPath)
-      : { ok: false, reason: '未检测到可用的 CUDA 透明图层合成链路' };
+  const avatarComposite = await detectFfmpegAvatarCompositeBackend(ffmpegPath, {
+    hwaccels,
+    filterNames
+  });
   const hardwareDecoders = await detectFfmpegHardwareDecoders(ffmpegPath, {
     encoderNames,
     hwaccels,
@@ -500,8 +696,16 @@ async function detectFfmpegCapabilities(ffmpegPath) {
     hardwareDecoders,
     videoAdapters,
     gstreamerEncoders,
-    cudaAvatarComposite: cudaAvatarComposite.ok,
-    cudaAvatarCompositeReason: cudaAvatarComposite.reason || '',
+    // Keep the CUDA fields for existing installations and persisted
+    // diagnostics. New callers should prefer avatarComposite: it can also
+    // describe an actually-probed VA-API, Vulkan or OpenCL final blend.
+    avatarComposite: avatarComposite.backend,
+    avatarCompositeReason: avatarComposite.reason || '',
+    cudaAvatarComposite: avatarComposite.backend?.value === 'cuda',
+    cudaAvatarCompositeReason:
+      avatarComposite.backend?.value === 'cuda'
+        ? ''
+        : avatarComposite.cudaReason || avatarComposite.reason || '',
     probedAt: Date.now(),
     probeError: encoderProbe.ok ? '' : encoderProbe.error
   };
@@ -3479,6 +3683,11 @@ module.exports = {
   normalizeContainerStage,
   normalizeCommandCounts,
   mergeCommandCounts,
+  AVATAR_COMPOSITE_BACKENDS,
+  findVaapiRenderDevice,
+  getAvatarCompositeDeviceSpec,
+  testFfmpegAvatarCompositeBackend,
+  detectFfmpegAvatarCompositeBackend,
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,

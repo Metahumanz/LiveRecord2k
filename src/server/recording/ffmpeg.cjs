@@ -34,6 +34,73 @@ function getJetsonGstreamerEncoder(codec) {
   return isHevcCodec(codec) ? 'nvv4l2h265enc' : 'nvv4l2h264enc';
 }
 
+function normalizeAvatarCompositeBackend(value) {
+  const backend = String(value || '').trim().toLowerCase();
+  return ['cuda', 'vaapi', 'vulkan', 'opencl'].includes(backend) ? backend : '';
+}
+
+function getAvatarCompositeGraphProfile(backend) {
+  switch (normalizeAvatarCompositeBackend(backend)) {
+    case 'vaapi':
+      return {
+        baseFormat: 'nv12',
+        panelFormat: 'yuva420p',
+        overlay: 'overlay_vaapi',
+        download: 'hwdownload,format=nv12,format=yuv420p'
+      };
+    case 'vulkan':
+      return {
+        baseFormat: 'yuva420p',
+        panelFormat: 'yuva420p',
+        overlay: 'overlay_vulkan',
+        download: 'hwdownload,format=yuva420p,format=yuv420p'
+      };
+    case 'opencl':
+      return {
+        baseFormat: 'yuva420p',
+        panelFormat: 'yuva420p',
+        overlay: 'overlay_opencl',
+        download: 'hwdownload,format=yuva420p,format=yuv420p'
+      };
+    default:
+      return null;
+  }
+}
+
+function resolveAvatarPanelFps(fps, avatarOverlay) {
+  const sourceFps = normalizeMergeFps(fps) || 30;
+  const requested = Number(avatarOverlay?.compositeFps);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.max(12, Math.min(sourceFps, Math.round(requested)));
+  }
+  const entryCount = Array.isArray(avatarOverlay?.entries) ? avatarOverlay.entries.length : 0;
+  const cap = entryCount > 48 ? 20 : entryCount > 20 ? 24 : 30;
+  return Math.min(sourceFps, cap);
+}
+
+function appendAvatarCompositeDeviceArgs(args, backend, device) {
+  const value = normalizeAvatarCompositeBackend(backend);
+  if (!value) return '';
+  const deviceName = 'br2k_avatar';
+  let deviceSpec = '';
+  if (value === 'cuda') {
+    deviceSpec = `cuda=${deviceName}:0`;
+  } else if (value === 'vulkan') {
+    deviceSpec = `vulkan=${deviceName}:0`;
+  } else if (value === 'opencl') {
+    deviceSpec = `opencl=${deviceName}`;
+  } else if (value === 'vaapi') {
+    const renderDevice = String(device || '').trim();
+    if (!/^\/dev\/dri\/renderD\d+$/.test(renderDevice)) {
+      throw new Error('VA-API 头像合成缺少有效的 render 设备。');
+    }
+    deviceSpec = `vaapi=${deviceName}:${renderDevice}`;
+  }
+  if (!deviceSpec) return '';
+  args.push('-init_hw_device', deviceSpec, '-filter_hw_device', deviceName);
+  return deviceName;
+}
+
 // V4L2 M2M encoders use a target bitrate rather than CRF.  Keep the existing
 // quality control meaningful by mapping its 16–35 range to a conservative
 // bitrate range; the real capability probe guarantees that this encoder can
@@ -338,7 +405,7 @@ function createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, e
   const panelLeft = Math.max(0, Number(panel.left) || 0);
   const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
   const panelHeight = Math.max(1, Math.ceil(Number(panel.height) || 1));
-  const layerFps = normalizeMergeFps(fps) || 30;
+  const layerFps = resolveAvatarPanelFps(fps, avatarOverlay);
   const filters = [];
   const splitLabels = Array.from({ length: chunkCount }, (_unused, index) => `[avatar_chunk_input_${index}]`).join('');
   filters.push(`[0:v]${createBurnVideoFilter(assPath, fps)},split=${chunkCount}${splitLabels}`);
@@ -401,16 +468,17 @@ function createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, e
   return `${filters.join(';\n')}\n`;
 }
 
-// CPU rendering builds avatar artwork in a transparent side-panel stream and
-// composites it once above ASS. CUDA's overlay filter cannot chain a
-// transparent alpha main input, so its path composites the same circles
-// directly onto the already-rendered ASS video. The vector portrait beneath
-// remains the failure fallback in both cases.
+// CPU and hybrid rendering build avatar artwork in a transparent side-panel
+// stream and composite it once above ASS. CUDA's overlay filter cannot
+// chain a transparent alpha main input, so its full-GPU path composites the
+// same circles directly onto the already-rendered ASS video. The vector
+// portrait beneath remains the failure fallback in every path.
 function createAvatarOverlayFilterScript({
   assPath,
   fps,
   avatarOverlay,
   gpuComposite = false,
+  gpuCompositeBackend = '',
   gpuOutputToCpu = false,
   duration,
   chunkDuration,
@@ -425,6 +493,13 @@ function createAvatarOverlayFilterScript({
 } = {}) {
   const entries = normalizeAvatarOverlayEntries(avatarOverlay);
   if (!entries.length) return '';
+  // Existing callers only passed gpuComposite=true for CUDA. Preserve that
+  // contract while allowing newer callers to explicitly request a hybrid
+  // final-blend backend.
+  const requestedCompositeBackend = normalizeAvatarCompositeBackend(gpuCompositeBackend);
+  const avatarCompositeBackend = gpuComposite ? requestedCompositeBackend || 'cuda' : '';
+  const cudaAvatarComposite = avatarCompositeBackend === 'cuda';
+  const finalBlendProfile = cudaAvatarComposite ? null : getAvatarCompositeGraphProfile(avatarCompositeBackend);
   if (!gpuComposite && Number(chunkDuration) > 0) {
     return createChunkedAvatarOverlayFilterScript({ assPath, fps, avatarOverlay, entries, duration, chunkDuration });
   }
@@ -445,9 +520,12 @@ function createAvatarOverlayFilterScript({
   const panelLeft = Math.max(0, Number(panel.left) || 0);
   const panelWidth = Math.max(1, Math.ceil(Number(panel.width) || 1));
   const panelHeight = Math.max(1, Math.ceil(Number(panel.height) || 1));
-  const layerFps = normalizeMergeFps(fps) || 30;
+  // Portraits are animated inside a small transparent side panel. Reusing
+  // those frames on a 60/120fps main video is visually equivalent but
+  // removes a large amount of CPU blending work on all machines.
+  const layerFps = cudaAvatarComposite ? normalizeMergeFps(fps) || 30 : resolveAvatarPanelFps(fps, avatarOverlay);
   const filters = [
-    gpuComposite
+    cudaAvatarComposite
       ? `[0:v]${createBurnVideoFilter(assPath, fps, {
         timelineOffset: sourceClockOffset,
         skipInitialKeyframeGuard,
@@ -468,7 +546,7 @@ function createAvatarOverlayFilterScript({
           preserveSourceFrameTiming
         })}[burn_base]`
   ];
-  if (!gpuComposite) {
+  if (!cudaAvatarComposite) {
     filters.push(
       `color=c=black@0.0:s=${panelWidth}x${panelHeight}:r=${layerFps}:d=${formatFilterNumber(
         layerDuration
@@ -486,9 +564,9 @@ function createAvatarOverlayFilterScript({
     filters.push(
       `movie='${escapeFilterPath(entry.imagePath)}',loop=loop=-1:size=1:start=0,trim=duration=${formatFilterNumber(
         layerDuration
-      )},settb=AVTB,setpts=PTS-STARTPTS,format=rgba${imageClockFilter}${gpuComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
+      )},settb=AVTB,setpts=PTS-STARTPTS,format=rgba${imageClockFilter}${cudaAvatarComposite ? ',hwupload_cuda' : ''}[${imageLabel}]`
     );
-    if (gpuComposite) {
+    if (cudaAvatarComposite) {
       filters.push(
         `[${previousLayer}][${imageLabel}]overlay_cuda=` +
           `x='${avatarGpuMotionExpression(entry.segments, 'x')}':` +
@@ -505,14 +583,29 @@ function createAvatarOverlayFilterScript({
       );
     }
   }
-  filters.push(
-    gpuComposite
-        ? `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
-          usesExplicitLeadingPadding || gpuOutputToCpu ? ',hwdownload,format=yuv420p' : ''
-        }${outputClockFilter}${outputLabel}`
-      : `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
-          `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${outputLabel}`
-  );
+  if (cudaAvatarComposite) {
+    filters.push(
+      `[avatar_layer_${entries.length}]scale_cuda=format=yuv420p${
+        usesExplicitLeadingPadding || gpuOutputToCpu ? ',hwdownload,format=yuv420p' : ''
+      }${outputClockFilter}${outputLabel}`
+    );
+  } else if (finalBlendProfile) {
+    // VA-API/Vulkan/OpenCL cannot reliably evaluate the per-avatar motion
+    // expressions used by overlay_cuda. Keep that inexpensive small panel
+    // on the CPU, then move the costly full-frame alpha blend to the
+    // validated GPU backend.
+    filters.push(
+      `[burn_base]format=${finalBlendProfile.baseFormat},hwupload[avatar_gpu_base]`,
+      `[avatar_layer_${entries.length}]format=${finalBlendProfile.panelFormat},hwupload[avatar_gpu_panel]`,
+      `[avatar_gpu_base][avatar_gpu_panel]${finalBlendProfile.overlay}=x=${formatFilterNumber(panelLeft)}:y=0,` +
+        `${finalBlendProfile.download}${outputClockFilter}${outputLabel}`
+    );
+  } else {
+    filters.push(
+      `[burn_base][avatar_layer_${entries.length}]overlay=x=${formatFilterNumber(panelLeft)}:y=0:` +
+        `eof_action=pass:repeatlast=0:format=auto,format=yuv420p${outputClockFilter}${outputLabel}`
+    );
+  }
   if (usesExplicitLeadingPadding) {
     filters.push(
       createExplicitLeadingVideoPaddingGraph({
@@ -546,6 +639,7 @@ function createAvatarOverlayChunkFilterScript({
   inputTrimEndSec = 0,
   preserveSourceFrameTiming = true,
   gpuComposite = false,
+  gpuCompositeBackend = '',
   gpuOutputToCpu = false
 } = {}) {
   const start = Math.max(0, Number(chunkStart) || 0);
@@ -583,6 +677,7 @@ function createAvatarOverlayChunkFilterScript({
     fps,
     avatarOverlay: { ...(avatarOverlay || {}), entries },
     gpuComposite,
+    gpuCompositeBackend,
     gpuOutputToCpu,
     timelineOffset: sourceClockOffset,
     resetOutputTimestamps: true,
@@ -694,12 +789,17 @@ function createBurnArgs({
   const hasFilterScript = Boolean(String(avatarOverlay?.filterScriptPath || '').trim());
   const avatarEntries = hasFilterScript ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
   const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite);
+  const avatarCompositeBackend = gpuAvatarComposite
+    ? normalizeAvatarCompositeBackend(avatarOverlay?.gpuCompositeBackend) || 'cuda'
+    : '';
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
-  if (gpuAvatarComposite) {
-    args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
-  }
+  const avatarCompositeDevice = appendAvatarCompositeDeviceArgs(
+    args,
+    avatarCompositeBackend,
+    avatarOverlay?.gpuCompositeDevice
+  );
   appendHardwareDecodeInputArgs(args, decoder, {
-    device: gpuAvatarComposite && decoder === 'cuda' ? 'br2k_avatar' : ''
+    device: avatarCompositeBackend === 'cuda' && decoder === 'cuda' ? avatarCompositeDevice : ''
   });
   if (inputSeek && hasStart) {
     args.push('-ss', formatFfmpegSeconds(inputSeekStart));
@@ -810,12 +910,17 @@ function createBurnRawVideoArgs({
   const hasFilterScript = Boolean(String(avatarOverlay?.filterScriptPath || '').trim());
   const avatarEntries = hasFilterScript ? normalizeAvatarOverlayEntries(avatarOverlay) : [];
   const gpuAvatarComposite = Boolean(avatarEntries.length && avatarOverlay?.gpuComposite);
+  const avatarCompositeBackend = gpuAvatarComposite
+    ? normalizeAvatarCompositeBackend(avatarOverlay?.gpuCompositeBackend) || 'cuda'
+    : '';
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
-  if (gpuAvatarComposite) {
-    args.push('-init_hw_device', 'cuda=br2k_avatar:0', '-filter_hw_device', 'br2k_avatar');
-  }
+  const avatarCompositeDevice = appendAvatarCompositeDeviceArgs(
+    args,
+    avatarCompositeBackend,
+    avatarOverlay?.gpuCompositeDevice
+  );
   appendHardwareDecodeInputArgs(args, decoder, {
-    device: gpuAvatarComposite && decoder === 'cuda' ? 'br2k_avatar' : ''
+    device: avatarCompositeBackend === 'cuda' && decoder === 'cuda' ? avatarCompositeDevice : ''
   });
   if (inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(inputSeekStart));
   args.push('-i', cleanPath);
@@ -1839,6 +1944,10 @@ module.exports = {
   isV4l2M2mCodec,
   isJetsonGstreamerCodec,
   getJetsonGstreamerEncoder,
+  normalizeAvatarCompositeBackend,
+  getAvatarCompositeGraphProfile,
+  resolveAvatarPanelFps,
+  appendAvatarCompositeDeviceArgs,
   getV4l2TargetBitrate,
   getJetsonGstreamerBitrate,
   formatGstreamerFramerate,
