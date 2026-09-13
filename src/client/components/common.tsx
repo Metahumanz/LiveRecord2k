@@ -166,6 +166,16 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
           : hasPercent
           ? `${Math.round(percent)}%`
           : '处理中';
+  const primaryMessage = progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
+  const timingDetails = [hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : ''].filter(Boolean);
+  const rateDetails = [renderFpsLabel, realtimeLabel].filter(Boolean);
+  const backendDetails = [
+    progress.avatarCompositeBackend || '',
+    progress.fallbackReason ? `回退：${progress.fallbackReason}` : '',
+    decoderLabel,
+    encoderBackendLabel
+  ].filter(Boolean);
+  const fullProgressTitle = [primaryMessage, ...timingDetails, ...rateDetails, ...backendDetails].join(' · ');
   return (
     <div className={`job-progress ${progress.status}`}>
       <div className="job-progress-heading">
@@ -175,20 +185,12 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
       <div className={indeterminate ? 'job-progress-track indeterminate' : 'job-progress-track'}>
         <span style={indeterminate ? undefined : { width: `${percent}%` }} />
       </div>
-      <span className="job-progress-message" title={progress.outputPath || ''}>
-        {[
-          progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度'),
-          hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : '',
-          renderFpsLabel,
-          realtimeLabel,
-          progress.avatarCompositeBackend || '',
-          progress.fallbackReason ? `回退：${progress.fallbackReason}` : '',
-          decoderLabel,
-          encoderBackendLabel
-        ]
-          .filter(Boolean)
-          .join(' · ')}
-      </span>
+      <div className="job-progress-details" title={fullProgressTitle || progress.outputPath || ''}>
+        <span className="job-progress-message">{primaryMessage}</span>
+        {timingDetails.length ? <span className="job-progress-meta">{timingDetails.join(' · ')}</span> : null}
+        {rateDetails.length ? <span className="job-progress-meta">{rateDetails.join(' · ')}</span> : null}
+        {backendDetails.length ? <span className="job-progress-meta backend">{backendDetails.join(' · ')}</span> : null}
+      </div>
     </div>
   );
 }
