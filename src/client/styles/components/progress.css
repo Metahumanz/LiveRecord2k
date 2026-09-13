@@ -103,7 +103,7 @@
 .job-progress-heading {
   min-width: 0;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   color: #dbe7e4;
@@ -113,9 +113,8 @@
 
 .job-progress-heading span {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .job-progress-heading strong {
@@ -155,7 +154,8 @@
 }
 
 .job-progress.error .job-progress-heading strong,
-.job-progress.error .job-progress-message {
+.job-progress.error .job-progress-message,
+.job-progress.error .job-progress-meta {
   color: #ffb0b6;
 }
 
@@ -165,7 +165,8 @@
 }
 
 .job-progress.cancelled .job-progress-heading strong,
-.job-progress.cancelled .job-progress-message {
+.job-progress.cancelled .job-progress-message,
+.job-progress.cancelled .job-progress-meta {
   color: #f2d88d;
 }
 
@@ -175,8 +176,10 @@
 
 .job-progress.queued .job-progress-heading strong,
 .job-progress.queued .job-progress-message,
+.job-progress.queued .job-progress-meta,
 .job-progress.retrying .job-progress-heading strong,
-.job-progress.retrying .job-progress-message {
+.job-progress.retrying .job-progress-message,
+.job-progress.retrying .job-progress-meta {
   color: #f2d88d;
 }
 
@@ -185,14 +188,34 @@
   background: linear-gradient(90deg, #d8c36e, #f2d88d);
 }
 
+.job-progress-details {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
 .job-progress-message {
   min-width: 0;
-  overflow: hidden;
   color: #9fb0ac;
   font-size: 14px;
   font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.job-progress-meta {
+  min-width: 0;
+  color: #91a5a0;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.job-progress-meta.backend {
+  color: #a8c7c1;
 }
 
 .toast-host {

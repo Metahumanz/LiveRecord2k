@@ -73,7 +73,7 @@ test('merge watchdog terminates an FFmpeg process whose media timestamp stops pr
   assert.ok(Date.now() - startedAt < 5000);
 });
 
-test('one source segment with an A/V boundary offset forces safe normalization even when stream specs match', () => {
+test('a source PTS boundary offset is advisory when measured A/V duration remains in sync', () => {
   const delayedAudio = getMergeSegmentTimingAssessment(
     {
       timelineHealth: {
@@ -103,8 +103,9 @@ test('one source segment with an A/V boundary offset forces safe normalization e
     true
   );
 
-  assert.equal(delayedAudio.requiresNormalization, true);
-  assert.match(delayedAudio.reason, /起始/);
+  assert.equal(delayedAudio.requiresNormalization, false);
+  assert.equal(delayedAudio.requiresPostMergeVerification, true);
+  assert.match(delayedAudio.reason, /PTS/);
   assert.equal(aligned.requiresNormalization, false);
 });
 
@@ -219,7 +220,7 @@ test('merge normalization can retry one corrupt segment with CUDA decode and a d
   assert.doesNotMatch(filter, /async=1|fps=/, 'recovery must retain original audio/video clocks');
 });
 
-test('real merge normalizes a timing-risk source segment and produces an A/V-safe merged recording', async () => {
+test('real merge keeps a PTS-origin-only source segment on the fast copy path and verifies A/V safety', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-merge-av-'));
   const firstPath = path.join(outputDir, 'first.clean.mp4');
   const secondPath = path.join(outputDir, 'second.clean.mp4');
@@ -274,7 +275,46 @@ test('real merge normalizes a timing-risk source segment and produces an A/V-saf
     assert.equal(merged.mergedFrom.length, 2);
     assert.ok(mergedMediaInfo.videoInfo);
     assert.ok(Math.abs(mergedTiming.avDeltaSec) <= 0.08, JSON.stringify(mergedTiming));
-    assert.ok(logs.some((message) => /单段音画时间轴风险/.test(message)), logs.join('\n'));
+    assert.ok(logs.some((message) => /仅 PTS 起点偏移不会再触发规范化重编码/.test(message)), logs.join('\n'));
+    assert.ok(logs.some((message) => /快速无损合并/.test(message)), logs.join('\n'));
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('full-length recording segments are merge boundaries while adjacent incomplete reconnect segments remain eligible', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-merge-boundary-'));
+  const paths = ['first.clean.mp4', 'second.clean.mp4', 'tail.clean.mp4'].map((name) => path.join(outputDir, name));
+  try {
+    await Promise.all(paths.map((filePath) => fsp.writeFile(filePath, 'source')));
+    const service = createMergeTestService();
+    const room = { id: 'merge-boundary', title: 'Boundary', anchor: 'test', recording: false };
+    service.rooms.set(room.id, room);
+    service.recordings = paths.map((cleanPath, index) => ({
+      roomId: room.id,
+      mergeGroup: 'boundary-group',
+      mergeSequence: index + 1,
+      startedAt: index + 1,
+      cleanPath,
+      mergeOutputPath: path.join(outputDir, 'session.merged.mp4'),
+      durationSec: index < 2 ? 3600 : 1200,
+      segmentTargetDurationSec: 3600,
+      valid: true
+    }));
+
+    assert.equal(await service.getPendingMergeGroupForRoom(room), null);
+    const result = await service.mergeReconnectGroupIfNeeded(room, 'boundary-group', service.recordings[2]);
+    assert.equal(result, service.recordings[2]);
+
+    service.recordings[0].durationSec = 120;
+    service.recordings[1].durationSec = 180;
+    service.recordings[2].durationSec = 240;
+    service.recordings.forEach((recording) => {
+      recording.segmentTargetDurationSec = 600;
+    });
+    const pending = await service.getPendingMergeGroupForRoom(room);
+    assert.equal(pending?.mergeGroup, 'boundary-group');
+    assert.equal(pending?.fallbackRecording.cleanPath, paths[2]);
   } finally {
     await fsp.rm(outputDir, { recursive: true, force: true });
   }

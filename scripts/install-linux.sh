@@ -147,7 +147,10 @@ if command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
   PACKAGE_KIND=deb
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates curl jq openssl python3 ffmpeg fonts-noto-cjk gstreamer1.0-tools gstreamer1.0-plugins-base
+  # Ubuntu 20.04 / 22.04 / 24.04 all provide this common GStreamer base. The
+  # NVIDIA nvv4l2 plugin itself remains supplied by the installed JetPack/L4T
+  # stack, so do not attempt to install a mismatched nvidia-l4t package here.
+  apt-get install -y ca-certificates curl jq openssl python3 ffmpeg fonts-noto-cjk gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
 elif command -v dnf >/dev/null 2>&1; then
   dnf install -y ca-certificates curl jq openssl python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
   dnf install -y google-noto-sans-cjk-fonts || dnf install -y google-noto-cjk-fonts || \
@@ -171,6 +174,19 @@ for required_command in curl jq openssl python3 base64 sha256sum ffmpeg tar fc-m
 done
 fc-match -f '%{family}' 'Noto Sans CJK SC' | grep -qi 'Noto Sans CJK SC' || \
   fail '没有检测到可验证的 Noto Sans CJK SC 字体。'
+
+# Jetson images based on Ubuntu 20.04, 22.04, and 24.04 can expose different
+# FFmpeg/V4L2 and GStreamer element names. The application probes each runtime
+# path before using it, but report a missing Jetson GStreamer plugin early so
+# the user has an actionable installer diagnosis rather than a later export
+# fallback.
+if [ -r /etc/nv_tegra_release ] || [ -e /dev/nvhost-msenc ]; then
+  if gst-inspect-1.0 nvv4l2h264enc >/dev/null 2>&1 || gst-inspect-1.0 nvv4l2h265enc >/dev/null 2>&1; then
+    printf '%s\n' '检测到 Jetson GStreamer 硬编插件；安装后将由运行时能力测试选择可用编码/解码后端。'
+  else
+    printf '%s\n' '提示：检测到 Jetson，但未找到 nvv4l2 GStreamer 硬编插件；程序仍会继续安装并测试 FFmpeg V4L2 M2M，必要时回退软件编码。' >&2
+  fi
+fi
 
 # A reinstall must not silently turn a privately bound, password-protected
 # service into the installer defaults.  Read only the persisted public

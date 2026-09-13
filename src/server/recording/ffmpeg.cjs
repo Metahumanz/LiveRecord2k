@@ -84,6 +84,18 @@ function formatFilterNumber(value) {
 function appendHardwareDecodeInputArgs(args, decoder, options = {}) {
   const value = String(decoder || '').trim().toLowerCase();
   if (!value || value === 'software') return;
+  // L4T's NVIDIA V4L2 decoder is an FFmpeg input codec, not an entry in
+  // `ffmpeg -hwaccels`.  It must be selected before the input and must not be
+  // passed to `-hwaccel` (which stock R35 FFmpeg rejects).
+  if (
+    value === 'h264_nvv4l2dec' ||
+    value === 'hevc_nvv4l2dec' ||
+    value === 'h264_v4l2m2m' ||
+    value === 'hevc_v4l2m2m'
+  ) {
+    args.push('-c:v', value);
+    return;
+  }
   const supported = new Set(['cuda', 'qsv', 'd3d11va', 'dxva2', 'vaapi']);
   if (!supported.has(value)) {
     throw new Error(`不支持的硬件解码方式：${value}`);
@@ -845,11 +857,12 @@ function createBurnRawVideoArgs({
   return args;
 }
 
-function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false }) {
+function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false, converter = 'nvvidconv' }) {
   const encoder = getJetsonGstreamerEncoder(codec);
   const outputWidth = makeEvenDimension(width);
   const outputHeight = makeEvenDimension(height);
-  if (!encoder || !outputWidth || !outputHeight || !outputPath) {
+  const normalizedConverter = String(converter || '').trim();
+  if (!encoder || !outputWidth || !outputHeight || !outputPath || !['nvvidconv', 'nvvideoconvert'].includes(normalizedConverter)) {
     throw new Error('Jetson GStreamer 编码缺少有效的编码器、画面尺寸或输出路径。');
   }
   const hevc = isHevcCodec(codec);
@@ -870,7 +883,7 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
     'format=i420',
     `framerate=${formatGstreamerFramerate(fps)}`,
     '!',
-    'nvvidconv',
+    normalizedConverter,
     '!',
     'video/x-raw(memory:NVMM),format=NV12',
     '!',
@@ -1385,6 +1398,165 @@ function createNormalizeSegmentArgs({
   return args;
 }
 
+// The Jetson GStreamer encoder accepts I420 through rawvideoparse. Keep the
+// expensive decode/scale/timestamp-reset graph in FFmpeg, then stream only
+// its video output to nvv4l2{h264,h265}enc. Audio is muxed in a second, short
+// FFmpeg pass below so normalizing a long reconnect segment never stores raw
+// frames on the recording disk.
+function createNormalizeRawVideoArgs({
+  inputPath,
+  durationSec,
+  targetVideoInfo,
+  decoder = 'software',
+  decoderThreads = 2,
+  recoverySeekSec = 0,
+  timelineAlignment = null
+}) {
+  const width = makeEvenDimension(targetVideoInfo?.width);
+  const height = makeEvenDimension(targetVideoInfo?.height);
+  if (!inputPath) {
+    throw new Error('Jetson 规范化分段缺少输入路径。');
+  }
+  if (!width || !height) {
+    throw new Error('Jetson 规范化分段缺少有效的目标分辨率。');
+  }
+  const normalizedDuration = Number(durationSec);
+  const requestedRecoverySeekSec = Math.max(0, Number(recoverySeekSec) || 0);
+  const safeRecoverySeekSec =
+    normalizedDuration > 0
+      ? Math.min(requestedRecoverySeekSec, Math.max(0, normalizedDuration - 0.1))
+      : requestedRecoverySeekSec;
+  const args = [
+    '-hide_banner',
+    '-nostats',
+    '-progress',
+    'pipe:2',
+    '-y',
+    '-filter_threads',
+    '1',
+    '-filter_complex_threads',
+    '1',
+    '-threads',
+    String(Math.max(1, Number(decoderThreads) || 2)),
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err'
+  ];
+  appendHardwareDecodeInputArgs(args, decoder);
+  if (safeRecoverySeekSec > 0) {
+    args.push('-ss', formatFfmpegSeconds(safeRecoverySeekSec));
+  }
+  args.push('-i', inputPath);
+
+  const videoDurationFilter = normalizedDuration > 0 ? `trim=duration=${formatFfmpegSeconds(normalizedDuration)},` : '';
+  const leadingVideoPaddingSec = Math.max(0, Number(timelineAlignment?.videoPaddingSec) || 0);
+  const totalVideoPaddingSec = safeRecoverySeekSec + leadingVideoPaddingSec;
+  const videoPaddingFilter =
+    totalVideoPaddingSec > 0.0005
+      ? `,tpad=start_duration=${formatFfmpegSeconds(totalVideoPaddingSec)}:start_mode=add:color=black${
+          normalizedDuration > 0
+            ? `,trim=duration=${formatFfmpegSeconds(normalizedDuration)},setpts=PTS-STARTPTS`
+            : ''
+        }`
+      : '';
+  const filter =
+    `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
+    `${createBoundedEvenScaleFilter(width, height)},` +
+    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p` +
+    `${videoPaddingFilter}[vout]`;
+  args.push(
+    '-filter_complex',
+    filter,
+    '-map',
+    '[vout]',
+    '-an',
+    '-r',
+    formatGstreamerFramerate(targetVideoInfo?.fps),
+    '-c:v',
+    'rawvideo',
+    '-pix_fmt',
+    'yuv420p',
+    '-f',
+    'rawvideo',
+    'pipe:1'
+  );
+  return args;
+}
+
+function createNormalizeEncodedVideoMuxArgs({
+  encodedVideoPath,
+  inputPath,
+  outputPath,
+  codec,
+  fps,
+  container,
+  durationSec,
+  hasAudio,
+  timelineAlignment = null
+}) {
+  if (!encodedVideoPath || !outputPath) {
+    throw new Error('Jetson 规范化分段缺少临时视频或输出路径。');
+  }
+  if (hasAudio && !inputPath) {
+    throw new Error('Jetson 规范化分段缺少音频源路径。');
+  }
+  const normalizedDuration = Math.max(0.001, Number(durationSec) || 0.001);
+  const leadingAudioPaddingMs = Math.max(0, Math.round((Number(timelineAlignment?.audioPaddingSec) || 0) * 1000));
+  const args = [
+    '-hide_banner',
+    '-nostats',
+    '-progress',
+    'pipe:2',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-r',
+    formatGstreamerFramerate(fps),
+    '-i',
+    encodedVideoPath
+  ];
+  if (hasAudio) {
+    args.push('-i', inputPath);
+  } else {
+    args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo');
+  }
+  const audioPaddingFilter = leadingAudioPaddingMs > 0 ? `adelay=${leadingAudioPaddingMs}:all=1,` : '';
+  const audioFilter = hasAudio
+    ? `[1:a:0]aresample=48000,asetpts=PTS-STARTPTS,${audioPaddingFilter}apad,atrim=duration=${formatFfmpegSeconds(
+        normalizedDuration
+      )},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[aout]`
+    : `[1:a:0]atrim=duration=${formatFfmpegSeconds(normalizedDuration)},asetpts=PTS-STARTPTS[aout]`;
+  args.push(
+    '-filter_complex',
+    audioFilter,
+    '-map',
+    '0:v:0',
+    '-map',
+    '[aout]',
+    '-c:v',
+    'copy',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '160k',
+    '-ac',
+    '2',
+    '-dn',
+    '-sn',
+    '-avoid_negative_ts',
+    'make_zero'
+  );
+  if (container === 'mp4') {
+    if (isHevcCodec(codec)) args.push('-tag:v', 'hvc1');
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
+  return args;
+}
+
 function createConcatTranscodeArgs({ segments, outputPath, container, targetVideoInfo, videoCodec, softwareThreads = 4 }) {
   const width = makeEvenDimension(targetVideoInfo?.width);
   const height = makeEvenDimension(targetVideoInfo?.height);
@@ -1685,6 +1857,8 @@ module.exports = {
   createClipCopyArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
+  createNormalizeRawVideoArgs,
+  createNormalizeEncodedVideoMuxArgs,
   createConcatTranscodeArgs,
   createBoundedEvenScaleFilter,
   selectHighestResolutionVideoInfo,
