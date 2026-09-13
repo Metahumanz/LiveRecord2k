@@ -342,6 +342,29 @@ test('large avatar plans fall back from CUDA compositing without reducing the hi
   assert.equal(service.shouldUseCudaAvatarComposite('libx265', entries(1)), true);
 });
 
+test('a verified non-CUDA final-blend backend remains available for dense avatar plans', () => {
+  const service = new LiveRecordService();
+  service.ffmpegCapabilities = {
+    avatarComposite: {
+      value: 'vulkan',
+      label: 'Vulkan 透明图层最终合成',
+      mode: 'final-blend'
+    },
+    cudaAvatarComposite: false
+  };
+  const plan = { entries: Array.from({ length: 96 }, () => ({})) };
+
+  assert.deepEqual(service.selectAvatarCompositeBackend(plan), service.ffmpegCapabilities.avatarComposite);
+  assert.equal(service.shouldUseCudaAvatarComposite('libx265', plan), false);
+  assert.match(
+    service.getAvatarCompositeBackendLabel(
+      { gpuComposite: true, gpuCompositeBackend: 'vulkan', compositeFps: 24, entries: [{}] },
+      'high'
+    ),
+    /Vulkan.*CPU 24 fps/
+  );
+});
+
 test('CUDA avatar composition failure retries the prebuilt CPU graph', async () => {
   const service = new LiveRecordService();
   const attempts = [];
@@ -384,6 +407,37 @@ test('CUDA avatar composition failure retries the prebuilt CPU graph', async () 
   assert.equal(attempts[0].layer.gpuComposite, true);
   assert.equal(attempts[1].layer.gpuComposite, false);
   assert.equal(attempts[1].layer.filterScriptPath, gpuLayer.cpuFilterScriptPath);
+});
+
+test('a non-CUDA GPU final-blend failure retries the prebuilt CPU graph', async () => {
+  const service = new LiveRecordService();
+  const attempts = [];
+  service.log = () => {};
+  service.runFfmpegWithHardwareDecodeFallback = async ({ createArgs }) => {
+    const next = createArgs('software');
+    attempts.push(next);
+    if (attempts.length === 1) {
+      const error = new Error('ffmpeg 退出码 -22');
+      error.ffmpegStderr = '[overlay_vulkan] Failed to create Vulkan image';
+      throw error;
+    }
+    return 'software';
+  };
+  const result = await service.runFfmpegWithCudaAvatarCompositeFallback({
+    avatarLayer: {
+      gpuComposite: true,
+      gpuCompositeBackend: 'vulkan',
+      filterScriptPath: 'C:/temp/avatar-layer.vulkan.ffscript',
+      cpuFilterScriptPath: 'C:/temp/avatar-layer.cpu.ffscript',
+      entries: [{}]
+    },
+    createArgs: (decoder, layer) => ({ decoder, layer })
+  });
+
+  assert.equal(result, 'software');
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[1].layer.gpuComposite, false);
+  assert.equal(attempts[1].layer.gpuCompositeBackend, '');
 });
 
 test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {

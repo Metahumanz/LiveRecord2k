@@ -92,7 +92,7 @@ const {
   detectVideoAdapterVendor,
   hasVideoAdapterVendor,
   testFfmpegEncoder,
-  testFfmpegCudaAvatarComposite,
+  testFfmpegAvatarCompositeBackend,
   normalizeBurnCodec,
   normalizeRoomImageMode,
   normalizeBurnOverlayMode,
@@ -744,13 +744,12 @@ function isFfmpegHardwareDecodeError(error) {
   );
 }
 
-function isFfmpegCudaAvatarCompositeError(error) {
+function isFfmpegAvatarCompositeError(error) {
   const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
-  // overlay_cuda's supported alpha/pixel-format combinations vary between
-  // bundled FFmpeg/NVIDIA builds.  This is a filter-composition failure, not
-  // a decoder or NVENC failure, so it needs a CPU-overlay retry instead of
-  // the ordinary hardware-decoder fallback.
-  return /(?:(?:overlay_cuda|hwupload_cuda|scale_cuda)[^\n]*(?:can't|cannot|failed|error)|(?:can't|cannot) overlay\s+\w+\s+on\s+\w+)/i.test(
+  // A GPU blend failure is distinct from decoder/encoder failures. Retry
+  // the same job with the prewritten CPU panel graph instead of losing an
+  // otherwise healthy hardware encoder.
+  return /(?:(?:overlay_(?:cuda|vaapi|vulkan|opencl)|hwupload(?:_cuda)?|hwdownload|scale_cuda|init_hw_device|filter_hw_device)[^\n]*(?:can't|cannot|failed|error)|(?:can't|cannot) overlay\s+\w+\s+on\s+\w+)/i.test(
     detail
   );
 }
@@ -761,6 +760,10 @@ function createCpuAvatarCompositeFallbackLayer(layer) {
   return {
     ...layer,
     gpuComposite: false,
+    gpuCompositeBackend: '',
+    gpuCompositeMode: '',
+    gpuCompositeDevice: '',
+    gpuOutputToCpu: false,
     filterScriptPath: cpuFilterScriptPath,
     chunked: false,
     chunkDuration: 0
@@ -1111,6 +1114,8 @@ class LiveRecordService {
       hardwareDecoders: [],
       videoAdapters: [],
       gstreamerEncoders: [],
+      avatarComposite: null,
+      avatarCompositeReason: '',
       cudaAvatarComposite: false,
       cudaAvatarCompositeReason: '',
       probedAt: 0,
@@ -1228,12 +1233,17 @@ class LiveRecordService {
       (this.ffmpegCapabilities.hardwareDecoders || []).length ? 'info' : 'warn',
       `可用硬件解码：${hardwareDecoderSummary}`
     );
+    const avatarComposite = this.getAvatarCompositeCapability();
     this.log(
-      this.ffmpegCapabilities.cudaAvatarComposite ? 'info' : 'warn',
-      this.ffmpegCapabilities.cudaAvatarComposite
-        ? '已验证 NVIDIA CUDA 真实头像合成链路；它独立于视频编码后端，Jetson GStreamer 编码同样可使用。'
+      avatarComposite ? 'info' : 'warn',
+      avatarComposite
+        ? avatarComposite.value === 'cuda'
+          ? '已验证 NVIDIA CUDA 真实头像合成链路；它独立于视频编码后端，Jetson GStreamer 编码同样可使用。'
+          : `已验证 ${avatarComposite.label}；头像动画在 CPU 小面板生成，最终全画面透明叠加由 GPU 完成。`
         : `真实头像透明图层将使用 CPU 合成${
-            this.ffmpegCapabilities.cudaAvatarCompositeReason ? `：${this.ffmpegCapabilities.cudaAvatarCompositeReason}` : ''
+            this.ffmpegCapabilities.avatarCompositeReason || this.ffmpegCapabilities.cudaAvatarCompositeReason
+              ? `：${this.ffmpegCapabilities.avatarCompositeReason || this.ffmpegCapabilities.cudaAvatarCompositeReason}`
+              : ''
           }`
     );
     this.emitState();
@@ -1485,13 +1495,38 @@ class LiveRecordService {
   }
 
   getAvatarCompositeBackendLabel(avatarLayer, avatarMode) {
+    const backend = String(
+      avatarLayer?.gpuCompositeBackend || (avatarLayer?.gpuComposite ? 'cuda' : '')
+    ).trim().toLowerCase();
+    const backendCapability = this.getAvatarCompositeCapability();
+    const backendLabel =
+      backendCapability?.value === backend
+        ? backendCapability.label
+        : backend === 'cuda'
+          ? 'NVIDIA CUDA 真实头像合成'
+          : backend === 'vaapi'
+            ? 'VA-API 透明图层最终合成'
+            : backend === 'vulkan'
+              ? 'Vulkan 透明图层最终合成'
+              : backend === 'opencl'
+                ? 'OpenCL 透明图层最终合成'
+                : '';
+    const panelFps = Math.max(0, Math.round(Number(avatarLayer?.compositeFps) || 0));
     if (avatarLayer?.gpuComposite) {
-      return avatarLayer.gpuOutputToCpu ? 'CUDA 头像合成（回传 CPU 编码链路）' : 'CUDA 头像合成';
+      if (backend === 'cuda') {
+        return avatarLayer.gpuOutputToCpu ? 'CUDA 头像合成（回传 CPU 编码链路）' : 'CUDA 头像合成';
+      }
+      return `${backendLabel || 'GPU 透明图层最终合成'}（头像面板 CPU ${panelFps || 30} fps）`;
     }
-    if (avatarLayer?.chunked && this.ffmpegCapabilities?.cudaAvatarComposite) {
-      return avatarLayer.gpuOutputToCpu ? 'CUDA/CPU 分段头像合成（回传 CPU 编码链路）' : 'CUDA/CPU 分段头像合成';
+    if (avatarLayer?.chunked && backend) {
+      if (backend === 'cuda') {
+        return avatarLayer.gpuOutputToCpu ? 'CUDA/CPU 分段头像合成（回传 CPU 编码链路）' : 'CUDA/CPU 分段头像合成';
+      }
+      return `${backendLabel || 'GPU'}/CPU 分段头像合成（头像面板 ${panelFps || 30} fps）`;
     }
-    if (Array.isArray(avatarLayer?.entries) && avatarLayer.entries.length) return 'CPU 头像合成';
+    if (Array.isArray(avatarLayer?.entries) && avatarLayer.entries.length) {
+      return panelFps ? `CPU 头像合成（小面板 ${panelFps} fps）` : 'CPU 头像合成';
+    }
     return avatarMode === 'off' ? '真实头像关闭' : '通用头像';
   }
 
@@ -1575,7 +1610,7 @@ class LiveRecordService {
     const resources = ['diskRead', 'diskWrite', hardwareEncoder ? 'gpuEncode' : 'cpuEncode'];
     // Burn-in/compositing is deliberately a separate GPU budget.  It remains
     // paused while a copy recording is active; a plain GPU transcode can run.
-    if (options.gpuComposite && hardwareEncoder) {
+    if (options.gpuComposite) {
       resources.push('gpuComposite');
     }
     return {
@@ -1612,8 +1647,31 @@ class LiveRecordService {
     return Boolean(
       entryCount > 0 &&
         entryCount <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
-        this.ffmpegCapabilities?.cudaAvatarComposite
+        this.getAvatarCompositeCapability()?.value === 'cuda'
     );
+  }
+
+  getAvatarCompositeCapability() {
+    const capability = this.ffmpegCapabilities?.avatarComposite;
+    if (capability?.value && ['cuda', 'vaapi', 'vulkan', 'opencl'].includes(capability.value)) {
+      return capability;
+    }
+    // 0.6.6 and older persisted only this boolean. Preserve the usable CUDA
+    // route when an application process is upgraded without a restart.
+    if (this.ffmpegCapabilities?.cudaAvatarComposite) {
+      return { value: 'cuda', label: 'NVIDIA CUDA 真实头像合成', mode: 'full' };
+    }
+    return null;
+  }
+
+  selectAvatarCompositeBackend(avatarPlan) {
+    const entryCount = Array.isArray(avatarPlan?.entries) ? avatarPlan.entries.length : 0;
+    const capability = this.getAvatarCompositeCapability();
+    if (!capability || entryCount <= 0) return null;
+    // Full CUDA keeps every portrait as a GPU surface. Let the existing
+    // bounded chunk path handle dense timelines rather than risking VRAM.
+    if (capability.value === 'cuda' && entryCount > MAX_CUDA_AVATAR_OVERLAY_ENTRIES) return null;
+    return capability;
   }
 
   normalizeRoom(room) {
@@ -3744,7 +3802,8 @@ try {
               playlistPath: workingPlaylistPath,
               segmentPattern: path.join(workingPreviewDir, 'segment_%05d.ts'),
               codec: activeCodec,
-              decoder: activeDecoder.value
+              decoder: activeDecoder.value,
+              sourceCodec: previewDecoder.codec
             }),
             handlePreviewStderr,
             {
@@ -7355,6 +7414,7 @@ try {
                         durationSec: sourceDurationSec,
                         targetVideoInfo,
                         decoder: nextDecoder,
+                        sourceCodec: preferredDecoder.codec,
                         decoderThreads,
                         recoverySeekSec,
                         timelineAlignment
@@ -7395,6 +7455,7 @@ try {
                   videoCodec,
                   softwareThreads: mergeSoftwareThreads,
                   decoder,
+                  sourceCodec: preferredDecoder.codec,
                   decoderThreads,
                   recoverySeekSec,
                   timelineAlignment
@@ -8719,27 +8780,41 @@ try {
       }
       const videoWidth = Math.floor(Math.max(0, Number(options.recording?.videoInfo?.width) || 0) / 2) * 2;
       const videoHeight = Math.floor(Math.max(0, Number(options.recording?.videoInfo?.height) || 0) / 2) * 2;
+      const sourceFps = Math.max(1, Math.min(240, Number(options.fps) || 30));
+      const panelFpsCap = entries.length > 48 ? 20 : entries.length > 20 ? 24 : 30;
+      const compositeFps = Math.max(1, Math.min(sourceFps, panelFpsCap));
       const overlay = {
         panel: avatarPlan.panel,
         entries,
         videoWidth,
-        videoHeight
+        videoHeight,
+        compositeFps
       };
       const filterScriptPath = path.join(workingDir, 'avatar-layer.ffscript');
       const gpuComposite = Boolean(options.gpuComposite);
-      // CUDA can stay on-device only for an NVENC encode. Jetson's GStreamer
-      // bridge (and all other encoders) consume system-memory I420, so retain
-      // CUDA compositing but explicitly download the finished frame.
-      const gpuOutputToCpu = Boolean(options.gpuOutputToCpu);
+      const gpuCompositeBackend = String(options.gpuCompositeBackend || (gpuComposite ? 'cuda' : ''))
+        .trim()
+        .toLowerCase();
+      const gpuCompositeMode = gpuComposite
+        ? String(options.gpuCompositeMode || (gpuCompositeBackend === 'cuda' ? 'full' : 'final-blend')).trim()
+        : '';
+      const gpuCompositeDevice = gpuComposite ? String(options.gpuCompositeDevice || '').trim() : '';
+      const fullCudaComposite = gpuComposite && gpuCompositeBackend === 'cuda';
+      // CUDA can remain on-device before NVENC. Hybrid final-blend backends
+      // must download their result because FFmpeg/GStreamer encode paths
+      // consume system-memory frames.
+      const gpuOutputToCpu = Boolean(options.gpuOutputToCpu) || (gpuComposite && !fullCudaComposite);
       const cpuFilterScriptPath = gpuComposite ? path.join(workingDir, 'avatar-layer.cpu.ffscript') : '';
-      const chunkDuration = !gpuComposite && entries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES ? AVATAR_OVERLAY_CHUNK_SECONDS : 0;
+      const chunkDuration =
+        !fullCudaComposite && entries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES ? AVATAR_OVERLAY_CHUNK_SECONDS : 0;
       if (!chunkDuration) {
-        const createFilterScript = (useGpuComposite) =>
+        const createFilterScript = (useGpuComposite, backend = gpuCompositeBackend) =>
           createAvatarOverlayFilterScript({
             assPath: options.assPath,
             fps: options.fps,
             avatarOverlay: overlay,
             gpuComposite: useGpuComposite,
+            gpuCompositeBackend: useGpuComposite ? backend : '',
             gpuOutputToCpu: useGpuComposite && gpuOutputToCpu,
             duration: options.duration,
             timelineOffset: options.timelineOffset,
@@ -8753,9 +8828,9 @@ try {
           return null;
         }
         await fsp.writeFile(filterScriptPath, script, 'utf8');
-        // Keep a CPU graph next to the CUDA graph.  A few FFmpeg/NVIDIA
-        // combinations advertise overlay_cuda successfully but reject a
-        // production stream's alpha/pixel-format pairing at runtime.
+        // Keep a CPU graph next to every GPU graph. A production stream can
+        // still expose an alpha/pixel-format pair that the short startup
+        // probe did not cover.
         if (gpuComposite) {
           const cpuScript = createFilterScript(false);
           if (!cpuScript) {
@@ -8765,11 +8840,23 @@ try {
           await fsp.writeFile(cpuFilterScriptPath, cpuScript, 'utf8');
         }
       }
+      const compositeCapability = this.getAvatarCompositeCapability();
+      const compositeLabel =
+        compositeCapability?.value === gpuCompositeBackend
+          ? compositeCapability.label
+          : gpuCompositeBackend.toUpperCase();
+      const compositeSummary = gpuComposite
+        ? gpuCompositeBackend === 'cuda'
+          ? `，NVIDIA CUDA 合成${gpuOutputToCpu ? '后回传 CPU 编码链路' : ''}，已预置 CPU 回退。`
+          : `，${compositeLabel}（头像面板 CPU ${Math.round(compositeFps)} fps，GPU 最终透明合成），已预置 CPU 回退。`
+        : chunkDuration
+          ? '，按时间分段合成（按段选择 CUDA/CPU）。'
+          : `，CPU 小面板 ${Math.round(compositeFps)} fps。`;
       this.log(
         'info',
         `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
-          avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
-          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${gpuComposite ? `，NVIDIA CUDA 合成${gpuOutputToCpu ? '后回传 CPU 编码链路' : ''}，已预置 CPU 回退。` : chunkDuration ? '，按时间分段合成（按段选择 CUDA/CPU）。' : '。'}`
+         avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
+          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${compositeSummary}`
       );
       return {
         ...overlay,
@@ -8777,6 +8864,9 @@ try {
         cpuFilterScriptPath,
         temporaryDir: workingDir,
         gpuComposite,
+        gpuCompositeBackend,
+        gpuCompositeMode,
+        gpuCompositeDevice,
         gpuOutputToCpu,
         chunked: Boolean(chunkDuration),
         chunkDuration
@@ -8855,12 +8945,12 @@ try {
       return await run(avatarLayer);
     } catch (error) {
       const cpuAvatarLayer = createCpuAvatarCompositeFallbackLayer(avatarLayer);
-      if (error?.code === 'BR2K_MEDIA_CANCELLED' || !cpuAvatarLayer || !isFfmpegCudaAvatarCompositeError(error)) {
+      if (error?.code === 'BR2K_MEDIA_CANCELLED' || !cpuAvatarLayer || !isFfmpegAvatarCompositeError(error)) {
         throw error;
       }
       this.log(
         'warn',
-        `${label} 的 CUDA 真实头像合成不兼容当前 FFmpeg，保留当前编码器并改用 CPU 头像合成重试：${compactLogLine(
+        `${label} 的 ${this.getAvatarCompositeBackendLabel(avatarLayer, 'high')} 不兼容当前 FFmpeg，保留当前编码器并改用 CPU 头像合成重试：${compactLogLine(
           error.message
         )}`
       );
@@ -8884,12 +8974,12 @@ try {
       return await createTranscode(avatarLayer);
     } catch (error) {
       const cpuAvatarLayer = createCpuAvatarCompositeFallbackLayer(avatarLayer);
-      if (error?.code === 'BR2K_MEDIA_CANCELLED' || !cpuAvatarLayer || !isFfmpegCudaAvatarCompositeError(error)) {
+      if (error?.code === 'BR2K_MEDIA_CANCELLED' || !cpuAvatarLayer || !isFfmpegAvatarCompositeError(error)) {
         throw error;
       }
       this.log(
         'warn',
-        `${label} 的 CUDA 真实头像合成不兼容当前 FFmpeg，保留 Jetson GStreamer 硬编并改用 CPU 头像合成重试：${compactLogLine(
+        `${label} 的 ${this.getAvatarCompositeBackendLabel(avatarLayer, 'high')} 不兼容当前 FFmpeg，保留 Jetson GStreamer 硬编并改用 CPU 头像合成重试：${compactLogLine(
           error.message
         )}`
       );
@@ -8953,7 +9043,12 @@ try {
         ffmpegArgs: createRawArgs(nextDecoder),
         gstreamerArgs,
         onFfmpegStderr: onStderr,
-        onGstreamerStderr: (text) => onStderr?.(`GStreamer: ${text}`),
+        onGstreamerStderr: (text) => {
+          const label = /(?:\bargus\b|nvargus-daemon|socketclientdispatch|fileoperationfailed)/i.test(String(text || ''))
+            ? 'GStreamer Argus 附加诊断'
+            : 'GStreamer';
+          onStderr?.(`${label}: ${text}`);
+        },
         onChild
       });
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
@@ -8996,6 +9091,7 @@ try {
     fps,
     avatarLayer,
     decoder = 'software',
+    sourceCodec = '',
     includeAudio = true,
     copyAudio = false,
     timelineAlignment,
@@ -9024,7 +9120,12 @@ try {
     const chunkDurations = [];
     const scriptPaths = [];
     let activeDecoder = decoder;
-    let cudaAvatarCompositeEnabled = Boolean(this.ffmpegCapabilities?.cudaAvatarComposite);
+    let avatarCompositeBackend = String(
+      avatarLayer?.gpuCompositeBackend || this.getAvatarCompositeCapability()?.value || ''
+    )
+      .trim()
+      .toLowerCase();
+    let avatarCompositeEnabled = Boolean(avatarCompositeBackend);
     const concatPath = path.join(temporaryDir, 'avatar-chunks.ffconcat');
     let completedDuration = 0;
     const cancellationError = () => {
@@ -9048,9 +9149,10 @@ try {
         let chunkLength = Math.min(chunkDuration, totalDuration - completedDuration);
         let chunkEnd = chunkStart + chunkLength;
         let activeEntries = clipAvatarOverlayEntries(avatarLayer, chunkStart, chunkEnd);
-        const canUseCuda = cudaAvatarCompositeEnabled;
+        const canUseAvatarComposite = avatarCompositeEnabled;
         while (
-          canUseCuda &&
+          avatarCompositeBackend === 'cuda' &&
+          canUseAvatarComposite &&
           activeEntries.length > MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
           chunkLength > MIN_CUDA_AVATAR_CHUNK_SECONDS + 0.001
         ) {
@@ -9068,14 +9170,21 @@ try {
         const encodedChunkPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
           isHevcCodec(codec) ? 'h265' : 'h264'
         }`;
-        const useCudaForChunk = Boolean(
+        const useGpuForChunk = Boolean(
           activeEntries.length > 0 &&
-            activeEntries.length <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
-            canUseCuda
+            canUseAvatarComposite &&
+            (avatarCompositeBackend !== 'cuda' || activeEntries.length <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES)
         );
+        const activeCompositeBackend = useGpuForChunk ? avatarCompositeBackend : '';
+        const activeCompositeLabel = useGpuForChunk
+          ? this.getAvatarCompositeBackendLabel(
+              { ...avatarLayer, gpuComposite: true, gpuCompositeBackend: activeCompositeBackend },
+              'high'
+            )
+          : 'CPU 头像合成';
         onStage?.(
           `正在烧录头像分段 ${chunkIndex + 1}（${
-            activeEntries.length ? (useCudaForChunk ? 'CUDA 头像合成' : 'CPU 头像合成') : '本段无真实头像'
+            activeEntries.length ? activeCompositeLabel : '本段无真实头像'
           }）`
         );
         const script = createAvatarOverlayChunkFilterScript({
@@ -9090,8 +9199,9 @@ try {
           inputTrimStartSec: chunkSeekPrerollSec,
           inputTrimEndSec: chunkInputTrimEndSec,
           preserveSourceFrameTiming: true,
-          gpuComposite: useCudaForChunk,
-          gpuOutputToCpu: useCudaForChunk && Boolean(avatarLayer?.gpuOutputToCpu)
+          gpuComposite: useGpuForChunk,
+          gpuCompositeBackend: activeCompositeBackend,
+          gpuOutputToCpu: useGpuForChunk && Boolean(avatarLayer?.gpuOutputToCpu)
         });
         if (!script) throw new Error(`头像分段 ${chunkIndex + 1} 没有生成有效滤镜。`);
         await fsp.writeFile(scriptPath, script, 'utf8');
@@ -9101,7 +9211,8 @@ try {
           ...avatarLayer,
           entries: activeEntries,
           filterScriptPath: scriptPath,
-          gpuComposite: useCudaForChunk
+          gpuComposite: useGpuForChunk,
+          gpuCompositeBackend: activeCompositeBackend
         };
         const createChunkBurnArgs = (nextDecoder) =>
           createBurnArgs({
@@ -9122,7 +9233,8 @@ try {
             timelineOffset: chunkTimelineOffset,
             leadingVideoPaddingSec: chunkVideoPaddingSec,
             includeAudio: false,
-            decoder: nextDecoder
+            decoder: nextDecoder,
+            sourceCodec
           });
         let usedDecoder;
         try {
@@ -9148,7 +9260,10 @@ try {
                     inputTrimEndSec: chunkInputTrimEndSec,
                     timelineOffset: chunkTimelineOffset,
                     leadingVideoPaddingSec: chunkVideoPaddingSec,
-                    decoder: nextDecoder
+                    decoder: nextDecoder,
+                    sourceCodec,
+                    videoWidth: avatarLayer?.videoWidth,
+                    videoHeight: avatarLayer?.videoHeight
                   }),
                 createMuxArgs: () =>
                   createBurnEncodedVideoMuxArgs({
@@ -9179,13 +9294,14 @@ try {
                 label: `${label} ${chunkIndex + 1}`
               });
         } catch (error) {
-          if (!useCudaForChunk || error?.code === 'BR2K_MEDIA_CANCELLED' || !isFfmpegCudaAvatarCompositeError(error)) {
+          if (!useGpuForChunk || error?.code === 'BR2K_MEDIA_CANCELLED' || !isFfmpegAvatarCompositeError(error)) {
             throw error;
           }
-          cudaAvatarCompositeEnabled = false;
+          const failedCompositeLabel = this.getAvatarCompositeBackendLabel(chunkAvatarLayer, 'high');
+          avatarCompositeEnabled = false;
           this.log(
             'warn',
-            `${label} 第 ${chunkIndex + 1} 段 CUDA 真实头像合成不兼容当前 FFmpeg，当前及后续分段改用 CPU 头像合成：${compactLogLine(
+            `${label} 第 ${chunkIndex + 1} 段 ${failedCompositeLabel} 不兼容当前 FFmpeg，当前及后续分段改用 CPU 头像合成：${compactLogLine(
               error.message
             )}`
           );
@@ -9203,12 +9319,13 @@ try {
             inputTrimStartSec: chunkSeekPrerollSec,
             inputTrimEndSec: chunkInputTrimEndSec,
             preserveSourceFrameTiming: true,
-            gpuComposite: false
+            gpuComposite: false,
+            gpuCompositeBackend: ''
           });
           if (!cpuScript) throw error;
           await fsp.writeFile(scriptPath, cpuScript, 'utf8');
           await fsp.rm(chunkPath, { force: true }).catch(() => {});
-          chunkAvatarLayer = { ...chunkAvatarLayer, gpuComposite: false };
+          chunkAvatarLayer = { ...chunkAvatarLayer, gpuComposite: false, gpuCompositeBackend: '', gpuOutputToCpu: false };
           usedDecoder = isJetsonGstreamerCodec(codec)
             ? await this.runJetsonGstreamerTranscode({
                 codec,
@@ -9231,7 +9348,10 @@ try {
                     inputTrimEndSec: chunkInputTrimEndSec,
                     timelineOffset: chunkTimelineOffset,
                     leadingVideoPaddingSec: chunkVideoPaddingSec,
-                    decoder: nextDecoder
+                    decoder: nextDecoder,
+                    sourceCodec,
+                    videoWidth: avatarLayer?.videoWidth,
+                    videoHeight: avatarLayer?.videoHeight
                   }),
                 createMuxArgs: () =>
                   createBurnEncodedVideoMuxArgs({
@@ -9373,8 +9493,11 @@ try {
       });
       await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
       const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
-      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(burnCodec, assets.avatarPlan);
-      const gpuAvatarOutputToCpu = !String(burnCodec || '').includes('nvenc');
+      const avatarComposite = this.selectAvatarCompositeBackend(assets.avatarPlan);
+      const requestedAvatarComposite = avatarComposite || this.getAvatarCompositeCapability();
+      const gpuAvatarComposite = Boolean(avatarComposite);
+      const gpuAvatarOutputToCpu =
+        requestedAvatarComposite?.value !== 'cuda' || !String(burnCodec || '').includes('nvenc');
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         recording,
         assPath: assets.assPath,
@@ -9385,6 +9508,9 @@ try {
         outputDuration: durationSec,
         label: `${roomLabel(room)} 烧录`,
         gpuComposite: gpuAvatarComposite,
+        gpuCompositeBackend: requestedAvatarComposite?.value || '',
+        gpuCompositeMode: requestedAvatarComposite?.mode || '',
+        gpuCompositeDevice: requestedAvatarComposite?.device || '',
         gpuOutputToCpu: gpuAvatarOutputToCpu,
         isCancelled: () => this.burnCancelRequests.has(room.id)
       });
@@ -9541,6 +9667,7 @@ try {
               fps: burnFps,
               avatarLayer,
               decoder: decoderInfo,
+              sourceCodec: decoderInfo.codec,
               includeAudio: Boolean(mediaInfo.audioInfo),
               copyAudio: copySourceAudio,
               timelineAlignment: burnTimeline,
@@ -9554,7 +9681,7 @@ try {
                 this.markRoomDirty(room.id);
               },
               onCudaAvatarFallback: () => {
-                this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+                this.setProgressFallback(progress, 'GPU 头像合成不兼容，已回退到 CPU 头像合成。', {
                   avatarCompositeBackend: 'CPU 头像合成'
                 });
                 this.markRoomDirty(room.id);
@@ -9579,7 +9706,8 @@ try {
                 leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
                 leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
                 copyAudio: copySourceAudio,
-                decoder
+                decoder,
+                sourceCodec: decoderInfo.codec
               });
             const onDecoderFallback = () => {
               this.setProgressDecoder(
@@ -9592,9 +9720,9 @@ try {
             };
             const onCudaAvatarCompositeFallback = () => {
               if (room.burnProgress?.id === progress.id) {
-                this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+                this.setProgressFallback(progress, 'GPU 头像合成不兼容，已回退到 CPU 头像合成。', {
                   reset: true,
-                  message: 'CUDA 头像合成不兼容，正在使用 CPU 头像合成重新烧录',
+                  message: 'GPU 头像合成不兼容，正在使用 CPU 头像合成重新烧录',
                   avatarCompositeBackend: 'CPU 头像合成'
                 });
               }
@@ -9624,7 +9752,10 @@ try {
                         duration: durationSec,
                         timelineOffset: burnTimeline.videoClockStartSec,
                         leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-                        decoder
+                        decoder,
+                        sourceCodec: decoderInfo.codec,
+                        videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                        videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
                       }),
                     createMuxArgs: () =>
                       createBurnEncodedVideoMuxArgs({
@@ -10136,8 +10267,11 @@ try {
       cssPath = assets.cssPath;
       assPath = assets.assPath;
       const exportFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps;
-      const gpuAvatarComposite = this.shouldUseCudaAvatarComposite(burnCodec, assets.avatarPlan);
-      const gpuAvatarOutputToCpu = !String(burnCodec || '').includes('nvenc');
+      const avatarComposite = this.selectAvatarCompositeBackend(assets.avatarPlan);
+      const requestedAvatarComposite = avatarComposite || this.getAvatarCompositeCapability();
+      const gpuAvatarComposite = Boolean(avatarComposite);
+      const gpuAvatarOutputToCpu =
+        requestedAvatarComposite?.value !== 'cuda' || !String(burnCodec || '').includes('nvenc');
       burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
       copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       setExportStage('正在准备真实头像');
@@ -10152,6 +10286,9 @@ try {
         skipInitialKeyframeGuard: true,
         label: '烧录片段导出',
         gpuComposite: gpuAvatarComposite,
+        gpuCompositeBackend: requestedAvatarComposite?.value || '',
+        gpuCompositeMode: requestedAvatarComposite?.mode || '',
+        gpuCompositeDevice: requestedAvatarComposite?.device || '',
         gpuOutputToCpu: gpuAvatarOutputToCpu,
         isCancelled: () => this.exportCancelRequested
       });
@@ -10176,7 +10313,8 @@ try {
             leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
             leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
             copyAudio: copySourceAudio,
-            decoder
+            decoder,
+            sourceCodec: decoderInfo.codec
           });
         args = createBurnExportArgs(decoderInfo.value);
       }
@@ -10236,6 +10374,7 @@ try {
           fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
           avatarLayer,
           decoder: decoderInfo,
+          sourceCodec: decoderInfo.codec,
           includeAudio: Boolean(mediaInfo.audioInfo),
           copyAudio: copySourceAudio,
           timelineAlignment: burnTimeline,
@@ -10249,7 +10388,7 @@ try {
             this.emitState('mediaJob');
           },
           onCudaAvatarFallback: () => {
-            this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+            this.setProgressFallback(progress, 'GPU 头像合成不兼容，已回退到 CPU 头像合成。', {
               avatarCompositeBackend: 'CPU 头像合成'
             });
             this.emitState('mediaJob');
@@ -10269,9 +10408,9 @@ try {
         };
         const onCudaAvatarCompositeFallback = () => {
           if (this.exportProgress?.id === progress.id) {
-            this.setProgressFallback(progress, 'CUDA 头像合成不兼容，已回退到 CPU 头像合成。', {
+            this.setProgressFallback(progress, 'GPU 头像合成不兼容，已回退到 CPU 头像合成。', {
               reset: true,
-              message: 'CUDA 头像合成不兼容，正在使用 CPU 头像合成重新导出',
+              message: 'GPU 头像合成不兼容，正在使用 CPU 头像合成重新导出',
               avatarCompositeBackend: 'CPU 头像合成'
             });
           }
@@ -10302,7 +10441,10 @@ try {
                     inputSeek: true,
                     timelineOffset: burnTimeline.videoClockStartSec,
                     leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-                    decoder
+                    decoder,
+                    sourceCodec: decoderInfo.codec,
+                    videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                    videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
                   }),
                 createMuxArgs: () =>
                   createBurnEncodedVideoMuxArgs({
@@ -10601,6 +10743,8 @@ try {
       const codec = this.chooseBurnCodec(this.settings.burnCodec);
       const codecInfo = this.getBurnCodecInfo(codec);
       const decoder = (this.ffmpegCapabilities.hardwareDecoders || [])[0];
+      const avatarComposite = this.getAvatarCompositeCapability();
+      const avatarCompositeLabel = avatarComposite?.label || 'GPU 头像合成';
       const startedAt = Date.now();
       this.hardwareSelfTest = {
         status: 'running',
@@ -10610,7 +10754,7 @@ try {
         codec,
         encoderBackend: this.getEncoderBackendLabel(codecInfo),
         decoderBackend: decoder ? `${decoder.label}（能力已探测；真实解码取决于源视频）` : 'CPU（未探测到可用硬件解码）',
-        avatarCompositeBackend: '正在测试 CUDA 头像合成',
+        avatarCompositeBackend: avatarComposite ? `正在测试 ${avatarCompositeLabel}` : 'CPU 头像合成（未检测到 GPU 合成）',
         fallbackReason: ''
       };
       this.log(
@@ -10624,7 +10768,7 @@ try {
           ...this.hardwareSelfTest,
           status: 'unavailable',
           completedAt: Date.now(),
-          avatarCompositeBackend: this.ffmpegCapabilities.cudaAvatarComposite ? 'CUDA 头像合成可用' : 'CPU 头像合成（CUDA 不可用）',
+          avatarCompositeBackend: avatarComposite ? `${avatarCompositeLabel} 可用` : 'CPU 头像合成（GPU 合成不可用）',
           message: '当前没有选中可用的硬件编码器；请先在设置中选择已通过能力探测的硬编。',
           fallbackReason: '当前使用软件编码。'
         };
@@ -10642,22 +10786,32 @@ try {
             frames: 90,
             timeoutMs: 10000
           });
-      const avatarTest = await testFfmpegCudaAvatarComposite(this.ffmpegPath);
+      const avatarTest = avatarComposite
+        ? await testFfmpegAvatarCompositeBackend(this.ffmpegPath, avatarComposite, {
+            renderDevice: avatarComposite.device
+          })
+        : {
+            ok: false,
+            reason:
+              this.ffmpegCapabilities.avatarCompositeReason ||
+              this.ffmpegCapabilities.cudaAvatarCompositeReason ||
+              '未检测到可用的 GPU 透明图层合成链路'
+          };
       const fallbackReason = [
         encoderTest.ok ? '' : `编码自检失败：${encoderTest.reason || '未知原因'}`,
-        avatarTest.ok ? '' : `CUDA 头像合成不可用，运行时将使用 CPU：${avatarTest.reason || '未知原因'}`
+        avatarTest.ok ? '' : `GPU 头像合成不可用，运行时将使用 CPU：${avatarTest.reason || '未知原因'}`
       ].filter(Boolean).join('；');
       const encoderPassed = Boolean(encoderTest.ok);
       this.hardwareSelfTest = {
         ...this.hardwareSelfTest,
         status: encoderPassed ? (avatarTest.ok ? 'completed' : 'degraded') : 'failed',
         completedAt: Date.now(),
-        avatarCompositeBackend: avatarTest.ok ? 'CUDA 头像合成' : 'CPU 头像合成（CUDA 自检未通过）',
+        avatarCompositeBackend: avatarTest.ok ? avatarCompositeLabel : 'CPU 头像合成（GPU 自检未通过）',
         fallbackReason,
         message: encoderPassed
           ? avatarTest.ok
-            ? '硬件编码和 CUDA 头像合成自检通过。'
-            : '硬件编码自检通过；CUDA 头像合成未通过，将自动使用 CPU 头像合成。'
+            ? `硬件编码和 ${avatarCompositeLabel} 自检通过。`
+            : '硬件编码自检通过；GPU 头像合成未通过，将自动使用 CPU 头像合成。'
           : '硬件编码自检未通过；不会将此结果伪装为可用硬编。'
       };
       this.log(

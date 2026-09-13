@@ -11,12 +11,16 @@ const {
   getAppPackageType,
   normalizeUpdateManifest,
   updatePackageFileName,
-  shouldTestHardwareEncoder
+  shouldTestHardwareEncoder,
+  runCapturedProcess
 } = require('../src/server/shared/helpers.cjs');
 const {
   isJetsonGstreamerCodec,
+  getNativeSoftwareDecoder,
   createBurnArgs,
+  createBurnVideoFilter,
   createBurnRawVideoArgs,
+  createJetsonBurnLeadingVideoFilterGraph,
   createAvatarOverlayFilterScript,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
@@ -38,6 +42,20 @@ const {
 } = require('../packaging/linux/linux-update.cjs');
 const { migrateBootstrapStore } = require('../packaging/linux/bootstrap-config.cjs');
 const { LiveRecordService } = require('../src/server/app/service.cjs');
+
+function resolveJetPackR35FfmpegPath() {
+  const configured = String(process.env.BILI_RECORD_JETPACK_R35_FFMPEG || '').trim();
+  if (configured) return configured;
+  if (process.platform !== 'linux') return '';
+  try {
+    const release = fs.readFileSync('/etc/nv_tegra_release', 'utf8');
+    return /\bR35\b/i.test(release) ? '/usr/bin/ffmpeg' : '';
+  } catch {
+    return '';
+  }
+}
+
+const jetPackR35FfmpegPath = resolveJetPackR35FfmpegPath();
 
 const files = [
   {
@@ -636,6 +654,167 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   assert.ok(normalizeMuxArgs.includes('/recordings/normalized.mkv'));
 });
 
+test('software decode explicitly selects native H.264/HEVC and skipped seek guard emits no select filter', () => {
+  assert.equal(getNativeSoftwareDecoder('h264 (High)'), 'h264');
+  assert.equal(getNativeSoftwareDecoder('H.265 / HEVC Main'), 'hevc');
+  assert.equal(getNativeSoftwareDecoder('vp9'), '');
+
+  const h264Args = createBurnArgs({
+    cleanPath: '/recordings/source-h264.mkv',
+    assPath: '/recordings/danmaku.ass',
+    burnedPath: '/recordings/output.mp4',
+    codec: 'libx264',
+    crf: 24,
+    container: 'mp4',
+    fps: 30,
+    decoder: 'software',
+    sourceCodec: 'h264 (High)'
+  });
+  const h264DecoderIndex = h264Args.indexOf('-c:v');
+  assert.equal(h264Args[h264DecoderIndex + 1], 'h264');
+  assert.ok(h264DecoderIndex < h264Args.indexOf('-i'));
+
+  const hevcArgs = createBurnRawVideoArgs({
+    cleanPath: '/recordings/source-hevc.mkv',
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    duration: 12,
+    decoder: 'software',
+    sourceCodec: 'hevc (Main)'
+  });
+  const hevcDecoderIndex = hevcArgs.indexOf('-c:v');
+  assert.equal(hevcArgs[hevcDecoderIndex + 1], 'hevc');
+  assert.ok(hevcDecoderIndex < hevcArgs.indexOf('-i'));
+
+  const jetsonDecodeArgs = createBurnRawVideoArgs({
+    cleanPath: '/recordings/source-hevc.mkv',
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    duration: 12,
+    decoder: 'hevc_nvv4l2dec',
+    sourceCodec: 'hevc'
+  });
+  assert.equal(jetsonDecodeArgs[jetsonDecodeArgs.indexOf('-c:v') + 1], 'hevc_nvv4l2dec');
+
+  const guarded = createBurnVideoFilter('/recordings/danmaku.ass', 30, { inputSeek: false });
+  const skipped = createBurnVideoFilter('/recordings/danmaku.ass', 30, {
+    skipInitialKeyframeGuard: true,
+    inputTrimStartSec: 2,
+    inputTrimEndSec: 12
+  });
+  assert.match(guarded, /select='if\(isnan\(prev_selected_t\)/);
+  assert.doesNotMatch(skipped, /select=/);
+  assert.match(skipped, /trim=start=2:end=12,setpts=PTS-STARTPTS,ass=/);
+});
+
+test('JetPack R35-compatible raw burn uses explicit black-frame concat for the full 1.019-second lead-in', () => {
+  const graph = createJetsonBurnLeadingVideoFilterGraph({
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    timelineOffset: 1.019,
+    leadingVideoPaddingSec: 1.019,
+    outputDuration: 2102,
+    skipInitialKeyframeGuard: true,
+    inputTrimStartSec: 2,
+    inputTrimEndSec: 2102,
+    videoWidth: 1920,
+    videoHeight: 1080
+  });
+  assert.match(graph, /color=c=black:s=1920x1080:r=30:d=1\.019/);
+  assert.match(graph, /concat=n=2:v=1:a=0,trim=duration=2102,setpts=PTS-STARTPTS/);
+  assert.match(graph, /trim=start=2:end=2102,setpts=PTS-STARTPTS/);
+  assert.doesNotMatch(graph, /(?:\btpad=|select=)/);
+
+  const rawArgs = createBurnRawVideoArgs({
+    cleanPath: '/recordings/source-hevc.mkv',
+    assPath: '/recordings/danmaku.ass',
+    fps: 30,
+    duration: 2102,
+    inputSeek: true,
+    timelineOffset: 1.019,
+    leadingVideoPaddingSec: 1.019,
+    inputTrimStartSec: 2,
+    inputTrimEndSec: 2102,
+    decoder: 'software',
+    sourceCodec: 'hevc',
+    videoWidth: 1920,
+    videoHeight: 1080
+  });
+  const filterGraph = rawArgs[rawArgs.indexOf('-filter_complex') + 1];
+  assert.equal(rawArgs[rawArgs.indexOf('-c:v') + 1], 'hevc');
+  assert.match(filterGraph, /color=c=black:s=1920x1080:r=30:d=1\.019/);
+  assert.doesNotMatch(filterGraph, /(?:\btpad=|select=)/);
+});
+
+test(
+  'JetPack R35 FFmpeg 4.x executes the 1.019-second explicit burn lead-in',
+  { skip: !jetPackR35FfmpegPath },
+  async () => {
+    const ffmpegPath = jetPackR35FfmpegPath;
+    assert.equal(fs.existsSync(ffmpegPath), true, `找不到 JetPack R35 FFmpeg：${ffmpegPath}`);
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-r35-filter-'));
+    const sourcePath = path.join(tempDir, 'source.mp4');
+    const assPath = path.join(tempDir, 'subtitle.ass');
+    try {
+      const version = await runCapturedProcess(ffmpegPath, ['-version'], { timeoutMs: 15_000 });
+      assert.equal(version.status, 0, version.stderr);
+      assert.match(`${version.stdout}\n${version.stderr}`, /ffmpeg version 4\./i);
+      await fsp.writeFile(
+        assPath,
+        '[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\n' +
+          '[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,' +
+          'Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,' +
+          'MarginL,MarginR,MarginV,Encoding\n' +
+          'Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n' +
+          '[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n' +
+          'Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,R35 lead-in\n',
+        'utf8'
+      );
+      const source = await runCapturedProcess(
+        ffmpegPath,
+        [
+          '-hide_banner',
+          '-y',
+          '-f',
+          'lavfi',
+          '-i',
+          'testsrc2=size=320x180:rate=25:duration=2',
+          '-an',
+          '-c:v',
+          'mpeg4',
+          sourcePath
+        ],
+        { timeoutMs: 30_000 }
+      );
+      assert.equal(source.status, 0, source.stderr);
+      await runFfmpegToGstreamerJob({
+        ffmpegPath,
+        ffmpegArgs: createBurnRawVideoArgs({
+          cleanPath: sourcePath,
+          assPath,
+          fps: 25,
+          duration: 2,
+          inputSeek: true,
+          timelineOffset: 1.019,
+          leadingVideoPaddingSec: 1.019,
+          decoder: 'software',
+          sourceCodec: 'mpeg4',
+          videoWidth: 320,
+          videoHeight: 180
+        }),
+        gstreamerPath: process.execPath,
+        gstreamerArgs: [
+          '-e',
+          "let bytes = 0; process.stdin.on('data', (chunk) => { bytes += chunk.length; }); process.stdin.on('end', () => process.exit(bytes > 0 ? 0 : 1));"
+        ],
+        timeoutMs: 45_000
+      });
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
 test('Jetson GStreamer keeps CUDA avatar composition independent from the video encoder', () => {
   const avatarOverlay = {
     panel: { left: 10, width: 120, height: 180 },
@@ -682,6 +861,61 @@ test('Jetson GStreamer keeps CUDA avatar composition independent from the video 
   assert.equal(softwareEncodeArgs[softwareEncodeArgs.indexOf('-init_hw_device') + 1], 'cuda=br2k_avatar:0');
 });
 
+test('non-CUDA GPU final blend keeps avatar motion in a capped CPU side panel', () => {
+  const avatarOverlay = {
+    panel: { left: 10, width: 120, height: 180 },
+    filterScriptPath: '/recordings/avatar-layer.ffscript',
+    gpuComposite: true,
+    gpuCompositeBackend: 'vulkan',
+    gpuOutputToCpu: true,
+    compositeFps: 24,
+    entries: [
+      {
+        imagePath: '/recordings/avatar.png',
+        segments: [{ start: 0, end: 2, x1: 18, x2: 42, y1: 28, y2: 28 }]
+      }
+    ]
+  };
+  const script = createAvatarOverlayFilterScript({
+    assPath: '/recordings/danmaku.ass',
+    fps: 60,
+    avatarOverlay,
+    gpuComposite: true,
+    gpuCompositeBackend: 'vulkan',
+    gpuOutputToCpu: true
+  });
+  const vulkanArgs = createBurnArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    burnedPath: '/recordings/output.mkv',
+    codec: 'libx265',
+    crf: 24,
+    container: 'mkv',
+    fps: 60,
+    avatarOverlay
+  });
+  const vaapiArgs = createBurnArgs({
+    cleanPath: '/recordings/source.mkv',
+    assPath: '/recordings/danmaku.ass',
+    burnedPath: '/recordings/output-vaapi.mkv',
+    codec: 'libx265',
+    crf: 24,
+    container: 'mkv',
+    fps: 60,
+    avatarOverlay: {
+      ...avatarOverlay,
+      gpuCompositeBackend: 'vaapi',
+      gpuCompositeDevice: '/dev/dri/renderD128'
+    }
+  });
+
+  assert.match(script, /color=c=black@0\.0:s=120x180:r=24/);
+  assert.match(script, /overlay=x='if\(between\(t/);
+  assert.match(script, /overlay_vulkan=x=10:y=0,hwdownload,format=yuva420p,format=yuv420p\[vout\]/);
+  assert.equal(vulkanArgs[vulkanArgs.indexOf('-init_hw_device') + 1], 'vulkan=br2k_avatar:0');
+  assert.equal(vaapiArgs[vaapiArgs.indexOf('-init_hw_device') + 1], 'vaapi=br2k_avatar:/dev/dri/renderD128');
+});
+
 test('FFmpeg-to-GStreamer bridge streams stdout into stdin and clears its cancellable child', async () => {
   const children = [];
   await runFfmpegToGstreamerJob({
@@ -696,6 +930,54 @@ test('FFmpeg-to-GStreamer bridge streams stdout into stdin and clears its cancel
   });
   assert.ok(children.some(Boolean));
   assert.equal(children.at(-1), null);
+});
+
+test('FFmpeg-to-GStreamer bridge keeps FFmpeg stderr as root cause and Argus as an attachment', async () => {
+  let captured = null;
+  try {
+    await runFfmpegToGstreamerJob({
+      ffmpegPath: process.execPath,
+      ffmpegArgs: [
+        '-e',
+        "process.stdout.write('raw-i420-frame'); process.stderr.write('FFMPEG ROOT: native HEVC decoder failed\\n'); setTimeout(() => process.exit(7), 150);"
+      ],
+      gstreamerPath: process.execPath,
+      gstreamerArgs: [
+        '-e',
+        "process.stderr.write('(Argus) Error FileOperationFailed: Connecting to nvargus-daemon failed\\n'); process.stdin.resume(); setInterval(() => {}, 1000);"
+      ]
+    });
+    assert.fail('预期 FFmpeg 非零退出会导致桥接失败。');
+  } catch (error) {
+    captured = error;
+  }
+  assert.equal(captured?.primaryProcess, 'ffmpeg');
+  assert.equal(captured?.gstreamerStoppedByPipeline, true);
+  assert.match(captured?.message || '', /FFmpeg：FFMPEG ROOT: native HEVC decoder failed/);
+  assert.match(captured?.message || '', /Argus 附加诊断/);
+  assert.match(captured?.argusDiagnostics || '', /nvargus-daemon/);
+});
+
+test('FFmpeg-to-GStreamer bridge never presents an Argus-only GStreamer message as the root cause', async () => {
+  let captured = null;
+  try {
+    await runFfmpegToGstreamerJob({
+      ffmpegPath: process.execPath,
+      ffmpegArgs: ['-e', "process.stdout.write('raw-i420-frame'); setInterval(() => {}, 1000);"],
+      gstreamerPath: process.execPath,
+      gstreamerArgs: [
+        '-e',
+        "process.stderr.write('(Argus) Error FileOperationFailed: Connecting to nvargus-daemon failed\\n'); process.exit(8);"
+      ]
+    });
+    assert.fail('预期 GStreamer 非零退出会导致桥接失败。');
+  } catch (error) {
+    captured = error;
+  }
+  assert.equal(captured?.primaryProcess, 'gstreamer');
+  assert.match(captured?.message || '', /GStreamer：管线异常（仅收到 Argus 附加诊断）/);
+  assert.match(captured?.message || '', /Argus 附加诊断/);
+  assert.doesNotMatch(captured?.message || '', /GStreamer：[^；]*nvargus-daemon/);
 });
 
 test('root updater refuses to append through a symbolic-link log target', { skip: process.platform !== 'linux' }, async () => {
