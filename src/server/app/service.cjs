@@ -3802,7 +3802,8 @@ try {
               playlistPath: workingPlaylistPath,
               segmentPattern: path.join(workingPreviewDir, 'segment_%05d.ts'),
               codec: activeCodec,
-              decoder: activeDecoder.value
+              decoder: activeDecoder.value,
+              sourceCodec: previewDecoder.codec
             }),
             handlePreviewStderr,
             {
@@ -7413,6 +7414,7 @@ try {
                         durationSec: sourceDurationSec,
                         targetVideoInfo,
                         decoder: nextDecoder,
+                        sourceCodec: preferredDecoder.codec,
                         decoderThreads,
                         recoverySeekSec,
                         timelineAlignment
@@ -7453,6 +7455,7 @@ try {
                   videoCodec,
                   softwareThreads: mergeSoftwareThreads,
                   decoder,
+                  sourceCodec: preferredDecoder.codec,
                   decoderThreads,
                   recoverySeekSec,
                   timelineAlignment
@@ -9040,7 +9043,12 @@ try {
         ffmpegArgs: createRawArgs(nextDecoder),
         gstreamerArgs,
         onFfmpegStderr: onStderr,
-        onGstreamerStderr: (text) => onStderr?.(`GStreamer: ${text}`),
+        onGstreamerStderr: (text) => {
+          const label = /(?:\bargus\b|nvargus-daemon|socketclientdispatch|fileoperationfailed)/i.test(String(text || ''))
+            ? 'GStreamer Argus 附加诊断'
+            : 'GStreamer';
+          onStderr?.(`${label}: ${text}`);
+        },
         onChild
       });
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
@@ -9083,6 +9091,7 @@ try {
     fps,
     avatarLayer,
     decoder = 'software',
+    sourceCodec = '',
     includeAudio = true,
     copyAudio = false,
     timelineAlignment,
@@ -9224,7 +9233,8 @@ try {
             timelineOffset: chunkTimelineOffset,
             leadingVideoPaddingSec: chunkVideoPaddingSec,
             includeAudio: false,
-            decoder: nextDecoder
+            decoder: nextDecoder,
+            sourceCodec
           });
         let usedDecoder;
         try {
@@ -9250,7 +9260,10 @@ try {
                     inputTrimEndSec: chunkInputTrimEndSec,
                     timelineOffset: chunkTimelineOffset,
                     leadingVideoPaddingSec: chunkVideoPaddingSec,
-                    decoder: nextDecoder
+                    decoder: nextDecoder,
+                    sourceCodec,
+                    videoWidth: avatarLayer?.videoWidth,
+                    videoHeight: avatarLayer?.videoHeight
                   }),
                 createMuxArgs: () =>
                   createBurnEncodedVideoMuxArgs({
@@ -9335,7 +9348,10 @@ try {
                     inputTrimEndSec: chunkInputTrimEndSec,
                     timelineOffset: chunkTimelineOffset,
                     leadingVideoPaddingSec: chunkVideoPaddingSec,
-                    decoder: nextDecoder
+                    decoder: nextDecoder,
+                    sourceCodec,
+                    videoWidth: avatarLayer?.videoWidth,
+                    videoHeight: avatarLayer?.videoHeight
                   }),
                 createMuxArgs: () =>
                   createBurnEncodedVideoMuxArgs({
@@ -9651,6 +9667,7 @@ try {
               fps: burnFps,
               avatarLayer,
               decoder: decoderInfo,
+              sourceCodec: decoderInfo.codec,
               includeAudio: Boolean(mediaInfo.audioInfo),
               copyAudio: copySourceAudio,
               timelineAlignment: burnTimeline,
@@ -9689,7 +9706,8 @@ try {
                 leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
                 leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
                 copyAudio: copySourceAudio,
-                decoder
+                decoder,
+                sourceCodec: decoderInfo.codec
               });
             const onDecoderFallback = () => {
               this.setProgressDecoder(
@@ -9734,7 +9752,10 @@ try {
                         duration: durationSec,
                         timelineOffset: burnTimeline.videoClockStartSec,
                         leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-                        decoder
+                        decoder,
+                        sourceCodec: decoderInfo.codec,
+                        videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                        videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
                       }),
                     createMuxArgs: () =>
                       createBurnEncodedVideoMuxArgs({
@@ -10292,7 +10313,8 @@ try {
             leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
             leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
             copyAudio: copySourceAudio,
-            decoder
+            decoder,
+            sourceCodec: decoderInfo.codec
           });
         args = createBurnExportArgs(decoderInfo.value);
       }
@@ -10352,6 +10374,7 @@ try {
           fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
           avatarLayer,
           decoder: decoderInfo,
+          sourceCodec: decoderInfo.codec,
           includeAudio: Boolean(mediaInfo.audioInfo),
           copyAudio: copySourceAudio,
           timelineAlignment: burnTimeline,
@@ -10418,7 +10441,10 @@ try {
                     inputSeek: true,
                     timelineOffset: burnTimeline.videoClockStartSec,
                     leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-                    decoder
+                    decoder,
+                    sourceCodec: decoderInfo.codec,
+                    videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                    videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
                   }),
                 createMuxArgs: () =>
                   createBurnEncodedVideoMuxArgs({
