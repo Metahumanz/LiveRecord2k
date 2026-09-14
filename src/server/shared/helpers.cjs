@@ -129,6 +129,10 @@ const HARDWARE_DECODER_CANDIDATES = [
 ];
 const APP_ROOT = getAppRoot();
 const APP_VERSION = getAppVersion();
+const JETSON_SELF_TEST_SAMPLE_FILES = Object.freeze({
+  h264: 'h264-sample.mp4',
+  hevc: 'hevc-sample.mp4'
+});
 // 官方更新清单（releases/latest/download/update.json）与下载包共用镜像回退。
 const OFFICIAL_RELEASE_DOWNLOAD_PREFIX = 'https://github.com/Metahumanz/LiveRecord2k/releases/';
 const UPDATE_DOWNLOAD_MIRROR_PREFIX = 'https://gh-proxy.com/';
@@ -754,39 +758,21 @@ function shouldTestHardwareDecoder(candidate, hwaccels, adapters, platform = pro
   return true;
 }
 
-async function createHardwareDecodeProbeSample(ffmpegPath, sourceCodec, outputPath) {
-  const encoder = sourceCodec === 'hevc' ? 'libx265' : 'libx264';
-  const result = await runCapturedProcess(
-    ffmpegPath,
-    [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-      '-y',
-      '-f',
-      'lavfi',
-      '-i',
-      'testsrc2=size=640x360:rate=3:duration=1',
-      '-frames:v',
-      '3',
-      '-an',
-      '-c:v',
-      encoder,
-      '-preset',
-      'ultrafast',
-      '-threads',
-      '1',
-      '-g',
-      '1',
-      '-pix_fmt',
-      'yuv420p',
-      '-f',
-      'matroska',
-      outputPath
-    ],
-    { timeoutMs: 15000, maxOutputBytes: 128 * 1024 }
-  );
-  return result.status === 0 && !result.error && !result.timedOut;
+function getJetsonSelfTestSamplePath(sourceCodec, options = {}) {
+  const codec = String(sourceCodec || '').toLowerCase();
+  const configured = options.samplePaths && String(options.samplePaths[codec] || '').trim();
+  const candidates = [
+    configured,
+    path.join(String(options.appRoot || APP_ROOT), 'assets', 'jetson-self-test', JETSON_SELF_TEST_SAMPLE_FILES[codec] || ''),
+    path.resolve(__dirname, '..', '..', 'assets', 'jetson-self-test', JETSON_SELF_TEST_SAMPLE_FILES[codec] || '')
+  ].filter(Boolean);
+  return candidates.find((candidate) => {
+    try {
+      return fs.statSync(candidate).isFile() && fs.statSync(candidate).size >= 1024;
+    } catch {
+      return false;
+    }
+  }) || '';
 }
 
 async function testFfmpegHardwareDecoder(ffmpegPath, accelerator, inputPath, options = {}) {
@@ -826,48 +812,33 @@ async function testFfmpegHardwareDecoder(ffmpegPath, accelerator, inputPath, opt
 }
 
 async function detectFfmpegHardwareDecoders(ffmpegPath, options = {}) {
-  const encoderNames = options.encoderNames instanceof Set ? options.encoderNames : new Set();
   const hwaccels = Array.isArray(options.hwaccels) ? options.hwaccels : [];
   const videoAdapters = Array.isArray(options.videoAdapters) ? options.videoAdapters : [];
   const candidates = HARDWARE_DECODER_CANDIDATES.filter((candidate) =>
     shouldTestHardwareDecoder(candidate, hwaccels, videoAdapters)
   );
-  const sourceProfiles = [
-    { codec: 'h264', encoder: 'libx264' },
-    { codec: 'hevc', encoder: 'libx265' }
-  ].filter((profile) => encoderNames.has(profile.encoder));
+  const sourceProfiles = ['h264', 'hevc']
+    .map((codec) => ({ codec, samplePath: getJetsonSelfTestSamplePath(codec, options) }))
+    .filter((profile) => profile.samplePath);
   if (!candidates.length || !sourceProfiles.length) return [];
-
-  const temporaryDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-hwdecode-probe-'));
-  const samples = new Map();
   const supported = [];
-  try {
-    for (const profile of sourceProfiles) {
-      const samplePath = path.join(temporaryDir, `${profile.codec}.mkv`);
-      if (await createHardwareDecodeProbeSample(ffmpegPath, profile.codec, samplePath)) {
-        samples.set(profile.codec, samplePath);
-      }
-    }
-    for (const candidate of candidates) {
-      for (const [codec, samplePath] of samples) {
-        if (candidate.codec && candidate.codec !== codec) continue;
-        const result = await testFfmpegHardwareDecoder(ffmpegPath, candidate.value, samplePath, {
-          directDecoder: Boolean(candidate.directDecoder)
+  for (const candidate of candidates) {
+    for (const { codec, samplePath } of sourceProfiles) {
+      if (candidate.codec && candidate.codec !== codec) continue;
+      const result = await testFfmpegHardwareDecoder(ffmpegPath, candidate.value, samplePath, {
+        directDecoder: Boolean(candidate.directDecoder)
+      });
+      if (result.ok) {
+        supported.push({
+          value: candidate.value,
+          label: candidate.label,
+          vendor: candidate.vendor,
+          codec
         });
-        if (result.ok) {
-          supported.push({
-            value: candidate.value,
-            label: candidate.label,
-            vendor: candidate.vendor,
-            codec
-          });
-        }
       }
     }
-    return supported;
-  } finally {
-    await fsp.rm(temporaryDir, { recursive: true, force: true }).catch(() => {});
   }
+  return supported;
 }
 
 async function runFfmpegProbe(ffmpegPath, args, options = {}) {
@@ -1264,7 +1235,7 @@ async function testFfmpegCudaAvatarComposite(ffmpegPath) {
 
 function normalizeBurnCodec(value) {
   const codec = String(value || '').trim();
-  return BURN_CODEC_VALUES.has(codec) ? codec : 'libx265';
+  return BURN_CODEC_VALUES.has(codec) ? codec : '';
 }
 
 function normalizeRoomImageMode(value) {
@@ -2360,6 +2331,31 @@ function findFfmpegPath() {
     }
   }
   return 'ffmpeg';
+}
+
+function findBundledSceneGraphFfmpegPath() {
+  if (process.platform !== 'linux' || process.arch !== 'arm64') return '';
+  const candidate = path.join(APP_ROOT, 'bin', 'ffmpeg-full');
+  try {
+    return fs.statSync(candidate).isFile() ? candidate : '';
+  } catch {
+    return '';
+  }
+}
+
+async function preferSceneGraphCapableFfmpeg(ffmpegPath) {
+  const current = String(ffmpegPath || '').trim() || 'ffmpeg';
+  const bundled = findBundledSceneGraphFfmpegPath();
+  if (!bundled || bundled === current) return { path: current, fallbackReason: '' };
+  const probe = await runFfmpegProbe(current, [
+    '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=0.1',
+    '-vf', 'drawtext=text=Scene:fontsize=8:x=1:y=1', '-frames:v', '1', '-f', 'null', '-'
+  ], { timeoutMs: 8000, maxOutputBytes: 64 * 1024 });
+  if (probe.ok) return { path: current, fallbackReason: '' };
+  return {
+    path: bundled,
+    fallbackReason: `系统 FFmpeg 不满足 Scene Graph 绘制要求，已自动切换内置完整 ARM64 FFmpeg：${probe.error || 'drawtext 实命令失败'}`
+  };
 }
 
 function getAppVersion() {
@@ -3742,6 +3738,7 @@ module.exports = {
   hasVideoAdapterVendor,
   shouldTestHardwareEncoder,
   testFfmpegEncoder,
+  getJetsonSelfTestSamplePath,
   testJetsonGstreamerEncoder,
   testFfmpegCudaAvatarComposite,
   normalizeBurnCodec,
@@ -3799,6 +3796,8 @@ module.exports = {
   normalizeServerHost,
   getAppRoot,
   findFfmpegPath,
+  findBundledSceneGraphFfmpegPath,
+  preferSceneGraphCapableFfmpeg,
   getAppVersion,
   requestUrlBuffer,
   requestUrlBufferOnce,

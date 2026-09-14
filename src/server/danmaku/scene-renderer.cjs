@@ -323,7 +323,24 @@ function createSceneFilterScript(scene, options) {
   const plan = createSceneRenderPlan(scene, source);
   const fps = Math.max(1, number(source.fps, 30));
   const duration = Math.max(0.001, number(source.duration, plan.duration));
-  const filters = ['[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba[scene_base_0]'];
+  const outputDuration = Math.max(0.001, number(source.outputDuration, duration));
+  const leadingVideoPaddingSec = Math.max(0, number(source.leadingVideoPaddingSec, 0));
+  const canvasWidth = Math.max(2, Math.floor(number(plan.canvas?.width, 2) / 2) * 2);
+  const canvasHeight = Math.max(2, Math.floor(number(plan.canvas?.height, 2) / 2) * 2);
+  // Scene Graph is rendered directly on the clean-video input. If that video
+  // starts later than the source audio, prepend explicit black frames here so
+  // the Scene clock and final mux remain aligned. This avoids tpad, which is
+  // unreliable on older Jetson FFmpeg builds, and trims back to the requested
+  // output timeline instead of extending the recording.
+  const filters = leadingVideoPaddingSec > 0.0005
+    ? [
+        '[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba[scene_source_0]',
+        'color=c=black:s=' + canvasWidth + 'x' + canvasHeight + ':r=' + ff(fps) + ':d=' + ff(leadingVideoPaddingSec) +
+          ',format=rgba,setpts=PTS-STARTPTS[scene_lead_0]',
+        '[scene_lead_0][scene_source_0]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
+          ',setpts=PTS-STARTPTS,format=rgba[scene_base_0]'
+      ]
+    : ['[0:v]settb=AVTB,setpts=PTS-STARTPTS,format=rgba[scene_base_0]'];
   let previous = 'scene_base_0';
   let index = 0;
   for (const object of plan.objects) {
@@ -331,7 +348,7 @@ function createSceneFilterScript(scene, options) {
       for (const variant of textVariants(object)) {
         const image = 'scene_text_image_' + index;
         const output = 'scene_text_' + index;
-        filters.push(textLayerFilter(variant, image, duration, fps));
+        filters.push(textLayerFilter(variant, image, outputDuration, fps));
         filters.push(overlayShape(previous, image, output, variant));
         previous = output;
         index += 1;
@@ -344,14 +361,14 @@ function createSceneFilterScript(scene, options) {
       const shadowImage = 'scene_shadow_image_' + index;
       const shadowOutput = 'scene_shadow_' + index;
       const padding = Math.max(1, Math.ceil(shadow.blur * 2));
-      filters.push(objectShapeFilter(shadowShapeObject(object, shadow), shadowImage, duration, fps, { padding, blur: shadow.blur }));
+      filters.push(objectShapeFilter(shadowShapeObject(object, shadow), shadowImage, outputDuration, fps, { padding, blur: shadow.blur }));
       filters.push(overlayShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding }));
       previous = shadowOutput;
       index += 1;
     }
     const image = 'scene_image_' + index;
     const output = 'scene_layer_' + index;
-    filters.push(object.type === 'Avatar' ? avatarFilter(object, image, duration) : objectShapeFilter(object, image, duration, fps));
+    filters.push(object.type === 'Avatar' ? avatarFilter(object, image, outputDuration) : objectShapeFilter(object, image, outputDuration, fps));
     filters.push(overlayShape(previous, image, output, object));
     previous = output;
     index += 1;

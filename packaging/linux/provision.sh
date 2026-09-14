@@ -101,10 +101,35 @@ check_recording_directory_access() {
     return 1
   }
   command -v runuser >/dev/null 2>&1 || {
-    echo '缺少 runuser，无法以 bili-record-2k 服务用户验证录像目录权限。' >&2
-    return 1
+    echo '缺少 runuser，无法切换到 bili-record-2k 服务用户执行录像目录权限探针。' >&2
+    return 2
   }
-  runuser -u "$SERVICE_USER" -- sh -eu -c '
+  expected_uid=$(id -u "$SERVICE_USER" 2>/dev/null) || {
+    echo "无法读取 $SERVICE_USER 的 UID，服务用户身份校验失败。" >&2
+    return 2
+  }
+  identity_log=$(mktemp "${TMPDIR:-/tmp}/bili-record-2k-runuser.XXXXXX") || {
+    echo '无法创建服务用户身份校验的诊断临时文件。' >&2
+    return 2
+  }
+  if ! runuser -u "$SERVICE_USER" -- id -u >"$identity_log" 2>&1; then
+    echo "无法切换到 $SERVICE_USER 服务用户；这不是录像目录或 SMB 权限错误。" >&2
+    sed -n '1,8p' "$identity_log" >&2 || true
+    rm -f "$identity_log"
+    return 2
+  fi
+  actual_uid=$(tr -d '[:space:]' <"$identity_log")
+  rm -f "$identity_log"
+  if [ "$actual_uid" != "$expected_uid" ]; then
+    echo "服务用户身份校验失败：预期 UID $expected_uid，实际 UID ${actual_uid:-未知}；这不是录像目录或 SMB 权限错误。" >&2
+    return 2
+  fi
+
+  probe_log=$(mktemp "${TMPDIR:-/tmp}/bili-record-2k-recording-probe.XXXXXX") || {
+    echo '无法创建录像目录权限探针的诊断临时文件。' >&2
+    return 2
+  }
+  if ! runuser -u "$SERVICE_USER" -- /bin/sh -eu -c '
     target_path=$1
     probe_dir=
     cleanup() {
@@ -126,19 +151,40 @@ check_recording_directory_access() {
     [ ! -e "$probe_dir/write-test" ]
     rmdir -- "$probe_dir"
     probe_dir=
-  ' sh "$target_path"
+  ' sh "$target_path" >"$probe_log" 2>&1; then
+    echo "录像保存目录的服务用户读写探针失败：$target_path" >&2
+    sed -n '1,12p' "$probe_log" >&2 || true
+    rm -f "$probe_log"
+    return 1
+  fi
+  rm -f "$probe_log"
 }
 
-RECORDING_OUTPUT_DIR=$(read_recording_output_dir) || {
-  echo '无法读取已持久化的录像保存目录，安装已停止。' >&2
-  exit 1
-}
-if ! check_recording_directory_access "$RECORDING_OUTPUT_DIR"; then
-  echo "录像保存目录无法由 $SERVICE_USER 创建、写入并删除测试文件：$RECORDING_OUTPUT_DIR" >&2
-  echo "请为 $SERVICE_USER:$SERVICE_GROUP 授予该目录的实际写权限（SMB 挂载请检查 uid/gid、file_mode、dir_mode），然后重新安装。" >&2
-  exit 1
+if [ "${BILI_RECORD_UPDATE_APPLYING:-0}" = "1" ]; then
+  # The managed updater runs in a hardened root systemd unit. Do not run an
+  # external-mount probe through runuser here: a session/identity-switch
+  # failure would make dpkg leave an otherwise installed package in iF. The
+  # main service runs outside this unit as the real service account and keeps
+  # the normal runtime directory admission check.
+  echo "受控更新：跳过外部录像目录权限探针；更新后由主服务在正常 systemd 环境中以 $SERVICE_USER 身份验证。"
+else
+  RECORDING_OUTPUT_DIR=$(read_recording_output_dir) || {
+    echo '无法读取已持久化的录像保存目录，安装已停止。' >&2
+    exit 1
+  }
+  if check_recording_directory_access "$RECORDING_OUTPUT_DIR"; then
+    echo "录像保存目录权限验证通过（$SERVICE_USER）：$RECORDING_OUTPUT_DIR"
+  else
+    check_status=$?
+    if [ "$check_status" -eq 2 ]; then
+      echo '服务用户身份切换或身份校验失败；请检查 runuser、PAM 与 bili-record-2k 用户状态后重新安装。' >&2
+    else
+      echo "录像保存目录无法由 $SERVICE_USER 创建、写入并删除测试文件：$RECORDING_OUTPUT_DIR" >&2
+      echo "请为 $SERVICE_USER:$SERVICE_GROUP 授予该目录的实际写权限（SMB 挂载请检查 uid/gid、file_mode、dir_mode），然后重新安装。" >&2
+    fi
+    exit 1
+  fi
 fi
-echo "录像保存目录权限验证通过（$SERVICE_USER）：$RECORDING_OUTPUT_DIR"
 
 chmod 0755 /usr/bin/bili-record-2k /usr/bin/bili-record-2k-update
 chmod 0755 /usr/lib/bili-record-2k/bin/node /usr/lib/bili-record-2k/linux-update.cjs /usr/lib/bili-record-2k/provision.sh /usr/lib/bili-record-2k/bootstrap-config.cjs

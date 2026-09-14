@@ -462,7 +462,7 @@ export function MaintenancePage({
           {jetsonBurnTests.length ? (
             <div className="maintenance-section">
               <h3>Jetson 端到端烧录自检</h3>
-              <p className="field-help">每种 H.264/H.265 后端均以真实 ASS、字体、头像、0 秒和 1.019 秒前导跑完 I420 bridge、nvv4l2、最终 mux 与 ffprobe；头像失败只回退通用头像。</p>
+              <p className="field-help">每种 H.264/H.265 后端先以 CPU 解码、Scene Graph、真实字体、头像、0 秒和 1.019 秒前导跑完 I420 bridge、nvv4l2、最终 mux 与 ffprobe；硬解仅作为额外加速验证，失败不阻断 CPU 烧录链。</p>
               {jetsonBurnTests.map((probe) => (
                 <div key={probe.codec} className={`inline-status ${probe.ok ? '' : 'error'}`} title={probe.reason || ''}>
                   <strong>{probe.codec}：{probe.ok ? '烧录可用' : '不可用'}</strong>

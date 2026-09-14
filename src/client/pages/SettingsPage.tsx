@@ -348,7 +348,7 @@ export function SettingsPage({
                   </option>
                 ))}
               </select>
-              <p className="field-help">自动烧录、片段 MP4、三套 ASS 轨和播放器都从同一 Scene Graph 样式出发。</p>
+              <p className="field-help">保留原有“当前默认”，另有三种侧栏样式；自动烧录、片段 MP4、四套 ASS 轨和播放器都从同一 Scene Graph 样式出发。</p>
             </label>
 
             <label className="field">
@@ -387,9 +387,12 @@ export function SettingsPage({
             <label className="field">
               <span>弹幕视频编码</span>
               <select
-                value={settingsDraft.burnCodec}
+                value={codecOptions.some((option) => option.value === settingsDraft.burnCodec) ? settingsDraft.burnCodec : ''}
                 onChange={(event) => updateSetting({ burnCodec: event.target.value })}
               >
+                <option value="" disabled>
+                  {codecOptions.length ? '请选择已通过探测的编码器' : '未探测到可用编码器'}
+                </option>
                 {codecOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
@@ -397,7 +400,10 @@ export function SettingsPage({
                 ))}
               </select>
               <p className="field-help">
-                当前使用{selectedCodec?.kind === 'hardware' ? '硬件' : '软件'}编码 {settingsDraft.burnCodec}；{burnCodecSummary(codecOptions)}
+                {selectedCodec
+                  ? `当前使用${selectedCodec.kind === 'hardware' ? '硬件' : '软件'}编码 ${settingsDraft.burnCodec}；`
+                  : '当前没有可用于烧录的编码器；'}
+                {burnCodecSummary(codecOptions)}
               </p>
               {unavailableHardwareText ? <p className="field-help">不可用硬编：{unavailableHardwareText}</p> : null}
             </label>

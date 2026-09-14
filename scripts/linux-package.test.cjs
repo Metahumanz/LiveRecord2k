@@ -611,21 +611,20 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
     cleanPath: '/recordings/source.mkv',
     outputPath: '/recordings/final.mp4',
     codec: 'h264_nvv4l2',
+    sourceCodec: 'hevc (Main)',
     fps: 30,
     duration: 12,
     container: 'mp4'
   });
   assert.ok(muxArgs.includes('copy'));
   assert.ok(muxArgs.includes('/recordings/final.mp4'));
+  const decoderArgs = muxArgs.reduce((values, value, index) => value === '-c:v' ? [...values, muxArgs[index + 1]] : values, []);
+  assert.deepEqual(decoderArgs.slice(0, 2), ['h264', 'hevc']);
 
-  const jetsonDecodeArgs = createNormalizeSegmentArgs({
+  const jetsonDecodeArgs = createNormalizeRawVideoArgs({
     inputPath: '/recordings/source.mkv',
-    outputPath: '/recordings/normalized.mkv',
-    container: 'mkv',
     durationSec: 12,
-    hasAudio: true,
     targetVideoInfo: { width: 1920, height: 1080, fps: 30, codec: 'h264', pixelFormat: 'yuv420p' },
-    videoCodec: 'h264_nvv4l2',
     decoder: 'h264_nvv4l2dec'
   });
   assert.equal(jetsonDecodeArgs[jetsonDecodeArgs.indexOf('-c:v') + 1], 'h264_nvv4l2dec');
@@ -1090,6 +1089,10 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(provision, /bootstrap-config\.cjs/);
   assert.match(provision, /usermod -a -G "\$hardware_group" "\$SERVICE_USER"/);
   assert.match(provision, /runuser -u "\$SERVICE_USER"/);
+  assert.match(provision, /服务用户身份切换或身份校验失败/);
+  assert.match(provision, /这不是录像目录或 SMB 权限错误/);
+  assert.match(provision, /BILI_RECORD_UPDATE_APPLYING:-0.*= "1"/);
+  assert.match(provision, /受控更新：跳过外部录像目录权限探针/);
   assert.match(provision, /read_recording_output_dir/);
   assert.match(provision, /bili-record-2k-permission-check/);
   assert.match(provision, /write-test/);

@@ -24,6 +24,22 @@ test('LiveRecordService 将设置默认值、归一化、校验与保存委托�
   assert.deepEqual(saveArguments, [{ preferHevc: false }, { preserveCookie: true }]);
 });
 
+test('Scene Graph 保留当前默认样式，并迁移既有烧录样式而不替换为侧栏样式', () => {
+  const service = new LiveRecordService();
+  const defaults = service.createDefaultSettings();
+  assert.equal(defaults.sceneGraphDefaultStyle, 'current');
+  assert.equal(defaults.burnDanmakuStylePreset, 'current');
+
+  const migrated = service.normalizeSettings({
+    ...defaults,
+    sceneGraphDefaultStyle: undefined,
+    burnDanmakuStylePreset: 'current'
+  });
+  assert.equal(migrated.sceneGraphDefaultStyle, 'current');
+  assert.equal(migrated.burnDanmakuStylePreset, 'current');
+  assert.equal(service.normalizeSettings({ ...defaults, sceneGraphDefaultStyle: 'bubble' }).sceneGraphDefaultStyle, 'bubble');
+});
+
 test('设置落盘失败时不会提交内存设置或触发凭据副作用', async () => {
   const service = new LiveRecordService();
   const originalSettings = service.settings;

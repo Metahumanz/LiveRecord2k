@@ -96,7 +96,10 @@ export type DanmakuArea = 'quarter' | 'half' | 'three-quarter' | 'no-overlap' | 
 
 export type DanmakuStylePreset = 'current' | 'h5-card' | 'bubble' | 'minimal';
 
-export type SceneStylePreset = Exclude<DanmakuStylePreset, 'current'>;
+// Scene Graph is the canonical representation for every existing visual preset.
+// `current` is the original rolling-danmaku presentation and must remain
+// selectable alongside the three newer sidebar presentations.
+export type SceneStylePreset = DanmakuStylePreset;
 
 export type BurnAvatarMode = 'off' | 'limited' | 'high';
 

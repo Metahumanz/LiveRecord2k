@@ -120,6 +120,41 @@ function getJetsonGstreamerBitrate(quality, codec, options = {}) {
   return Math.max(1_000_000, Number.parseInt(value, 10) * 1_000_000);
 }
 
+// Keep encoder options explicit.  Passing a generic `-crf` to an unknown
+// encoder used to hide selection/probe bugs and is especially misleading on
+// embedded V4L2 stacks.  Callers must first select a capability-probed codec;
+// this function is the final whitelist guard before FFmpeg is spawned.
+function appendWhitelistedVideoEncoderArgs(args, options = {}) {
+  const codec = String(options.codec || '').trim();
+  const quality = Math.max(0, Number(options.quality ?? options.crf) || 0);
+  const preset = String(options.preset || 'medium');
+  if (codec === 'libx264' || codec === 'libx265') {
+    args.push('-c:v', codec, '-preset', preset, '-crf', String(quality || 24));
+    if (options.threads) args.push('-threads', String(Math.max(1, Number(options.threads) || 1)));
+    return codec;
+  }
+  if (/^(?:h264|hevc)_nvenc$/.test(codec)) {
+    args.push('-c:v', codec, '-preset', options.preview ? 'p4' : 'p5', '-cq', String(quality || 24), '-b:v', '0');
+    return codec;
+  }
+  if (/^(?:h264|hevc)_qsv$/.test(codec)) {
+    args.push('-c:v', codec, '-global_quality', String(quality || 24));
+    return codec;
+  }
+  if (/^(?:h264|hevc)_amf$/.test(codec)) {
+    args.push('-c:v', codec, '-quality', options.preview ? 'speed' : 'balanced', '-qp_i', String(quality || 24), '-qp_p', String(quality || 24));
+    return codec;
+  }
+  if (/^(?:h264|hevc)_v4l2m2m$/.test(codec)) {
+    args.push('-c:v', codec, '-b:v', getV4l2TargetBitrate(quality || 24, codec, { preview: Boolean(options.preview) }));
+    return codec;
+  }
+  if (/^(?:h264|hevc)_nvv4l2$/.test(codec)) {
+    throw new Error(`${codec} 只能通过已验证的 Jetson FFmpeg → I420 → GStreamer nvv4l2 管线使用。`);
+  }
+  throw new Error(`未知或未获准的编码器：${codec || '未选择'}。请先完成能力探测并选择可用编码器。`);
+}
+
 function formatGstreamerFramerate(value) {
   const fps = Math.max(1, Math.min(240, Number(value) || 30));
   const rounded = Math.round(fps);
@@ -904,19 +939,7 @@ function createBurnArgs({
       })
     );
   }
-  args.push('-c:v', codec || 'libx265');
-
-  if ((codec || '').includes('nvenc')) {
-    args.push('-preset', 'p5', '-cq', String(crf), '-b:v', '0');
-  } else if ((codec || '').includes('qsv')) {
-    args.push('-global_quality', String(crf));
-  } else if ((codec || '').includes('amf')) {
-    args.push('-quality', 'balanced', '-qp_i', String(crf), '-qp_p', String(crf));
-  } else if (isV4l2M2mCodec(codec)) {
-    args.push('-b:v', getV4l2TargetBitrate(crf, codec));
-  } else {
-    args.push('-preset', 'medium', '-crf', String(crf));
-  }
+  appendWhitelistedVideoEncoderArgs(args, { codec, crf, preset: 'medium' });
 
   args.push('-avoid_negative_ts', 'make_zero');
 
@@ -1103,6 +1126,7 @@ function createBurnEncodedVideoMuxArgs({
   cleanPath,
   outputPath,
   codec,
+  sourceCodec = '',
   fps,
   startTime,
   duration,
@@ -1121,12 +1145,18 @@ function createBurnEncodedVideoMuxArgs({
     '-err_detect',
     'ignore_err',
     '-r',
-    formatGstreamerFramerate(fps),
-    '-i',
-    encodedVideoPath
+    formatGstreamerFramerate(fps)
   ];
+  // This stage stream-copies video, but FFmpeg may still initialize a decoder
+  // while probing its inputs. Keep ARM64 builds from silently selecting a
+  // CUDA wrapper when the Jetson pipeline deliberately uses CPU decoding.
+  const encodedDecoder = getNativeSoftwareDecoder(codec);
+  if (encodedDecoder) args.push('-c:v', encodedDecoder);
+  args.push('-i', encodedVideoPath);
   if (includeAudio) {
     if (hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+    const cleanDecoder = getNativeSoftwareDecoder(sourceCodec);
+    if (cleanDecoder) args.push('-c:v', cleanDecoder);
     args.push('-i', cleanPath);
   }
   if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
@@ -1134,13 +1164,16 @@ function createBurnEncodedVideoMuxArgs({
   if (includeAudio) {
     const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
     if (copyAudio && audioPaddingMs <= 0) {
-      args.push('-map', '1:a?', '-c:a', 'copy', '-shortest');
+      // The elementary H26x stream from nvv4l2 has no container timestamps.
+      // `-shortest` can therefore stop before the first AAC packet even when
+      // both inputs are valid. The explicit output -t above is authoritative.
+      args.push('-map', '1:a?', '-c:a', 'copy');
     } else {
       const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
       if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
       if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
       audioFilters.push('asetpts=PTS-STARTPTS');
-      args.push('-map', '1:a?', '-af', audioFilters.join(','), '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-shortest');
+      args.push('-map', '1:a?', '-af', audioFilters.join(','), '-c:a', 'aac', '-b:a', '160k', '-ac', '2');
     }
   } else {
     args.push('-an');
@@ -1159,6 +1192,7 @@ function createBurnAudioMuxArgs({
   cleanPath,
   outputPath,
   codec,
+  sourceCodec = '',
   crf,
   startTime,
   duration,
@@ -1179,12 +1213,15 @@ function createBurnAudioMuxArgs({
     '-f',
     'concat',
     '-safe',
-    '0',
-    '-i',
-    concatPath
+    '0'
   ];
+  const concatDecoder = getNativeSoftwareDecoder(codec);
+  if (concatDecoder) args.push('-c:v', concatDecoder);
+  args.push('-i', concatPath);
   if (includeAudio) {
     if (hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+    const cleanDecoder = getNativeSoftwareDecoder(sourceCodec);
+    if (cleanDecoder) args.push('-c:v', cleanDecoder);
     args.push('-i', cleanPath);
   }
   if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
@@ -1228,7 +1265,7 @@ function createPreviewHlsArgs({
   inputPath,
   playlistPath,
   segmentPattern,
-  codec = 'libx264',
+  codec,
   decoder = 'software',
   sourceCodec = ''
 }) {
@@ -1250,20 +1287,13 @@ function createPreviewHlsArgs({
     '0:a?',
     '-vf',
     `${createBoundedEvenScaleFilter(1280, 720)},format=yuv420p`,
-    '-c:v',
-    codec
   );
-  if (String(codec).includes('nvenc')) {
-    args.push('-preset', 'p4', '-cq', '28', '-b:v', '0');
-  } else if (String(codec).includes('qsv')) {
-    args.push('-global_quality', '28');
-  } else if (String(codec).includes('amf')) {
-    args.push('-quality', 'speed', '-qp_i', '28', '-qp_p', '28');
-  } else if (isV4l2M2mCodec(codec)) {
-    args.push('-b:v', getV4l2TargetBitrate(28, codec, { preview: true }));
-  } else {
-    args.push('-preset', 'veryfast', '-crf', '28');
-  }
+  appendWhitelistedVideoEncoderArgs(args, {
+    codec,
+    quality: 28,
+    preset: 'veryfast',
+    preview: true
+  });
   args.push(
     '-c:a',
     'aac',
@@ -1657,20 +1687,13 @@ function resolveMergePixelFormat(targetVideoInfo, videoCodec) {
 }
 
 function appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, softwareThreads = 4 }) {
-  const codec = String(videoCodec || '').trim() || 'libx264';
-  args.push('-c:v', codec);
-  if (codec.includes('nvenc')) {
-    args.push('-preset', 'p5', '-cq', isHevcCodec(codec) ? '24' : '20', '-b:v', '0');
-  } else if (codec.includes('qsv')) {
-    args.push('-global_quality', isHevcCodec(codec) ? '24' : '20');
-  } else if (codec.includes('amf')) {
-    const qp = isHevcCodec(codec) ? '24' : '20';
-    args.push('-quality', 'balanced', '-qp_i', qp, '-qp_p', qp);
-  } else if (isV4l2M2mCodec(codec)) {
-    args.push('-b:v', getV4l2TargetBitrate(isHevcCodec(codec) ? 24 : 20, codec));
-  } else {
-    args.push('-preset', 'veryfast', '-crf', isHevcCodec(codec) ? '24' : '20', '-threads', String(Math.max(1, Number(softwareThreads) || 4)));
-  }
+  const codec = String(videoCodec || '').trim();
+  appendWhitelistedVideoEncoderArgs(args, {
+    codec,
+    quality: isHevcCodec(codec) ? 24 : 20,
+    preset: 'veryfast',
+    threads: softwareThreads
+  });
   if (targetVideoInfo?.colorPrimaries) args.push('-color_primaries', String(targetVideoInfo.colorPrimaries));
   if (targetVideoInfo?.colorTransfer) args.push('-color_trc', String(targetVideoInfo.colorTransfer));
   if (targetVideoInfo?.colorSpace) args.push('-colorspace', String(targetVideoInfo.colorSpace));
@@ -2242,6 +2265,7 @@ module.exports = {
   appendAvatarCompositeDeviceArgs,
   getV4l2TargetBitrate,
   getJetsonGstreamerBitrate,
+  appendWhitelistedVideoEncoderArgs,
   formatGstreamerFramerate,
   createAssFilter,
   createRecordingArgs,

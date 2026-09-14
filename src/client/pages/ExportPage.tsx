@@ -169,7 +169,7 @@ export function ExportPage({
       return;
     }
     const sceneStylePreset =
-      draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
+      draft.stylePreset === 'current' || draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
         ? draft.stylePreset
         : state.settings.sceneGraphDefaultStyle;
     void recorder
@@ -911,7 +911,7 @@ export function ExportPage({
             onClick={() =>
               run('scene-tracks', async () => {
                 const sceneStylePreset =
-                  draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
+                  draft.stylePreset === 'current' || draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
                     ? draft.stylePreset
                     : state.settings.sceneGraphDefaultStyle;
                 const sceneTracks = await recorder.prepareSceneTracks({
@@ -933,7 +933,7 @@ export function ExportPage({
             }
           >
             <FileVideo size={18} />
-            生成三套 Scene 轨 + MKV
+            生成四套 Scene 轨 + MKV
           </button>
           {sceneTracksMessage ? <p className="field-help">{sceneTracksMessage}</p> : null}
           {exportBlockReason ? (

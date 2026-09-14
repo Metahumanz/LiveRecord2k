@@ -75,10 +75,10 @@ test('Scene Graph is the canonical layout for Web, ASS, CUDA and Jetson targets'
   assert.ok(ass.degradedEffects.includes('shadow'));
 
   const tracks = createSceneAssTracks(events, {
-    presets: ['h5-card', 'bubble', 'minimal'],
+    presets: ['current', 'h5-card', 'bubble', 'minimal'],
     videoInfo: { width: 1280, height: 720 }
   });
-  assert.deepEqual(Object.keys(tracks).sort(), ['bubble', 'h5-card', 'minimal']);
+  assert.deepEqual(Object.keys(tracks).sort(), ['bubble', 'current', 'h5-card', 'minimal']);
   for (const track of Object.values(tracks)) assert.match(track.ass, /\[Events\]/);
 
   const targets = ['software', 'cuda', 'jetson'];
@@ -119,6 +119,17 @@ test('Scene Graph is the canonical layout for Web, ASS, CUDA and Jetson targets'
   assert.equal(filter.plan.metadata.avoidsAssVideoIntermediate, true);
   assert.equal(filter.plan.metadata.avoidsTransparentVideoIntermediate, true);
 
+  const leadingFilter = createSceneFilterScript(clipped, {
+    duration: 8,
+    outputDuration: 8,
+    leadingVideoPaddingSec: 1.019,
+    fps: 30,
+    target: 'jetson'
+  });
+  assert.match(leadingFilter.script, /color=c=black:s=/);
+  assert.match(leadingFilter.script, /concat=n=2:v=1:a=0,trim=duration=8/);
+  assert.doesNotMatch(leadingFilter.script, /tpad=/);
+
   const remuxArgs = createSceneAssRemuxArgs({
     cleanPath: 'source.clean.mp4',
     assPath: 'scene.h5-card.ass',
@@ -151,7 +162,7 @@ test('Scene Graph is the canonical layout for Web, ASS, CUDA and Jetson targets'
   }
 });
 
-test('three Scene ASS tracks remux the original audio and video into MKV with stream copy', async () => {
+test('four Scene ASS tracks retain the original style and remux original audio/video into MKV with stream copy', async () => {
   const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-scene-remux-'));
   try {
     const cleanPath = path.join(temporaryDirectory, 'source.clean.mp4');
@@ -192,7 +203,7 @@ test('three Scene ASS tracks remux the original audio and video into MKV with st
       { cleanPath, danmakuPath, durationSec: 2, videoInfo: { width: 640, height: 360, fps: 30 } },
       { stylePreset: 'bubble', remux: true, remuxPath, videoInfo: { width: 640, height: 360, fps: 30 } }
     );
-    assert.deepEqual(result.tracks.map((track) => track.preset).sort(), ['bubble', 'h5-card', 'minimal']);
+    assert.deepEqual(result.tracks.map((track) => track.preset).sort(), ['bubble', 'current', 'h5-card', 'minimal']);
     for (const track of result.tracks) assert.ok((await fs.stat(track.assPath)).size > 80);
     const media = await probeMediaFileInfo(ffmpegPath, result.remuxPath);
     assert.ok(media.videoInfo, 'remux retains the original video stream');

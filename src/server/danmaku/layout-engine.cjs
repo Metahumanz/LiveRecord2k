@@ -37,7 +37,9 @@ const DEFAULT_STYLE = {
   visualPreset: 'current'
 };
 
-const SCENE_STYLE_PRESETS = ['h5-card', 'bubble', 'minimal'];
+// Keep the legacy/default rolling style in the Scene Graph.  The three
+// side-stream styles are additions, not replacements.
+const SCENE_STYLE_PRESETS = ['current', 'h5-card', 'bubble', 'minimal'];
 const MESSAGE_ANIMATION_SEC = 0.25;
 const MAX_SCENE_DURATION_SEC = 86400;
 
@@ -581,7 +583,7 @@ class LayoutEngine {
       .filter((event) => this.overlayMode === 'danmaku' ? event.type === 'danmaku' : true)
       .map((event) => Object.assign({}, event, { videoTime: eventTime(event), time: eventTime(event) }))
       .sort((left, right) => eventTime(left) - eventTime(right));
-    const sideStream = SCENE_STYLE_PRESETS.includes(this.style.visualPreset);
+    const sideStream = this.style.visualPreset !== 'current' && SCENE_STYLE_PRESETS.includes(this.style.visualPreset);
     const entries = sideStream
       ? layoutMessages(sorted, this.style, true)
       : layoutRolling(sorted, this.style, this.displayArea).concat(layoutMessages(sorted.filter((event) => event.type !== 'danmaku'), this.style, false));

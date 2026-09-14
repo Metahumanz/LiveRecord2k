@@ -31,13 +31,13 @@ class SettingsService {
       // cache-only 是低性能设备的旁路模式：录制时只追加 Scene Graph 缓存，
       // 不触发视频解码、编码或烧录。
       sceneGraphCaptureMode: 'cache-and-export',
-      sceneGraphDefaultStyle: 'h5-card',
+      sceneGraphDefaultStyle: 'current',
       burnOverlayMode: 'danmaku-gift',
       burnDanmakuArea: 'half',
-      burnDanmakuStylePreset: 'h5-card',
+      burnDanmakuStylePreset: 'current',
       burnDanmakuStyleLayout: {},
       burnAvatarMode: 'high',
-      burnCodec: 'libx265',
+      burnCodec: '',
       burnCrf: 24,
       notifyLiveStarted: true,
       notifyLiveEnded: true,
@@ -66,11 +66,13 @@ class SettingsService {
     const burnCodec = Number(this.owner.ffmpegCapabilities?.probedAt || 0) > 0
       ? this.owner.chooseBurnCodec(settings.burnCodec)
       : this.normalizeBurnCodec(settings.burnCodec);
-    const sceneGraphDefaultStyle = ['h5-card', 'bubble', 'minimal'].includes(settings.sceneGraphDefaultStyle)
-      ? settings.sceneGraphDefaultStyle
-      : 'h5-card';
     const requestedBurnStyle = this.normalizeDanmakuStylePreset(settings.burnDanmakuStylePreset);
-    const burnDanmakuStylePreset = ['h5-card', 'bubble', 'minimal'].includes(requestedBurnStyle)
+    const sceneGraphDefaultStyle = ['current', 'h5-card', 'bubble', 'minimal'].includes(settings.sceneGraphDefaultStyle)
+      ? settings.sceneGraphDefaultStyle
+      // Configurations created before Scene Graph did not have its separate
+      // default. Preserve their existing selected visual style during migration.
+      : requestedBurnStyle;
+    const burnDanmakuStylePreset = ['current', 'h5-card', 'bubble', 'minimal'].includes(requestedBurnStyle)
       ? requestedBurnStyle
       : sceneGraphDefaultStyle;
     return {
@@ -276,7 +278,7 @@ class SettingsService {
       burnDanmakuArea: ['quarter', 'half', 'three-quarter', 'no-overlap', 'unlimited'],
       burnAvatarMode: ['off', 'limited', 'high'],
       sceneGraphCaptureMode: ['cache-only', 'cache-and-export'],
-      sceneGraphDefaultStyle: ['h5-card', 'bubble', 'minimal'],
+      sceneGraphDefaultStyle: ['current', 'h5-card', 'bubble', 'minimal'],
       serverHost: ['127.0.0.1', '0.0.0.0', 'localhost', '::']
     };
     for (const [key, values] of Object.entries(enumValues)) {

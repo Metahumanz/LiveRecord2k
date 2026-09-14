@@ -95,6 +95,7 @@ async function populatePayload(targetRoot, { version, packageType, arch, serverB
   await fsp.cp(path.join(root, 'dist'), path.join(appDir, 'dist'), { recursive: true });
   await fsp.cp(path.join(root, 'assets'), path.join(appDir, 'assets'), { recursive: true });
   await fsp.copyFile(process.execPath, path.join(binDir, 'node'));
+  await copyBundledArm64SceneGraphFfmpeg(binDir, arch);
   await copyExecutable(path.join(packagingRoot, 'linux-update.cjs'), path.join(appDir, 'linux-update.cjs'));
   await copyTextFile(path.join(packagingRoot, 'update-public-key.pem'), path.join(appDir, 'update-public-key.pem'), 0o644);
   await copyExecutable(path.join(packagingRoot, 'provision.sh'), path.join(appDir, 'provision.sh'));
@@ -149,6 +150,19 @@ async function copyTextFile(source, target, mode) {
   const body = (await fsp.readFile(source, 'utf8')).replace(/\r\n/g, '\n');
   await fsp.writeFile(target, body, { encoding: 'utf8', mode });
   await fsp.chmod(target, mode);
+}
+
+async function copyBundledArm64SceneGraphFfmpeg(binDir, arch) {
+  if (arch !== 'arm64') return;
+  const sourceDir = path.join(root, 'assets', 'ffmpeg', 'linux-arm64');
+  for (const [sourceName, targetName] of [['ffmpeg', 'ffmpeg-full'], ['ffprobe', 'ffprobe-full']]) {
+    const source = path.join(sourceDir, sourceName);
+    if (!fs.existsSync(source)) {
+      throw new Error(`ARM64 Linux 安装包缺少内置完整 FFmpeg：${source}`);
+    }
+    await fsp.copyFile(source, path.join(binDir, targetName));
+    await fsp.chmod(path.join(binDir, targetName), 0o755);
+  }
 }
 
 function normalizeNodeArch(value) {

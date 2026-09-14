@@ -1,10 +1,15 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 const {
   SELF_TEST_LEAD_INS,
   STAGE_LABELS,
+  REQUIRED_SCENE_FILTERS,
+  createSelfTestSceneGraph,
   createJetsonSelfTestPlan,
   createJetsonStageResults,
+  resolveFfprobePath,
   runJetsonEndToEndSelfTest
 } = require('../src/server/recording/jetson-self-test.cjs');
 
@@ -13,7 +18,7 @@ test('Jetson end-to-end self-test always covers H.264/HEVC plans and both requir
   assert.deepEqual(createJetsonSelfTestPlan('h264_nvv4l2'), {
     codec: 'h264_nvv4l2',
     sourceCodec: 'h264',
-    sourceEncoder: 'libx264',
+    sampleFile: 'h264-sample.mp4',
     nativeDecoder: 'h264_nvv4l2dec',
     encoderElement: 'nvv4l2h264enc',
     parserElement: 'h264parse',
@@ -22,6 +27,25 @@ test('Jetson end-to-end self-test always covers H.264/HEVC plans and both requir
   assert.equal(createJetsonSelfTestPlan('hevc_nvv4l2').sourceCodec, 'hevc');
   assert.equal(createJetsonSelfTestPlan('hevc_nvv4l2').nativeDecoder, 'hevc_nvv4l2dec');
   assert.deepEqual(Object.keys(createJetsonStageResults()), Object.keys(STAGE_LABELS));
+  assert.equal(Object.hasOwn(createJetsonStageResults(), 'cpuDecode'), true);
+  assert.ok(REQUIRED_SCENE_FILTERS.includes('movie'));
+  assert.ok(REQUIRED_SCENE_FILTERS.includes('concat'));
+  const bundledFfmpegPath = path.join(__dirname, '..', 'build', 'ffmpeg-full');
+  const bundledFfprobePath = path.join(__dirname, '..', 'build', 'ffprobe-full');
+  fs.writeFileSync(bundledFfprobePath, 'probe');
+  try {
+    assert.equal(resolveFfprobePath(bundledFfmpegPath), bundledFfprobePath);
+  } finally {
+    fs.rmSync(bundledFfprobePath, { force: true });
+  }
+  assert.equal(fs.statSync(path.join(__dirname, '..', 'assets', 'jetson-self-test', 'h264-sample.mp4')).size > 1024, true);
+  assert.equal(fs.statSync(path.join(__dirname, '..', 'assets', 'jetson-self-test', 'hevc-sample.mp4')).size > 1024, true);
+  const graph = createSelfTestSceneGraph({ width: 320, height: 180, fps: 30 }, 'avatar.png');
+  const types = new Set(graph.objects.map((object) => object.type));
+  for (const type of ['Text', 'Avatar', 'Card', 'SuperChat', 'Gift']) assert.ok(types.has(type), 'missing Scene object ' + type);
+  const implementation = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'recording', 'jetson-self-test.cjs'), 'utf8');
+  assert.match(implementation, /CPU 解码回退/);
+  assert.doesNotMatch(implementation, /'-filters'/);
 });
 
 test('non-Jetson hosts never mark nvv4l2 as burn-ready', async () => {
