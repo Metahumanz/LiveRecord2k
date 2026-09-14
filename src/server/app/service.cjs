@@ -803,13 +803,6 @@ function createCpuAvatarCompositeFallbackLayer(layer) {
   };
 }
 
-function isFfmpegHardwareEncodeError(error) {
-  const detail = `${error?.ffmpegStderr || ''}\n${error?.message || ''}`;
-  return /(?:nvenc|qsv|amf|no capable devices|cannot load nvcuda|initializeencoder|initialiseencoder|error while opening encoder|failed to create.*(?:encoder|session)|hardware encoder)/i.test(
-    detail
-  );
-}
-
 function finiteTimelineValue(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
@@ -1456,8 +1449,7 @@ class LiveRecordService {
   }
 
   getAvailableBurnCodecs() {
-    const codecs = (this.ffmpegCapabilities?.burnCodecs || []).map((codec) => codec.value).filter(Boolean);
-    return codecs.length ? codecs : ['libx265', 'libx264'];
+    return (this.ffmpegCapabilities?.burnCodecs || []).map((codec) => codec.value).filter(Boolean);
   }
 
   chooseBurnCodec(value) {
@@ -1465,15 +1457,23 @@ class LiveRecordService {
     const burnCodec = normalizeBurnCodec(rawCodec);
     const availableBurnCodecs = this.getAvailableBurnCodecs();
     const availableSet = new Set(availableBurnCodecs);
-    const preferredHardwareCodec = this.getPreferredHardwareBurnCodec();
-    const stillDefaultSoftware = !rawCodec || burnCodec === 'libx265';
-    if (preferredHardwareCodec && stillDefaultSoftware) {
-      return preferredHardwareCodec;
-    }
-    if (availableBurnCodecs.length && !availableSet.has(burnCodec)) {
-      return preferredHardwareCodec || availableBurnCodecs[0];
-    }
-    return burnCodec;
+    if (burnCodec && availableSet.has(burnCodec)) return burnCodec;
+    // An empty selection may choose only from the already-probed set. A
+    // stale/manual selection is never silently replaced by a fallback codec.
+    if (!rawCodec) return this.getPreferredHardwareBurnCodec() || availableBurnCodecs[0] || '';
+    return '';
+  }
+
+  requireAvailableBurnCodec(codec, action = '烧录') {
+    const value = String(codec || '').trim();
+    if (this.getAvailableBurnCodecs().includes(value)) return value;
+    const unavailable = (this.ffmpegCapabilities?.unavailableBurnCodecs || []).find((item) => item.value === value);
+    const detail = unavailable?.reason ? `：${unavailable.reason}` : '';
+    throw businessError(
+      'BURN_CODEC_UNAVAILABLE',
+      `${action}没有可用的、已通过能力探测的编码器${value ? `（${value}）` : ''}${detail}。请在维护页完成探测后选择可用编码器。`,
+      409
+    );
   }
 
   getPreferredHardwareBurnCodec() {
@@ -1577,7 +1577,7 @@ class LiveRecordService {
     // preserve the source-size render graph.  The lightweight HLS preview
     // remains an FFmpeg pipeline, so do not hand it an encoder name that
     // belongs exclusively to gst-launch.
-    return ['h264_nvenc', 'h264_v4l2m2m', 'h264_qsv', 'h264_amf', 'libx264'].find((codec) => available.has(codec)) || 'libx264';
+    return ['h264_nvenc', 'h264_v4l2m2m', 'h264_qsv', 'h264_amf', 'libx264'].find((codec) => available.has(codec)) || '';
   }
 
   getHardwareDecoder(videoInfo, encoderCodec = '') {
@@ -3762,6 +3762,7 @@ try {
     const durationSec = await this.resolveRecordingDuration({ cleanPath: sourcePath }, mediaInfo).catch(() => mediaInfo.durationSec || 0);
     await this.waitForRuntimeCapabilities();
     const previewCodec = this.getPreviewCodec();
+    this.requireAvailableBurnCodec(previewCodec, '兼容预览');
     const previewCodecInfo = this.getBurnCodecInfo(previewCodec);
     const previewDecoder = this.getHardwareDecoder(mediaInfo.videoInfo, previewCodec);
     const progress = createFfmpegJobProgress({
@@ -3862,13 +3863,6 @@ try {
               'warn',
               `兼容预览的 ${activeDecoder.label} 硬件解码不支持当前视频，立即改用 CPU 解码：${compactLogLine(error.message)}`
             );
-            activeDecoder = { value: 'software', label: 'CPU', kind: 'software' };
-          } else if (!activeCodec.includes('libx') && isFfmpegHardwareEncodeError(error)) {
-            this.log(
-              'warn',
-              `兼容预览的硬件 H.264 编码不可用，立即改用 libx264：${compactLogLine(error.message)}`
-            );
-            activeCodec = 'libx264';
             activeDecoder = { value: 'software', label: 'CPU', kind: 'software' };
           } else {
             throw error;
@@ -8847,6 +8841,7 @@ try {
       try {
         await this.waitForRuntimeCapabilities();
         const codec = this.chooseBurnCodec(item.options.codec || this.settings.burnCodec);
+        this.requireAvailableBurnCodec(codec, '弹幕烧录');
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'burn',
@@ -10088,6 +10083,7 @@ try {
     }
     await this.waitForRuntimeCapabilities();
     const burnCodec = this.chooseBurnCodec(options.codec || this.settings.burnCodec);
+    this.requireAvailableBurnCodec(burnCodec, '自动弹幕烧录');
     const burnCrf = clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35);
 
     let avatarLayer = null;
@@ -10944,6 +10940,7 @@ try {
           return;
         }
         const codec = this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
+        if (item.mode === 'burn') this.requireAvailableBurnCodec(codec, '片段烧录');
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'export',
@@ -11201,6 +11198,7 @@ try {
     }
     const mode = normalizeExportMode(options.mode);
     const burnCodec = mode === 'burn' ? this.chooseBurnCodec(options.codec || this.settings.burnCodec) : '';
+    if (mode === 'burn') this.requireAvailableBurnCodec(burnCodec, '片段烧录');
     const burnCrf = clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
@@ -11770,7 +11768,12 @@ try {
         : ['h264_nvenc', 'h264_nvv4l2', 'h264_v4l2m2m', 'h264_qsv', 'h264_amf'];
     const hardware = hardwareCandidates.find((codec) => available.has(codec)) || '';
     const software = hevc ? 'libx265' : 'libx264';
-    return { preferred: hardware || software, fallback: hardware ? software : '', software, tenBit };
+    const probedSoftware = available.has(software) ? software : '';
+    const preferred = hardware || probedSoftware;
+    if (!preferred) {
+      throw businessError('BURN_CODEC_UNAVAILABLE', '合并需要重编码，但没有通过能力探测的可用编码器。', 409);
+    }
+    return { preferred, fallback: hardware && probedSoftware ? probedSoftware : '', software: probedSoftware, tenBit };
   }
 
   async requestManagedLinuxUpdate(manifest, packagePath) {
@@ -11793,6 +11796,22 @@ try {
     return candidates.find((candidate) => {
       try {
         return fs.statSync(candidate).isFile();
+      } catch {
+        return false;
+      }
+    }) || '';
+  }
+
+  getJetsonSelfTestSamplePath(codec) {
+    const family = isHevcCodec(codec) ? 'hevc' : 'h264';
+    const fileName = family + '-sample.mp4';
+    const candidates = [
+      path.join(APP_ROOT, 'assets', 'jetson-self-test', fileName),
+      path.join(APP_ROOT, 'public', 'jetson-self-test', fileName)
+    ];
+    return candidates.find((candidate) => {
+      try {
+        return fs.statSync(candidate).isFile() && fs.statSync(candidate).size >= 1024;
       } catch {
         return false;
       }
@@ -11823,6 +11842,7 @@ try {
       ffmpegPath: this.ffmpegPath,
       converter: codecInfo?.converter,
       builtInAvatarPath: this.getJetsonSelfTestBuiltInAvatarPath(),
+      samplePath: this.getJetsonSelfTestSamplePath(codecInfo?.value),
       remoteAvatarUrl: `bilibili:uid:${JETSON_SELF_TEST_AVATAR_UID}`,
       downloadAvatar: () => this.fetchJetsonSelfTestAvatar(),
       runProcess: runCapturedProcess
@@ -11844,6 +11864,7 @@ try {
     const run = async () => {
       await this.waitForRuntimeCapabilities();
       const codec = this.chooseBurnCodec(this.settings.burnCodec);
+      this.requireAvailableBurnCodec(codec, '硬件自检');
       const codecInfo = this.getBurnCodecInfo(codec);
       const decoder = (this.ffmpegCapabilities.hardwareDecoders || [])[0];
       const avatarComposite = this.getAvatarCompositeCapability();

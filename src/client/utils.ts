@@ -1,5 +1,5 @@
 import type { AppSettings, AppState, ExportDraft, FfmpegCodecOption, RecordingState, RoomState } from './types';
-import { fallbackCodecOptions, qnOptions, settingsExportKeys } from './ui/options';
+import { qnOptions, settingsExportKeys } from './ui/options';
 
 export function getStats(rooms: RoomState[]) {
   return {
@@ -149,22 +149,12 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function burnCodecOptions(detected: FfmpegCodecOption[] | undefined, selected: string) {
-  const options = detected?.length ? detected : fallbackCodecOptions;
-  if (selected && !options.some((option) => option.value === selected)) {
-    return [
-      ...options,
-      {
-        value: selected,
-        label: `${selected}（当前不可用）`,
-        kind: 'software' as const,
-        reason: '当前 ffmpeg 环境未通过探测'
-      }
-    ];
-  }
-  return options;
+  void selected;
+  return detected || [];
 }
 
 export function burnCodecSummary(options: FfmpegCodecOption[]) {
+  if (!options.length) return '未探测到可用编码器；烧录、预览和需转码合并已禁用。';
   const hardware = options.filter((option) => option.kind === 'hardware');
   const software = options.filter((option) => option.kind === 'software');
   if (hardware.length) {

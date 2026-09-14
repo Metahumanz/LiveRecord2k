@@ -10,6 +10,8 @@ const {
   createJetsonGstreamerEncodeArgs,
   runFfmpegToGstreamerJob
 } = require('./ffmpeg.cjs');
+const { buildSceneGraph } = require('../danmaku/scene-graph.cjs');
+const { writeSceneFilterScript } = require('../danmaku/scene-renderer.cjs');
 
 const SOURCE_DURATION_SEC = 2.5;
 const SELF_TEST_LEAD_INS = [0, 1.019];
@@ -17,6 +19,7 @@ const STAGE_LABELS = {
   nativeDecode: '原生解码',
   assLibass: 'ASS + libass',
   font: '真实字体',
+  sceneFilters: 'Scene Graph 滤镜',
   leadingFilter: '前导滤镜',
   avatarImage: '头像图片处理',
   rawBridge: 'FFmpeg → I420 raw bridge',
@@ -55,12 +58,32 @@ function createJetsonSelfTestPlan(codec) {
   return {
     codec: value,
     sourceCodec: hevc ? 'hevc' : 'h264',
-    sourceEncoder: hevc ? 'libx265' : 'libx264',
+    sampleFile: hevc ? 'hevc-sample.mp4' : 'h264-sample.mp4',
     nativeDecoder: hevc ? 'hevc_nvv4l2dec' : 'h264_nvv4l2dec',
     encoderElement: hevc ? 'nvv4l2h265enc' : 'nvv4l2h264enc',
     parserElement: hevc ? 'h265parse' : 'h264parse',
     encodedExtension: hevc ? 'h265' : 'h264'
   };
+}
+
+const REQUIRED_SCENE_FILTERS = ['drawtext', 'overlay', 'scale', 'geq', 'color', 'movie', 'boxblur', 'trim', 'concat', 'setpts', 'settb', 'format'];
+
+function createSelfTestSceneGraph(videoInfo, avatarPath) {
+  return buildSceneGraph(
+    [
+      { type: 'danmaku', time: 0.15, uid: 901, user: 'Scene文字', text: 'Jetson Scene Graph 文字', color: 0xffffff, avatarUrl: 'builtin:avatar' },
+      { type: 'superchat', time: 0.45, uid: 901, user: 'Scene卡片', text: 'Scene Graph 卡片与动画', price: 30, avatarUrl: 'builtin:avatar' },
+      { type: 'gift', time: 1.1, uid: 901, user: 'Scene头像', giftName: '测试礼物', count: 1, price: 1, avatarUrl: 'builtin:avatar' }
+    ],
+    {
+      stylePreset: 'h5-card',
+      overlayMode: 'danmaku-gift',
+      danmakuArea: 'half',
+      videoInfo,
+      durationSec: SOURCE_DURATION_SEC,
+      avatarAssets: { 901: { path: avatarPath } }
+    }
+  );
 }
 
 function createProbeAss(fontFamily) {
@@ -171,7 +194,7 @@ async function runJetsonEndToEndSelfTest(options = {}) {
   const result = { ok: false, codec: plan.codec, converter: '', stages, reason: '' };
   const finish = () => {
     result.reason = summarizeJetsonStages(stages);
-    const required = ['nativeDecode', 'assLibass', 'font', 'leadingFilter', 'rawBridge', 'nvvidconv', 'nvv4l2Encoder', 'parser', 'finalMux'];
+    const required = ['nativeDecode', 'assLibass', 'font', 'sceneFilters', 'leadingFilter', 'rawBridge', 'nvvidconv', 'nvv4l2Encoder', 'parser', 'finalMux'];
     result.ok = required.every((key) => stages[key]?.status === 'passed');
     if (!result.reason && !result.ok) result.reason = 'Jetson 端到端烧录自检未完整通过。';
     return result;
@@ -199,9 +222,17 @@ async function runJetsonEndToEndSelfTest(options = {}) {
     return finish();
   }
 
+  const sourcePath = String(options.samplePath || '').trim();
+  if ((await fileSize(sourcePath)) < 1024) {
+    setStage(stages.nativeDecode, 'failed', `未找到内置 ${plan.sourceCodec.toUpperCase()} 测试样本：${sourcePath || plan.sampleFile}`);
+    for (const [key, stage] of Object.entries(stages)) {
+      if (key !== 'nativeDecode') setStage(stage, 'skipped', '缺少安装包内置测试样本，未启动自检');
+    }
+    return finish();
+  }
   const temporaryDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-jetson-e2e-'));
-  const sourcePath = path.join(temporaryDir, 'source-' + plan.sourceCodec + '.mp4');
   const assPath = path.join(temporaryDir, 'probe.ass');
+  const sceneFilterPath = path.join(temporaryDir, 'scene.filter');
   try {
     let font = null;
     try {
@@ -214,15 +245,10 @@ async function runJetsonEndToEndSelfTest(options = {}) {
 
     try {
       await runCommand(runProcess, ffmpegPath, [
-        '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30',
-        '-f', 'lavfi', '-i', 'sine=frequency=880:sample_rate=48000', '-t', String(SOURCE_DURATION_SEC),
-        '-shortest', '-c:v', plan.sourceEncoder, '-pix_fmt', 'yuv420p', '-c:a', 'aac', sourcePath
-      ], { label: plan.sourceCodec.toUpperCase() + ' 测试源生成' });
-      await runCommand(runProcess, ffmpegPath, [
         '-hide_banner', '-loglevel', 'error', '-c:v', plan.nativeDecoder, '-i', sourcePath,
         '-frames:v', '1', '-f', 'null', '-'
       ], { label: plan.nativeDecoder + ' 原生解码' });
-      setStage(stages.nativeDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 2.5 秒测试源已由 ' + plan.nativeDecoder + ' 解码');
+      setStage(stages.nativeDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 内置 2.5 秒测试样本已由 ' + plan.nativeDecoder + ' 解码');
     } catch (error) {
       setStage(stages.nativeDecode, 'failed', error.message);
     }
@@ -239,6 +265,40 @@ async function runJetsonEndToEndSelfTest(options = {}) {
       }
     } else {
       setStage(stages.assLibass, 'skipped', '原生解码或字体阶段未通过');
+    }
+
+    try {
+      const filterList = await runCommand(runProcess, ffmpegPath, ['-hide_banner', '-filters'], {
+        timeoutMs: 10_000,
+        label: 'FFmpeg Scene Graph 滤镜列表'
+      });
+      const output = String(filterList.stdout || '') + '\n' + String(filterList.stderr || '');
+      const missing = REQUIRED_SCENE_FILTERS.filter((name) => !new RegExp('\\b' + name + '\\b', 'i').test(output));
+      setStage(
+        stages.sceneFilters,
+        missing.length ? 'failed' : 'passed',
+        missing.length ? '缺少 Scene Graph 所需滤镜：' + missing.join('、') : 'Scene Graph 所需滤镜均可用：' + REQUIRED_SCENE_FILTERS.join('、'),
+        { required: REQUIRED_SCENE_FILTERS, missing }
+      );
+    } catch (error) {
+      setStage(stages.sceneFilters, 'failed', error.message, { required: REQUIRED_SCENE_FILTERS });
+    }
+
+    let sceneLayer = null;
+    const builtInSceneAvatarPath = String(options.builtInAvatarPath || '').trim();
+    if (stages.nativeDecode.status === 'passed' && (await fileSize(builtInSceneAvatarPath)) > 0) {
+      try {
+        const graph = createSelfTestSceneGraph({ width: 320, height: 180, fps: 30 }, builtInSceneAvatarPath);
+        sceneLayer = await writeSceneFilterScript(sceneFilterPath, graph, {
+          duration: SOURCE_DURATION_SEC,
+          fps: 30,
+          target: 'jetson'
+        });
+      } catch (error) {
+        setStage(stages.sceneFilters, 'failed', 'Scene Graph → scene.filter 失败：' + error.message);
+      }
+    } else if (stages.sceneFilters.status === 'passed') {
+      setStage(stages.sceneFilters, 'failed', 'Scene Graph 缺少可用的内置头像资源，无法生成包含头像的 scene.filter。');
     }
 
     const inspect = async (element, stage) => {
@@ -325,8 +385,8 @@ async function runJetsonEndToEndSelfTest(options = {}) {
       setStage(stages.avatarImage, 'skipped', 'ASS 或测试视频未通过，无法执行头像 overlay', avatarChecks);
     }
 
-    const pipelineReady = rawParserReady && Boolean(converter) && encoderReady && parserReady &&
-      stages.nativeDecode.status === 'passed' && stages.assLibass.status === 'passed';
+    const pipelineReady = rawParserReady && Boolean(converter) && encoderReady && parserReady && Boolean(sceneLayer?.filterScriptPath) &&
+      stages.nativeDecode.status === 'passed' && stages.assLibass.status === 'passed' && stages.sceneFilters.status === 'passed';
     const leadResults = {};
     if (pipelineReady) {
       for (const leadIn of SELF_TEST_LEAD_INS) {
@@ -341,7 +401,7 @@ async function runJetsonEndToEndSelfTest(options = {}) {
           await runFfmpegToGstreamerJob({
             ffmpegPath,
             ffmpegArgs: createBurnRawVideoArgs({
-              cleanPath: sourcePath, assPath, fps: 30, duration: outputDuration, decoder: plan.nativeDecoder,
+              cleanPath: sourcePath, assPath: '', avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath }, fps: 30, duration: outputDuration, decoder: plan.nativeDecoder,
               sourceCodec: plan.sourceCodec, timelineOffset: leadIn, leadingVideoPaddingSec: leadIn, videoWidth: 320, videoHeight: 180
             }),
             gstreamerArgs,
@@ -404,7 +464,13 @@ async function runJetsonEndToEndSelfTest(options = {}) {
         if (stage.status === 'pending') setStage(stage, 'skipped', '前置阶段未通过，未启动端到端管线');
       }
       for (const stage of [stages.nvvidconv, stages.nvv4l2Encoder, stages.parser]) {
-        if (stage.status === 'pending') setStage(stage, 'skipped', 'GStreamer 元素预检未通过');
+        if (stage.status === 'pending') {
+          setStage(
+            stage,
+            'skipped',
+            `${stage.message || 'GStreamer 元素已预检'}；原生解码、ASS 或 Scene Graph 前置阶段未通过，未运行端到端验证`
+          );
+        }
       }
     }
     return finish();
@@ -417,8 +483,10 @@ module.exports = {
   SOURCE_DURATION_SEC,
   SELF_TEST_LEAD_INS,
   STAGE_LABELS,
+  REQUIRED_SCENE_FILTERS,
   createJetsonStageResults,
   createJetsonSelfTestPlan,
+  createSelfTestSceneGraph,
   summarizeJetsonStages,
   runJetsonEndToEndSelfTest
 };

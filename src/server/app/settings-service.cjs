@@ -37,7 +37,7 @@ class SettingsService {
       burnDanmakuStylePreset: 'current',
       burnDanmakuStyleLayout: {},
       burnAvatarMode: 'high',
-      burnCodec: 'libx265',
+      burnCodec: '',
       burnCrf: 24,
       notifyLiveStarted: true,
       notifyLiveEnded: true,

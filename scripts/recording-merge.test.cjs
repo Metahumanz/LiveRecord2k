@@ -206,7 +206,10 @@ test('旧版 FFmpeg 兼容缩放不依赖 force_divisible_by，并保持偶数�
   const previewArgs = createPreviewHlsArgs({
     inputPath: 'source.mp4',
     playlistPath: 'preview.m3u8',
-    segmentPattern: 'preview-%03d.ts'
+    segmentPattern: 'preview-%03d.ts',
+    // The preview builder deliberately has no implicit software-codec
+    // fallback; this test is only about the scale expression.
+    codec: 'libx264'
   });
   assert.equal(previewArgs[previewArgs.indexOf('-vf') + 1], `${scaleFilter},format=yuv420p`);
 

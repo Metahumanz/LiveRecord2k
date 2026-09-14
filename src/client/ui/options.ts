@@ -18,11 +18,6 @@ export const qnOptions = [
   { label: '高清', value: 150 }
 ];
 
-export const fallbackCodecOptions: FfmpegCodecOption[] = [
-  { label: 'H.265 软件编码', value: 'libx265', kind: 'software' },
-  { label: 'H.264 软件编码', value: 'libx264', kind: 'software' }
-];
-
 export const containerOptions = [
   { label: 'MP4', value: 'mp4' },
   { label: 'MKV', value: 'mkv' }
