@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { Clock3, Cpu, Download, FolderOpen, HardDrive, Power, RefreshCw, Trash2, Upload } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { PageHeader, PathLine, SettingPanel, Toggle, UpdateProgress } from '../components/common';
-import type { AppSettings, AppState, CleanupScanResult } from '../types';
+import type { AppSettings, AppState, CapabilityStage, CleanupScanResult } from '../types';
 import {
   ffmpegCodecSummary,
   formatFileSize,
@@ -16,6 +16,19 @@ import {
 import changelogText from '../../../CHANGELOG.md?raw';
 
 const changelogEntries = parseChangelog(changelogText);
+
+function capabilityStageStatus(stage: CapabilityStage) {
+  switch (stage.status) {
+    case 'passed':
+      return '通过';
+    case 'failed':
+      return '失败';
+    case 'skipped':
+      return '跳过';
+    default:
+      return '等待';
+  }
+}
 
 export function MaintenancePage({
   state,
@@ -64,6 +77,7 @@ export function MaintenancePage({
     .filter((codec) => codec.kind === 'hardware')
     .map((codec) => `${codec.label}：${codec.reason || '不可用'}`)
     .join('；');
+  const jetsonBurnTests = Object.values(state.ffmpegCapabilities?.jetsonBurnTests || {});
 
   function updateSetting(nextSettings: Partial<AppSettings>, saveMode: 'immediate' | 'debounced' | 'commit' = 'immediate') {
     updateSettingsDraft(nextSettings, { saveMode });
@@ -445,9 +459,24 @@ export function MaintenancePage({
             value={`${currentCodec?.kind === 'hardware' ? '硬件' : '软件'} ${state.settings.burnCodec}`}
           />
           <PathLine label="不可用硬编" value={unavailableCodecText || '无'} />
+          {jetsonBurnTests.length ? (
+            <div className="maintenance-section">
+              <h3>Jetson 端到端烧录自检</h3>
+              <p className="field-help">每种 H.264/H.265 后端均以真实 ASS、字体、头像、0 秒和 1.019 秒前导跑完 I420 bridge、nvv4l2、最终 mux 与 ffprobe；头像失败只回退通用头像。</p>
+              {jetsonBurnTests.map((probe) => (
+                <div key={probe.codec} className={`inline-status ${probe.ok ? '' : 'error'}`} title={probe.reason || ''}>
+                  <strong>{probe.codec}：{probe.ok ? '烧录可用' : '不可用'}</strong>
+                  {Object.entries(probe.stages || {}).map(([key, stage]) => (
+                    <span key={key} title={stage.message}>{stage.label}：{capabilityStageStatus(stage)}</span>
+                  ))}
+                  {probe.reason ? <span>详情：{probe.reason}</span> : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
           <div className="maintenance-section">
             <h3>硬件加速自检</h3>
-            <p className="field-help">使用 90 帧合成画面验证当前编码后端，并单独验证 CUDA 真实头像合成；不会写入录像目录，通常约 5–10 秒。</p>
+            <p className="field-help">验证当前编码后端与头像合成。Jetson 会重跑完整 FFmpeg → I420 → nvv4l2 → mux → ffprobe 链路；不会写入录像目录。</p>
             <button
               className="wide-button fill"
               type="button"
@@ -463,6 +492,9 @@ export function MaintenancePage({
                 <span>编码：{state.hardwareSelfTest.codec || '-'} · {state.hardwareSelfTest.encoderBackend || '-'}</span>
                 <span>解码：{state.hardwareSelfTest.decoderBackend || '-'}</span>
                 <span>头像合成：{state.hardwareSelfTest.avatarCompositeBackend || '-'}</span>
+                {Object.entries(state.hardwareSelfTest.stages || {}).map(([key, stage]) => (
+                  <span key={key} title={stage.message}>{stage.label}：{capabilityStageStatus(stage)}</span>
+                ))}
                 {state.hardwareSelfTest.fallbackReason ? <span>回退原因：{state.hardwareSelfTest.fallbackReason}</span> : null}
               </div>
             ) : null}

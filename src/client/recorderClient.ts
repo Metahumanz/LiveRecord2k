@@ -1,4 +1,4 @@
-import type { AppSettings, AppState, LogEntry, RecorderApi, RoomState } from './types';
+import type { AppSettings, AppState, LogEntry, RecorderApi, RoomState, SceneGraph, SceneTracksResult } from './types';
 
 const listeners = new Set<(state: AppState) => void>();
 let eventSource: EventSource | null = null;
@@ -57,6 +57,17 @@ export const recorder: RecorderApi = {
   cancelBurnDanmaku: (roomId) => api<AppState>('/api/rooms/burn/cancel', { roomId }),
   prepareDanmaku: (roomId, options) => api<AppState>('/api/rooms/subtitles', { roomId, options }, { timeoutMs: 180000 }),
   prepareSubtitleAssets: (request) => api('/api/export/subtitles', request, { timeoutMs: 180000 }),
+  prepareSceneTracks: (request) => api<SceneTracksResult>('/api/export/scene-tracks', request, { timeoutMs: 180000 }),
+  getSceneGraph: (request) => {
+    const params = new URLSearchParams({ cleanPath: request.cleanPath });
+    if (request.stylePreset) params.set('stylePreset', request.stylePreset);
+    if (request.overlayMode) params.set('overlayMode', request.overlayMode);
+    if (request.danmakuArea) params.set('danmakuArea', request.danmakuArea);
+    if (request.styleLayout && Object.keys(request.styleLayout).length) {
+      params.set('styleLayout', JSON.stringify(request.styleLayout));
+    }
+    return api<SceneGraph>('/api/scene?' + params.toString(), undefined, { timeoutMs: 60000 });
+  },
   exportClip: (request) => api('/api/export/clip', request),
   cancelExport: () => api<AppState>('/api/export/cancel', {}),
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}, { timeoutMs: 180000 }),

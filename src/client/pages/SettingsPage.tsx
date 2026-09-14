@@ -8,9 +8,9 @@ import {
   burnAvatarModeOptions,
   containerOptions,
   danmakuAreaOptions,
-  danmakuStylePresetOptions,
   overlayModeOptions,
-  qnOptions
+  qnOptions,
+  sceneGraphStyleOptions
 } from '../ui/options';
 import { burnCodecOptions, burnCodecSummary, formatFileSize, isBilibiliLoggedIn } from '../utils';
 
@@ -287,21 +287,10 @@ export function SettingsPage({
             <Toggle
               label="录制结束后自动生成弹幕视频"
               checked={settingsDraft.autoBurnDanmaku}
-              onChange={(checked) =>
-                updateSetting({
-                  autoBurnDanmaku: checked,
-                  deleteSourceAfterBurn: checked ? settingsDraft.deleteSourceAfterBurn : false
-                })
-              }
-            />
-            <Toggle
-              label="弹幕视频烧录完成后自动删除无弹幕源文件"
-              checked={settingsDraft.deleteSourceAfterBurn}
-              disabled={!settingsDraft.autoBurnDanmaku}
-              onChange={(checked) => updateSetting({ deleteSourceAfterBurn: checked })}
+              onChange={(checked) => updateSetting({ autoBurnDanmaku: checked })}
             />
             <p className="field-help">
-              仅自动烧录生效：有弹幕成片已验证、且续录分段清理完成后才删除无弹幕源视频；手动烧录、取消或失败都不会删除。
+              clean 视频、JSONL 弹幕文件和头像资源始终保留为原始源文件；烧录、封装和导出均不会自动删除它们。
             </p>
           </div>
 
@@ -341,22 +330,39 @@ export function SettingsPage({
             </label>
 
             <label className="field">
-              <span>默认弹幕样式</span>
+              <span>默认 Scene Graph 烧录样式</span>
               <select
-                value={settingsDraft.burnDanmakuStylePreset}
-                onChange={(event) =>
+                value={settingsDraft.sceneGraphDefaultStyle}
+                onChange={(event) => {
+                  const sceneGraphDefaultStyle = event.target.value as AppSettings['sceneGraphDefaultStyle'];
                   updateSetting({
-                    burnDanmakuStylePreset: event.target.value as AppSettings['burnDanmakuStylePreset'],
+                    sceneGraphDefaultStyle,
+                    burnDanmakuStylePreset: sceneGraphDefaultStyle,
                     burnDanmakuStyleLayout: {}
-                  })
-                }
+                  });
+                }}
               >
-                {danmakuStylePresetOptions.map((option) => (
+                {sceneGraphStyleOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
                 ))}
               </select>
+              <p className="field-help">自动烧录、片段 MP4、三套 ASS 轨和播放器都从同一 Scene Graph 样式出发。</p>
+            </label>
+
+            <label className="field">
+              <span>Scene Graph 录制模式</span>
+              <select
+                value={settingsDraft.sceneGraphCaptureMode}
+                onChange={(event) =>
+                  updateSetting({ sceneGraphCaptureMode: event.target.value as AppSettings['sceneGraphCaptureMode'] })
+                }
+              >
+                <option value="cache-and-export">缓存并允许自动处理</option>
+                <option value="cache-only">低性能：仅缓存，不解码或编码</option>
+              </select>
+              <p className="field-help">两种模式都会记录可重放的 Scene Graph 缓存；低性能模式不会自动启动烧录。</p>
             </label>
 
             <label className="field">

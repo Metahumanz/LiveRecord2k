@@ -3,6 +3,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const ffmpeg = require('ffmpeg-static');
 const { createAss } = require('../src/server/danmaku/ass.cjs');
+const { createAssFilter } = require('../src/server/recording/ffmpeg.cjs');
 
 const outDir = path.join(process.cwd(), 'smoke-output');
 const cleanPath = path.join(outDir, 'sample.clean.mp4');
@@ -92,7 +93,7 @@ async function main() {
     '-i',
     cleanPath,
     '-vf',
-    `ass='${escapeFilterPath(assPath)}'`,
+    createAssFilter(assPath),
     '-c:v',
     'libx264',
     '-preset',
@@ -137,8 +138,4 @@ function run(label, args) {
   if (result.status !== 0) {
     throw new Error(`${label} failed with code ${result.status}`);
   }
-}
-
-function escapeFilterPath(filePath) {
-  return String(filePath).replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 }

@@ -46,6 +46,89 @@ async function confirmMergedResidualCleanup(service) {
   return service.cleanupMergedSegmentResiduals({ confirm: true, scanId: scan.scanId });
 }
 
+test('avatar preparation exposes categorized fallback diagnostics without blocking export', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-diagnostics-'));
+  try {
+    const service = createService(outputDir);
+    const reports = [];
+    const layer = await service.prepareAvatarOverlayLayer(
+      {
+        panel: { left: 0, width: 80, height: 180 },
+        entries: [{ uid: 0, avatarUrl: '', size: 32, segments: [{ start: 0, end: 1, x1: 0, x2: 0, y1: 0, y2: 0 }] }]
+      },
+      {
+        assPath: path.join(outputDir, 'subtitle.ass'),
+        recording: { cleanPath: path.join(outputDir, 'source.clean.mp4') },
+        onDiagnostics: (diagnostics) => reports.push(diagnostics)
+      }
+    );
+    assert.equal(layer, null);
+    const diagnostics = reports.at(-1);
+    assert.equal(diagnostics.requested, 1);
+    assert.equal(diagnostics.prepared, 0);
+    assert.equal(diagnostics.fallback, 1);
+    assert.equal(diagnostics.noAvatarSource, 1);
+    assert.equal(diagnostics.downloadFailed, 0);
+    assert.equal(diagnostics.firstError.stage, 'source');
+    assert.match(diagnostics.firstError.stderr, /没有可用头像地址/);
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('avatar preparation distinguishes download and image-decode failures', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-diagnostic-kinds-'));
+  const avatarPlan = {
+    panel: { left: 0, width: 80, height: 180 },
+    entries: [{ uid: 42, avatarUrl: 'https://i0.hdslb.com/bfs/face/member/noface.jpg', size: 32, segments: [{ start: 0, end: 1, x1: 0, x2: 0, y1: 0, y2: 0 }] }]
+  };
+  const options = { assPath: path.join(outputDir, 'subtitle.ass'), recording: { cleanPath: path.join(outputDir, 'source.clean.mp4') } };
+  try {
+    const downloadService = createService(outputDir);
+    downloadService.fetchAvatarImageAsset = async () => {
+      throw new Error('HTTP 503 avatar upstream');
+    };
+    let downloadDiagnostics = null;
+    await downloadService.prepareAvatarOverlayLayer(avatarPlan, { ...options, onDiagnostics: (value) => { downloadDiagnostics = value; } });
+    assert.equal(downloadDiagnostics.downloadFailed, 1);
+    assert.equal(downloadDiagnostics.decodeFailed, 0);
+    assert.equal(downloadDiagnostics.firstError.stage, 'download');
+    assert.match(downloadDiagnostics.firstError.stderr, /HTTP 503/);
+
+    const decodeService = createService(outputDir);
+    decodeService.ffmpegPath = process.execPath;
+    decodeService.fetchAvatarImageAsset = async () => ({ body: Buffer.from('not an image'), contentType: 'image/png' });
+    let decodeDiagnostics = null;
+    await decodeService.prepareAvatarOverlayLayer(avatarPlan, { ...options, onDiagnostics: (value) => { decodeDiagnostics = value; } });
+    assert.equal(decodeDiagnostics.downloadFailed, 0);
+    assert.equal(decodeDiagnostics.decodeFailed, 1);
+    assert.equal(decodeDiagnostics.firstError.stage, 'decode');
+    assert.ok(decodeDiagnostics.firstError.stderr.length > 0);
+
+    const cropService = createService(outputDir);
+    cropService.fetchAvatarImageAsset = async () => ({ body: Buffer.from('synthetic image'), contentType: 'image/png' });
+    let cropCalls = 0;
+    let cropDiagnostics = null;
+    await cropService.prepareAvatarOverlayLayer(avatarPlan, {
+      ...options,
+      runAvatarProcess: async () => {
+        cropCalls += 1;
+        return cropCalls === 1
+          ? { status: 0, timedOut: false, stderr: '' }
+          : { status: 1, timedOut: false, stderr: 'synthetic crop stderr' };
+      },
+      onDiagnostics: (value) => { cropDiagnostics = value; }
+    });
+    assert.equal(cropDiagnostics.downloadFailed, 0);
+    assert.equal(cropDiagnostics.decodeFailed, 0);
+    assert.equal(cropDiagnostics.cropFailed, 1);
+    assert.equal(cropDiagnostics.firstError.stage, 'crop');
+    assert.match(cropDiagnostics.firstError.stderr, /synthetic crop stderr/);
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('merged recording metadata preserves cleanup lineage across a library refresh', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-metadata-'));
   const sourceOne = path.join(outputDir, 'session-part-1.clean.mp4');
@@ -125,7 +208,7 @@ test('manual cleanup processes persisted pending cleanup tasks without recording
   }
 });
 
-test('automatic cleanup retry drains every pending task for a room after burning finishes', async () => {
+test('automatic cleanup retry drains pending tasks while retaining original source inputs', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-retry-'));
   const room = { id: 'room-retry', title: 'Retry', anchor: 'test', burning: false };
   try {
@@ -152,8 +235,8 @@ test('automatic cleanup retry drains every pending task for a room after burning
 
     await service.cleanupPendingSegmentCleanupsForRoom(room);
 
-    assert.equal(await fileExists(path.join(outputDir, 'one-part.clean.mp4')), false);
-    assert.equal(await fileExists(path.join(outputDir, 'two-part.clean.mp4')), false);
+    assert.equal(await fileExists(path.join(outputDir, 'one-part.clean.mp4')), true);
+    assert.equal(await fileExists(path.join(outputDir, 'two-part.clean.mp4')), true);
     assert.equal(service.pendingSegmentCleanups.size, 0);
   } finally {
     await fsp.rm(outputDir, { recursive: true, force: true });
@@ -304,7 +387,7 @@ test('crash recovery removes only a zero-byte capture owned by an interrupted re
   }
 });
 
-test('source deletion setting is disabled whenever automatic burn is disabled', () => {
+test('source deletion setting is permanently disabled to retain original recording inputs', () => {
   const service = new LiveRecordService();
   const disabled = service.normalizeSettings({
     ...service.settings,
@@ -318,7 +401,7 @@ test('source deletion setting is disabled whenever automatic burn is disabled', 
   });
 
   assert.equal(disabled.deleteSourceAfterBurn, false);
-  assert.equal(enabled.deleteSourceAfterBurn, true);
+  assert.equal(enabled.deleteSourceAfterBurn, false);
 });
 
 test('real-avatar mode preserves legacy high quality by default and normalizes all three choices', () => {
@@ -440,7 +523,7 @@ test('a non-CUDA GPU final-blend failure retries the prebuilt CPU graph', async 
   assert.equal(attempts[1].layer.gpuCompositeBackend, '');
 });
 
-test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {
+test('legacy automatic source deletion hook is a no-op and preserves every original input', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-delete-source-after-burn-'));
   const sourcePath = path.join(outputDir, 'session.clean.mp4');
   const burnedPath = path.join(outputDir, 'session.danmaku.mp4');
@@ -452,21 +535,15 @@ test('automatic burn source deletion requires a completed output and preserves s
     const sourceRecording = service.normalizeRecording({ cleanPath: sourcePath, danmakuPath: sourceDanmakuPath });
     service.recordings = [sourceRecording];
 
-    await assert.rejects(
-      () => service.deleteBurnSourceAfterSuccess(room, sourceRecording, burnedPath),
-      /弹幕版成片不存在/
-    );
-    assert.equal(await fileExists(sourcePath), true);
-
     await writeRecordingFile(burnedPath);
     const result = await service.deleteBurnSourceAfterSuccess(room, sourceRecording, burnedPath);
 
-    assert.deepEqual(result, { deleted: true, missing: false });
-    assert.equal(await fileExists(sourcePath), false);
+    assert.deepEqual(result, { deleted: false, retained: true });
+    assert.equal(await fileExists(sourcePath), true);
     assert.equal(await fileExists(burnedPath), true);
     assert.equal(await fileExists(sourceDanmakuPath), true);
-    assert.equal(service.recordings.length, 0);
-    assert.equal(room.currentRecording, undefined);
+    assert.equal(service.recordings.length, 1);
+    assert.equal(room.currentRecording.cleanPath, sourcePath);
   } finally {
     await fsp.rm(outputDir, { recursive: true, force: true });
   }

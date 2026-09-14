@@ -26,10 +26,15 @@ class SettingsService {
       outputContainer: 'mp4',
       segmentMinutes: 60,
       autoBurnDanmaku: true,
+      // 原始 clean 视频、JSONL 与头像快照是可重复导出的源文件，永远不因烧录而删除。
       deleteSourceAfterBurn: false,
+      // cache-only 是低性能设备的旁路模式：录制时只追加 Scene Graph 缓存，
+      // 不触发视频解码、编码或烧录。
+      sceneGraphCaptureMode: 'cache-and-export',
+      sceneGraphDefaultStyle: 'h5-card',
       burnOverlayMode: 'danmaku-gift',
       burnDanmakuArea: 'half',
-      burnDanmakuStylePreset: 'current',
+      burnDanmakuStylePreset: 'h5-card',
       burnDanmakuStyleLayout: {},
       burnAvatarMode: 'high',
       burnCodec: 'libx265',
@@ -61,6 +66,13 @@ class SettingsService {
     const burnCodec = Number(this.owner.ffmpegCapabilities?.probedAt || 0) > 0
       ? this.owner.chooseBurnCodec(settings.burnCodec)
       : this.normalizeBurnCodec(settings.burnCodec);
+    const sceneGraphDefaultStyle = ['h5-card', 'bubble', 'minimal'].includes(settings.sceneGraphDefaultStyle)
+      ? settings.sceneGraphDefaultStyle
+      : 'h5-card';
+    const requestedBurnStyle = this.normalizeDanmakuStylePreset(settings.burnDanmakuStylePreset);
+    const burnDanmakuStylePreset = ['h5-card', 'bubble', 'minimal'].includes(requestedBurnStyle)
+      ? requestedBurnStyle
+      : sceneGraphDefaultStyle;
     return {
       ...this.createDefaultSettings(),
       ...settings,
@@ -73,10 +85,14 @@ class SettingsService {
       preferHevc: Boolean(settings.preferHevc),
       roomImageMode: this.normalizeRoomImageMode(settings.roomImageMode),
       autoBurnDanmaku: Boolean(settings.autoBurnDanmaku),
-      deleteSourceAfterBurn: Boolean(settings.autoBurnDanmaku) && Boolean(settings.deleteSourceAfterBurn),
+      deleteSourceAfterBurn: false,
+      sceneGraphCaptureMode: ['cache-only', 'cache-and-export'].includes(settings.sceneGraphCaptureMode)
+        ? settings.sceneGraphCaptureMode
+        : 'cache-and-export',
+      sceneGraphDefaultStyle,
       burnOverlayMode: this.normalizeBurnOverlayMode(settings.burnOverlayMode),
       burnDanmakuArea: this.normalizeDanmakuDisplayArea(settings.burnDanmakuArea),
-      burnDanmakuStylePreset: this.normalizeDanmakuStylePreset(settings.burnDanmakuStylePreset),
+      burnDanmakuStylePreset,
       burnDanmakuStyleLayout: this.normalizeDanmakuStyleLayout(settings.burnDanmakuStyleLayout),
       burnAvatarMode: this.normalizeBurnAvatarMode(settings.burnAvatarMode),
       notifyLiveStarted: settings.notifyLiveStarted !== false,
@@ -259,6 +275,8 @@ class SettingsService {
       burnOverlayMode: ['danmaku', 'danmaku-gift'],
       burnDanmakuArea: ['quarter', 'half', 'three-quarter', 'no-overlap', 'unlimited'],
       burnAvatarMode: ['off', 'limited', 'high'],
+      sceneGraphCaptureMode: ['cache-only', 'cache-and-export'],
+      sceneGraphDefaultStyle: ['h5-card', 'bubble', 'minimal'],
       serverHost: ['127.0.0.1', '0.0.0.0', 'localhost', '::']
     };
     for (const [key, values] of Object.entries(enumValues)) {
