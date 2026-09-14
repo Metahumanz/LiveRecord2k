@@ -22,6 +22,32 @@ const { createBurnArgs, createSceneAssRemuxArgs } = require('../src/server/recor
 const { LiveRecordService } = require('../src/server/app/service.cjs');
 const { probeMediaFileInfo } = require('../src/server/shared/helpers.cjs');
 
+let sceneGraphFfmpegPathPromise;
+
+function getSceneGraphFfmpegPath() {
+  if (sceneGraphFfmpegPathPromise) return sceneGraphFfmpegPathPromise;
+  const candidates = [
+    process.env.FFMPEG_BIN,
+    process.platform === 'linux' ? '/usr/bin/ffmpeg' : '',
+    ffmpegPath
+  ].filter(Boolean);
+  sceneGraphFfmpegPathPromise = (async () => {
+    for (const candidate of [...new Set(candidates)]) {
+      try {
+        await run(candidate, [
+          '-hide_banner', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=16x16',
+          '-vf', 'drawtext=text=Scene:fontsize=8:x=1:y=1', '-frames:v', '1', '-f', 'null', '-'
+        ]);
+        return candidate;
+      } catch {
+        // 继续尝试具有实际 Scene Graph 绘制能力的下一个二进制。
+      }
+    }
+    return '';
+  })();
+  return sceneGraphFfmpegPathPromise;
+}
+
 function comparableState(state) {
   return {
     visible: state.visible,
@@ -215,13 +241,15 @@ test('four Scene ASS tracks retain the original style and remux original audio/v
   }
 });
 
-test('a legacy style request is migrated to one-pass Scene Graph MP4 export', async () => {
+test('a legacy style request is migrated to one-pass Scene Graph MP4 export', async (t) => {
+  const sceneGraphFfmpegPath = await getSceneGraphFfmpegPath();
+  if (!sceneGraphFfmpegPath) return t.skip('当前测试环境没有可实际执行 drawtext 的 FFmpeg');
   const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-scene-export-'));
   try {
     const cleanPath = path.join(temporaryDirectory, 'source.clean.mp4');
     const danmakuPath = path.join(temporaryDirectory, 'source.danmaku.jsonl');
     const outputPath = path.join(temporaryDirectory, 'source.scene.mp4');
-    await run(ffmpegPath, [
+    await run(sceneGraphFfmpegPath, [
       '-hide_banner',
       '-y',
       '-f',
@@ -244,7 +272,7 @@ test('a legacy style request is migrated to one-pass Scene Graph MP4 export', as
     const service = new LiveRecordService();
     service.settings.outputDir = temporaryDirectory;
     service.settings.sceneGraphDefaultStyle = 'bubble';
-    service.ffmpegPath = ffmpegPath;
+    service.ffmpegPath = sceneGraphFfmpegPath;
     service.log = () => {};
     service.emitState = () => {};
     service.waitForRuntimeCapabilities = async () => {};
@@ -271,14 +299,16 @@ test('a legacy style request is migrated to one-pass Scene Graph MP4 export', as
   }
 });
 
-test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS video input', async () => {
+test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS video input', async (t) => {
+  const sceneGraphFfmpegPath = await getSceneGraphFfmpegPath();
+  if (!sceneGraphFfmpegPath) return t.skip('当前测试环境没有可实际执行 drawtext 的 FFmpeg');
   const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-scene-burn-'));
   try {
     const cleanPath = path.join(temporaryDirectory, 'source.clean.mp4');
     const outputPath = path.join(temporaryDirectory, 'scene.mp4');
     const filterPath = path.join(temporaryDirectory, 'scene.filter');
     const avatarPath = path.join(temporaryDirectory, 'avatar.png');
-    await run(ffmpegPath, [
+    await run(sceneGraphFfmpegPath, [
       '-hide_banner',
       '-y',
       '-f',
@@ -293,7 +323,7 @@ test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS
       'yuv420p',
       cleanPath
     ]);
-    await run(ffmpegPath, [
+    await run(sceneGraphFfmpegPath, [
       '-hide_banner',
       '-y',
       '-f',
@@ -345,7 +375,7 @@ test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS
     });
     assert.ok(args.includes('-filter_complex_script'));
     assert.equal(args.includes('-vf'), false);
-    await run(ffmpegPath, args);
+    await run(sceneGraphFfmpegPath, args);
     assert.ok((await fs.stat(outputPath)).size > 32 * 1024);
   } finally {
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
