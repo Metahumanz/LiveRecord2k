@@ -1126,6 +1126,7 @@ function createBurnEncodedVideoMuxArgs({
   cleanPath,
   outputPath,
   codec,
+  sourceCodec = '',
   fps,
   startTime,
   duration,
@@ -1144,12 +1145,18 @@ function createBurnEncodedVideoMuxArgs({
     '-err_detect',
     'ignore_err',
     '-r',
-    formatGstreamerFramerate(fps),
-    '-i',
-    encodedVideoPath
+    formatGstreamerFramerate(fps)
   ];
+  // This stage stream-copies video, but FFmpeg may still initialize a decoder
+  // while probing its inputs. Keep ARM64 builds from silently selecting a
+  // CUDA wrapper when the Jetson pipeline deliberately uses CPU decoding.
+  const encodedDecoder = getNativeSoftwareDecoder(codec);
+  if (encodedDecoder) args.push('-c:v', encodedDecoder);
+  args.push('-i', encodedVideoPath);
   if (includeAudio) {
     if (hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+    const cleanDecoder = getNativeSoftwareDecoder(sourceCodec);
+    if (cleanDecoder) args.push('-c:v', cleanDecoder);
     args.push('-i', cleanPath);
   }
   if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
@@ -1157,13 +1164,16 @@ function createBurnEncodedVideoMuxArgs({
   if (includeAudio) {
     const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
     if (copyAudio && audioPaddingMs <= 0) {
-      args.push('-map', '1:a?', '-c:a', 'copy', '-shortest');
+      // The elementary H26x stream from nvv4l2 has no container timestamps.
+      // `-shortest` can therefore stop before the first AAC packet even when
+      // both inputs are valid. The explicit output -t above is authoritative.
+      args.push('-map', '1:a?', '-c:a', 'copy');
     } else {
       const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
       if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
       if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
       audioFilters.push('asetpts=PTS-STARTPTS');
-      args.push('-map', '1:a?', '-af', audioFilters.join(','), '-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-shortest');
+      args.push('-map', '1:a?', '-af', audioFilters.join(','), '-c:a', 'aac', '-b:a', '160k', '-ac', '2');
     }
   } else {
     args.push('-an');
@@ -1182,6 +1192,7 @@ function createBurnAudioMuxArgs({
   cleanPath,
   outputPath,
   codec,
+  sourceCodec = '',
   crf,
   startTime,
   duration,
@@ -1202,12 +1213,15 @@ function createBurnAudioMuxArgs({
     '-f',
     'concat',
     '-safe',
-    '0',
-    '-i',
-    concatPath
+    '0'
   ];
+  const concatDecoder = getNativeSoftwareDecoder(codec);
+  if (concatDecoder) args.push('-c:v', concatDecoder);
+  args.push('-i', concatPath);
   if (includeAudio) {
     if (hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
+    const cleanDecoder = getNativeSoftwareDecoder(sourceCodec);
+    if (cleanDecoder) args.push('-c:v', cleanDecoder);
     args.push('-i', cleanPath);
   }
   if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));

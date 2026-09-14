@@ -156,6 +156,7 @@ const {
   normalizeServerHost,
   getAppRoot,
   findFfmpegPath,
+  preferSceneGraphCapableFfmpeg,
   getAppVersion,
   requestUrlBuffer,
   requestUrlBufferOnce,
@@ -1234,6 +1235,11 @@ class LiveRecordService {
   }
 
   async initializeRuntimeCapabilities() {
+    const ffmpegSelection = await preferSceneGraphCapableFfmpeg(this.ffmpegPath);
+    if (ffmpegSelection.path !== this.ffmpegPath) {
+      this.ffmpegPath = ffmpegSelection.path;
+      this.log('warn', ffmpegSelection.fallbackReason);
+    }
     [this.ffmpegCapabilities, this.startupEnabled] = await Promise.all([
       detectFfmpegCapabilities(this.ffmpegPath, {
         testJetsonEndToEnd: (codecInfo) => this.runJetsonGstreamerEndToEndSelfTest(codecInfo)
@@ -9664,6 +9670,7 @@ try {
                     cleanPath,
                     outputPath: chunkPath,
                     codec,
+                    sourceCodec,
                     fps,
                     startTime: chunkStart,
                     duration: chunkLength,
@@ -9752,6 +9759,7 @@ try {
                     cleanPath,
                     outputPath: chunkPath,
                     codec,
+                    sourceCodec,
                     fps,
                     startTime: chunkStart,
                     duration: chunkLength,
@@ -9805,6 +9813,7 @@ try {
               cleanPath,
               outputPath: burnedPath,
               codec,
+              sourceCodec,
               startTime: sourceStart,
               duration: totalDuration,
               container: getContainerFromPath(burnedPath),
@@ -9884,6 +9893,8 @@ try {
           : 'software';
       const sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
         duration: durationSec || graph.timeline.end,
+        outputDuration: durationSec || graph.timeline.end,
+        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
         fps: burnFps,
         target
       });
@@ -10027,6 +10038,7 @@ try {
                   cleanPath: recording.cleanPath,
                   outputPath: burnedTmpPath,
                   codec: burnCodec,
+                  sourceCodec: mediaInfo.videoInfo?.codec,
                   fps: burnFps,
                   startTime: 0,
                   duration: durationSec,
@@ -10413,6 +10425,7 @@ try {
                         cleanPath: burnSourcePath,
                         outputPath: burnedTmpPath,
                         codec: burnCodec,
+                        sourceCodec: mediaInfo.videoInfo?.codec,
                         fps: burnFps,
                         startTime: 0,
                         duration: durationSec,
@@ -11018,6 +11031,7 @@ try {
       });
       const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
       const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
+      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
       const target = isJetsonGstreamerCodec(burnCodec)
         ? 'jetson'
         : String(burnCodec || '').includes('nvenc')
@@ -11025,10 +11039,11 @@ try {
           : 'software';
       const sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
         duration,
+        outputDuration: duration,
+        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
         fps,
         target
       });
-      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -11106,6 +11121,7 @@ try {
               cleanPath: recording.cleanPath,
               outputPath: temporaryOutputPath,
               codec: burnCodec,
+              sourceCodec: mediaInfo.videoInfo?.codec,
               fps,
               startTime,
               duration,
@@ -11535,6 +11551,7 @@ try {
                     cleanPath: recording.cleanPath,
                     outputPath: temporaryOutputPath,
                     codec: burnCodec,
+                    sourceCodec: mediaInfo.videoInfo?.codec,
                     fps: recording.videoInfo?.fps || mediaInfo.videoInfo?.fps,
                     startTime,
                     duration,

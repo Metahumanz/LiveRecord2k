@@ -119,6 +119,17 @@ test('Scene Graph is the canonical layout for Web, ASS, CUDA and Jetson targets'
   assert.equal(filter.plan.metadata.avoidsAssVideoIntermediate, true);
   assert.equal(filter.plan.metadata.avoidsTransparentVideoIntermediate, true);
 
+  const leadingFilter = createSceneFilterScript(clipped, {
+    duration: 8,
+    outputDuration: 8,
+    leadingVideoPaddingSec: 1.019,
+    fps: 30,
+    target: 'jetson'
+  });
+  assert.match(leadingFilter.script, /color=c=black:s=/);
+  assert.match(leadingFilter.script, /concat=n=2:v=1:a=0,trim=duration=8/);
+  assert.doesNotMatch(leadingFilter.script, /tpad=/);
+
   const remuxArgs = createSceneAssRemuxArgs({
     cleanPath: 'source.clean.mp4',
     assPath: 'scene.h5-card.ass',

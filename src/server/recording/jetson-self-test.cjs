@@ -4,7 +4,6 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   createAssFilter,
-  createAvatarOverlayFilterScript,
   createBurnEncodedVideoMuxArgs,
   createBurnRawVideoArgs,
   createJetsonGstreamerEncodeArgs,
@@ -17,6 +16,7 @@ const SOURCE_DURATION_SEC = 2.5;
 const SELF_TEST_LEAD_INS = [0, 1.019];
 const STAGE_LABELS = {
   nativeDecode: '原生解码',
+  cpuDecode: 'CPU 解码回退',
   assLibass: 'ASS + libass',
   font: '真实字体',
   sceneFilters: 'Scene Graph 滤镜',
@@ -159,8 +159,8 @@ function resolveFfprobePath(ffmpegPath, configuredPath) {
   if (String(configuredPath || '').trim()) return String(configuredPath).trim();
   const source = String(ffmpegPath || '').trim();
   const fileName = path.basename(source);
-  if (/^ffmpeg(?:\.exe)?$/i.test(fileName)) {
-    const sibling = path.join(path.dirname(source), fileName.replace(/ffmpeg/i, 'ffprobe'));
+  if (/^ffmpeg(?:-full)?(?:\.exe)?$/i.test(fileName)) {
+    const sibling = path.join(path.dirname(source), fileName.replace(/^ffmpeg/i, 'ffprobe'));
     if (fs.existsSync(sibling)) return sibling;
   }
   return 'ffprobe';
@@ -176,6 +176,32 @@ function avatarExtension(contentType) {
 
 async function fileSize(filePath) {
   return fsp.stat(filePath).then((stat) => (stat.isFile() ? stat.size : 0)).catch(() => 0);
+}
+
+function escapeFilterPath(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/,/g, '\\,');
+}
+
+function createSceneFilterProbeCommands(sourcePath, avatarPath, fontPath) {
+  const base = ['-hide_banner', '-loglevel', 'error', '-i', sourcePath];
+  const frame = ['-frames:v', '1', '-f', 'null', '-'];
+  const filter = (name, expression) => ({ name, args: [...base, '-vf', expression, ...frame] });
+  const complex = (name, expression) => ({ name, args: [...base, '-filter_complex', expression, '-map', '[probe_out]', ...frame] });
+  const avatar = escapeFilterPath(avatarPath);
+  return [
+    filter('drawtext', `drawtext=fontfile='${escapeFilterPath(fontPath)}':text='Scene':fontsize=12:x=2:y=2`),
+    complex('overlay', '[0:v][0:v]overlay=x=0:y=0[probe_out]'),
+    filter('scale', 'scale=160:90'),
+    filter('geq', "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)'") ,
+    complex('color', 'color=c=black:s=16x16:r=30:d=0.1[probe_color];[0:v][probe_color]overlay=x=0:y=0[probe_out]'),
+    complex('movie', `movie='${avatar}',trim=duration=0.1,setpts=PTS-STARTPTS[probe_avatar];[0:v][probe_avatar]overlay=x=0:y=0[probe_out]`),
+    filter('boxblur', 'boxblur=lr=1:lp=1'),
+    complex('trim', '[0:v]trim=duration=0.1,setpts=PTS-STARTPTS[probe_out]'),
+    complex('concat', '[0:v]trim=duration=0.1,setpts=PTS-STARTPTS[probe_a];[0:v]trim=start=0.1:duration=0.1,setpts=PTS-STARTPTS[probe_b];[probe_a][probe_b]concat=n=2:v=1:a=0[probe_out]'),
+    filter('setpts', 'setpts=PTS-STARTPTS'),
+    filter('settb', 'settb=AVTB'),
+    filter('format', 'format=yuv420p')
+  ];
 }
 
 function summarizeJetsonStages(stages) {
@@ -194,7 +220,9 @@ async function runJetsonEndToEndSelfTest(options = {}) {
   const result = { ok: false, codec: plan.codec, converter: '', stages, reason: '' };
   const finish = () => {
     result.reason = summarizeJetsonStages(stages);
-    const required = ['nativeDecode', 'assLibass', 'font', 'sceneFilters', 'leadingFilter', 'rawBridge', 'nvvidconv', 'nvv4l2Encoder', 'parser', 'finalMux'];
+    // Jetson 的最小烧录链是 CPU 解码 → Scene Graph → I420 → nvvidconv
+    // → nvv4l2 → mux。硬解和 ASS 都是可观测的附加能力，不得阻断它。
+    const required = ['cpuDecode', 'font', 'sceneFilters', 'leadingFilter', 'rawBridge', 'nvvidconv', 'nvv4l2Encoder', 'parser', 'finalMux'];
     result.ok = required.every((key) => stages[key]?.status === 'passed');
     if (!result.reason && !result.ok) result.reason = 'Jetson 端到端烧录自检未完整通过。';
     return result;
@@ -207,26 +235,11 @@ async function runJetsonEndToEndSelfTest(options = {}) {
     for (const stage of Object.values(stages)) setStage(stage, 'failed', '端到端自检缺少 FFmpeg 或命令执行器');
     return finish();
   }
-  // Avoid creating media samples or making the avatar network request on a
-  // generic Linux host. The actual Jetson encoder element is the cheapest
-  // authoritative gate before the expensive end-to-end probe begins.
-  const encoderPresence = await runProcess('gst-inspect-1.0', [plan.encoderElement], {
-    timeoutMs: 5000,
-    maxOutputBytes: 64 * 1024
-  }).catch(() => null);
-  if (!isCommandSuccess(encoderPresence)) {
-    setStage(stages.nvv4l2Encoder, 'failed', commandReason(encoderPresence, '未找到 ' + plan.encoderElement));
-    for (const [key, stage] of Object.entries(stages)) {
-      if (key !== 'nvv4l2Encoder') setStage(stage, 'skipped', '未检测到 Jetson nvv4l2 编码器');
-    }
-    return finish();
-  }
-
   const sourcePath = String(options.samplePath || '').trim();
   if ((await fileSize(sourcePath)) < 1024) {
     setStage(stages.nativeDecode, 'failed', `未找到内置 ${plan.sourceCodec.toUpperCase()} 测试样本：${sourcePath || plan.sampleFile}`);
     for (const [key, stage] of Object.entries(stages)) {
-      if (key !== 'nativeDecode') setStage(stage, 'skipped', '缺少安装包内置测试样本，未启动自检');
+      if (key !== 'nativeDecode') setStage(stage, 'failed', '缺少安装包内置测试样本，无法运行独立验证');
     }
     return finish();
   }
@@ -245,48 +258,55 @@ async function runJetsonEndToEndSelfTest(options = {}) {
 
     try {
       await runCommand(runProcess, ffmpegPath, [
-        '-hide_banner', '-loglevel', 'error', '-c:v', plan.nativeDecoder, '-i', sourcePath,
+        '-hide_banner', '-loglevel', 'error', '-c:v', plan.sourceCodec, '-i', sourcePath,
         '-frames:v', '1', '-f', 'null', '-'
-      ], { label: plan.nativeDecoder + ' 原生解码' });
-      setStage(stages.nativeDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 内置 2.5 秒测试样本已由 ' + plan.nativeDecoder + ' 解码');
+      ], { label: plan.sourceCodec + ' CPU 解码' });
+      setStage(stages.cpuDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 内置样本已由 FFmpeg CPU 解码');
     } catch (error) {
-      setStage(stages.nativeDecode, 'failed', error.message);
+      setStage(stages.cpuDecode, 'failed', error.message);
     }
 
-    if (stages.nativeDecode.status === 'passed' && stages.font.status === 'passed') {
+    if (stages.font.status === 'passed') {
       try {
         await runCommand(runProcess, ffmpegPath, [
-          '-hide_banner', '-loglevel', 'error', '-i', sourcePath, '-vf', createAssFilter(assPath),
+          '-hide_banner', '-loglevel', 'error', '-c:v', plan.sourceCodec, '-i', sourcePath, '-vf', createAssFilter(assPath),
           '-frames:v', '1', '-f', 'null', '-'
         ], { label: 'ASS + libass + 真实字体' });
-        setStage(stages.assLibass, 'passed', '真实 ASS 与 ' + font.family + ' 已渲染');
+        setStage(stages.assLibass, 'passed', '真实 ASS 与 ' + font.family + ' 已由 CPU 解码路径渲染');
       } catch (error) {
         setStage(stages.assLibass, 'failed', error.message);
       }
     } else {
-      setStage(stages.assLibass, 'skipped', '原生解码或字体阶段未通过');
+      setStage(stages.assLibass, 'failed', '未找到真实字体，无法执行 ASS + libass 验证');
     }
 
-    try {
-      const filterList = await runCommand(runProcess, ffmpegPath, ['-hide_banner', '-filters'], {
-        timeoutMs: 10_000,
-        label: 'FFmpeg Scene Graph 滤镜列表'
-      });
-      const output = String(filterList.stdout || '') + '\n' + String(filterList.stderr || '');
-      const missing = REQUIRED_SCENE_FILTERS.filter((name) => !new RegExp('\\b' + name + '\\b', 'i').test(output));
+    const builtInSceneAvatarPath = String(options.builtInAvatarPath || '').trim();
+    const filterResults = {};
+    if (stages.cpuDecode.status === 'passed' && font?.filePath && (await fileSize(builtInSceneAvatarPath)) > 0) {
+      for (const probe of createSceneFilterProbeCommands(sourcePath, builtInSceneAvatarPath, font.filePath)) {
+        try {
+          await runCommand(runProcess, ffmpegPath, ['-c:v', plan.sourceCodec, ...probe.args], {
+            timeoutMs: 12_000,
+            label: 'Scene Graph 滤镜 ' + probe.name
+          });
+          filterResults[probe.name] = { status: 'passed' };
+        } catch (error) {
+          filterResults[probe.name] = { status: 'failed', message: compact(error.message) };
+        }
+      }
+      const missing = REQUIRED_SCENE_FILTERS.filter((name) => filterResults[name]?.status !== 'passed');
       setStage(
         stages.sceneFilters,
         missing.length ? 'failed' : 'passed',
-        missing.length ? '缺少 Scene Graph 所需滤镜：' + missing.join('、') : 'Scene Graph 所需滤镜均可用：' + REQUIRED_SCENE_FILTERS.join('、'),
-        { required: REQUIRED_SCENE_FILTERS, missing }
+        missing.length ? 'Scene Graph 实命令失败：' + missing.join('、') : 'Scene Graph 所需滤镜均由真实命令渲染通过',
+        { required: REQUIRED_SCENE_FILTERS, probes: filterResults, missing }
       );
-    } catch (error) {
-      setStage(stages.sceneFilters, 'failed', error.message, { required: REQUIRED_SCENE_FILTERS });
+    } else {
+      setStage(stages.sceneFilters, 'failed', 'CPU 解码、字体或内置头像资源未通过，无法执行 Scene Graph 滤镜实命令验证', { required: REQUIRED_SCENE_FILTERS, probes: filterResults });
     }
 
     let sceneLayer = null;
-    const builtInSceneAvatarPath = String(options.builtInAvatarPath || '').trim();
-    if (stages.nativeDecode.status === 'passed' && (await fileSize(builtInSceneAvatarPath)) > 0) {
+    if (stages.cpuDecode.status === 'passed' && (await fileSize(builtInSceneAvatarPath)) > 0) {
       try {
         const graph = createSelfTestSceneGraph({ width: 320, height: 180, fps: 30 }, builtInSceneAvatarPath);
         sceneLayer = await writeSceneFilterScript(sceneFilterPath, graph, {
@@ -301,37 +321,73 @@ async function runJetsonEndToEndSelfTest(options = {}) {
       setStage(stages.sceneFilters, 'failed', 'Scene Graph 缺少可用的内置头像资源，无法生成包含头像的 scene.filter。');
     }
 
-    const inspect = async (element, stage) => {
+    const rawProbePath = path.join(temporaryDir, 'cpu-i420.yuv');
+    const encodedProbePath = path.join(temporaryDir, 'gstreamer-probe.' + plan.encodedExtension);
+    const rawCaps = ['rawvideoparse', 'format=i420', 'width=320', 'height=180', 'framerate=30/1'];
+    let rawReady = false;
+    if (stages.cpuDecode.status === 'passed') {
       try {
-        await runCommand(runProcess, 'gst-inspect-1.0', [element], { timeoutMs: 5000, label: 'GStreamer ' + element });
-        stage.message = element + ' 已找到，等待完整管线验证';
-        return true;
+        await runCommand(runProcess, ffmpegPath, [
+          '-hide_banner', '-loglevel', 'error', '-c:v', plan.sourceCodec, '-i', sourcePath,
+          '-frames:v', '1', '-vf', 'scale=320:180,format=yuv420p', '-f', 'rawvideo', rawProbePath
+        ], { label: 'CPU I420 测试帧' });
+        await runCommand(runProcess, 'gst-launch-1.0', ['-q', 'filesrc', 'location=' + rawProbePath, '!', ...rawCaps, '!', 'fakesink', 'sync=false'], {
+          timeoutMs: 10_000,
+          label: 'GStreamer rawvideoparse'
+        });
+        rawReady = true;
+        setStage(stages.rawBridge, 'passed', 'CPU 解码 I420 已由 rawvideoparse 实际消费');
       } catch (error) {
-        setStage(stage, 'failed', error.message);
-        return false;
+        setStage(stages.rawBridge, 'failed', error.message);
       }
-    };
-    const rawParserReady = await inspect('rawvideoparse', stages.rawBridge);
+    } else {
+      setStage(stages.rawBridge, 'failed', 'CPU 解码未通过，无法生成 I420 输入');
+    }
+
     let converter = '';
     for (const candidate of [options.converter, 'nvvidconv', 'nvvideoconvert']) {
       const value = String(candidate || '').trim();
       if (!value || converter) continue;
       try {
-        await runCommand(runProcess, 'gst-inspect-1.0', [value], { timeoutMs: 5000, label: 'GStreamer ' + value });
+        await runCommand(runProcess, 'gst-launch-1.0', ['-q', 'filesrc', 'location=' + rawProbePath, '!', ...rawCaps, '!', value, '!', 'fakesink', 'sync=false'], {
+          timeoutMs: 12_000,
+          label: 'GStreamer ' + value
+        });
         converter = value;
-        stages.nvvidconv.message = value + ' 已找到，等待完整管线验证';
+        setStage(stages.nvvidconv, 'passed', value + ' 已独立完成 I420 → NVMM 转换');
       } catch (error) {
         stages.nvvidconv.message = compact(error.message);
       }
     }
-    if (!converter) setStage(stages.nvvidconv, 'failed', stages.nvvidconv.message || '未找到 nvvidconv 或 nvvideoconvert');
-    const encoderReady = await inspect(plan.encoderElement, stages.nvv4l2Encoder);
-    const parserReady = await inspect(plan.parserElement, stages.parser);
+    if (!converter) setStage(stages.nvvidconv, 'failed', stages.nvvidconv.message || 'nvvidconv / nvvideoconvert 独立测试失败');
+
+    let encoderReady = false;
+    try {
+      await runCommand(runProcess, 'gst-launch-1.0', [
+        '-q', 'filesrc', 'location=' + rawProbePath, '!', ...rawCaps, '!', converter || 'nvvidconv', '!', plan.encoderElement,
+        'bitrate=1000000', '!', plan.parserElement, '!', 'filesink', 'location=' + encodedProbePath
+      ], { timeoutMs: 15_000, label: 'GStreamer ' + plan.encoderElement });
+      encoderReady = (await fileSize(encodedProbePath)) >= 256;
+      if (!encoderReady) throw new Error(plan.encoderElement + ' 未写出有效 H26x 测试文件');
+      setStage(stages.nvv4l2Encoder, 'passed', plan.encoderElement + ' 已独立编码 CPU I420 测试帧');
+    } catch (error) {
+      setStage(stages.nvv4l2Encoder, 'failed', error.message);
+    }
+
+    try {
+      if (!encoderReady) throw new Error('没有可供 ' + plan.parserElement + ' 解析的 H26x 测试文件');
+      await runCommand(runProcess, 'gst-launch-1.0', ['-q', 'filesrc', 'location=' + encodedProbePath, '!', plan.parserElement, '!', 'fakesink', 'sync=false'], {
+        timeoutMs: 10_000,
+        label: 'GStreamer ' + plan.parserElement
+      });
+      setStage(stages.parser, 'passed', plan.parserElement + ' 已独立解析 nvv4l2 输出');
+    } catch (error) {
+      setStage(stages.parser, 'failed', error.message);
+    }
 
     const avatarChecks = {};
     const testAvatar = async (name, imagePath) => {
       const croppedPath = path.join(temporaryDir, name + '-circle.png');
-      const scriptPath = path.join(temporaryDir, name + '-overlay.ffscript');
       try {
         await runCommand(runProcess, ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-i', imagePath, '-frames:v', '1', '-f', 'null', '-'], {
           label: name + ' 头像解码'
@@ -340,21 +396,11 @@ async function runJetsonEndToEndSelfTest(options = {}) {
           '-hide_banner', '-loglevel', 'error', '-y', '-i', imagePath, '-frames:v', '1', '-vf', createAvatarCircleFilter(48),
           '-pix_fmt', 'rgba', croppedPath
         ], { label: name + ' 头像圆形裁切' });
-        const script = createAvatarOverlayFilterScript({
-          assPath,
-          fps: 30,
-          duration: SOURCE_DURATION_SEC,
-          avatarOverlay: {
-            panel: { left: 224, width: 96, height: 180 },
-            videoWidth: 320,
-            videoHeight: 180,
-            entries: [{ imagePath: croppedPath, segments: [{ start: 0, end: 2.2, x1: 8, x2: 28, y1: 64, y2: 64 }] }]
-          }
-        });
-        if (!script) throw new Error(name + ' 头像 overlay 滤镜为空');
-        await fsp.writeFile(scriptPath, script, 'utf8');
         await runCommand(runProcess, ffmpegPath, [
-          '-hide_banner', '-loglevel', 'error', '-i', sourcePath, '-filter_complex_script', scriptPath, '-map', '[vout]',
+          '-hide_banner', '-loglevel', 'error', '-c:v', plan.sourceCodec, '-i', sourcePath,
+          '-loop', '1', '-i', croppedPath,
+          '-filter_complex', '[0:v]scale=320:180,format=yuv420p[base];[1:v]scale=40:40,format=rgba[avatar];[base][avatar]overlay=272:64:shortest=1[vout]',
+          '-map', '[vout]',
           '-frames:v', '1', '-f', 'null', '-'
         ], { label: name + ' 头像 overlay' });
         return { status: 'passed', message: '下载/解码/裁圆/overlay 通过' };
@@ -362,7 +408,7 @@ async function runJetsonEndToEndSelfTest(options = {}) {
         return { status: 'failed', message: compact(error.message) };
       }
     };
-    if (stages.nativeDecode.status === 'passed' && stages.assLibass.status === 'passed') {
+    if (stages.cpuDecode.status === 'passed' && stages.sceneFilters.status === 'passed') {
       const builtInPath = String(options.builtInAvatarPath || '').trim();
       if (builtInPath && (await fileSize(builtInPath)) > 0) {
         avatarChecks.builtinPng = await testAvatar('builtin', builtInPath);
@@ -382,27 +428,37 @@ async function runJetsonEndToEndSelfTest(options = {}) {
       const avatarPassed = Object.values(avatarChecks).every((item) => item.status === 'passed');
       setStage(stages.avatarImage, avatarPassed ? 'passed' : 'failed', avatarPassed ? '内置 PNG 与远程 Bilibili 头像均已处理' : '头像失败将回退通用头像，不阻断视频导出', avatarChecks);
     } else {
-      setStage(stages.avatarImage, 'skipped', 'ASS 或测试视频未通过，无法执行头像 overlay', avatarChecks);
+      setStage(stages.avatarImage, 'failed', 'CPU 解码或 Scene Graph 滤镜未通过，无法执行头像 overlay', avatarChecks);
     }
 
-    const pipelineReady = rawParserReady && Boolean(converter) && encoderReady && parserReady && Boolean(sceneLayer?.filterScriptPath) &&
-      stages.nativeDecode.status === 'passed' && stages.assLibass.status === 'passed' && stages.sceneFilters.status === 'passed';
+    const pipelineReady = rawReady && Boolean(converter) && encoderReady && stages.parser.status === 'passed' && Boolean(sceneLayer?.filterScriptPath) &&
+      stages.cpuDecode.status === 'passed' && stages.sceneFilters.status === 'passed';
     const leadResults = {};
     if (pipelineReady) {
       for (const leadIn of SELF_TEST_LEAD_INS) {
         const key = leadIn > 0 ? 'lead_1_019' : 'lead_0';
-        const outputDuration = SOURCE_DURATION_SEC + leadIn;
+        // The source audio clock remains at zero. A 1.019-second video lead
+        // replaces the tail with black/video alignment; it must not lengthen
+        // the recording or add a second artificial audio lead.
+        const outputDuration = SOURCE_DURATION_SEC;
         const encodedPath = path.join(temporaryDir, key + '.' + plan.encodedExtension);
         const muxPath = path.join(temporaryDir, key + '.mp4');
         try {
+          sceneLayer = await writeSceneFilterScript(sceneFilterPath, createSelfTestSceneGraph({ width: 320, height: 180, fps: 30 }, builtInSceneAvatarPath), {
+            duration: outputDuration,
+            outputDuration,
+            leadingVideoPaddingSec: leadIn,
+            fps: 30,
+            target: 'jetson'
+          });
           const gstreamerArgs = createJetsonGstreamerEncodeArgs({
             codec: plan.codec, width: 320, height: 180, fps: 30, quality: 28, outputPath: encodedPath, converter
           });
           await runFfmpegToGstreamerJob({
             ffmpegPath,
             ffmpegArgs: createBurnRawVideoArgs({
-              cleanPath: sourcePath, assPath: '', avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath }, fps: 30, duration: outputDuration, decoder: plan.nativeDecoder,
-              sourceCodec: plan.sourceCodec, timelineOffset: leadIn, leadingVideoPaddingSec: leadIn, videoWidth: 320, videoHeight: 180
+              cleanPath: sourcePath, assPath: '', avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath }, fps: 30, duration: outputDuration, decoder: 'software',
+              sourceCodec: plan.sourceCodec, timelineOffset: 0, leadingVideoPaddingSec: 0, videoWidth: 320, videoHeight: 180
             }),
             gstreamerArgs,
             gstreamerOutputPath: encodedPath,
@@ -411,8 +467,8 @@ async function runJetsonEndToEndSelfTest(options = {}) {
           });
           if ((await fileSize(encodedPath)) < 256) throw new Error('GStreamer 没有写出有效临时 H26x 文件');
           await runCommand(runProcess, ffmpegPath, createBurnEncodedVideoMuxArgs({
-            encodedVideoPath: encodedPath, cleanPath: sourcePath, outputPath: muxPath, codec: plan.codec, fps: 30,
-            duration: outputDuration, container: 'mp4', leadingAudioPaddingSec: leadIn, includeAudio: true
+            encodedVideoPath: encodedPath, cleanPath: sourcePath, outputPath: muxPath, codec: plan.codec, sourceCodec: plan.sourceCodec, fps: 30,
+            duration: outputDuration, container: 'mp4', leadingAudioPaddingSec: 0, includeAudio: true
           }), { timeoutMs: 30_000, label: key + ' 最终 MP4 mux' });
           const probe = await runCommand(runProcess, resolveFfprobePath(ffmpegPath, options.ffprobePath), [
             '-v', 'error', '-show_entries', 'format=duration:stream=codec_type,codec_name', '-of', 'json', muxPath
@@ -457,21 +513,32 @@ async function runJetsonEndToEndSelfTest(options = {}) {
       const failure = Object.values(leadResults).find((item) => item.status === 'failed');
       setStage(stages.rawBridge, 'failed', failure?.message || 'FFmpeg → I420 → GStreamer bridge 失败');
       for (const stage of [stages.nvvidconv, stages.nvv4l2Encoder, stages.parser, stages.finalMux]) {
-        if (stage.status === 'pending') setStage(stage, 'skipped', '端到端 bridge 未完成：' + (failure?.message || '未知原因'));
+        if (stage.status === 'pending') setStage(stage, 'failed', '端到端 bridge 未完成：' + (failure?.message || '未知原因'));
       }
     } else {
       for (const stage of [stages.leadingFilter, stages.rawBridge, stages.finalMux]) {
-        if (stage.status === 'pending') setStage(stage, 'skipped', '前置阶段未通过，未启动端到端管线');
+        if (stage.status === 'pending') setStage(stage, 'failed', '独立阶段未通过，无法启动完整 CPU 解码 → Scene Graph → I420 → nvv4l2 管线');
       }
       for (const stage of [stages.nvvidconv, stages.nvv4l2Encoder, stages.parser]) {
         if (stage.status === 'pending') {
           setStage(
             stage,
-            'skipped',
-            `${stage.message || 'GStreamer 元素已预检'}；原生解码、ASS 或 Scene Graph 前置阶段未通过，未运行端到端验证`
+            'failed',
+            `${stage.message || 'GStreamer 元素独立命令未运行'}；未完成独立验证`
           );
         }
       }
+    }
+    // The CPU path above is the Jetson admission gate. Only after it has
+    // completed do we probe native decode as an optional acceleration.
+    try {
+      await runCommand(runProcess, ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error', '-c:v', plan.nativeDecoder, '-i', sourcePath,
+        '-frames:v', '1', '-f', 'null', '-'
+      ], { label: plan.nativeDecoder + ' 原生解码' });
+      setStage(stages.nativeDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 内置样本已由 ' + plan.nativeDecoder + ' 解码；生产烧录可额外启用硬解加速');
+    } catch (error) {
+      setStage(stages.nativeDecode, 'failed', error.message + '；CPU 解码烧录链不受影响');
     }
     return finish();
   } finally {
@@ -487,6 +554,7 @@ module.exports = {
   createJetsonStageResults,
   createJetsonSelfTestPlan,
   createSelfTestSceneGraph,
+  resolveFfprobePath,
   summarizeJetsonStages,
   runJetsonEndToEndSelfTest
 };

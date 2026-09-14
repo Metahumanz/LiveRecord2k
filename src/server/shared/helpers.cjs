@@ -2333,6 +2333,31 @@ function findFfmpegPath() {
   return 'ffmpeg';
 }
 
+function findBundledSceneGraphFfmpegPath() {
+  if (process.platform !== 'linux' || process.arch !== 'arm64') return '';
+  const candidate = path.join(APP_ROOT, 'bin', 'ffmpeg-full');
+  try {
+    return fs.statSync(candidate).isFile() ? candidate : '';
+  } catch {
+    return '';
+  }
+}
+
+async function preferSceneGraphCapableFfmpeg(ffmpegPath) {
+  const current = String(ffmpegPath || '').trim() || 'ffmpeg';
+  const bundled = findBundledSceneGraphFfmpegPath();
+  if (!bundled || bundled === current) return { path: current, fallbackReason: '' };
+  const probe = await runFfmpegProbe(current, [
+    '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=0.1',
+    '-vf', 'drawtext=text=Scene:fontsize=8:x=1:y=1', '-frames:v', '1', '-f', 'null', '-'
+  ], { timeoutMs: 8000, maxOutputBytes: 64 * 1024 });
+  if (probe.ok) return { path: current, fallbackReason: '' };
+  return {
+    path: bundled,
+    fallbackReason: `系统 FFmpeg 不满足 Scene Graph 绘制要求，已自动切换内置完整 ARM64 FFmpeg：${probe.error || 'drawtext 实命令失败'}`
+  };
+}
+
 function getAppVersion() {
   const candidates = [
     path.join(APP_ROOT, 'version.json'),
@@ -3771,6 +3796,8 @@ module.exports = {
   normalizeServerHost,
   getAppRoot,
   findFfmpegPath,
+  findBundledSceneGraphFfmpegPath,
+  preferSceneGraphCapableFfmpeg,
   getAppVersion,
   requestUrlBuffer,
   requestUrlBufferOnce,

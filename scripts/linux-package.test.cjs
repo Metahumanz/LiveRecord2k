@@ -611,12 +611,15 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
     cleanPath: '/recordings/source.mkv',
     outputPath: '/recordings/final.mp4',
     codec: 'h264_nvv4l2',
+    sourceCodec: 'hevc (Main)',
     fps: 30,
     duration: 12,
     container: 'mp4'
   });
   assert.ok(muxArgs.includes('copy'));
   assert.ok(muxArgs.includes('/recordings/final.mp4'));
+  const decoderArgs = muxArgs.reduce((values, value, index) => value === '-c:v' ? [...values, muxArgs[index + 1]] : values, []);
+  assert.deepEqual(decoderArgs.slice(0, 2), ['h264', 'hevc']);
 
   const jetsonDecodeArgs = createNormalizeRawVideoArgs({
     inputPath: '/recordings/source.mkv',
