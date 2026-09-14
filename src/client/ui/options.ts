@@ -87,9 +87,9 @@ export const danmakuStylePresetOptions = (Object.entries(danmakuStylePresets) as
   [DanmakuStylePreset, DanmakuStylePresetDefinition]
 >).map(([value, definition]) => ({ value, ...definition }));
 
-export const sceneGraphStyleOptions = danmakuStylePresetOptions.filter(
-  (option): option is (typeof danmakuStylePresetOptions)[number] & { value: SceneStylePreset } => option.value !== 'current'
-);
+export const sceneGraphStyleOptions = danmakuStylePresetOptions as Array<
+  (typeof danmakuStylePresetOptions)[number] & { value: SceneStylePreset }
+>;
 
 export const burnAvatarModeOptions: Array<{ value: BurnAvatarMode; label: string }> = [
   { value: 'off', label: '关闭（通用头像）' },

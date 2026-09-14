@@ -34,7 +34,7 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
       cssPath: current.cssPath || currentRecording.cssPath || '',
       overlayMode: current.overlayMode || state.settings.burnOverlayMode,
       danmakuArea: current.danmakuArea || state.settings.burnDanmakuArea,
-      stylePreset: current.stylePreset === 'h5-card' || current.stylePreset === 'bubble' || current.stylePreset === 'minimal'
+      stylePreset: current.stylePreset === 'current' || current.stylePreset === 'h5-card' || current.stylePreset === 'bubble' || current.stylePreset === 'minimal'
         ? current.stylePreset
         : state.settings.sceneGraphDefaultStyle,
       styleLayout: current.styleLayout || { ...state.settings.burnDanmakuStyleLayout },

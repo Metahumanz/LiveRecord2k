@@ -241,7 +241,7 @@ function createAssFromScene(graph, options) {
 
 function createSceneAssTracks(events, options) {
   const source = options || {};
-  const presets = Array.isArray(source.presets) && source.presets.length ? source.presets : ['h5-card', 'bubble', 'minimal'];
+  const presets = Array.isArray(source.presets) && source.presets.length ? source.presets : ['current', 'h5-card', 'bubble', 'minimal'];
   const tracks = {};
   for (const preset of presets) {
     const graph = buildSceneGraph(events, Object.assign({}, source, { stylePreset: preset }));

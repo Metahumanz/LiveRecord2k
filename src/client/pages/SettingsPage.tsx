@@ -348,7 +348,7 @@ export function SettingsPage({
                   </option>
                 ))}
               </select>
-              <p className="field-help">自动烧录、片段 MP4、三套 ASS 轨和播放器都从同一 Scene Graph 样式出发。</p>
+              <p className="field-help">保留原有“当前默认”，另有三种侧栏样式；自动烧录、片段 MP4、四套 ASS 轨和播放器都从同一 Scene Graph 样式出发。</p>
             </label>
 
             <label className="field">

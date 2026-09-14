@@ -689,12 +689,12 @@ function deriveSceneGraphPath(cleanPath) {
 }
 
 function deriveSceneAssPath(cleanPath, stylePreset) {
-  const preset = SCENE_STYLE_PRESETS.includes(String(stylePreset || '')) ? String(stylePreset) : 'h5-card';
+  const preset = SCENE_STYLE_PRESETS.includes(String(stylePreset || '')) ? String(stylePreset) : 'current';
   return deriveSiblingPath(cleanPath, 'scene.' + preset, 'ass');
 }
 
 function deriveSceneMkvPath(cleanPath, stylePreset) {
-  const preset = SCENE_STYLE_PRESETS.includes(String(stylePreset || '')) ? String(stylePreset) : 'h5-card';
+  const preset = SCENE_STYLE_PRESETS.includes(String(stylePreset || '')) ? String(stylePreset) : 'current';
   return deriveSiblingPath(cleanPath, 'scene.' + preset, 'mkv');
 }
 
@@ -1452,7 +1452,7 @@ class LiveRecordService {
     const requested = String(value || '').trim();
     if (SCENE_STYLE_PRESETS.includes(requested)) return requested;
     const configured = String(this.settings.sceneGraphDefaultStyle || '').trim();
-    return SCENE_STYLE_PRESETS.includes(configured) ? configured : 'h5-card';
+  return SCENE_STYLE_PRESETS.includes(configured) ? configured : 'current';
   }
 
   getAvailableBurnCodecs() {
@@ -9857,7 +9857,7 @@ try {
         presets: SCENE_STYLE_PRESETS,
         remux: false
       });
-      this.log('success', roomLabel(room) + ' 已生成 Scene Graph 三套 ASS 轨：' + tracks.tracks.map((track) => path.basename(track.assPath)).join(' / '));
+      this.log('success', roomLabel(room) + ' 已生成 Scene Graph 四套 ASS 轨：' + tracks.tracks.map((track) => path.basename(track.assPath)).join(' / '));
       return true;
     }
     const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
@@ -10803,7 +10803,7 @@ try {
     );
     await this.writeRecordingMetadata(recording).catch(() => {});
     await this.saveStore();
-    this.log('success', 'Scene Graph 已生成三套 ASS 轨，并已快速封装 MKV：' + path.basename(result.remuxPath || result.scenePath));
+    this.log('success', 'Scene Graph 已生成四套 ASS 轨，并已快速封装 MKV：' + path.basename(result.remuxPath || result.scenePath));
     return {
       ok: true,
       cleanPath: recording.cleanPath,

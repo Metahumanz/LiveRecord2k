@@ -544,7 +544,7 @@ export default function App() {
 
   async function saveExportStyleAsDefault() {
     const sceneGraphDefaultStyle =
-      exportDraft.stylePreset === 'h5-card' || exportDraft.stylePreset === 'bubble' || exportDraft.stylePreset === 'minimal'
+      exportDraft.stylePreset === 'current' || exportDraft.stylePreset === 'h5-card' || exportDraft.stylePreset === 'bubble' || exportDraft.stylePreset === 'minimal'
         ? exportDraft.stylePreset
         : state?.settings.sceneGraphDefaultStyle;
     await saveSettingsWithToast(
