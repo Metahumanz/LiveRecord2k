@@ -1090,6 +1090,10 @@ test('one-click Linux installer prompts through the terminal and verifies releas
   assert.match(provision, /bootstrap-config\.cjs/);
   assert.match(provision, /usermod -a -G "\$hardware_group" "\$SERVICE_USER"/);
   assert.match(provision, /runuser -u "\$SERVICE_USER"/);
+  assert.match(provision, /服务用户身份切换或身份校验失败/);
+  assert.match(provision, /这不是录像目录或 SMB 权限错误/);
+  assert.match(provision, /BILI_RECORD_UPDATE_APPLYING:-0.*= "1"/);
+  assert.match(provision, /受控更新：跳过外部录像目录权限探针/);
   assert.match(provision, /read_recording_output_dir/);
   assert.match(provision, /bili-record-2k-permission-check/);
   assert.match(provision, /write-test/);
