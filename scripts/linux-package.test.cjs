@@ -704,7 +704,7 @@ test('software decode explicitly selects native H.264/HEVC and skipped seek guar
   });
   assert.match(guarded, /select='if\(isnan\(prev_selected_t\)/);
   assert.doesNotMatch(skipped, /select=/);
-  assert.match(skipped, /trim=start=2:end=12,setpts=PTS-STARTPTS,ass=/);
+  assert.match(skipped, /trim=start=2:end=12,setpts=PTS-STARTPTS,ass=filename=/);
 });
 
 test('JetPack R35-compatible raw burn uses explicit black-frame concat for the full 1.019-second lead-in', () => {
@@ -978,6 +978,48 @@ test('FFmpeg-to-GStreamer bridge never presents an Argus-only GStreamer message 
   assert.match(captured?.message || '', /GStreamer：管线异常（仅收到 Argus 附加诊断）/);
   assert.match(captured?.message || '', /Argus 附加诊断/);
   assert.doesNotMatch(captured?.message || '', /GStreamer：[^；]*nvargus-daemon/);
+});
+
+test('FFmpeg-to-GStreamer bridge aborts an FFmpeg that produces no I420 data', async () => {
+  let captured = null;
+  try {
+    await runFfmpegToGstreamerJob({
+      ffmpegPath: process.execPath,
+      ffmpegArgs: ['-e', "setInterval(() => {}, 1000);"],
+      gstreamerPath: process.execPath,
+      gstreamerArgs: ['-e', "process.stdin.resume(); setInterval(() => {}, 1000);"],
+      noProgressTimeoutMs: 300
+    });
+    assert.fail('预期没有 I420 数据会触发 FFmpeg 卡死保护。');
+  } catch (error) {
+    captured = error;
+  }
+  assert.equal(captured?.code, 'BR2K_JETSON_FFMPEG_STALL');
+  assert.equal(captured?.primaryProcess, 'ffmpeg');
+  assert.match(captured?.message || '', /FFmpeg 未输出 I420 视频数据/);
+});
+
+test('FFmpeg-to-GStreamer bridge points to GStreamer when raw data flows but encoded output stops growing', async () => {
+  const outputPath = path.join(os.tmpdir(), `br2k-bridge-stall-${process.pid}-${Date.now()}.h264`);
+  let captured = null;
+  try {
+    await runFfmpegToGstreamerJob({
+      ffmpegPath: process.execPath,
+      ffmpegArgs: ['-e', "setInterval(() => process.stdout.write('raw-i420-frame'), 20);"],
+      gstreamerPath: process.execPath,
+      gstreamerArgs: ['-e', "process.stdin.resume(); setInterval(() => {}, 1000);"],
+      gstreamerOutputPath: outputPath,
+      noProgressTimeoutMs: 300
+    });
+    assert.fail('预期没有编码输出会触发 GStreamer 卡死保护。');
+  } catch (error) {
+    captured = error;
+  } finally {
+    await fsp.rm(outputPath, { force: true }).catch(() => {});
+  }
+  assert.equal(captured?.code, 'BR2K_JETSON_GSTREAMER_STALL');
+  assert.equal(captured?.primaryProcess, 'gstreamer');
+  assert.match(captured?.message || '', /GStreamer 未生成编码视频数据/);
 });
 
 test('root updater refuses to append through a symbolic-link log target', { skip: process.platform !== 'linux' }, async () => {

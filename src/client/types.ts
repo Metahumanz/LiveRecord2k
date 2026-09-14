@@ -308,6 +308,21 @@ export type FfmpegCodecOption = {
   reason?: string;
 };
 
+export type CapabilityStage = {
+  status: 'pending' | 'passed' | 'failed' | 'skipped';
+  label: string;
+  message: string;
+  details?: Record<string, unknown>;
+};
+
+export type JetsonBurnSelfTest = {
+  codec: string;
+  ok: boolean;
+  reason: string;
+  converter?: string;
+  stages: Record<string, CapabilityStage>;
+};
+
 export type FfmpegCapabilities = {
   burnCodecs: FfmpegCodecOption[];
   unavailableBurnCodecs: FfmpegCodecOption[];
@@ -323,8 +338,24 @@ export type FfmpegCapabilities = {
     vendor: 'nvidia' | 'intel' | 'amd' | 'unknown';
   }>;
   gstreamerEncoders?: string[];
+  jetsonBurnTests?: Record<string, JetsonBurnSelfTest>;
   probedAt: number;
   probeError?: string;
+};
+
+export type AvatarPreparationDiagnostics = {
+  requested: number;
+  prepared: number;
+  fallback: number;
+  noAvatarSource: number;
+  downloadFailed: number;
+  decodeFailed: number;
+  cropFailed: number;
+  firstError?: {
+    stage: string;
+    message: string;
+    stderr: string;
+  };
 };
 
 export type FfmpegJobProgress = {
@@ -342,6 +373,7 @@ export type FfmpegJobProgress = {
   sourceFps?: number;
   encoderBackend?: string;
   avatarCompositeBackend?: string;
+  avatarDiagnostics?: AvatarPreparationDiagnostics;
   fallbackReason?: string;
   startedAt: number;
   workStartedAt?: number;
@@ -367,6 +399,7 @@ export type HardwareSelfTest = {
   decoderBackend: string;
   avatarCompositeBackend: string;
   fallbackReason: string;
+  stages?: Record<string, CapabilityStage>;
 };
 
 export type ExportQueueItem = {

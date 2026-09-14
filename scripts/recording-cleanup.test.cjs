@@ -46,6 +46,89 @@ async function confirmMergedResidualCleanup(service) {
   return service.cleanupMergedSegmentResiduals({ confirm: true, scanId: scan.scanId });
 }
 
+test('avatar preparation exposes categorized fallback diagnostics without blocking export', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-diagnostics-'));
+  try {
+    const service = createService(outputDir);
+    const reports = [];
+    const layer = await service.prepareAvatarOverlayLayer(
+      {
+        panel: { left: 0, width: 80, height: 180 },
+        entries: [{ uid: 0, avatarUrl: '', size: 32, segments: [{ start: 0, end: 1, x1: 0, x2: 0, y1: 0, y2: 0 }] }]
+      },
+      {
+        assPath: path.join(outputDir, 'subtitle.ass'),
+        recording: { cleanPath: path.join(outputDir, 'source.clean.mp4') },
+        onDiagnostics: (diagnostics) => reports.push(diagnostics)
+      }
+    );
+    assert.equal(layer, null);
+    const diagnostics = reports.at(-1);
+    assert.equal(diagnostics.requested, 1);
+    assert.equal(diagnostics.prepared, 0);
+    assert.equal(diagnostics.fallback, 1);
+    assert.equal(diagnostics.noAvatarSource, 1);
+    assert.equal(diagnostics.downloadFailed, 0);
+    assert.equal(diagnostics.firstError.stage, 'source');
+    assert.match(diagnostics.firstError.stderr, /没有可用头像地址/);
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('avatar preparation distinguishes download and image-decode failures', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-diagnostic-kinds-'));
+  const avatarPlan = {
+    panel: { left: 0, width: 80, height: 180 },
+    entries: [{ uid: 42, avatarUrl: 'https://i0.hdslb.com/bfs/face/member/noface.jpg', size: 32, segments: [{ start: 0, end: 1, x1: 0, x2: 0, y1: 0, y2: 0 }] }]
+  };
+  const options = { assPath: path.join(outputDir, 'subtitle.ass'), recording: { cleanPath: path.join(outputDir, 'source.clean.mp4') } };
+  try {
+    const downloadService = createService(outputDir);
+    downloadService.fetchAvatarImageAsset = async () => {
+      throw new Error('HTTP 503 avatar upstream');
+    };
+    let downloadDiagnostics = null;
+    await downloadService.prepareAvatarOverlayLayer(avatarPlan, { ...options, onDiagnostics: (value) => { downloadDiagnostics = value; } });
+    assert.equal(downloadDiagnostics.downloadFailed, 1);
+    assert.equal(downloadDiagnostics.decodeFailed, 0);
+    assert.equal(downloadDiagnostics.firstError.stage, 'download');
+    assert.match(downloadDiagnostics.firstError.stderr, /HTTP 503/);
+
+    const decodeService = createService(outputDir);
+    decodeService.ffmpegPath = process.execPath;
+    decodeService.fetchAvatarImageAsset = async () => ({ body: Buffer.from('not an image'), contentType: 'image/png' });
+    let decodeDiagnostics = null;
+    await decodeService.prepareAvatarOverlayLayer(avatarPlan, { ...options, onDiagnostics: (value) => { decodeDiagnostics = value; } });
+    assert.equal(decodeDiagnostics.downloadFailed, 0);
+    assert.equal(decodeDiagnostics.decodeFailed, 1);
+    assert.equal(decodeDiagnostics.firstError.stage, 'decode');
+    assert.ok(decodeDiagnostics.firstError.stderr.length > 0);
+
+    const cropService = createService(outputDir);
+    cropService.fetchAvatarImageAsset = async () => ({ body: Buffer.from('synthetic image'), contentType: 'image/png' });
+    let cropCalls = 0;
+    let cropDiagnostics = null;
+    await cropService.prepareAvatarOverlayLayer(avatarPlan, {
+      ...options,
+      runAvatarProcess: async () => {
+        cropCalls += 1;
+        return cropCalls === 1
+          ? { status: 0, timedOut: false, stderr: '' }
+          : { status: 1, timedOut: false, stderr: 'synthetic crop stderr' };
+      },
+      onDiagnostics: (value) => { cropDiagnostics = value; }
+    });
+    assert.equal(cropDiagnostics.downloadFailed, 0);
+    assert.equal(cropDiagnostics.decodeFailed, 0);
+    assert.equal(cropDiagnostics.cropFailed, 1);
+    assert.equal(cropDiagnostics.firstError.stage, 'crop');
+    assert.match(cropDiagnostics.firstError.stderr, /synthetic crop stderr/);
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('merged recording metadata preserves cleanup lineage across a library refresh', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-metadata-'));
   const sourceOne = path.join(outputDir, 'session-part-1.clean.mp4');

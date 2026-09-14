@@ -169,8 +169,17 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const primaryMessage = progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
   const timingDetails = [hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : ''].filter(Boolean);
   const rateDetails = [renderFpsLabel, realtimeLabel].filter(Boolean);
+  const avatarDiagnostics = progress.avatarDiagnostics;
+  const avatarDiagnosticsLabel = avatarDiagnostics
+    ? `头像 ${avatarDiagnostics.prepared}/${avatarDiagnostics.requested}，通用回退 ${avatarDiagnostics.fallback}（无源 ${
+        avatarDiagnostics.noAvatarSource
+      }，下载 ${avatarDiagnostics.downloadFailed}，解码 ${avatarDiagnostics.decodeFailed}，裁切 ${avatarDiagnostics.cropFailed}）${
+        avatarDiagnostics.firstError ? `；首条：${avatarDiagnostics.firstError.stderr}` : ''
+      }`
+    : '';
   const backendDetails = [
     progress.avatarCompositeBackend || '',
+    avatarDiagnosticsLabel,
     progress.fallbackReason ? `回退：${progress.fallbackReason}` : '',
     decoderLabel,
     encoderBackendLabel

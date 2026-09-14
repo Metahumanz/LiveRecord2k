@@ -209,6 +209,7 @@ const {
 } = require('../shared/security.cjs');
 const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safety.cjs');
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
+const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
 
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -307,6 +308,7 @@ const WEBHOOK_RETRY_DELAYS_MS = [0, 1000, 3000];
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const MAX_PROXY_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_AVATAR_OVERLAY_IMAGE_BYTES = 2 * 1024 * 1024;
+const JETSON_SELF_TEST_AVATAR_UID = 1;
 const LIMITED_AVATAR_OVERLAY_ENTRIES = 6;
 const UNLIMITED_AVATAR_OVERLAY_ENTRIES = Number.MAX_SAFE_INTEGER;
 // FFmpeg's expression evaluator has a practical nesting limit.  Keep each
@@ -1116,6 +1118,7 @@ class LiveRecordService {
       fallbackReason: ''
     };
     this.hardwareSelfTestPromise = null;
+    this.jetsonAvatarSelfTestAssetPromise = null;
     this.accessAuth = new AccessAuthManager();
     this.updateState = {
       status: 'idle',
@@ -1145,6 +1148,7 @@ class LiveRecordService {
       hardwareDecoders: [],
       videoAdapters: [],
       gstreamerEncoders: [],
+      jetsonBurnTests: {},
       avatarComposite: null,
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
@@ -1238,7 +1242,9 @@ class LiveRecordService {
 
   async initializeRuntimeCapabilities() {
     [this.ffmpegCapabilities, this.startupEnabled] = await Promise.all([
-      detectFfmpegCapabilities(this.ffmpegPath),
+      detectFfmpegCapabilities(this.ffmpegPath, {
+        testJetsonEndToEnd: (codecInfo) => this.runJetsonGstreamerEndToEndSelfTest(codecInfo)
+      }),
       isStartupEnabled()
     ]);
     this.settings = this.normalizeSettings(this.settings);
@@ -1264,6 +1270,14 @@ class LiveRecordService {
       (this.ffmpegCapabilities.hardwareDecoders || []).length ? 'info' : 'warn',
       `可用硬件解码：${hardwareDecoderSummary}`
     );
+    for (const probe of Object.values(this.ffmpegCapabilities.jetsonBurnTests || {})) {
+      this.log(
+        probe?.ok ? 'success' : 'warn',
+        `Jetson ${probe?.codec || 'nvv4l2'} 端到端烧录自检${probe?.ok ? '通过，可用于烧录。' : '未通过，不会标记为可用。'}${
+          probe?.reason ? ` 原因：${probe.reason}` : ''
+        }`
+      );
+    }
     const avatarComposite = this.getAvatarCompositeCapability();
     this.log(
       avatarComposite ? 'info' : 'warn',
@@ -8921,7 +8935,27 @@ try {
 
   async prepareAvatarOverlayLayer(avatarPlan, options = {}) {
     const requestedEntries = Array.isArray(avatarPlan?.entries) ? avatarPlan.entries : [];
-    if (!requestedEntries.length || !options.assPath) return null;
+    const avatarDiagnostics = {
+      requested: requestedEntries.length,
+      prepared: 0,
+      fallback: requestedEntries.length,
+      noAvatarSource: 0,
+      downloadFailed: 0,
+      decodeFailed: 0,
+      cropFailed: 0,
+      firstError: null
+    };
+    const reportAvatarDiagnostics = () => {
+      options.onDiagnostics?.({
+        ...avatarDiagnostics,
+        firstError: avatarDiagnostics.firstError ? { ...avatarDiagnostics.firstError } : undefined
+      });
+    };
+    if (!requestedEntries.length || !options.assPath) {
+      if (requestedEntries.length && !options.assPath) avatarDiagnostics.noAvatarSource = requestedEntries.length;
+      reportAvatarDiagnostics();
+      return null;
+    }
 
     const label = String(options.label || '烧录');
     const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
@@ -8933,11 +8967,56 @@ try {
     const throwIfCancelled = () => {
       if (isCancelled()) throw cancellationError();
     };
+    const avatarPreparationError = (stage, message, stderr = '') => {
+      const error = new Error(message);
+      error.avatarPreparationStage = stage;
+      error.avatarPreparationStderr = compactLogLine(stderr || message);
+      return error;
+    };
+    const recordAvatarFailure = (error, fallbackStage = 'decode') => {
+      const stage = String(error?.avatarPreparationStage || fallbackStage);
+      if (stage === 'source') avatarDiagnostics.noAvatarSource += 1;
+      else if (stage === 'download') avatarDiagnostics.downloadFailed += 1;
+      else if (stage === 'crop') avatarDiagnostics.cropFailed += 1;
+      else avatarDiagnostics.decodeFailed += 1;
+      const stderr = compactLogLine(error?.avatarPreparationStderr || error?.stderr || error?.message || '头像处理失败');
+      if (!avatarDiagnostics.firstError) {
+        avatarDiagnostics.firstError = { stage, message: compactLogLine(error?.message || stderr), stderr };
+      }
+    };
+    const avatarDiagnosticsSummary = () =>
+      `无头像源 ${avatarDiagnostics.noAvatarSource}，下载失败 ${avatarDiagnostics.downloadFailed}，格式或解码失败 ${
+        avatarDiagnostics.decodeFailed
+      }，裁切失败 ${avatarDiagnostics.cropFailed}${
+        avatarDiagnostics.firstError ? `；首条 stderr：${avatarDiagnostics.firstError.stderr}` : ''
+      }`;
+    const runAvatarProcess = (args, processOptions) =>
+      typeof options.runAvatarProcess === 'function'
+        ? options.runAvatarProcess(args, processOptions)
+        : runCapturedProcess(this.ffmpegPath, args, processOptions);
     throwIfCancelled();
-    const workingDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-'));
-    const avatarManifest = await this.loadAvatarManifestForRecording(options.recording);
+    let workingDir = '';
+    try {
+      workingDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-avatar-layer-'));
+    } catch (error) {
+      recordAvatarFailure(error);
+      reportAvatarDiagnostics();
+      this.log('warn', `${label} 无法创建头像临时目录，继续使用通用头像（${avatarDiagnosticsSummary()}）。`);
+      return null;
+    }
+    let avatarManifest;
+    try {
+      avatarManifest = await this.loadAvatarManifestForRecording(options.recording);
+    } catch (error) {
+      recordAvatarFailure(error);
+      reportAvatarDiagnostics();
+      await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
+      this.log('warn', `${label} 无法读取头像清单，继续使用通用头像（${avatarDiagnosticsSummary()}）。`);
+      return null;
+    }
     const avatarUrlsByUid = new Map();
     const sourceFilesByUrl = new Map();
+    const decodedAvatarBySource = new Map();
     const renderedAvatarBySource = new Map();
     const recordedSnapshotPaths = new Set();
     let failedCount = 0;
@@ -8972,16 +9051,42 @@ try {
         sourceFilesByUrl.set(
           avatarUrl,
           (async () => {
-            const asset = await this.fetchAvatarImageAsset(avatarUrl);
-            const extension = avatarImageExtension(asset.contentType) || '.img';
-            const digest = crypto.createHash('sha256').update(avatarUrl).digest('hex').slice(0, 24);
-            const sourcePath = path.join(workingDir, `source-${digest}${extension}`);
-            await fsp.writeFile(sourcePath, asset.body);
-            return sourcePath;
+            try {
+              const asset = await this.fetchAvatarImageAsset(avatarUrl);
+              const extension = avatarImageExtension(asset.contentType) || '.img';
+              const digest = crypto.createHash('sha256').update(avatarUrl).digest('hex').slice(0, 24);
+              const sourcePath = path.join(workingDir, `source-${digest}${extension}`);
+              await fsp.writeFile(sourcePath, asset.body);
+              return sourcePath;
+            } catch (error) {
+              throw avatarPreparationError('download', `头像下载失败：${compactLogLine(error?.message || String(error))}`, error?.stderr || error?.message);
+            }
           })()
         );
       }
       return sourceFilesByUrl.get(avatarUrl);
+    };
+    const decodeAvatar = (sourcePath) => {
+      if (!decodedAvatarBySource.has(sourcePath)) {
+        decodedAvatarBySource.set(
+          sourcePath,
+          (async () => {
+            const decoded = await runAvatarProcess(
+              ['-hide_banner', '-loglevel', 'error', '-i', sourcePath, '-frames:v', '1', '-f', 'null', '-'],
+              { timeoutMs: 15000, maxOutputBytes: 32 * 1024 }
+            );
+            if (decoded.timedOut || decoded.status !== 0) {
+              throw avatarPreparationError(
+                'decode',
+                `头像格式或解码失败：${compactLogLine(decoded.stderr || 'FFmpeg 无法读取头像。')}`,
+                decoded.stderr
+              );
+            }
+            return true;
+          })()
+        );
+      }
+      return decodedAvatarBySource.get(sourcePath);
     };
     const renderAvatar = (sourcePath, size) => {
       const renderKey = `${sourcePath}\u0000${size}`;
@@ -8991,8 +9096,7 @@ try {
         renderedAvatarBySource.set(
           renderKey,
           (async () => {
-            const rendered = await runCapturedProcess(
-              this.ffmpegPath,
+            const rendered = await runAvatarProcess(
               [
                 '-hide_banner',
                 '-loglevel',
@@ -9011,7 +9115,11 @@ try {
               { timeoutMs: 15000, maxOutputBytes: 32 * 1024 }
             );
             if (rendered.timedOut || rendered.status !== 0 || (await getFileSize(imagePath)) < 128) {
-              throw new Error(compactLogLine(rendered.stderr || '头像圆形裁切失败。'));
+              throw avatarPreparationError(
+                'crop',
+                `头像圆形裁切失败：${compactLogLine(rendered.stderr || 'FFmpeg 没有生成 PNG。')}`,
+                rendered.stderr
+              );
             }
             return imagePath;
           })()
@@ -9026,8 +9134,9 @@ try {
         try {
           throwIfCancelled();
           const source = await resolveAvatarSource(entry);
-          if (!source) throw new Error('没有可用头像地址。');
+          if (!source) throw avatarPreparationError('source', '没有可用头像地址。');
           const sourcePath = source.kind === 'file' ? source.path : await fetchAvatarSource(source.url);
+          await decodeAvatar(sourcePath);
           const size = Math.round(clamp(Number(entry?.size || 0), 8, 512));
           const imagePath = await renderAvatar(sourcePath, size);
           throwIfCancelled();
@@ -9035,14 +9144,18 @@ try {
         } catch (error) {
           if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
           failedCount += 1;
+          recordAvatarFailure(error);
           return null;
         }
       });
       throwIfCancelled();
       const entries = prepared.filter(Boolean);
+      avatarDiagnostics.prepared = entries.length;
+      avatarDiagnostics.fallback = Math.max(0, requestedEntries.length - entries.length);
       if (!entries.length) {
         await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
-        this.log('warn', `${label} 未能准备真实头像，继续使用通用头像图标。`);
+        reportAvatarDiagnostics();
+        this.log('warn', `${label} 未能准备真实头像，继续使用通用头像图标（${avatarDiagnosticsSummary()}）。`);
         return null;
       }
       const videoWidth = Math.floor(Math.max(0, Number(options.recording?.videoInfo?.width) || 0) / 2) * 2;
@@ -9091,6 +9204,10 @@ try {
           });
         const script = createFilterScript(gpuComposite);
         if (!script) {
+          recordAvatarFailure(avatarPreparationError('decode', '头像 overlay 滤镜未能生成。'));
+          avatarDiagnostics.prepared = 0;
+          avatarDiagnostics.fallback = requestedEntries.length;
+          reportAvatarDiagnostics();
           await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
           return null;
         }
@@ -9101,6 +9218,10 @@ try {
         if (gpuComposite) {
           const cpuScript = createFilterScript(false);
           if (!cpuScript) {
+            recordAvatarFailure(avatarPreparationError('decode', 'CPU 头像 overlay 回退滤镜未能生成。'));
+            avatarDiagnostics.prepared = 0;
+            avatarDiagnostics.fallback = requestedEntries.length;
+            reportAvatarDiagnostics();
             await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
             return null;
           }
@@ -9123,8 +9244,9 @@ try {
         'info',
         `${label} 已准备独立透明头像图层：${entries.length}/${requestedEntries.length}${
          avatarPlan.truncated ? `（从 ${avatarPlan.candidateCount || requestedEntries.length} 处互动均匀取样）` : ''
-          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退` : ''}${compositeSummary}`
+          }${recordedCount ? `，本地快照 ${recordedCount} 个` : ''}${failedCount ? `，${failedCount} 个保留通用头像回退（${avatarDiagnosticsSummary()}）` : ''}${compositeSummary}`
       );
+      reportAvatarDiagnostics();
       return {
         ...overlay,
         filterScriptPath: chunkDuration ? '' : filterScriptPath,
@@ -9136,12 +9258,20 @@ try {
         gpuCompositeDevice,
         gpuOutputToCpu,
         chunked: Boolean(chunkDuration),
-        chunkDuration
+        chunkDuration,
+        diagnostics: {
+          ...avatarDiagnostics,
+          firstError: avatarDiagnostics.firstError ? { ...avatarDiagnostics.firstError } : undefined
+        }
       };
     } catch (error) {
       await fsp.rm(workingDir, { recursive: true, force: true }).catch(() => {});
       if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-      this.log('warn', `${label} 真实头像图层准备失败，继续使用通用头像：${compactLogLine(error.message)}`);
+      recordAvatarFailure(error);
+      avatarDiagnostics.prepared = 0;
+      avatarDiagnostics.fallback = requestedEntries.length;
+      reportAvatarDiagnostics();
+      this.log('warn', `${label} 真实头像图层准备失败，继续使用通用头像（${avatarDiagnosticsSummary()}）。`);
       return null;
     }
   }
@@ -9309,6 +9439,7 @@ try {
         ffmpegPath: this.ffmpegPath,
         ffmpegArgs: createRawArgs(nextDecoder),
         gstreamerArgs,
+        gstreamerOutputPath: outputPath,
         onFfmpegStderr: onStderr,
         onGstreamerStderr: (text) => {
           const label = /(?:\bargus\b|nvargus-daemon|socketclientdispatch|fileoperationfailed)/i.test(String(text || ''))
@@ -10016,6 +10147,7 @@ try {
       const gpuAvatarComposite = Boolean(avatarComposite);
       const gpuAvatarOutputToCpu =
         requestedAvatarComposite?.value !== 'cuda' || !String(burnCodec || '').includes('nvenc');
+      let avatarDiagnostics = null;
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
         recording,
         assPath: assets.assPath,
@@ -10030,6 +10162,9 @@ try {
         gpuCompositeMode: requestedAvatarComposite?.mode || '',
         gpuCompositeDevice: requestedAvatarComposite?.device || '',
         gpuOutputToCpu: gpuAvatarOutputToCpu,
+        onDiagnostics: (diagnostics) => {
+          avatarDiagnostics = diagnostics;
+        },
         isCancelled: () => this.burnCancelRequests.has(room.id)
       });
       const progress = createFfmpegJobProgress({
@@ -10045,7 +10180,8 @@ try {
         decoderLabel: decoderInfo.label,
         sourceFps: burnFps,
         encoderBackend: this.getEncoderBackendLabel(codecInfo),
-        avatarCompositeBackend: this.getAvatarCompositeBackendLabel(avatarLayer, avatarMode)
+        avatarCompositeBackend: this.getAvatarCompositeBackendLabel(avatarLayer, avatarMode),
+        avatarDiagnostics: avatarDiagnostics || avatarLayer?.diagnostics
       });
       room.burning = true;
       room.burnProgress = progress;
@@ -11166,6 +11302,7 @@ try {
     let assPath = recording.assPath;
     let temporaryAssDir = '';
     let avatarLayer = null;
+    let avatarDiagnostics = null;
     let args;
     let createBurnExportArgs = null;
     let burnTimeline = null;
@@ -11234,9 +11371,13 @@ try {
         gpuCompositeMode: requestedAvatarComposite?.mode || '',
         gpuCompositeDevice: requestedAvatarComposite?.device || '',
         gpuOutputToCpu: gpuAvatarOutputToCpu,
+        onDiagnostics: (diagnostics) => {
+          avatarDiagnostics = diagnostics;
+        },
         isCancelled: () => this.exportCancelRequested
       });
       progress.avatarCompositeBackend = this.getAvatarCompositeBackendLabel(avatarLayer, avatarMode);
+      progress.avatarDiagnostics = avatarDiagnostics || avatarLayer?.diagnostics;
       progress.updatedAt = Date.now();
       throwIfExportCancelled();
       if (!avatarLayer?.chunked) {
@@ -11644,34 +11785,52 @@ try {
     return this.updateService.scheduleAutomaticUpdateCheck(delayMs);
   }
 
-  async runJetsonGstreamerBridgeSelfTest(codecInfo) {
-    const codec = String(codecInfo?.value || '').trim();
-    const gstreamerArgs = createJetsonGstreamerEncodeArgs({
-      codec,
-      width: 320,
-      height: 180,
-      fps: 30,
-      quality: 28,
-      outputPath: '/dev/null',
-      converter: codecInfo?.converter
-    });
-    // Use fakesink: this validates the same FFmpeg raw-I420 to nvv4l2 bridge
-    // used by a burn without leaving an elementary stream on disk.
-    gstreamerArgs.splice(gstreamerArgs.length - 3, 3, '!', 'fakesink');
-    try {
-      await runFfmpegToGstreamerJob({
-        ffmpegPath: this.ffmpegPath,
-        ffmpegArgs: [
-          '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30',
-          '-frames:v', '90', '-an', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', 'pipe:1'
-        ],
-        gstreamerArgs,
-        timeoutMs: 10000
-      });
-      return { ok: true, reason: '' };
-    } catch (error) {
-      return { ok: false, reason: compactLogLine(error?.message || String(error)) };
+  getJetsonSelfTestBuiltInAvatarPath() {
+    const candidates = [
+      path.join(APP_ROOT, 'assets', 'app-icon.png'),
+      path.join(APP_ROOT, 'public', 'app-icon.png')
+    ];
+    return candidates.find((candidate) => {
+      try {
+        return fs.statSync(candidate).isFile();
+      } catch {
+        return false;
+      }
+    }) || '';
+  }
+
+  async fetchJetsonSelfTestAvatar() {
+    if (!this.jetsonAvatarSelfTestAssetPromise) {
+      this.jetsonAvatarSelfTestAssetPromise = (async () => {
+        const avatarUrl = await this.lookupBiliAvatarForOverlay(JETSON_SELF_TEST_AVATAR_UID).catch(() => '');
+        if (!avatarUrl) {
+          throw new Error(`未能获取 Bilibili UID ${JETSON_SELF_TEST_AVATAR_UID} 的实际头像地址。`);
+        }
+        return this.fetchAvatarImageAsset(avatarUrl);
+      })();
     }
+    try {
+      return await this.jetsonAvatarSelfTestAssetPromise;
+    } catch (error) {
+      this.jetsonAvatarSelfTestAssetPromise = null;
+      throw error;
+    }
+  }
+
+  async runJetsonGstreamerEndToEndSelfTest(codecInfo) {
+    return runJetsonBurnEndToEndSelfTest({
+      codecInfo,
+      ffmpegPath: this.ffmpegPath,
+      converter: codecInfo?.converter,
+      builtInAvatarPath: this.getJetsonSelfTestBuiltInAvatarPath(),
+      remoteAvatarUrl: `bilibili:uid:${JETSON_SELF_TEST_AVATAR_UID}`,
+      downloadAvatar: () => this.fetchJetsonSelfTestAvatar(),
+      runProcess: runCapturedProcess
+    });
+  }
+
+  async runJetsonGstreamerBridgeSelfTest(codecInfo) {
+    return this.runJetsonGstreamerEndToEndSelfTest(codecInfo);
   }
 
   async runHardwareAccelerationSelfTest() {
@@ -11699,7 +11858,8 @@ try {
         encoderBackend: this.getEncoderBackendLabel(codecInfo),
         decoderBackend: decoder ? `${decoder.label}（能力已探测；真实解码取决于源视频）` : 'CPU（未探测到可用硬件解码）',
         avatarCompositeBackend: avatarComposite ? `正在测试 ${avatarCompositeLabel}` : 'CPU 头像合成（未检测到 GPU 合成）',
-        fallbackReason: ''
+        fallbackReason: '',
+        stages: {}
       };
       this.log(
         'info',
@@ -11741,6 +11901,7 @@ try {
               this.ffmpegCapabilities.cudaAvatarCompositeReason ||
               '未检测到可用的 GPU 透明图层合成链路'
           };
+      const jetsonStages = encoderTest?.stages && typeof encoderTest.stages === 'object' ? encoderTest.stages : undefined;
       const fallbackReason = [
         encoderTest.ok ? '' : `编码自检失败：${encoderTest.reason || '未知原因'}`,
         avatarTest.ok ? '' : `GPU 头像合成不可用，运行时将使用 CPU：${avatarTest.reason || '未知原因'}`
@@ -11751,6 +11912,7 @@ try {
         status: encoderPassed ? (avatarTest.ok ? 'completed' : 'degraded') : 'failed',
         completedAt: Date.now(),
         avatarCompositeBackend: avatarTest.ok ? avatarCompositeLabel : 'CPU 头像合成（GPU 自检未通过）',
+        ...(jetsonStages ? { stages: jetsonStages } : {}),
         fallbackReason,
         message: encoderPassed
           ? avatarTest.ok

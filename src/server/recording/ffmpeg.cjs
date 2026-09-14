@@ -143,6 +143,13 @@ function escapeFilterPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 }
 
+// Keep the ASS filter spelling in exactly one place. Apart from being easier
+// to audit, `filename=` prevents FFmpeg's filter-option parser from treating a
+// Windows drive letter as an unnamed second option.
+function createAssFilter(assPath) {
+  return `ass=filename='${escapeFilterPath(assPath)}'`;
+}
+
 function formatFilterNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return '0';
@@ -366,7 +373,7 @@ function createBurnVideoFilter(assPath, fps, options = {}) {
   const leadingPaddingFilter = createLeadingVideoPaddingFilter(leadingVideoPaddingSec, options.outputDuration);
   return (
     `settb=AVTB,setpts=PTS-STARTPTS${inputTrimFilter}${selectFilter}${fpsFilter}${sourceClockFilter},` +
-    `ass='${escapeFilterPath(assPath)}'${outputClockFilter}${leadingPaddingFilter}`
+    `${createAssFilter(assPath)}${outputClockFilter}${leadingPaddingFilter}`
   );
 }
 
@@ -1293,7 +1300,10 @@ function runFfmpegToGstreamerJob({
   onFfmpegStderr,
   onGstreamerStderr,
   onChild,
-  timeoutMs = 0
+  timeoutMs = 0,
+  noProgressTimeoutMs = 75_000,
+  gstreamerOutputPath = '',
+  onBridgeProgress
 }) {
   return new Promise((resolve, reject) => {
     let ffmpeg = null;
@@ -1304,8 +1314,17 @@ function runFfmpegToGstreamerJob({
     let gstreamerResult = { code: null, signal: '', error: null, stderr: '' };
     let settled = false;
     const timeout = Math.max(0, Number(timeoutMs) || 0);
+    const noProgressTimeout = Math.max(0, Number(noProgressTimeoutMs) || 0);
+    const progressCheckInterval = Math.max(250, Math.min(5000, Math.round(noProgressTimeout / 12) || 1000));
     let timeoutTimer = null;
     let timeoutError = null;
+    let noProgressTimer = null;
+    let noProgressError = null;
+    let ffmpegRawBytes = 0;
+    let gstreamerOutputBytes = 0;
+    let lastFfmpegRawAt = Date.now();
+    let lastGstreamerOutputAt = Date.now();
+    const outputPath = String(gstreamerOutputPath || '').trim();
     const stopReasons = { ffmpeg: '', gstreamer: '' };
 
     const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim().slice(-4000);
@@ -1335,8 +1354,17 @@ function runFfmpegToGstreamerJob({
         return false;
       }
     };
+    const readGstreamerOutputBytes = () => {
+      if (!outputPath) return 0;
+      try {
+        const stat = fs.statSync(outputPath);
+        return stat.isFile() ? Math.max(0, Number(stat.size) || 0) : 0;
+      } catch {
+        return 0;
+      }
+    };
     const hasFailure = (result, stopReason) => {
-      if (result.error && result.error !== timeoutError) return true;
+      if (result.error && result.error !== timeoutError && result.error !== noProgressError) return true;
       if (result.code !== null && result.code !== 0) return true;
       // A signal sent by this bridge is an expected cleanup action rather
       // than a second root cause. Signals without a recorded bridge reason
@@ -1347,6 +1375,7 @@ function runFfmpegToGstreamerJob({
       if (settled || !ffmpegClosed || !gstreamerClosed) return;
       settled = true;
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (noProgressTimer) clearInterval(noProgressTimer);
       onChild?.(null);
       if (ffmpegResult.code === 0 && !ffmpegResult.error && gstreamerResult.code === 0 && !gstreamerResult.error) {
         resolve();
@@ -1358,7 +1387,13 @@ function runFfmpegToGstreamerJob({
       const gstreamerDetail = splitArgusDiagnostics(gstreamerResult.stderr || gstreamerResult.error?.message);
       const details = [];
       let primaryProcess = '';
-      if (ffmpegFailed) {
+      if (noProgressError) {
+        primaryProcess = noProgressError.primaryProcess || 'bridge';
+        details.push(noProgressError.message);
+        if (ffmpegDetail) details.push(`FFmpeg 附加输出：${ffmpegDetail}`);
+        if (gstreamerDetail.primary) details.push(`GStreamer 附加输出：${gstreamerDetail.primary}`);
+        if (gstreamerDetail.argus) details.push(`Argus 附加诊断：${gstreamerDetail.argus}`);
+      } else if (ffmpegFailed) {
         // FFmpeg owns decode and filters. If it returned a real nonzero exit,
         // its stderr is the root cause even when we subsequently kill the
         // GStreamer side of the bridge.
@@ -1401,6 +1436,9 @@ function runFfmpegToGstreamerJob({
       error.gstreamerStderr = compact(gstreamerResult.stderr);
       error.argusDiagnostics = gstreamerDetail.argus;
       error.primaryProcess = primaryProcess;
+      error.code = noProgressError?.code || timeoutError?.code || error.code;
+      error.noProgressTimeoutMs = noProgressError ? noProgressTimeout : 0;
+      error.stalledProcess = noProgressError?.primaryProcess || '';
       error.gstreamerStoppedByPipeline = Boolean(
         ['ffmpeg-failed', 'ffmpeg-spawn-failed'].includes(stopReasons.gstreamer)
       );
@@ -1415,10 +1453,56 @@ function runFfmpegToGstreamerJob({
       ffmpeg = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
       onChild?.(ffmpeg);
       ffmpeg.stdout.pipe(gstreamer.stdin);
+      gstreamerOutputBytes = readGstreamerOutputBytes();
       ffmpeg.stdout.on('error', () => {});
+      ffmpeg.stdout.on('data', (chunk) => {
+        const now = Date.now();
+        ffmpegRawBytes += Math.max(0, Number(chunk?.length) || 0);
+        lastFfmpegRawAt = now;
+        onBridgeProgress?.({ ffmpegRawBytes, gstreamerOutputBytes, lastFfmpegRawAt, lastGstreamerOutputAt });
+      });
       gstreamer.stdin.on('error', () => {
         stop(ffmpeg, 'ffmpeg', 'gstreamer-stdin-closed');
       });
+      if (noProgressTimeout) {
+        noProgressTimer = setInterval(() => {
+          if (settled || (ffmpegClosed && gstreamerClosed)) return;
+          const now = Date.now();
+          const outputBytes = readGstreamerOutputBytes();
+          if (outputBytes > gstreamerOutputBytes) {
+            gstreamerOutputBytes = outputBytes;
+            lastGstreamerOutputAt = now;
+            onBridgeProgress?.({ ffmpegRawBytes, gstreamerOutputBytes, lastFfmpegRawAt, lastGstreamerOutputAt });
+          }
+          const ffmpegIdleMs = now - lastFfmpegRawAt;
+          const gstreamerIdleMs = now - lastGstreamerOutputAt;
+          let stalledProcess = '';
+          // Once FFmpeg has supplied any I420 bytes, a frozen GStreamer
+          // consumer can back-pressure its stdout and make FFmpeg appear
+          // idle. Prefer the missing encoded-file growth in that case so
+          // diagnostics point at the process that is actually blocking.
+          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout) {
+            stalledProcess = 'gstreamer';
+          } else if (!ffmpegClosed && ffmpegIdleMs >= noProgressTimeout) {
+            stalledProcess = 'ffmpeg';
+          }
+          if (!stalledProcess || noProgressError) return;
+          const idleMs = stalledProcess === 'ffmpeg' ? ffmpegIdleMs : gstreamerIdleMs;
+          const error = new Error(
+            `Jetson 管线无视频数据/无进度超过 ${Math.ceil(idleMs / 1000)} 秒，已中止：${
+              stalledProcess === 'ffmpeg' ? 'FFmpeg 未输出 I420 视频数据' : 'GStreamer 未生成编码视频数据'
+            }。`
+          );
+          error.code = stalledProcess === 'ffmpeg' ? 'BR2K_JETSON_FFMPEG_STALL' : 'BR2K_JETSON_GSTREAMER_STALL';
+          error.primaryProcess = stalledProcess;
+          noProgressError = error;
+          ffmpegResult.error = ffmpegResult.error || error;
+          gstreamerResult.error = gstreamerResult.error || error;
+          stop(ffmpeg, 'ffmpeg', `${stalledProcess}-no-progress`);
+          stop(gstreamer, 'gstreamer', `${stalledProcess}-no-progress`);
+        }, progressCheckInterval);
+        noProgressTimer.unref?.();
+      }
       if (timeout) {
         timeoutTimer = setTimeout(() => {
           const error = new Error(`Jetson GStreamer 编码超时（${timeout}ms）`);
@@ -1432,6 +1516,7 @@ function runFfmpegToGstreamerJob({
         timeoutTimer.unref?.();
       }
     } catch (error) {
+      if (noProgressTimer) clearInterval(noProgressTimer);
       onChild?.(null);
       reject(error);
       return;
@@ -2158,6 +2243,7 @@ module.exports = {
   getV4l2TargetBitrate,
   getJetsonGstreamerBitrate,
   formatGstreamerFramerate,
+  createAssFilter,
   createRecordingArgs,
   createMp4FinalizeArgs,
   createBurnVideoFilter,

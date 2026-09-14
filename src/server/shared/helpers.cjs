@@ -636,7 +636,7 @@ async function detectFfmpegAvatarCompositeBackend(ffmpegPath, { hwaccels = [], f
   };
 }
 
-async function detectFfmpegCapabilities(ffmpegPath) {
+async function detectFfmpegCapabilities(ffmpegPath, options = {}) {
   const [encoderProbe, hwaccelProbe, filterProbe, videoAdapters] = await Promise.all([
     runFfmpegProbe(ffmpegPath, ['-hide_banner', '-encoders']),
     runFfmpegProbe(ffmpegPath, ['-hide_banner', '-hwaccels']),
@@ -649,6 +649,7 @@ async function detectFfmpegCapabilities(ffmpegPath) {
   const burnCodecs = [];
   const unavailableBurnCodecs = [];
   const gstreamerEncoders = [];
+  const jetsonBurnTests = {};
 
   for (const candidate of BURN_CODEC_CANDIDATES) {
     if (candidate.backend === 'gstreamer') {
@@ -656,9 +657,30 @@ async function detectFfmpegCapabilities(ffmpegPath) {
         unavailableBurnCodecs.push({ ...candidate, reason: '当前平台不支持 Jetson GStreamer 编码后端' });
         continue;
       }
-      const test = await testJetsonGstreamerEncoder(candidate);
+      let test;
+      try {
+        test = typeof options.testJetsonEndToEnd === 'function'
+          ? await options.testJetsonEndToEnd(candidate, { encoderNames, hwaccels, filterNames, videoAdapters })
+          : {
+              ok: false,
+              reason: '尚未运行完整 Jetson 烧录链路自检，不能标记为烧录可用。',
+              stages: {}
+            };
+      } catch (error) {
+        test = { ok: false, reason: compactLogLine(error?.message || String(error)), stages: {} };
+      }
+      if (!test || typeof test !== 'object') {
+        test = { ok: false, reason: 'Jetson 完整烧录链路自检没有返回有效结果。', stages: {} };
+      }
+      jetsonBurnTests[candidate.value] = {
+        codec: candidate.value,
+        ok: Boolean(test?.ok),
+        reason: String(test?.reason || ''),
+        converter: String(test?.converter || ''),
+        stages: test?.stages || {}
+      };
       if (!test.ok) {
-        unavailableBurnCodecs.push({ ...candidate, reason: test.reason || 'Jetson GStreamer 硬件编码测试未通过' });
+        unavailableBurnCodecs.push({ ...candidate, reason: test.reason || 'Jetson 完整烧录链路自检未通过' });
         continue;
       }
       burnCodecs.push({ ...candidate, converter: test.converter || JETSON_GSTREAMER_CONVERTERS[0] });
@@ -700,6 +722,7 @@ async function detectFfmpegCapabilities(ffmpegPath) {
     hardwareDecoders,
     videoAdapters,
     gstreamerEncoders,
+    jetsonBurnTests,
     // Keep the CUDA fields for existing installations and persisted
     // diagnostics. New callers should prefer avatarComposite: it can also
     // describe an actually-probed VA-API, Vulkan or OpenCL final blend.
