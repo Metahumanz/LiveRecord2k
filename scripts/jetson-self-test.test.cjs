@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
@@ -30,13 +31,14 @@ test('Jetson end-to-end self-test always covers H.264/HEVC plans and both requir
   assert.equal(Object.hasOwn(createJetsonStageResults(), 'cpuDecode'), true);
   assert.ok(REQUIRED_SCENE_FILTERS.includes('movie'));
   assert.ok(REQUIRED_SCENE_FILTERS.includes('concat'));
-  const bundledFfmpegPath = path.join(__dirname, '..', 'build', 'ffmpeg-full');
-  const bundledFfprobePath = path.join(__dirname, '..', 'build', 'ffprobe-full');
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'br2k-ffprobe-path-'));
+  const bundledFfmpegPath = path.join(temporaryDirectory, 'ffmpeg-full');
+  const bundledFfprobePath = path.join(temporaryDirectory, 'ffprobe-full');
   fs.writeFileSync(bundledFfprobePath, 'probe');
   try {
     assert.equal(resolveFfprobePath(bundledFfmpegPath), bundledFfprobePath);
   } finally {
-    fs.rmSync(bundledFfprobePath, { force: true });
+    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
   assert.equal(fs.statSync(path.join(__dirname, '..', 'assets', 'jetson-self-test', 'h264-sample.mp4')).size > 1024, true);
   assert.equal(fs.statSync(path.join(__dirname, '..', 'assets', 'jetson-self-test', 'hevc-sample.mp4')).size > 1024, true);
