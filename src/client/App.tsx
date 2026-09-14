@@ -478,7 +478,7 @@ export default function App() {
       endTime: duration > 0 ? formatTimelineTime(duration) : '',
       overlayMode: state?.settings.burnOverlayMode || current.overlayMode,
       danmakuArea: state?.settings.burnDanmakuArea || current.danmakuArea,
-      stylePreset: state?.settings.burnDanmakuStylePreset || current.stylePreset,
+      stylePreset: state?.settings.sceneGraphDefaultStyle || current.stylePreset,
       styleLayout: { ...(state?.settings.burnDanmakuStyleLayout || current.styleLayout) },
       avatarMode: state?.settings.burnAvatarMode || current.avatarMode,
       outputDir: current.outputDir || state?.settings.outputDir || ''
@@ -543,13 +543,18 @@ export default function App() {
   }
 
   async function saveExportStyleAsDefault() {
+    const sceneGraphDefaultStyle =
+      exportDraft.stylePreset === 'h5-card' || exportDraft.stylePreset === 'bubble' || exportDraft.stylePreset === 'minimal'
+        ? exportDraft.stylePreset
+        : state?.settings.sceneGraphDefaultStyle;
     await saveSettingsWithToast(
       {
-        burnDanmakuStylePreset: exportDraft.stylePreset,
+        burnDanmakuStylePreset: sceneGraphDefaultStyle || exportDraft.stylePreset,
         burnDanmakuStyleLayout: exportDraft.styleLayout,
-        burnAvatarMode: exportDraft.avatarMode
+        burnAvatarMode: exportDraft.avatarMode,
+        ...(sceneGraphDefaultStyle ? { sceneGraphDefaultStyle } : {})
       },
-      '已设为默认烧录样式；自动烧录和下次导出会使用这组参数'
+      '已设为默认烧录样式；Scene Graph、自动烧录和下次导出会使用这组参数'
     );
   }
 

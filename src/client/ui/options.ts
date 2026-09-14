@@ -1,5 +1,5 @@
 import danmakuStylePresetData from '../../shared/danmaku-style-presets.json';
-import type { AppSettings, BurnAvatarMode, DanmakuStylePreset, FfmpegCodecOption } from '../types';
+import type { AppSettings, BurnAvatarMode, DanmakuStylePreset, FfmpegCodecOption, SceneStylePreset } from '../types';
 
 type DanmakuStylePresetDefinition = {
   label: string;
@@ -39,6 +39,8 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'segmentMinutes',
   'autoBurnDanmaku',
   'deleteSourceAfterBurn',
+  'sceneGraphCaptureMode',
+  'sceneGraphDefaultStyle',
   'burnOverlayMode',
   'burnDanmakuArea',
   'burnDanmakuStylePreset',
@@ -84,6 +86,10 @@ export const danmakuAreaOptions = [
 export const danmakuStylePresetOptions = (Object.entries(danmakuStylePresets) as Array<
   [DanmakuStylePreset, DanmakuStylePresetDefinition]
 >).map(([value, definition]) => ({ value, ...definition }));
+
+export const sceneGraphStyleOptions = danmakuStylePresetOptions.filter(
+  (option): option is (typeof danmakuStylePresetOptions)[number] & { value: SceneStylePreset } => option.value !== 'current'
+);
 
 export const burnAvatarModeOptions: Array<{ value: BurnAvatarMode; label: string }> = [
   { value: 'off', label: '关闭（通用头像）' },

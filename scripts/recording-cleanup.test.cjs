@@ -125,7 +125,7 @@ test('manual cleanup processes persisted pending cleanup tasks without recording
   }
 });
 
-test('automatic cleanup retry drains every pending task for a room after burning finishes', async () => {
+test('automatic cleanup retry drains pending tasks while retaining original source inputs', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-retry-'));
   const room = { id: 'room-retry', title: 'Retry', anchor: 'test', burning: false };
   try {
@@ -152,8 +152,8 @@ test('automatic cleanup retry drains every pending task for a room after burning
 
     await service.cleanupPendingSegmentCleanupsForRoom(room);
 
-    assert.equal(await fileExists(path.join(outputDir, 'one-part.clean.mp4')), false);
-    assert.equal(await fileExists(path.join(outputDir, 'two-part.clean.mp4')), false);
+    assert.equal(await fileExists(path.join(outputDir, 'one-part.clean.mp4')), true);
+    assert.equal(await fileExists(path.join(outputDir, 'two-part.clean.mp4')), true);
     assert.equal(service.pendingSegmentCleanups.size, 0);
   } finally {
     await fsp.rm(outputDir, { recursive: true, force: true });
@@ -304,7 +304,7 @@ test('crash recovery removes only a zero-byte capture owned by an interrupted re
   }
 });
 
-test('source deletion setting is disabled whenever automatic burn is disabled', () => {
+test('source deletion setting is permanently disabled to retain original recording inputs', () => {
   const service = new LiveRecordService();
   const disabled = service.normalizeSettings({
     ...service.settings,
@@ -318,7 +318,7 @@ test('source deletion setting is disabled whenever automatic burn is disabled', 
   });
 
   assert.equal(disabled.deleteSourceAfterBurn, false);
-  assert.equal(enabled.deleteSourceAfterBurn, true);
+  assert.equal(enabled.deleteSourceAfterBurn, false);
 });
 
 test('real-avatar mode preserves legacy high quality by default and normalizes all three choices', () => {
@@ -440,7 +440,7 @@ test('a non-CUDA GPU final-blend failure retries the prebuilt CPU graph', async 
   assert.equal(attempts[1].layer.gpuCompositeBackend, '');
 });
 
-test('automatic burn source deletion requires a completed output and preserves source sidecars', async () => {
+test('legacy automatic source deletion hook is a no-op and preserves every original input', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-delete-source-after-burn-'));
   const sourcePath = path.join(outputDir, 'session.clean.mp4');
   const burnedPath = path.join(outputDir, 'session.danmaku.mp4');
@@ -452,21 +452,15 @@ test('automatic burn source deletion requires a completed output and preserves s
     const sourceRecording = service.normalizeRecording({ cleanPath: sourcePath, danmakuPath: sourceDanmakuPath });
     service.recordings = [sourceRecording];
 
-    await assert.rejects(
-      () => service.deleteBurnSourceAfterSuccess(room, sourceRecording, burnedPath),
-      /弹幕版成片不存在/
-    );
-    assert.equal(await fileExists(sourcePath), true);
-
     await writeRecordingFile(burnedPath);
     const result = await service.deleteBurnSourceAfterSuccess(room, sourceRecording, burnedPath);
 
-    assert.deepEqual(result, { deleted: true, missing: false });
-    assert.equal(await fileExists(sourcePath), false);
+    assert.deepEqual(result, { deleted: false, retained: true });
+    assert.equal(await fileExists(sourcePath), true);
     assert.equal(await fileExists(burnedPath), true);
     assert.equal(await fileExists(sourceDanmakuPath), true);
-    assert.equal(service.recordings.length, 0);
-    assert.equal(room.currentRecording, undefined);
+    assert.equal(service.recordings.length, 1);
+    assert.equal(room.currentRecording.cleanPath, sourcePath);
   } finally {
     await fsp.rm(outputDir, { recursive: true, force: true });
   }

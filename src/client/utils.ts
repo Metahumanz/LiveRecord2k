@@ -34,7 +34,9 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
       cssPath: current.cssPath || currentRecording.cssPath || '',
       overlayMode: current.overlayMode || state.settings.burnOverlayMode,
       danmakuArea: current.danmakuArea || state.settings.burnDanmakuArea,
-      stylePreset: current.stylePreset || state.settings.burnDanmakuStylePreset,
+      stylePreset: current.stylePreset === 'h5-card' || current.stylePreset === 'bubble' || current.stylePreset === 'minimal'
+        ? current.stylePreset
+        : state.settings.sceneGraphDefaultStyle,
       styleLayout: current.styleLayout || { ...state.settings.burnDanmakuStyleLayout },
       avatarMode: current.avatarMode || state.settings.burnAvatarMode,
       outputDir: current.outputDir || state.settings.outputDir
@@ -48,7 +50,7 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
     endTime: '',
     overlayMode: state.settings.burnOverlayMode,
     danmakuArea: state.settings.burnDanmakuArea,
-    stylePreset: state.settings.burnDanmakuStylePreset,
+    stylePreset: state.settings.sceneGraphDefaultStyle,
     styleLayout: { ...state.settings.burnDanmakuStyleLayout },
     avatarMode: state.settings.burnAvatarMode,
     outputDir: current.outputDir || state.settings.outputDir
@@ -97,7 +99,9 @@ const settingsImportLabels: Partial<Record<keyof AppSettings, string>> = {
   cookie: '登录 Cookie',
   outputDir: '录像保存目录',
   autoBurnDanmaku: '自动生成弹幕视频',
-  deleteSourceAfterBurn: '烧录后删除源文件',
+  deleteSourceAfterBurn: '旧版删除源文件开关（已禁用）',
+  sceneGraphCaptureMode: 'Scene Graph 录制模式',
+  sceneGraphDefaultStyle: 'Scene Graph 默认样式',
   serverHost: '监听地址',
   serverPort: '服务端口',
   trustedProxies: '可信反向代理',
@@ -110,7 +114,7 @@ const highRiskSettings = new Set<keyof AppSettings>([
   'cookie',
   'outputDir',
   'autoBurnDanmaku',
-  'deleteSourceAfterBurn',
+  'sceneGraphCaptureMode',
   'serverHost',
   'serverPort',
   'trustedProxies',

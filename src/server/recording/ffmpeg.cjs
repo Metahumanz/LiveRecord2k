@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
+const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { readDanmakuEvents, getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
 
@@ -1503,6 +1504,43 @@ function createClipCopyArgs({ cleanPath, outputPath, startTime, duration, contai
   return args;
 }
 
+// Attach a Scene-derived ASS track without touching the original video or
+// audio packets. Matroska is used because it accepts ASS as a first-class
+// subtitle stream while keeping both media streams in copy mode.
+function createSceneAssRemuxArgs({ cleanPath, assPath, outputPath, title = 'BiliRecord2K Scene' }) {
+  if (!cleanPath || !assPath || !outputPath) {
+    throw new Error('Scene ASS 封装缺少源视频、字幕或输出路径。');
+  }
+  if (path.extname(String(outputPath)).toLowerCase() !== '.mkv') {
+    throw new Error('Scene ASS 快速封装只支持 MKV 输出。');
+  }
+  return [
+    '-hide_banner',
+    '-y',
+    '-fflags',
+    '+genpts+discardcorrupt',
+    '-err_detect',
+    'ignore_err',
+    '-i',
+    cleanPath,
+    '-i',
+    assPath,
+    '-map',
+    '0:v?',
+    '-map',
+    '0:a?',
+    '-map',
+    '1:0',
+    '-c',
+    'copy',
+    '-metadata:s:s:0',
+    'title=' + String(title || 'BiliRecord2K Scene').slice(0, 160),
+    '-metadata:s:s:0',
+    'language=zho',
+    outputPath
+  ];
+}
+
 function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec }) {
   const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
   if (container === 'mp4') {
@@ -2136,6 +2174,7 @@ module.exports = {
   createPreviewHlsArgs,
   runFfmpegToGstreamerJob,
   createClipCopyArgs,
+  createSceneAssRemuxArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
   createNormalizeRawVideoArgs,

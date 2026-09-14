@@ -40,6 +40,10 @@ export type RecordingState = {
   cleanPath: string;
   capturePath?: string;
   danmakuPath: string;
+  avatarManifestPath?: string;
+  sceneCachePath?: string;
+  scenePath?: string;
+  sceneStatus?: 'capturing' | 'ready' | 'degraded' | '';
   cssPath?: string;
   assPath?: string;
   burnedPath?: string;
@@ -53,6 +57,7 @@ export type RecordingState = {
   fileSize?: number;
   valid?: boolean;
   eventCount: number;
+  sceneEventCount?: number;
   rawDanmakuCount?: number;
   capturedDanmakuCount?: number;
   ignoredDanmakuCount?: number;
@@ -91,6 +96,8 @@ export type DanmakuArea = 'quarter' | 'half' | 'three-quarter' | 'no-overlap' | 
 
 export type DanmakuStylePreset = 'current' | 'h5-card' | 'bubble' | 'minimal';
 
+export type SceneStylePreset = Exclude<DanmakuStylePreset, 'current'>;
+
 export type BurnAvatarMode = 'off' | 'limited' | 'high';
 
 export type DanmakuStyleLayout = {
@@ -116,6 +123,8 @@ export type AppSettings = {
   segmentMinutes: number;
   autoBurnDanmaku: boolean;
   deleteSourceAfterBurn: boolean;
+  sceneGraphCaptureMode: 'cache-only' | 'cache-and-export';
+  sceneGraphDefaultStyle: SceneStylePreset;
   burnOverlayMode: 'danmaku' | 'danmaku-gift';
   burnDanmakuArea: DanmakuArea;
   burnDanmakuStylePreset: DanmakuStylePreset;
@@ -203,6 +212,51 @@ export type ExportResult = {
   cssPath?: string;
   assPath?: string;
   eventCount?: number;
+};
+
+export type SceneAnimation = {
+  type: 'Move' | 'Fade' | 'Scale';
+  start: number;
+  end: number;
+  from: number | { x: number; y: number };
+  to: number | { x: number; y: number };
+  easing?: string;
+};
+
+export type SceneObject = {
+  id: string;
+  type: 'Text' | 'Avatar' | 'Rect' | 'Card' | 'SuperChat' | 'Gift';
+  start: number;
+  end: number;
+  zIndex: number;
+  frame: { x: number; y: number; width: number; height: number };
+  animations?: SceneAnimation[];
+  props?: Record<string, unknown>;
+  style?: Record<string, unknown>;
+  render?: boolean;
+};
+
+export type SceneGraph = {
+  schema: string;
+  version: number;
+  coordinateSpace: 'pixel';
+  canvas: { width: number; height: number };
+  timeline: { start: number; end: number };
+  style: { preset: SceneStylePreset; overlayMode: string; displayArea: string; fontFamily?: string };
+  assets: Array<{ id: string; type: string; uid?: number; url?: string; src?: string; fallbackSrc?: string }>;
+  objects: SceneObject[];
+  metadata?: Record<string, unknown>;
+};
+
+export type SceneTracksResult = {
+  ok: boolean;
+  cleanPath: string;
+  scenePath: string;
+  sceneCachePath: string;
+  selectedStyle: SceneStylePreset;
+  tracks: Array<{ preset: SceneStylePreset; assPath: string; objectCount: number; degradedEffects: string[] }>;
+  remuxPath: string;
+  eventCount: number;
 };
 
 export type PreviewStartResult = {
@@ -480,6 +534,14 @@ export type RecorderApi = {
     }
   ) => Promise<AppState>;
   prepareSubtitleAssets: (request: SubtitleRequest) => Promise<ExportResult>;
+  prepareSceneTracks: (request: Omit<SubtitleRequest, 'startTime' | 'endTime'>) => Promise<SceneTracksResult>;
+  getSceneGraph: (request: {
+    cleanPath: string;
+    stylePreset?: DanmakuStylePreset;
+    overlayMode?: AppSettings['burnOverlayMode'];
+    danmakuArea?: DanmakuArea;
+    styleLayout?: DanmakuStyleLayout;
+  }) => Promise<SceneGraph>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
   cancelExport: () => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;

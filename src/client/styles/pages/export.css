@@ -272,6 +272,41 @@
   background: #000;
 }
 
+.scene-graph-overlay {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.scene-graph-stage {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center;
+  pointer-events: none;
+}
+
+.scene-graph-text {
+  overflow: visible;
+  text-rendering: geometricPrecision;
+}
+
+.scene-graph-avatar {
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 800;
+}
+
+.scene-graph-avatar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
 .clip-preview-error {
   position: absolute;
   inset: 0;

@@ -27,6 +27,17 @@ const {
   normalizeDanmakuStylePreset,
   normalizeDanmakuStyleLayout,
   prepareAssEvents,
+  readDanmakuEvents,
+  sceneCacheRecord,
+  stableId,
+  readSceneCacheEvents,
+  buildSceneGraph,
+  writeSceneGraph,
+  clipSceneGraph,
+  compileSceneToAss,
+  writeSceneFilterScript,
+  createSceneAssRemuxArgs,
+  SCENE_STYLE_PRESETS,
   getDanmakuEventDuration,
   createRecordingArgs,
   createMp4FinalizeArgs,
@@ -501,6 +512,8 @@ const SETTINGS_UPDATE_KEYS = new Set([
   'segmentMinutes',
   'autoBurnDanmaku',
   'deleteSourceAfterBurn',
+  'sceneGraphCaptureMode',
+  'sceneGraphDefaultStyle',
   'burnOverlayMode',
   'burnDanmakuArea',
   'burnDanmakuStylePreset',
@@ -663,6 +676,24 @@ function createDanmakuAssSuffix(overlayMode, danmakuArea) {
 
 function createClipDanmakuAssSuffix(startTime, endTime, overlayMode, danmakuArea) {
   return `${createClipSuffix(startTime, endTime, overlayMode)}.${normalizeDanmakuDisplayArea(danmakuArea)}`;
+}
+
+function deriveSceneCachePath(cleanPath) {
+  return deriveSiblingPath(cleanPath, 'scene', 'jsonl');
+}
+
+function deriveSceneGraphPath(cleanPath) {
+  return deriveSiblingPath(cleanPath, 'scene', 'json');
+}
+
+function deriveSceneAssPath(cleanPath, stylePreset) {
+  const preset = SCENE_STYLE_PRESETS.includes(String(stylePreset || '')) ? String(stylePreset) : 'h5-card';
+  return deriveSiblingPath(cleanPath, 'scene.' + preset, 'ass');
+}
+
+function deriveSceneMkvPath(cleanPath, stylePreset) {
+  const preset = SCENE_STYLE_PRESETS.includes(String(stylePreset || '')) ? String(stylePreset) : 'h5-card';
+  return deriveSiblingPath(cleanPath, 'scene.' + preset, 'mkv');
 }
 
 function deriveCapturePath(cleanPath) {
@@ -1328,7 +1359,8 @@ class LiveRecordService {
         anchor: '恢复任务'
       };
       await this.cleanupMergedSegmentFiles(room, cleanup.segments, cleanup.mergedRecording, {
-        cleanupId: cleanup.cleanupId
+        cleanupId: cleanup.cleanupId,
+        preserveSourceInputs: true
       });
     }
     await this.saveStore();
@@ -1344,7 +1376,8 @@ class LiveRecordService {
       if (this.isRoomBurning(room)) break;
       try {
         await this.cleanupMergedSegmentFiles(room, pendingCleanup.segments, pendingCleanup.mergedRecording, {
-          cleanupId: pendingCleanup.cleanupId
+          cleanupId: pendingCleanup.cleanupId,
+          preserveSourceInputs: true
         });
       } catch (error) {
         this.log('warn', `${roomLabel(room)} 清理合并前小分段失败：${error.message}`);
@@ -1353,41 +1386,13 @@ class LiveRecordService {
   }
 
   async deleteBurnSourceAfterSuccess(room, recording, burnedPath) {
-    const sourcePath = String(recording?.cleanPath || '').trim();
-    const completedPath = String(burnedPath || '').trim();
-    if (!sourcePath || !completedPath) {
-      throw new Error('缺少源录像或已完成的弹幕版路径，拒绝自动删除。');
-    }
-    const resolvedSourcePath = path.resolve(sourcePath);
-    const resolvedCompletedPath = path.resolve(completedPath);
-    if (resolvedSourcePath.toLowerCase() === resolvedCompletedPath.toLowerCase()) {
-      throw new Error('弹幕版输出与源录像指向同一文件，拒绝自动删除。');
-    }
-    if (
-      !isPathInsideDirectory(resolvedSourcePath, this.settings.outputDir) ||
-      !isPathInsideDirectory(resolvedCompletedPath, this.settings.outputDir)
-    ) {
-      throw new Error('源录像或弹幕版不在当前录像库内，拒绝自动删除。');
-    }
-    if (!(await isExistingFile(resolvedCompletedPath))) {
-      throw new Error('弹幕版成片不存在，源录像受保护且不会删除。');
-    }
-    const sourceStat = await fsp.stat(resolvedSourcePath).catch(() => null);
-    if (!sourceStat?.isFile()) {
-      return { deleted: false, missing: true };
-    }
-
-    await fsp.rm(resolvedSourcePath, { force: true });
-    const sourceKey = resolvedSourcePath.toLowerCase();
-    this.recordings = this.recordings.filter(
-      (item) => path.resolve(String(item?.cleanPath || '')).toLowerCase() !== sourceKey
-    );
-    if (path.resolve(String(room?.currentRecording?.cleanPath || '')).toLowerCase() === sourceKey) {
-      delete room.currentRecording;
-    }
-    await this.saveStore();
-    this.log('success', `${roomLabel(room)} 弹幕版验证成功，已自动删除无弹幕源文件：${path.basename(resolvedSourcePath)}。`);
-    return { deleted: true, missing: false };
+    // Kept as a compatibility no-op for legacy queue items. Raw clean media,
+    // JSONL and avatar snapshots are source inputs and must never be deleted
+    // as a side effect of a derived export.
+    void recording;
+    void burnedPath;
+    this.log('info', roomLabel(room) + ' 已保留 clean 视频、JSONL 与头像源资源。');
+    return { deleted: false, retained: true };
   }
 
   async bootstrapPersistentConfiguration() {
@@ -1427,6 +1432,13 @@ class LiveRecordService {
 
   normalizeSettings(settings) {
     return this.settingsService.normalizeSettings(settings);
+  }
+
+  resolveSceneGraphStylePreset(value) {
+    const requested = String(value || '').trim();
+    if (SCENE_STYLE_PRESETS.includes(requested)) return requested;
+    const configured = String(this.settings.sceneGraphDefaultStyle || '').trim();
+    return SCENE_STYLE_PRESETS.includes(configured) ? configured : 'h5-card';
   }
 
   getAvailableBurnCodecs() {
@@ -1716,6 +1728,9 @@ class LiveRecordService {
       cleanPath,
       danmakuPath: String(recording.danmakuPath || deriveSiblingPath(cleanPath, 'danmaku', 'jsonl')),
       avatarManifestPath: String(recording.avatarManifestPath || deriveAvatarManifestPath(cleanPath)),
+      sceneCachePath: String(recording.sceneCachePath || deriveSceneCachePath(cleanPath)),
+      scenePath: String(recording.scenePath || deriveSceneGraphPath(cleanPath)),
+      sceneStatus: String(recording.sceneStatus || ''),
       cssPath: String(recording.cssPath || deriveSiblingPath(cleanPath, 'danmaku', 'css')),
       assPath: String(recording.assPath || deriveSiblingPath(cleanPath, 'danmaku', 'ass')),
       burnedPath: String(recording.burnedPath || deriveBurnedPath(cleanPath, 'danmaku-gift')),
@@ -1739,6 +1754,7 @@ class LiveRecordService {
       fileSize: Number(recording.fileSize || 0),
       valid: recording.valid !== false,
       eventCount: Number(recording.eventCount || 0),
+      sceneEventCount: Number(recording.sceneEventCount || 0),
       rawDanmakuCount: Number(recording.rawDanmakuCount || 0),
       capturedDanmakuCount: Number(recording.capturedDanmakuCount ?? recording.eventCount ?? 0),
       ignoredDanmakuCount: Number(recording.ignoredDanmakuCount || 0),
@@ -1780,6 +1796,11 @@ class LiveRecordService {
       valid: saved.valid === false ? false : recording.valid,
       validReason: recording.validReason || saved.validReason || '',
       videoInfo: recording.videoInfo || saved.videoInfo || null,
+      avatarManifestPath: recording.avatarManifestPath || saved.avatarManifestPath || '',
+      sceneCachePath: recording.sceneCachePath || saved.sceneCachePath || '',
+      scenePath: recording.scenePath || saved.scenePath || '',
+      sceneStatus: recording.sceneStatus || saved.sceneStatus || '',
+      sceneEventCount: Number(recording.sceneEventCount || saved.sceneEventCount || 0),
       timingInfo: recording.timingInfo || saved.timingInfo || null,
       timelineHealth: recording.timelineHealth || saved.timelineHealth || null,
       timelineHealthStatus: recording.timelineHealthStatus || saved.timelineHealthStatus || '',
@@ -1992,6 +2013,10 @@ class LiveRecordService {
       liveSessionId: session.liveSessionId,
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
+      avatarManifestPath: session.avatarManifestPath,
+      sceneCachePath: session.sceneCachePath,
+      scenePath: session.scenePath,
+      sceneStatus: session.sceneStatus || '',
       cssPath: session.cssPath,
       assPath: session.assPath,
       burnedPath: session.burnedPath,
@@ -2007,6 +2032,7 @@ class LiveRecordService {
       recordingState: session.state || 'connecting',
       durationSec: this.getSessionMediaDurationSec(session),
       eventCount: Number(session.eventCount || 0),
+      sceneEventCount: Number(session.sceneEventCount || 0),
       rawDanmakuCount: Number(session.rawDanmakuCount || 0),
       capturedDanmakuCount: Number(session.capturedDanmakuCount ?? session.eventCount ?? 0),
       ignoredDanmakuCount: Number(session.ignoredCommandCount || 0),
@@ -4126,6 +4152,75 @@ try {
     pipeLocalFileToResponse(filePath, request, response, { start, end });
   }
 
+  async getSceneGraphForPreview(options = {}) {
+    const cleanPath = String(options.cleanPath || '').trim();
+    if (!cleanPath) throw new Error('Scene Graph 预览缺少录像路径。');
+    this.assertExportSourcePath(cleanPath);
+    let recording = this.normalizeRecording({ cleanPath });
+    recording = this.hydrateRecordingFromLibrary(recording);
+    const stylePreset = this.resolveSceneGraphStylePreset(options.stylePreset || this.settings.sceneGraphDefaultStyle);
+    const result = await this.buildSceneGraphForRecording(recording, {
+      stylePreset,
+      overlayMode: normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode),
+      danmakuArea: normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea),
+      styleLayout: normalizeDanmakuStyleLayout(options.styleLayout || this.settings.burnDanmakuStyleLayout),
+      durationSec: Number(recording.durationSec || 0)
+    });
+    return Object.assign({}, result.graph, {
+      assets: result.graph.assets.map((asset) => {
+        const params = new URLSearchParams({
+          cleanPath: recording.cleanPath,
+          assetId: String(asset.id || '')
+        });
+        const fallbackParams = new URLSearchParams({ url: String(asset.url || '') });
+        return {
+          id: asset.id,
+          type: asset.type,
+          uid: asset.uid,
+          url: asset.url,
+          src: '/api/scene/avatar?' + params.toString(),
+          fallbackSrc: asset.url ? '/api/image?' + fallbackParams.toString() : ''
+        };
+      })
+    });
+  }
+
+  async serveSceneAvatar(rawCleanPath, rawAssetId, request, response) {
+    const cleanPath = String(rawCleanPath || '').trim();
+    const assetId = String(rawAssetId || '').trim();
+    if (!cleanPath || !assetId || assetId.length > 128) {
+      writeJson(response, 400, { error: 'Scene 头像参数无效' });
+      return;
+    }
+    try {
+      this.assertExportSourcePath(cleanPath);
+      const recording = this.hydrateRecordingFromLibrary(this.normalizeRecording({ cleanPath }));
+      const manifest = await this.loadAvatarManifestForRecording(recording);
+      const avatarDirectory = deriveAvatarDirectory(recording.cleanPath);
+      const entry = (manifest.entries || []).find((candidate) => {
+        const key = Number(candidate.uid || 0) > 0
+          ? 'uid:' + Number(candidate.uid)
+          : candidate.avatarUrl
+            ? 'url:' + candidate.avatarUrl
+            : '';
+        return key && stableId('avatar', key) === assetId;
+      });
+      const filePath = String(entry?.filePath || '');
+      if (!filePath || !isPathInsideDirectory(path.resolve(filePath), path.resolve(avatarDirectory)) || !(await isExistingFile(filePath))) {
+        writeJson(response, 404, { error: '原始头像资源不存在' });
+        return;
+      }
+      response.writeHead(200, {
+        'Content-Type': mimeType(filePath),
+        'Cache-Control': 'private, max-age=300',
+        'Content-Length': String((await fsp.stat(filePath)).size)
+      });
+      pipeLocalFileToResponse(filePath, request, response);
+    } catch (error) {
+      writeJson(response, 403, { error: error.message || '无法读取 Scene 头像资源' });
+    }
+  }
+
   isKnownMediaPath(filePath) {
     const normalized = path.resolve(filePath);
     const comparablePath = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
@@ -4659,6 +4754,8 @@ try {
       const danmakuPath = path.join(outputDir, `${baseName}.danmaku.jsonl`);
       const avatarManifestPath = deriveAvatarManifestPath(cleanPath);
       const avatarDirectory = deriveAvatarDirectory(cleanPath);
+      const sceneCachePath = deriveSceneCachePath(cleanPath);
+      const scenePath = deriveSceneGraphPath(cleanPath);
       const cssPath = path.join(outputDir, `${baseName}.danmaku.css`);
       const assPath = path.join(outputDir, `${baseName}.danmaku.ass`);
       const burnedPath = path.join(outputDir, `${baseName}.danmaku.${container}`);
@@ -4707,6 +4804,18 @@ try {
           this.incrementDanmakuDrop(session, 'writeDropped');
         }
       });
+      const sceneStream = new BufferedJsonlWriter(sceneCachePath, {
+        onError: (error) => {
+          if (!session) return;
+          session.sceneWriteFailed = true;
+          session.sceneStatus = 'degraded';
+          this.log('warn', roomLabel(room) + ' Scene Graph 缓存写盘失败，原始 JSONL 与视频录制仍会继续：' + error.message);
+        },
+        onDrop: () => {
+          if (!session) return;
+          session.sceneWriteDropped = Number(session.sceneWriteDropped || 0) + 1;
+        }
+      });
       session = {
         roomId: room.id,
         liveSessionId,
@@ -4714,6 +4823,7 @@ try {
         stream,
         streamMetadata: this.createStreamMetadata(stream),
         eventStream,
+        sceneStream,
         danmakuClient: null,
         startedAt: startRecordingCalledAt,
         startedMono: startRecordingMono,
@@ -4732,6 +4842,9 @@ try {
         danmakuPath,
         avatarManifestPath,
         avatarDirectory,
+        sceneCachePath,
+        scenePath,
+        sceneStatus: 'capturing',
         cssPath,
         assPath,
         burnedPath,
@@ -4744,6 +4857,7 @@ try {
         segmentReason,
         diagnosticsPath,
         eventCount: 0,
+        sceneEventCount: 0,
         rawDanmakuCount: 0,
         capturedDanmakuCount: 0,
         danmakuCommandCounts: {},
@@ -4832,6 +4946,9 @@ try {
         cleanPath,
         danmakuPath,
         avatarManifestPath,
+        sceneCachePath,
+        scenePath,
+        sceneStatus: 'capturing',
         cssPath,
         assPath,
         burnedPath,
@@ -4846,6 +4963,7 @@ try {
         diagnosticsPath,
         recordingState: session.state,
         eventCount: 0,
+        sceneEventCount: 0,
         rawDanmakuCount: 0,
         capturedDanmakuCount: 0,
         danmakuStatus: 'connecting',
@@ -5481,6 +5599,67 @@ try {
     return this.readAvatarManifestFile(manifestPath);
   }
 
+  async getSceneAvatarAssets(recording) {
+    const manifest = await this.loadAvatarManifestForRecording(recording);
+    const assets = {};
+    for (const entry of manifest.entries || []) {
+      const asset = {
+        filePath: String(entry.filePath || ''),
+        url: String(entry.avatarUrl || '')
+      };
+      if (Number(entry.uid || 0) > 0) assets[entry.uid] = asset;
+      if (entry.avatarUrl) assets[entry.avatarUrl] = asset;
+    }
+    return assets;
+  }
+
+  async readSceneEventsForRecording(recording) {
+    const cachePath = String(recording?.sceneCachePath || deriveSceneCachePath(recording?.cleanPath || '')).trim();
+    let events = cachePath ? await readSceneCacheEvents(cachePath).catch(() => []) : [];
+    if (events.length) return events;
+    return readDanmakuEvents(String(recording?.danmakuPath || '')).catch(() => []);
+  }
+
+  getSceneGraphOptions(recording, options = {}) {
+    const stylePreset = this.resolveSceneGraphStylePreset(options.stylePreset || this.settings.sceneGraphDefaultStyle);
+    return {
+      stylePreset,
+      styleLayout: options.styleLayout || this.settings.burnDanmakuStyleLayout,
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode,
+      danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea,
+      videoInfo: options.videoInfo || recording?.videoInfo || null,
+      avatarAssets: options.avatarAssets || null
+    };
+  }
+
+  async buildSceneGraphForRecording(recording, options = {}) {
+    const normalized = this.normalizeRecording(recording) || recording;
+    if (!normalized?.cleanPath) throw new Error('Scene Graph 缺少录像源文件。');
+    const [events, avatarAssets] = await Promise.all([
+      this.readSceneEventsForRecording(normalized),
+      options.avatarAssets ? Promise.resolve(options.avatarAssets) : this.getSceneAvatarAssets(normalized)
+    ]);
+    let graph = buildSceneGraph(events, this.getSceneGraphOptions(normalized, { ...options, avatarAssets }));
+    const requestedDuration = Number(options.durationSec || normalized.durationSec || 0);
+    if (Number.isFinite(requestedDuration) && requestedDuration > 0) {
+      graph = clipSceneGraph(graph, 0, requestedDuration, { shiftTime: false });
+    }
+    graph.metadata = Object.assign({}, graph.metadata, {
+      sourceCleanPath: normalized.cleanPath,
+      sourceJsonlPath: normalized.danmakuPath,
+      sourceAvatarManifestPath: normalized.avatarManifestPath || '',
+      sourceCachePath: normalized.sceneCachePath || '',
+      capturedEventCount: events.length
+    });
+    return { graph, eventCount: events.length, scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath) };
+  }
+
+  async finalizeSceneGraphForRecording(recording, options = {}) {
+    const result = await this.buildSceneGraphForRecording(recording, options);
+    await writeSceneGraph(result.scenePath, result.graph);
+    return result;
+  }
+
   async mergeAvatarManifests(segments, targetManifestPath) {
     const sourceManifests = [];
     for (const segment of segments || []) {
@@ -5731,11 +5910,32 @@ try {
           }
           return;
         }
+        try {
+          const sceneWritten = session.sceneStream?.write(
+            JSON.stringify(sceneCacheRecord(event, { stylePreset: this.settings.sceneGraphDefaultStyle })) + '\\n'
+          );
+          if (sceneWritten) {
+            session.sceneEventCount = Number(session.sceneEventCount || 0) + 1;
+          } else if (session.sceneStream) {
+            session.sceneStatus = 'degraded';
+            const now = Date.now();
+            if (now - Number(session.lastSceneWriteWarningAt || 0) > 5000) {
+              session.lastSceneWriteWarningAt = now;
+              this.log('warn', roomLabel(room) + ' Scene Graph 缓存缓冲已满；原始 JSONL 仍在继续写入。');
+            }
+          }
+        } catch (error) {
+          session.sceneWriteFailed = true;
+          session.sceneStatus = 'degraded';
+          this.log('warn', roomLabel(room) + ' 追加 Scene Graph 缓存失败；原始 JSONL 仍在继续写入：' + error.message);
+        }
         session.eventCount += 1;
         session.capturedDanmakuCount = session.eventCount;
         session.firstDanmakuAt ||= event.receivedAt;
         if (this.shouldUpdateCurrentRecording(room, session)) {
           room.currentRecording.eventCount = session.eventCount;
+          room.currentRecording.sceneEventCount = Number(session.sceneEventCount || 0);
+          room.currentRecording.sceneStatus = session.sceneStatus || '';
           room.currentRecording.capturedDanmakuCount = session.capturedDanmakuCount;
           room.currentRecording.danmakuStatus = 'connected';
           room.currentRecording.danmakuMessage = `已捕获 ${session.eventCount} 条可烧录事件`;
@@ -5996,7 +6196,10 @@ try {
     session.finished = true;
     this.transitionRecordingState(room, session, 'finalizing');
     session.danmakuClient?.close('录制结束');
-    await new Promise((resolve) => session.eventStream.end(resolve));
+    await Promise.all([
+      new Promise((resolve) => session.eventStream.end(resolve)),
+      new Promise((resolve) => session.sceneStream ? session.sceneStream.end(resolve) : resolve())
+    ]);
     const avatarsDrained = await this.flushAvatarCapture(session);
     await this.scheduleAvatarManifestWrite(session, 'completed').catch((error) => {
       this.log('warn', `${roomLabel(room)} 写入最终头像记录清单失败：${error.message}`);
@@ -6102,6 +6305,27 @@ try {
         videoInfo: session.videoInfo
       }) &&
       finalized;
+    if (valid) {
+      try {
+        const sceneResult = await this.finalizeSceneGraphForRecording(
+          {
+            cleanPath: session.cleanPath,
+            danmakuPath: session.danmakuPath,
+            avatarManifestPath: session.avatarManifestPath,
+            sceneCachePath: session.sceneCachePath,
+            scenePath: session.scenePath,
+            durationSec: actualDurationSec,
+            videoInfo: session.videoInfo
+          },
+          { durationSec: actualDurationSec }
+        );
+        session.sceneStatus = 'ready';
+        session.sceneEventCount = sceneResult.eventCount;
+      } catch (error) {
+        session.sceneStatus = 'degraded';
+        this.log('warn', roomLabel(room) + ' Scene Graph 收尾失败；原始 clean 视频、JSONL 与头像资源均已保留：' + error.message);
+      }
+    }
     if (!valid && !session.validReason) {
       session.containerStage = 'failed';
       session.validReason = finalized
@@ -6131,6 +6355,9 @@ try {
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
       avatarManifestPath: session.avatarManifestPath,
+      sceneCachePath: session.sceneCachePath,
+      scenePath: session.scenePath,
+      sceneStatus: session.sceneStatus || '',
       cssPath: session.cssPath,
       assPath: session.assPath,
       burnedPath: session.burnedPath,
@@ -6147,6 +6374,7 @@ try {
       fileSize,
       valid,
       eventCount: session.eventCount,
+      sceneEventCount: Number(session.sceneEventCount || 0),
       rawDanmakuCount: session.rawDanmakuCount,
       capturedDanmakuCount: session.capturedDanmakuCount || session.eventCount,
       danmakuStatus: session.danmakuStatus,
@@ -6720,11 +6948,16 @@ try {
         this.log('warn', `${roomLabel(room)} 写入最终 diagnostics 失败：${error.message}`);
       });
     }
-    if (this.settings.autoBurnDanmaku && recording?.valid !== false && Number(recording?.eventCount || 0) > 0) {
+    if (
+      this.settings.autoBurnDanmaku &&
+      this.settings.sceneGraphCaptureMode !== 'cache-only' &&
+      recording?.valid !== false &&
+      Number(recording?.eventCount || 0) > 0
+    ) {
       setTimeout(() => {
         this.enqueueBurnRecording(room, recording, {
           automatic: true,
-          deleteSourceAfterSuccess: this.settings.deleteSourceAfterBurn
+          deleteSourceAfterSuccess: false
         }).catch((error) => {
           this.log('error', `${roomLabel(room)} 自动烧录失败：${error.message}`);
         });
@@ -6958,6 +7191,8 @@ try {
     const concatPath = replaceExtension(outputPath, '.concat.txt');
     const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
     const avatarManifestPath = deriveAvatarManifestPath(outputPath);
+    const sceneCachePath = deriveSceneCachePath(outputPath);
+    const scenePath = deriveSceneGraphPath(outputPath);
     const cssPath = deriveSiblingPath(outputPath, 'danmaku', 'css');
     const danmakuTmpPath = `${danmakuPath}.${process.pid}.tmp`;
     const cssTmpPath = `${cssPath}.${process.pid}.tmp`;
@@ -7737,6 +7972,9 @@ try {
         cleanPath: outputPath,
         danmakuPath,
         avatarManifestPath,
+        sceneCachePath,
+        scenePath,
+        sceneStatus: 'capturing',
         cssPath,
         assPath,
         burnedPath,
@@ -7788,6 +8026,17 @@ try {
             }
           : null
       });
+      try {
+        const sceneResult = await this.finalizeSceneGraphForRecording(mergedRecording, {
+          durationSec: mergedRecording.durationSec,
+          videoInfo: mergedRecording.videoInfo
+        });
+        mergedRecording.sceneStatus = 'ready';
+        mergedRecording.sceneEventCount = sceneResult.eventCount;
+      } catch (error) {
+        mergedRecording.sceneStatus = 'degraded';
+        this.log('warn', roomLabel(room) + ' 合并录像 Scene Graph 收尾失败；原始分段和合并 JSONL 均已保留：' + error.message);
+      }
       const outputPathKey = path.resolve(outputPath).toLowerCase();
       const segmentPathKeys = new Set(segments.map((segment) => path.resolve(segment.cleanPath).toLowerCase()));
       this.recordings = [
@@ -7814,7 +8063,7 @@ try {
         mergedRecording: cloneRecordingState(mergedRecording)
       });
       await this.saveStore();
-      await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId });
+      await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId, preserveSourceInputs: true });
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(room.mergeProgress, 'completed', '续录分段已合并');
       }
@@ -7892,6 +8141,7 @@ try {
       durationSec: Number(recording.durationSec || 0),
       danmakuDurationSec: Number(recording.danmakuDurationSec || 0),
       eventCount: Number(recording.eventCount || 0),
+      sceneEventCount: Number(recording.sceneEventCount || 0),
       videoInfo: recording.videoInfo || null,
       liveSessionId: String(recording.liveSessionId || ''),
       mergeGroup: String(recording.mergeGroup || ''),
@@ -7901,6 +8151,9 @@ try {
       avatarManifestPath: toMetadataRelativePath(
         recording.avatarManifestPath || deriveAvatarManifestPath(cleanPath)
       ),
+      sceneCachePath: toMetadataRelativePath(recording.sceneCachePath || deriveSceneCachePath(cleanPath)),
+      scenePath: toMetadataRelativePath(recording.scenePath || deriveSceneGraphPath(cleanPath)),
+      sceneStatus: String(recording.sceneStatus || ''),
       mergedFrom,
       cleanupId: String(recording.cleanupId || ''),
       segmentReason: String(recording.segmentReason || 'initial'),
@@ -7941,6 +8194,9 @@ try {
       segmentReason: session.segmentReason || 'initial',
       danmakuPath: path.basename(session.danmakuPath || ''),
       avatarManifestPath: path.basename(session.avatarManifestPath || deriveAvatarManifestPath(session.cleanPath)),
+      sceneCachePath: path.basename(session.sceneCachePath || deriveSceneCachePath(session.cleanPath)),
+      scenePath: path.basename(session.scenePath || deriveSceneGraphPath(session.cleanPath)),
+      sceneStatus: String(session.sceneStatus || 'capturing'),
       diagnosticsPath: path.basename(session.diagnosticsPath || ''),
       streamMetadata: session.streamMetadata || null,
       updatedAt: new Date().toISOString()
@@ -8347,6 +8603,17 @@ try {
     }
     for (const segment of segments) {
       addRecordingArtifacts(segment, addCleanupPath);
+      if (options.preserveSourceInputs) {
+        // The automatic merge flow never consumes original capture inputs.
+        // Explicit maintenance cleanup remains an independently confirmed
+        // user action and follows its existing confirmation contract.
+        addProtectedPath(segment.cleanPath);
+        addProtectedPath(segment.danmakuPath || deriveSiblingPath(segment.cleanPath, 'danmaku', 'jsonl'));
+        addProtectedPath(segment.avatarManifestPath || deriveAvatarManifestPath(segment.cleanPath));
+        addProtectedPath(deriveAvatarDirectory(segment.cleanPath));
+        addProtectedPath(segment.sceneCachePath || deriveSceneCachePath(segment.cleanPath));
+        addProtectedPath(segment.scenePath || deriveSceneGraphPath(segment.cleanPath));
+      }
     }
     // Burn/export can create area-specific ASS files and interrupted temporary
     // sidecars. They are not all present in an older recording object, so
@@ -9436,6 +9703,249 @@ try {
     }
   }
 
+  async startSceneGraphBurnRecording(room, recording, options, context) {
+    const source = context || {};
+    const burnCodec = source.burnCodec;
+    const burnCrf = source.burnCrf;
+    const overlayMode = source.overlayMode;
+    const danmakuArea = source.danmakuArea;
+    const stylePreset = source.stylePreset;
+    const styleLayout = source.styleLayout;
+    const mediaInfo = source.mediaInfo || {};
+    const durationSec = Math.max(0, Number(source.durationSec || recording.durationSec || 0));
+    const codecInfo = this.getBurnCodecInfo(burnCodec);
+    const decoderInfo = this.getHardwareDecoder(recording.videoInfo || mediaInfo.videoInfo, burnCodec);
+    if (options.prepareOnly) {
+      const tracks = await this.generateSceneAssTracks(recording, {
+        overlayMode,
+        danmakuArea,
+        stylePreset,
+        styleLayout,
+        videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+        durationSec,
+        presets: SCENE_STYLE_PRESETS,
+        remux: false
+      });
+      this.log('success', roomLabel(room) + ' 已生成 Scene Graph 三套 ASS 轨：' + tracks.tracks.map((track) => path.basename(track.assPath)).join(' / '));
+      return true;
+    }
+    const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
+    const burnedTmpPath = replaceExtension(burnedPath, '.tmp.' + getContainerFromPath(burnedPath));
+    const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
+    const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
+    const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
+    let sceneDirectory = '';
+    try {
+      recording.burnedPath = burnedPath;
+      await assertDiskSpace(burnedPath, {
+        estimatedBytes: Number(recording.fileSize || 0) * (isJetsonGstreamerCodec(burnCodec) ? 2 : 1)
+      });
+      await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+      sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-burn-scene-'));
+      const sceneResult = await this.buildSceneGraphForRecording(recording, {
+        overlayMode,
+        danmakuArea,
+        stylePreset,
+        styleLayout,
+        videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+        durationSec
+      });
+      const graph = durationSec > 0 ? clipSceneGraph(sceneResult.graph, 0, durationSec, { shiftTime: false }) : sceneResult.graph;
+      const target = isJetsonGstreamerCodec(burnCodec)
+        ? 'jetson'
+        : String(burnCodec || '').includes('nvenc')
+          ? 'cuda'
+          : 'software';
+      const sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
+        duration: durationSec || graph.timeline.end,
+        fps: burnFps,
+        target
+      });
+      const progress = createFfmpegJobProgress({
+        kind: 'burn',
+        label: '生成 Scene Graph 弹幕版：' + path.basename(burnedPath),
+        outputPath: burnedPath,
+        durationSec,
+        roomId: room.id,
+        codec: burnCodec,
+        codecKind: codecInfo.kind,
+        decoder: decoderInfo.value,
+        decoderKind: decoderInfo.kind,
+        decoderLabel: decoderInfo.label,
+        sourceFps: burnFps,
+        encoderBackend: this.getEncoderBackendLabel(codecInfo),
+        avatarCompositeBackend: 'Scene Graph 直接合成'
+      });
+      room.burning = true;
+      room.burnProgress = progress;
+      options.onProgressCreated?.(progress);
+      this.burnSessions.set(room.id, null);
+      this.log(
+        'info',
+        roomLabel(room) + ' 正在直接合成 Scene Graph 弹幕版：' + path.basename(burnedPath) +
+          '（' + overlayModeLabel(overlayMode) + '，' + danmakuDisplayAreaLabel(danmakuArea) + '，样式 ' + stylePreset +
+          '，编码器 ' + burnCodec + '）'
+      );
+      if (this.settings.notifyBurnStarted) {
+        this.notify('开始烧录弹幕版', roomLabel(room) + ' 正在直接合成 ' + path.basename(burnedPath), 'burn.started', {
+          roomId: room.id,
+          roomTitle: room.title || '',
+          anchor: room.anchor || '',
+          fileName: path.basename(burnedPath)
+        });
+      }
+      const onStderr = (line) => {
+        if (updateFfmpegJobProgress(progress, line)) this.markRoomDirty(room.id);
+        if (/error|failed|invalid/i.test(line)) this.log('warn', roomLabel(room) + ' Scene Graph 烧录：' + compactLogLine(line));
+      };
+      const onDecoderFallback = () => {
+        this.setProgressDecoder(progress, { value: 'software', label: 'CPU', kind: 'software' });
+        this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码；Scene Graph 几何未改变。');
+        this.markRoomDirty(room.id);
+      };
+      const finish = async (processingError) => {
+        const cancelled = this.burnCancelRequests.delete(room.id) || processingError?.code === 'BR2K_MEDIA_CANCELLED';
+        let failure = processingError || null;
+        if (!cancelled && !failure) {
+          try {
+            const result = await probeMediaFileInfo(this.ffmpegPath, burnedTmpPath, { timeoutMs: 15000 });
+            if (!result.videoInfo || (await getFileSize(burnedTmpPath)) < 32 * 1024) {
+              throw new Error('Scene Graph 烧录临时输出未通过视频流与文件大小验证。');
+            }
+            await atomicReplaceFile(burnedTmpPath, burnedPath);
+          } catch (error) {
+            failure = error;
+          }
+        }
+        room.burning = false;
+        this.burnSessions.delete(room.id);
+        if (cancelled) {
+          finishFfmpegJobProgress(progress, 'cancelled', 'Scene Graph 弹幕视频生成已取消');
+          await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+        } else if (!failure) {
+          finishFfmpegJobProgress(progress, 'completed', 'Scene Graph 弹幕版已生成');
+          this.log('success', roomLabel(room) + ' Scene Graph 弹幕版已生成：' + path.basename(burnedPath));
+          if (this.settings.notifyBurnEnded) {
+            this.notify('弹幕版已生成', roomLabel(room) + ' ' + path.basename(burnedPath), 'burn.completed', {
+              roomId: room.id,
+              roomTitle: room.title || '',
+              anchor: room.anchor || '',
+              fileName: path.basename(burnedPath)
+            });
+          }
+        } else {
+          await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+          finishFfmpegJobProgress(progress, 'error', 'Scene Graph 烧录失败：' + failure.message);
+          this.log('error', roomLabel(room) + ' Scene Graph 烧录失败：' + failure.message);
+        }
+        await this.cleanupPendingSegmentCleanupsForRoom(room);
+        this.emitState(['room', 'recording', 'mediaJob']);
+        setTimeout(() => {
+          if (room.burnProgress?.id === progress.id) {
+            delete room.burnProgress;
+            this.markRoomDirty(room.id);
+          }
+        }, 5000).unref?.();
+        this.scheduleQueuedUpdateCheck();
+      };
+      void (async () => {
+        let processingError = null;
+        try {
+          const createArgs = (decoder) =>
+            createBurnArgs({
+              cleanPath: recording.cleanPath,
+              assPath: '',
+              burnedPath: burnedTmpPath,
+              codec: burnCodec,
+              crf: burnCrf,
+              container: getContainerFromPath(burnedPath),
+              startTime: 0,
+              duration: durationSec,
+              fps: burnFps,
+              avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+              timelineOffset: 0,
+              leadingVideoPaddingSec: 0,
+              leadingAudioPaddingSec: 0,
+              copyAudio: copySourceAudio,
+              decoder,
+              sourceCodec: decoderInfo.codec
+            });
+          if (isJetsonGstreamerCodec(burnCodec)) {
+            const encodedVideoPath = burnedTmpPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
+              (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+            await this.runJetsonGstreamerTranscode({
+              codec: burnCodec,
+              quality: burnCrf,
+              width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+              height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
+              fps: burnFps,
+              encodedVideoPath,
+              createRawArgs: (decoder) =>
+                createBurnRawVideoArgs({
+                  cleanPath: recording.cleanPath,
+                  assPath: '',
+                  fps: burnFps,
+                  avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+                  startTime: 0,
+                  duration: durationSec,
+                  timelineOffset: 0,
+                  leadingVideoPaddingSec: 0,
+                  decoder,
+                  sourceCodec: decoderInfo.codec,
+                  videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+                  videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
+                }),
+              createMuxArgs: () =>
+                createBurnEncodedVideoMuxArgs({
+                  encodedVideoPath,
+                  cleanPath: recording.cleanPath,
+                  outputPath: burnedTmpPath,
+                  codec: burnCodec,
+                  fps: burnFps,
+                  startTime: 0,
+                  duration: durationSec,
+                  container: getContainerFromPath(burnedPath),
+                  includeAudio: Boolean(mediaInfo.audioInfo),
+                  copyAudio: copySourceAudio
+                }),
+              decoder: decoderInfo,
+              onStderr,
+              onChild: (child) => this.burnSessions.set(room.id, child),
+              beforeRetry: () => fsp.rm(burnedTmpPath, { force: true }).catch(() => {}),
+              onFallback: onDecoderFallback,
+              label: roomLabel(room) + ' Jetson Scene Graph 烧录'
+            });
+          } else {
+            await this.runFfmpegWithHardwareDecodeFallback({
+              decoder: decoderInfo,
+              createArgs,
+              onStderr,
+              onChild: (child) => this.burnSessions.set(room.id, child),
+              beforeRetry: () => fsp.rm(burnedTmpPath, { force: true }).catch(() => {}),
+              onFallback: onDecoderFallback,
+              label: roomLabel(room) + ' Scene Graph 烧录'
+            });
+          }
+        } catch (error) {
+          processingError = error;
+        }
+        try {
+          await finish(processingError);
+        } finally {
+          await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
+        }
+      })();
+      this.emitState(['room', 'recording', 'mediaJob']);
+      return true;
+    } catch (error) {
+      this.burnSessions.delete(room.id);
+      room.burning = false;
+      await fsp.rm(burnedTmpPath, { force: true }).catch(() => {});
+      if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+  }
+
   async startBurnRecording(room, recording, options = {}) {
     if (this.isRoomBurning(room)) {
       this.log('warn', `${roomLabel(room)} 已有弹幕版正在生成，跳过 ${path.basename(recording.cleanPath)}。`);
@@ -9453,7 +9963,8 @@ try {
     try {
       const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
       const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
-      const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+      const requestedStylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+      const stylePreset = this.resolveSceneGraphStylePreset(requestedStylePreset);
       const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
       const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
       this.burnCancelRequests.delete(room.id);
@@ -9464,6 +9975,18 @@ try {
       }
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
+      }
+      if (SCENE_STYLE_PRESETS.includes(stylePreset)) {
+        return this.startSceneGraphBurnRecording(room, recording, options, {
+          burnCodec,
+          burnCrf,
+          overlayMode,
+          danmakuArea,
+          stylePreset,
+          styleLayout,
+          mediaInfo,
+          durationSec
+        });
       }
       const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
@@ -9478,12 +10001,7 @@ try {
       const codecInfo = this.getBurnCodecInfo(burnCodec);
       const decoderInfo = this.getHardwareDecoder(recording.videoInfo || mediaInfo.videoInfo, burnCodec);
       const burnSourcePath = recording.cleanPath;
-      const deleteSourceAfterSuccess = Boolean(
-        options.automatic &&
-          options.deleteSourceAfterSuccess &&
-          this.settings.autoBurnDanmaku &&
-          this.settings.deleteSourceAfterBurn
-      );
+      const deleteSourceAfterSuccess = false;
 
       // The Jetson bridge retains one elementary encoded stream until FFmpeg
       // has muxed the final container, so reserve room for both temporary and
@@ -9850,6 +10368,114 @@ try {
     return this.getState();
   }
 
+  async generateSceneAssTracks(recording, options = {}) {
+    const normalized = this.normalizeRecording(recording) || recording;
+    if (!normalized?.cleanPath) throw new Error('请选择录像文件。');
+    await this.ensurePlatformCjkFont();
+    const selectedStyle = this.resolveSceneGraphStylePreset(options.stylePreset || this.settings.sceneGraphDefaultStyle);
+    const requestedPresets = Array.isArray(options.presets) && options.presets.length
+      ? options.presets.map(String).filter((preset) => SCENE_STYLE_PRESETS.includes(preset))
+      : SCENE_STYLE_PRESETS.slice();
+    const presets = requestedPresets.length ? Array.from(new Set(requestedPresets)) : SCENE_STYLE_PRESETS.slice();
+    const [events, avatarAssets] = await Promise.all([
+      this.readSceneEventsForRecording(normalized),
+      this.getSceneAvatarAssets(normalized)
+    ]);
+    let durationSec = Number(options.durationSec || normalized.durationSec || 0);
+    if (!(durationSec > 0) && normalized.cleanPath) {
+      const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, normalized.cleanPath).catch(() => null);
+      durationSec = await this.resolveRecordingDuration(normalized, mediaInfo || {}, 0);
+      if (mediaInfo?.videoInfo) normalized.videoInfo = mediaInfo.videoInfo;
+    }
+    const startTime = Number.isFinite(Number(options.startTime)) ? Math.max(0, Number(options.startTime)) : 0;
+    const endTime = Number.isFinite(Number(options.endTime)) && Number(options.endTime) > startTime
+      ? Number(options.endTime)
+      : durationSec > 0
+        ? durationSec
+        : 0;
+    const tracks = [];
+    let selectedGraph = null;
+    for (const preset of presets) {
+      let graph = buildSceneGraph(
+        events,
+        this.getSceneGraphOptions(normalized, {
+          ...options,
+          stylePreset: preset,
+          avatarAssets,
+          videoInfo: options.videoInfo || normalized.videoInfo
+        })
+      );
+      if (endTime > startTime) {
+        graph = clipSceneGraph(graph, startTime, endTime, { shiftTime: options.shiftTime === true });
+      } else if (durationSec > 0) {
+        graph = clipSceneGraph(graph, 0, durationSec, { shiftTime: false });
+      }
+      const compiled = compileSceneToAss(graph);
+      const assPath = options.assPath && presets.length === 1
+        ? String(options.assPath)
+        : deriveSceneAssPath(normalized.cleanPath, preset);
+      const temporaryAssPath = assPath + '.' + process.pid + '.' + Date.now() + '.tmp';
+      await fsp.writeFile(temporaryAssPath, compiled.ass, { encoding: 'utf8', mode: 0o660 });
+      await atomicReplaceFile(temporaryAssPath, assPath);
+      tracks.push({
+        preset,
+        assPath,
+        objectCount: compiled.objectCount,
+        degradedEffects: compiled.degradedEffects
+      });
+      if (preset === selectedStyle) selectedGraph = graph;
+    }
+    if (!selectedGraph) {
+      selectedGraph = buildSceneGraph(
+        events,
+        this.getSceneGraphOptions(normalized, {
+          ...options,
+          stylePreset: selectedStyle,
+          avatarAssets,
+          videoInfo: options.videoInfo || normalized.videoInfo
+        })
+      );
+      if (durationSec > 0) selectedGraph = clipSceneGraph(selectedGraph, 0, durationSec, { shiftTime: false });
+    }
+    const scenePath = normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath);
+    if (options.persistSceneGraph !== false) {
+      await writeSceneGraph(scenePath, selectedGraph);
+      normalized.scenePath = scenePath;
+      normalized.sceneStatus = 'ready';
+      normalized.sceneEventCount = events.length;
+    }
+
+    let remuxPath = '';
+    if (options.remux !== false) {
+      const selectedTrack = tracks.find((track) => track.preset === selectedStyle) || tracks[0];
+      if (selectedTrack) {
+        remuxPath = String(options.remuxPath || deriveSceneMkvPath(normalized.cleanPath, selectedTrack.preset));
+        const temporaryRemuxPath = remuxPath + '.' + process.pid + '.tmp.mkv';
+        await fsp.rm(temporaryRemuxPath, { force: true });
+        await runFfmpegJob(
+          this.ffmpegPath,
+          createSceneAssRemuxArgs({
+            cleanPath: normalized.cleanPath,
+            assPath: selectedTrack.assPath,
+            outputPath: temporaryRemuxPath,
+            title: 'BiliRecord2K Scene ' + selectedTrack.preset
+          })
+        );
+        await atomicReplaceFile(temporaryRemuxPath, remuxPath);
+      }
+    }
+    return {
+      scenePath,
+      sceneCachePath: normalized.sceneCachePath || deriveSceneCachePath(normalized.cleanPath),
+      eventCount: events.length,
+      selectedStyle,
+      canvas: selectedGraph.canvas,
+      graph: selectedGraph,
+      tracks,
+      remuxPath
+    };
+  }
+
   async generateSubtitleAssets(recording, options = {}) {
     await this.ensurePlatformCjkFont();
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
@@ -9872,6 +10498,45 @@ try {
       deriveSiblingPath(recording.cleanPath, createDanmakuAssSuffix(overlayMode, danmakuArea), 'ass');
     const temporaryAssPath = `${assPath}.${process.pid}.${Date.now()}.tmp`;
     const avatarPlanPath = `${temporaryAssPath}.avatar-plan.json`;
+    // This compatibility entry point is also consumed by the established
+    // ASS-plus-real-avatar export path. New Scene Graph callers use
+    // generateSceneAssTracks (or opt in explicitly), so keep the legacy
+    // avatar motion plan intact for existing exports.
+    if (options.sceneGraph === true && SCENE_STYLE_PRESETS.includes(stylePreset)) {
+      const sceneResult = await this.generateSceneAssTracks(recording, {
+        overlayMode,
+        danmakuArea,
+        stylePreset,
+        styleLayout,
+        avatarMode,
+        videoInfo,
+        durationSec: Number(recording.durationSec || 0),
+        startTime: options.startTime,
+        endTime: options.endTime,
+        shiftTime: options.shiftTime,
+        assPath,
+        presets: [stylePreset],
+        remux: false,
+        persistSceneGraph: !Number.isFinite(Number(options.startTime))
+      });
+      const track = sceneResult.tracks[0];
+      recording.cssPath = cssPath;
+      recording.assPath = track.assPath;
+      return {
+        cssPath,
+        assPath: track.assPath,
+        eventCount: sceneResult.eventCount,
+        stylePreset,
+        styleLayout,
+        avatarMode,
+        playWidth: Number(sceneResult.canvas?.width || videoInfo?.width || 0),
+        playHeight: Number(sceneResult.canvas?.height || videoInfo?.height || 0),
+        portrait: Number(sceneResult.canvas?.height || 0) > Number(sceneResult.canvas?.width || 0),
+        avatarPlan: null,
+        scenePath: sceneResult.scenePath,
+        degradedEffects: track.degradedEffects
+      };
+    }
     const result = await runAssWorkerJob({
       danmakuPath: recording.danmakuPath,
       cssPath,
@@ -9967,6 +10632,51 @@ try {
       cssPath: assets.cssPath,
       assPath: assets.assPath,
       eventCount: assets.eventCount
+    };
+  }
+
+  async prepareSceneTracks(options = {}) {
+    let recording = this.normalizeRecording(options.recording || options);
+    if (!recording) throw new Error('请选择录像文件。');
+    recording = this.hydrateRecordingFromLibrary(recording);
+    if (recording.valid === false) throw new Error('这个录像文件未通过完整性检查。');
+    this.assertExportSourcePath(recording.cleanPath);
+    if (!(await isExistingFile(recording.cleanPath))) throw new Error('源视频不存在：' + recording.cleanPath);
+    const mediaInfo = await probeMediaFileInfo(this.ffmpegPath, recording.cleanPath);
+    const durationSec = await this.resolveRecordingDuration(recording, mediaInfo);
+    if (durationSec > 0) recording.durationSec = durationSec;
+    if (mediaInfo.videoInfo) recording.videoInfo = mediaInfo.videoInfo;
+    const stylePreset = this.resolveSceneGraphStylePreset(options.stylePreset || this.settings.sceneGraphDefaultStyle);
+    const result = await this.generateSceneAssTracks(recording, {
+      stylePreset,
+      presets: SCENE_STYLE_PRESETS,
+      overlayMode: normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode),
+      danmakuArea: normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea),
+      styleLayout: normalizeDanmakuStyleLayout(options.styleLayout || this.settings.burnDanmakuStyleLayout),
+      videoInfo: recording.videoInfo,
+      durationSec,
+      remux: true,
+      remuxPath: options.remuxPath
+    });
+    recording.scenePath = result.scenePath;
+    recording.sceneStatus = 'ready';
+    recording.sceneEventCount = result.eventCount;
+    this.rememberRecording(
+      { id: recording.roomId, title: recording.roomTitle, anchor: recording.anchor },
+      recording
+    );
+    await this.writeRecordingMetadata(recording).catch(() => {});
+    await this.saveStore();
+    this.log('success', 'Scene Graph 已生成三套 ASS 轨，并已快速封装 MKV：' + path.basename(result.remuxPath || result.scenePath));
+    return {
+      ok: true,
+      cleanPath: recording.cleanPath,
+      scenePath: result.scenePath,
+      sceneCachePath: result.sceneCachePath,
+      selectedStyle: result.selectedStyle,
+      tracks: result.tracks,
+      remuxPath: result.remuxPath,
+      eventCount: result.eventCount
     };
   }
 
@@ -10130,6 +10840,215 @@ try {
     });
   }
 
+  async runSceneGraphClipExport({
+    recording,
+    burnCodec,
+    burnCrf,
+    overlayMode,
+    danmakuArea,
+    stylePreset,
+    styleLayout,
+    startTime,
+    endTime,
+    duration,
+    durationSec,
+    outputPath,
+    temporaryOutputPath,
+    outputContainer,
+    mediaInfo,
+    codecInfo,
+    decoderInfo,
+    progress,
+    setExportStage,
+    throwIfExportCancelled
+  }) {
+    let sceneDirectory = '';
+    let cancelled = false;
+    try {
+      const estimatedExportBytes = Math.ceil(
+        Number(recording.fileSize || 0) * Math.min(1, duration / Math.max(1, durationSec || duration))
+      );
+      await assertDiskSpace(outputPath, {
+        estimatedBytes: estimatedExportBytes * (isJetsonGstreamerCodec(burnCodec) ? 2 : 1)
+      });
+      await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+      throwIfExportCancelled();
+      sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-scene-'));
+      setExportStage('正在从 Scene Graph 直接合成');
+      const sceneResult = await this.buildSceneGraphForRecording(recording, {
+        overlayMode,
+        danmakuArea,
+        stylePreset,
+        styleLayout,
+        videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+        durationSec
+      });
+      const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
+      const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
+      const target = isJetsonGstreamerCodec(burnCodec)
+        ? 'jetson'
+        : String(burnCodec || '').includes('nvenc')
+          ? 'cuda'
+          : 'software';
+      const sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
+        duration,
+        fps,
+        target
+      });
+      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
+      progress.avatarCompositeBackend = 'Scene Graph 直接合成';
+      progress.stageLabel = '正在一次合成 Scene Graph';
+      progress.message = progress.stageLabel;
+      progress.updatedAt = Date.now();
+      this.emitState('mediaJob');
+      const createArgs = (decoder) =>
+        createBurnArgs({
+          cleanPath: recording.cleanPath,
+          assPath: '',
+          burnedPath: temporaryOutputPath,
+          codec: burnCodec,
+          crf: burnCrf,
+          container: outputContainer,
+          startTime,
+          duration,
+          fps,
+          avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+          inputSeek: true,
+          timelineOffset: 0,
+          leadingVideoPaddingSec: 0,
+          leadingAudioPaddingSec: 0,
+          copyAudio: copySourceAudio,
+          decoder,
+          sourceCodec: decoderInfo.codec
+        });
+      const onStderr = (line) => {
+        if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
+          this.emitState('mediaJob');
+        }
+        if (/error|failed|invalid/i.test(line)) this.log('warn', 'Scene Graph 导出：' + compactLogLine(line));
+      };
+      const onChild = (child) => {
+        this.exportProcess = child;
+      };
+      const onDecoderFallback = () => {
+        this.setProgressDecoder(
+          progress,
+          { value: 'software', label: 'CPU', kind: 'software' },
+          { reset: true, message: 'Scene Graph 硬件解码不兼容，正在使用 CPU 解码重新导出' }
+        );
+        this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码；Scene Graph 几何未改变。');
+        this.emitState('mediaJob');
+      };
+      throwIfExportCancelled();
+      if (isJetsonGstreamerCodec(burnCodec)) {
+        const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
+          (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+        await this.runJetsonGstreamerTranscode({
+          codec: burnCodec,
+          quality: burnCrf,
+          width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+          height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
+          fps,
+          encodedVideoPath,
+          createRawArgs: (decoder) =>
+            createBurnRawVideoArgs({
+              cleanPath: recording.cleanPath,
+              assPath: '',
+              fps,
+              avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+              startTime,
+              duration,
+              inputSeek: true,
+              timelineOffset: 0,
+              leadingVideoPaddingSec: 0,
+              decoder,
+              sourceCodec: decoderInfo.codec,
+              videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+              videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
+            }),
+          createMuxArgs: () =>
+            createBurnEncodedVideoMuxArgs({
+              encodedVideoPath,
+              cleanPath: recording.cleanPath,
+              outputPath: temporaryOutputPath,
+              codec: burnCodec,
+              fps,
+              startTime,
+              duration,
+              container: outputContainer,
+              includeAudio: Boolean(mediaInfo.audioInfo),
+              copyAudio: copySourceAudio
+            }),
+          decoder: decoderInfo,
+          onStderr,
+          onChild,
+          beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+          onFallback: onDecoderFallback,
+          label: 'Jetson Scene Graph 烧录'
+        });
+      } else {
+        await this.runFfmpegWithHardwareDecodeFallback({
+          decoder: decoderInfo,
+          createArgs,
+          onStderr,
+          onChild,
+          beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+          onFallback: onDecoderFallback,
+          label: 'Scene Graph 烧录'
+        });
+      }
+      throwIfExportCancelled();
+      setExportStage('正在验证并完成 Scene Graph 导出');
+      const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
+      if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
+        throw new Error('Scene Graph 导出临时输出未通过视频流与文件大小验证。');
+      }
+      await atomicReplaceFile(temporaryOutputPath, outputPath);
+      if (this.exportProgress?.id === progress.id) {
+        finishFfmpegJobProgress(this.exportProgress, 'completed', 'Scene Graph 片段已导出');
+        this.emitState('mediaJob');
+      }
+      this.log('success', 'Scene Graph 片段已导出：' + path.basename(outputPath));
+      return {
+        ok: true,
+        mode: 'burn',
+        outputPath,
+        cleanPath: recording.cleanPath,
+        scenePath: recording.scenePath || deriveSceneGraphPath(recording.cleanPath)
+      };
+    } catch (error) {
+      cancelled = this.exportCancelRequested || error?.code === 'BR2K_MEDIA_CANCELLED';
+      if (cancelled) {
+        if (this.exportProgress?.id === progress.id) {
+          finishFfmpegJobProgress(this.exportProgress, 'cancelled', '导出已取消');
+          this.emitState('mediaJob');
+        }
+        this.log('info', '已取消 Scene Graph 导出片段：' + path.basename(outputPath));
+      } else if (this.exportProgress?.id === progress.id) {
+        finishFfmpegJobProgress(this.exportProgress, 'error', 'Scene Graph 导出失败：' + error.message);
+        this.emitState('mediaJob');
+      }
+      if (!cancelled) throw error;
+      return { ok: false, mode: 'burn', cleanPath: recording.cleanPath };
+    } finally {
+      await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+      if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
+      if (this.exportProgress?.id === progress.id) {
+        this.exportProcess = null;
+        this.exportCancelRequested = false;
+      }
+      const progressId = progress.id;
+      this.exportProgressClearTimer = setTimeout(() => {
+        if (this.exportProgress?.id === progressId) {
+          this.exportProgress = null;
+          this.emitState('mediaJob');
+        }
+      }, 5000);
+      this.exportProgressClearTimer.unref?.();
+    }
+  }
+
   async runExportClipNow(options = {}) {
     await this.waitForRuntimeCapabilities();
     let recording = this.normalizeRecording(options.recording || options);
@@ -10149,7 +11068,8 @@ try {
     const burnCrf = clamp(Number(options.crf ?? this.settings.burnCrf), 16, 35);
     const overlayMode = normalizeBurnOverlayMode(options.overlayMode || this.settings.burnOverlayMode);
     const danmakuArea = normalizeDanmakuDisplayArea(options.danmakuArea || this.settings.burnDanmakuArea);
-    const stylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+    const requestedStylePreset = normalizeDanmakuStylePreset(options.stylePreset ?? this.settings.burnDanmakuStylePreset);
+    const stylePreset = this.resolveSceneGraphStylePreset(requestedStylePreset);
     const styleLayout = normalizeDanmakuStyleLayout(options.styleLayout ?? this.settings.burnDanmakuStyleLayout);
     const avatarMode = normalizeBurnAvatarMode(options.avatarMode ?? this.settings.burnAvatarMode);
     const startTime = parseTimeInput(options.startTime ?? options.start);
@@ -10216,6 +11136,30 @@ try {
     this.exportProcess = null;
     this.exportCancelRequested = false;
     options.onProgressCreated?.(progress);
+    if (mode === 'burn' && SCENE_STYLE_PRESETS.includes(stylePreset)) {
+      return this.runSceneGraphClipExport({
+        recording,
+        burnCodec,
+        burnCrf,
+        overlayMode,
+        danmakuArea,
+        stylePreset,
+        styleLayout,
+        startTime,
+        endTime,
+        duration,
+        durationSec,
+        outputPath,
+        temporaryOutputPath,
+        outputContainer,
+        mediaInfo,
+        codecInfo,
+        decoderInfo,
+        progress,
+        setExportStage,
+        throwIfExportCancelled
+      });
+    }
     setExportStage(mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段');
 
     let cssPath = recording.cssPath;

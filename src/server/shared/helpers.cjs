@@ -138,6 +138,10 @@ const UPDATE_DOWNLOAD_LOW_SPEED_WINDOW_MS = 20 * 1000;
 const danmakuClient = require('../danmaku/client.cjs');
 const danmakuAss = require('../danmaku/ass.cjs');
 const danmakuDedupe = require('../danmaku/dedupe.cjs');
+const layoutEngine = require('../danmaku/layout-engine.cjs');
+const sceneGraph = require('../danmaku/scene-graph.cjs');
+const sceneAss = require('../danmaku/scene-ass.cjs');
+const sceneRenderer = require('../danmaku/scene-renderer.cjs');
 const ffmpegHelpers = require('../recording/ffmpeg.cjs');
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000, label = '网络请求', consumeResponse = null) {
@@ -2681,6 +2685,11 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         danmakuPath,
         avatarManifestPath:
           resolveMetadataRelativePath(metadata?.avatarManifestPath) || deriveAvatarManifestPath(cleanPath),
+        sceneCachePath:
+          resolveMetadataRelativePath(metadata?.sceneCachePath) || deriveSiblingPath(cleanPath, 'scene', 'jsonl'),
+        scenePath:
+          resolveMetadataRelativePath(metadata?.scenePath) || deriveSiblingPath(cleanPath, 'scene', 'json'),
+        sceneStatus: String(metadata?.sceneStatus || ''),
         cssPath: deriveSiblingPath(cleanPath, 'danmaku', 'css'),
         assPath: deriveSiblingPath(cleanPath, 'danmaku', 'ass'),
         burnedPath: deriveBurnedPath(cleanPath, 'danmaku-gift'),
@@ -2697,6 +2706,7 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         fileSize: stat.size,
         valid,
         eventCount,
+        sceneEventCount: Number(metadata?.sceneEventCount || 0),
         capturedDanmakuCount: eventCount,
         rawDanmakuCount: eventCount,
         ignoredDanmakuCount: 0,
@@ -3642,6 +3652,9 @@ function mimeType(filePath) {
       '.json': 'application/json; charset=utf-8',
       '.svg': 'image/svg+xml',
       '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
       '.ico': 'image/x-icon',
       '.webp': 'image/webp',
       '.mp4': 'video/mp4',
@@ -3655,8 +3668,15 @@ function mimeType(filePath) {
 
 module.exports = {
   ...danmakuClient,
+  // Keep the longstanding ASS helper surface authoritative for legacy callers.
+  // Scene ASS exposes its compiler under distinct names, so it can be exported
+  // first without replacing assTime/assEscape/roundedRectPath.
+  ...sceneAss,
   ...danmakuAss,
   ...danmakuDedupe,
+  ...layoutEngine,
+  ...sceneGraph,
+  ...sceneRenderer,
   ...ffmpegHelpers,
   fetchWithTimeout,
   requestBiliJsonWithCookies,

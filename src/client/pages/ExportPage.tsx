@@ -16,13 +16,14 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
-import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
+import { SceneGraphOverlay } from '../components/SceneGraphOverlay';
+import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState, SceneGraph } from '../types';
 import {
   burnAvatarModeOptions,
   danmakuAreaOptions,
-  danmakuStylePresetOptions,
   exportModeOptions,
-  overlayModeOptions
+  overlayModeOptions,
+  sceneGraphStyleOptions
 } from '../ui/options';
 import {
   clampNumber,
@@ -70,6 +71,8 @@ export function ExportPage({
   const [previewNeedsProxy, setPreviewNeedsProxy] = useState(false);
   const [previewDeclined, setPreviewDeclined] = useState(false);
   const [previewStarting, setPreviewStarting] = useState(false);
+  const [sceneGraph, setSceneGraph] = useState<SceneGraph | null>(null);
+  const [sceneTracksMessage, setSceneTracksMessage] = useState('');
   const [pathPickerBusy, setPathPickerBusy] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -84,7 +87,7 @@ export function ExportPage({
   const timelineEnd = Number.isFinite(draftEnd)
     ? clampNumber(draftEnd, 0, canUseTimeline ? timelineDuration : 0)
     : timelineDuration;
-  const selectedStylePreset = danmakuStylePresetOptions.find((option) => option.value === draft.stylePreset);
+  const selectedStylePreset = sceneGraphStyleOptions.find((option) => option.value === draft.stylePreset);
   const rollingDanmakuDuration = clampNumber(
     Number(draft.styleLayout.danmakuDuration ?? selectedStylePreset?.style.danmakuDuration ?? 8),
     2,
@@ -151,11 +154,50 @@ export function ExportPage({
     setMediaDuration(0);
     setPlaybackTime(0);
     setDecodedVideoSize(null);
+    setSceneGraph(null);
     setPreviewError('');
     setPreviewNeedsProxy(false);
     setPreviewDeclined(false);
+    setSceneTracksMessage('');
     releasePreviewVideo();
   }, [draft.cleanPath]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!draft.cleanPath || draft.mode === 'clean') {
+      setSceneGraph(null);
+      return;
+    }
+    const sceneStylePreset =
+      draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
+        ? draft.stylePreset
+        : state.settings.sceneGraphDefaultStyle;
+    void recorder
+      .getSceneGraph({
+        cleanPath: draft.cleanPath,
+        stylePreset: sceneStylePreset,
+        overlayMode: draft.overlayMode,
+        danmakuArea: draft.danmakuArea,
+        styleLayout: draft.styleLayout
+      })
+      .then((nextScene) => {
+        if (!cancelled) setSceneGraph(nextScene);
+      })
+      .catch(() => {
+        if (!cancelled) setSceneGraph(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    draft.cleanPath,
+    draft.danmakuArea,
+    draft.mode,
+    draft.overlayMode,
+    draft.styleLayout,
+    draft.stylePreset,
+    state.settings.sceneGraphDefaultStyle
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -546,13 +588,17 @@ export function ExportPage({
                     void describePreviewError(event.currentTarget);
                   }}
                 />
-                <DanmakuStylePreview
-                  preset={draft.stylePreset}
-                  layout={draft.styleLayout}
-                  overlayMode={draft.overlayMode}
-                  videoInfo={previewVideoInfo}
-                  onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
-                />
+                {sceneGraph ? (
+                  <SceneGraphOverlay scene={sceneGraph} time={playbackTime} />
+                ) : (
+                  <DanmakuStylePreview
+                    preset={draft.stylePreset}
+                    layout={draft.styleLayout}
+                    overlayMode={draft.overlayMode}
+                    videoInfo={previewVideoInfo}
+                    onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
+                  />
+                )}
                 {activePreviewProgress ? (
                   <div className="clip-preview-progress">
                     <JobProgress progress={activePreviewProgress} />
@@ -795,7 +841,7 @@ export function ExportPage({
               </button>
             </div>
             <div className="danmaku-style-presets">
-              {danmakuStylePresetOptions.map((option) => (
+              {sceneGraphStyleOptions.map((option) => (
                 <button
                   key={option.value}
                   className={draft.stylePreset === option.value ? 'danmaku-style-preset active' : 'danmaku-style-preset'}
@@ -820,25 +866,23 @@ export function ExportPage({
                 ))}
               </select>
             </label>
-            {draft.stylePreset === 'current' ? (
-              <label className="danmaku-style-speed">
-                <span>滚动速度</span>
-                <select
-                  value={String(rollingDanmakuDuration)}
-                  onChange={(event) =>
-                    setDraft({
-                      ...draft,
-                      styleLayout: { ...draft.styleLayout, danmakuDuration: Number(event.target.value) }
-                    })
-                  }
-                >
-                  <option value="10">慢</option>
-                  <option value="8">标准</option>
-                  <option value="6">快</option>
-                  <option value="4">很快</option>
-                </select>
-              </label>
-            ) : null}
+            <label className="danmaku-style-speed">
+              <span>滚动速度</span>
+              <select
+                value={String(rollingDanmakuDuration)}
+                onChange={(event) =>
+                  setDraft({
+                    ...draft,
+                    styleLayout: { ...draft.styleLayout, danmakuDuration: Number(event.target.value) }
+                  })
+                }
+              >
+                <option value="10">慢</option>
+                <option value="8">标准</option>
+                <option value="6">快</option>
+                <option value="4">很快</option>
+              </select>
+            </label>
           </section>
 
           <div className="split-buttons export-actions">
@@ -860,6 +904,38 @@ export function ExportPage({
               {hasExportBacklog ? '加入导出队列' : '导出片段'}
             </button>
           </div>
+          <button
+            className="wide-button fill"
+            type="button"
+            disabled={!selectedRecording || !draft.danmakuPath || busy.has('scene-tracks')}
+            onClick={() =>
+              run('scene-tracks', async () => {
+                const sceneStylePreset =
+                  draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
+                    ? draft.stylePreset
+                    : state.settings.sceneGraphDefaultStyle;
+                const sceneTracks = await recorder.prepareSceneTracks({
+                  cleanPath: draft.cleanPath,
+                  danmakuPath: draft.danmakuPath,
+                  cssPath: draft.cssPath,
+                  overlayMode: draft.overlayMode,
+                  danmakuArea: draft.danmakuArea,
+                  stylePreset: sceneStylePreset,
+                  styleLayout: draft.styleLayout,
+                  avatarMode: draft.avatarMode,
+                  outputDir: draft.outputDir
+                });
+                setSceneTracksMessage(
+                  '已生成 ' + sceneTracks.tracks.length + ' 套独立 ASS 轨，并快速封装：' + filename(sceneTracks.remuxPath)
+                );
+                return sceneTracks;
+              })
+            }
+          >
+            <FileVideo size={18} />
+            生成三套 Scene 轨 + MKV
+          </button>
+          {sceneTracksMessage ? <p className="field-help">{sceneTracksMessage}</p> : null}
           {exportBlockReason ? (
             <div className="warning-line">
               <CircleAlert size={16} />

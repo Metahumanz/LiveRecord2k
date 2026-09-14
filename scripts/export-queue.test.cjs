@@ -17,7 +17,7 @@ async function waitFor(predicate, timeoutMs = 5_000) {
   throw new Error('等待导出状态超时。');
 }
 
-test('a dequeued export remains visible while subtitles and avatars are being prepared', async () => {
+test('a dequeued export remains visible while its Scene Graph is being prepared', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-queue-'));
   const inputPath = path.join(tempDir, '123_测试_20260825_120000.clean.mp4');
   const danmakuPath = path.join(tempDir, '123_测试_20260825_120000.danmaku.jsonl');
@@ -54,17 +54,14 @@ test('a dequeued export remains visible while subtitles and avatars are being pr
       queuedRequest = request;
       return runExportClipNow(request);
     };
-    let releaseSubtitlePreparation;
-    const subtitlePreparation = new Promise((resolve) => {
-      releaseSubtitlePreparation = resolve;
+    let releaseScenePreparation;
+    const scenePreparation = new Promise((resolve) => {
+      releaseScenePreparation = resolve;
     });
-    service.generateSubtitleAssets = async () => {
-      await subtitlePreparation;
-      return {
-        cssPath: path.join(tempDir, 'subtitle.css'),
-        assPath: path.join(tempDir, 'subtitle.ass'),
-        avatarPlan: { entries: [] }
-      };
+    const buildSceneGraphForRecording = service.buildSceneGraphForRecording.bind(service);
+    service.buildSceneGraphForRecording = async (...args) => {
+      await scenePreparation;
+      return buildSceneGraphForRecording(...args);
     };
 
     service.settings.burnCodec = 'libx264';
@@ -77,7 +74,7 @@ test('a dequeued export remains visible while subtitles and avatars are being pr
     });
     service.settings.burnCodec = 'libx265';
     assert.equal(queued.queued, true);
-    await waitFor(() => service.exportProgress?.status === 'running' && service.exportProgress?.message === '正在生成字幕');
+    await waitFor(() => service.exportProgress?.status === 'running' && service.exportProgress?.message === '正在从 Scene Graph 直接合成');
     assert.equal(service.exportQueue.length, 0, 'the task has left the waiting list only because it is now visible as current');
     assert.match(service.exportProgress.label, /导出烧录片段/);
     assert.equal(queuedRequest?.recording?.timelineHealth?.firstVideoPts, 1.03);
@@ -86,7 +83,7 @@ test('a dequeued export remains visible while subtitles and avatars are being pr
 
     await service.cancelExportClip();
     assert.equal(service.exportProgress.message, '正在取消准备中的导出');
-    releaseSubtitlePreparation();
+    releaseScenePreparation();
     await waitFor(() => service.exportProgress?.status === 'cancelled');
     await waitFor(() => !service.exportQueueRunning);
   } finally {

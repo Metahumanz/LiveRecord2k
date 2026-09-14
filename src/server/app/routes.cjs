@@ -95,6 +95,39 @@ async function handleApi(service, parsed, port, request, response, access) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/scene') {
+    try {
+      const rawStyleLayout = parsed.searchParams.get('styleLayout');
+      let styleLayout = {};
+      if (rawStyleLayout && rawStyleLayout.length <= 4096) {
+        try {
+          const parsedLayout = JSON.parse(rawStyleLayout);
+          if (parsedLayout && typeof parsedLayout === 'object' && !Array.isArray(parsedLayout)) styleLayout = parsedLayout;
+        } catch {}
+      }
+      writeJson(response, 200, await service.getSceneGraphForPreview({
+        cleanPath: parsed.searchParams.get('cleanPath'),
+        stylePreset: parsed.searchParams.get('stylePreset'),
+        overlayMode: parsed.searchParams.get('overlayMode'),
+        danmakuArea: parsed.searchParams.get('danmakuArea'),
+        styleLayout
+      }));
+    } catch (error) {
+      writeApiError(response, 400, 'SCENE_GRAPH_UNAVAILABLE', error.message || 'Scene Graph 不可用。');
+    }
+    return;
+  }
+
+  if (request.method === 'GET' && pathname === '/api/scene/avatar') {
+    await service.serveSceneAvatar(
+      parsed.searchParams.get('cleanPath'),
+      parsed.searchParams.get('assetId'),
+      request,
+      response
+    );
+    return;
+  }
+
   if (request.method === 'GET' && pathname.startsWith('/api/export/preview/')) {
     await service.serveExportPreview(parsed, request, response);
     return;
@@ -161,6 +194,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/export/preview/start': () => service.startExportPreview(body),
     '/api/export/preview/cancel': () => service.cancelExportPreview(),
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
+    '/api/export/scene-tracks': () => service.prepareSceneTracks(body),
     '/api/export/clip': () => service.exportClip(body),
     '/api/export/cancel': () => service.cancelExportClip(),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
