@@ -6,6 +6,7 @@
 - 常规安装的录像目录探针现在先单独验证 `bili-record-2k` 服务用户身份；`runuser`、PAM 或用户状态失败会显示具体诊断，不再错误提示为 SMB/CIFS 挂载权限问题。只有实际创建、读写、重命名或删除失败时才会给出 SMB 的 uid/gid 与 mode 配置建议。
 - 修复 Scene Graph 改造错误隐藏既有“当前默认”弹幕样式的问题。该样式现与互动流、气泡流和极简侧栏一同保留，可选作默认，并同样支持 Scene Graph 实时渲染、ASS/MKV 输出与最终 MP4 一次合成；旧配置会保留原来的样式选择。
 - 烧录、兼容预览和需要重编码的合并不再伪造 `libx264` / `libx265` 兜底：仅允许选择已通过能力探测的编码器，并按 NVENC、QSV、AMF、V4L2 与软件编码器白名单生成参数。Jetson 自检改用安装包内置 H.264/HEVC 样本，实际生成 Scene Graph 滤镜链并逐项验证所需滤镜、硬解、字体、头像、I420 bridge、GStreamer、前导与最终 mux；任一阶段失败均明确诊断且禁止烧录。
+- Jetson 端到端准入改为 CPU 解码优先：原生 `nvv4l2dec` 仅作为可选加速，失败不会阻断 `CPU 解码 → Scene Graph → I420 → nvvidconv → nvv4l2 → mux` 最低烧录链。每个 GStreamer 阶段、真实滤镜命令、头像处理、0 秒/1.019 秒前导和最终 `ffprobe` 均单独报告；系统 FFmpeg 缺少 Scene Graph 滤镜时自动改用安装包内置完整 ARM64 FFmpeg。Jetson 原始 H26x mux 不再因自动选择 `*_cuvid` 或 `-shortest` 丢失 AAC 音轨；Scene Graph 前导以显式黑帧保持原始时间轴。
 
 ## 0.7.0 - 2026-09-14
 
