@@ -1594,6 +1594,10 @@ function createFfmpegJobProgress({
     sourceFps: Number.isFinite(Number(sourceFps)) && Number(sourceFps) > 0 ? Number(sourceFps) : undefined,
     encoderBackend: encoderBackend || undefined,
     avatarCompositeBackend: avatarCompositeBackend || undefined,
+    // Filled only after the child processes have actually been started.  Do
+    // not turn capability-probe results into a claim about the active export.
+    activePipeline: undefined,
+    stageFps: undefined,
     fallbackReason: undefined,
     startedAt: now,
     updatedAt: now,
@@ -1607,6 +1611,19 @@ function createFfmpegJobProgress({
   };
   resetFfmpegJobProgressRate(progress);
   return progress;
+}
+
+function setFfmpegJobStageFps(progress, stageFps) {
+  if (!progress || progress.status !== 'running' || !stageFps || typeof stageFps !== 'object') return false;
+  const normalized = {};
+  for (const key of ['decode', 'scene', 'encode', 'total']) {
+    const value = Number(stageFps[key]);
+    if (Number.isFinite(value) && value >= 0) normalized[key] = value;
+  }
+  if (!Object.keys(normalized).length) return false;
+  progress.stageFps = normalized;
+  progress.updatedAt = Date.now();
+  return true;
 }
 
 function updateFfmpegJobProgress(progress, text) {
@@ -3816,6 +3833,7 @@ module.exports = {
   createFfmpegJobProgress,
   resetFfmpegJobProgressRate,
   updateFfmpegJobProgress,
+  setFfmpegJobStageFps,
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
   parseFfmpegTime,

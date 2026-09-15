@@ -385,6 +385,17 @@ export type FfmpegJobProgress = {
   sourceFps?: number;
   encoderBackend?: string;
   avatarCompositeBackend?: string;
+  activePipeline?: {
+    decoder: string;
+    sceneRenderer: string;
+    encoder: string;
+  };
+  stageFps?: {
+    decode?: number;
+    scene?: number;
+    encode?: number;
+    total?: number;
+  };
   avatarDiagnostics?: AvatarPreparationDiagnostics;
   fallbackReason?: string;
   startedAt: number;

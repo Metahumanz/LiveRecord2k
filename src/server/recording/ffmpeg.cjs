@@ -1136,7 +1136,10 @@ function createJetsonNativeDecodeArgs({
   width,
   height,
   fps,
-  converter = 'nvvidconv'
+  converter = 'nvvidconv',
+  helperMode = false,
+  startTime = 0,
+  duration = 0
 } = {}) {
   const normalizedConverter = String(converter || '').trim();
   const parser = isHevcCodec(sourceCodec) ? 'h265parse' : 'h264parse';
@@ -1144,6 +1147,14 @@ function createJetsonNativeDecodeArgs({
   const outputHeight = makeEvenDimension(height);
   if (!cleanPath || !outputWidth || !outputHeight || !['nvvidconv', 'nvvideoconvert'].includes(normalizedConverter)) {
     throw new Error('Jetson GStreamer 硬解缺少输入、画面尺寸或 nvvidconv。');
+  }
+  if (helperMode) {
+    return [
+      '--decode-native', '--input', String(cleanPath), '--codec', isHevcCodec(sourceCodec) ? 'hevc' : 'h264',
+      '--width', String(outputWidth), '--height', String(outputHeight), '--fps', String(formatGstreamerFramerate(fps)),
+      '--start', String(Math.max(0, Number(startTime) || 0)), '--duration', String(Math.max(0.001, Number(duration) || 0)),
+      '--converter', normalizedConverter, '--output-fd', '3'
+    ];
   }
   return [
     '-q', '-e', 'filesrc', `location=${cleanPath}`, '!', 'qtdemux', 'name=demux',
@@ -1709,12 +1720,15 @@ function runJetsonNativeDecodeSceneEncodeJob({
   ffmpegArgs,
   encoderArgs,
   gstreamerPath = 'gst-launch-1.0',
+  decoderPath = gstreamerPath,
   onDecoderStderr,
   onFfmpegStderr,
   onEncoderStderr,
   onChild,
   timeoutMs = 0,
-  encodedVideoPath = ''
+  encodedVideoPath = '',
+  frameSize = 0,
+  onStageMetrics
 } = {}) {
   return new Promise((resolve, reject) => {
     const results = {
@@ -1723,12 +1737,26 @@ function runJetsonNativeDecodeSceneEncodeJob({
       encoder: { code: null, stderr: '', error: null }
     };
     let decoder; let renderer; let encoder; let settled = false; let timer = null;
+    const startedAt = Date.now();
+    const counters = { decodedBytes: 0, sceneBytes: 0 };
+    let metricsTimer = null;
+    const reportMetrics = (final = false) => {
+      const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+      const bytesPerFrame = Math.max(1, Number(frameSize) || 1);
+      const decode = counters.decodedBytes / bytesPerFrame / elapsed;
+      const scene = counters.sceneBytes / bytesPerFrame / elapsed;
+      // renderer stdout is back-pressured by encoder.stdin; this is the rate
+      // at which raw frames are actually accepted by nvv4l2, not a probe.
+      onStageMetrics?.({ decode, scene, encode: scene, total: scene, elapsed, final });
+    };
     const children = () => [decoder, renderer, encoder].filter(Boolean);
     const stopAll = () => children().forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
     const finish = () => {
       if (settled || !Object.values(results).every((item) => item.code !== null || item.error)) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (metricsTimer) clearInterval(metricsTimer);
+      reportMetrics(true);
       onChild?.(null);
       // Once ffmpeg-full has rendered its requested duration it closes the
       // raw stdin; fdsink then reports EPIPE while the decoder is being torn
@@ -1757,18 +1785,82 @@ function runJetsonNativeDecodeSceneEncodeJob({
     try {
       encoder = spawn(gstreamerPath, encoderArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
       renderer = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-      decoder = spawn(gstreamerPath, decoderArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+      decoder = spawn(decoderPath, decoderArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
       decoder.stdio[3].pipe(renderer.stdin);
       renderer.stdout.pipe(encoder.stdin);
+      decoder.stdio[3].on('data', (chunk) => { counters.decodedBytes += Math.max(0, Number(chunk?.length) || 0); });
+      renderer.stdout.on('data', (chunk) => { counters.sceneBytes += Math.max(0, Number(chunk?.length) || 0); });
       decoder.stdio[3].on('error', () => {}); renderer.stdout.on('error', () => {});
       renderer.stdin.on('error', () => stopAll()); encoder.stdin.on('error', () => stopAll());
       onChild?.(renderer);
       attach(decoder, 'decoder', onDecoderStderr);
       attach(renderer, 'renderer', onFfmpegStderr);
       attach(encoder, 'encoder', onEncoderStderr);
+      metricsTimer = setInterval(() => reportMetrics(false), 1000);
+      metricsTimer.unref?.();
       const timeout = Math.max(0, Number(timeoutMs) || 0);
       if (timeout) timer = setTimeout(() => { results.renderer.error = new Error(`Jetson 原生三段式链路超时（${timeout}ms）`); stopAll(); finish(); }, timeout);
     } catch (error) { stopAll(); reject(error); }
+  });
+}
+
+// CUDA Scene owns its own NVMM encoder, so its middle and final stages are a
+// single helper process.  This still keeps the video decoder native: the only
+// bridge is the currently necessary I420 pipe, never a raw temporary file.
+function runJetsonNativeDecodeCudaSceneJob({
+  decoderPath = 'gst-launch-1.0',
+  decoderArgs,
+  helperPath,
+  helperArgs,
+  onDecoderStderr,
+  onHelperStderr,
+  onChild,
+  frameSize = 0,
+  onStageMetrics
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const result = { decoder: { code: null, stderr: '', error: null }, helper: { code: null, stderr: '', error: null } };
+    let decoder; let helper; let settled = false;
+    const startedAt = Date.now();
+    let decodedBytes = 0;
+    const report = (final = false) => {
+      const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+      const fps = decodedBytes / Math.max(1, Number(frameSize) || 1) / elapsed;
+      onStageMetrics?.({ decode: fps, scene: fps, encode: fps, total: fps, elapsed, final });
+    };
+    let timer = null;
+    const stop = () => [decoder, helper].filter(Boolean).forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
+    const finish = () => {
+      if (settled || !Object.values(result).every((item) => item.code !== null || item.error)) return;
+      settled = true;
+      if (timer) clearInterval(timer);
+      report(true);
+      onChild?.(null);
+      if (result.helper.code === 0 && !result.helper.error) return resolve();
+      const failed = result.helper.error || result.helper.code !== 0 ? result.helper : result.decoder;
+      const error = new Error(`Jetson 原生 NVDEC / CUDA Scene 链路失败：${String(failed.stderr || failed.error?.message || `退出码 ${failed.code}`).replace(/\s+/g, ' ').trim().slice(-3000)}`);
+      error.primaryProcess = result.helper.error || result.helper.code !== 0 ? 'cuda-scene' : 'decoder';
+      reject(error);
+    };
+    const attach = (child, name, callback) => {
+      child.stderr.on('data', (chunk) => {
+        const text = chunk.toString('utf8'); result[name].stderr = `${result[name].stderr}${text}`.slice(-8000); callback?.(text);
+      });
+      child.on('error', (error) => { result[name].error = error; stop(); finish(); });
+      child.on('close', (code) => { result[name].code = code === null ? -1 : code; if (code !== 0 && name !== 'decoder') stop(); finish(); });
+    };
+    try {
+      helper = spawn(helperPath, helperArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+      decoder = spawn(decoderPath, decoderArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+      decoder.stdio[3].pipe(helper.stdin);
+      decoder.stdio[3].on('data', (chunk) => { decodedBytes += Math.max(0, Number(chunk?.length) || 0); });
+      decoder.stdio[3].on('error', () => {}); helper.stdin.on('error', () => stop());
+      onChild?.(helper);
+      attach(decoder, 'decoder', onDecoderStderr);
+      attach(helper, 'helper', onHelperStderr);
+      timer = setInterval(() => report(false), 1000);
+      timer.unref?.();
+    } catch (error) { stop(); reject(error); }
   });
 }
 
@@ -2471,6 +2563,7 @@ module.exports = {
   createPreviewHlsArgs,
   runFfmpegToGstreamerJob,
   runJetsonNativeDecodeSceneEncodeJob,
+  runJetsonNativeDecodeCudaSceneJob,
   createClipCopyArgs,
   createSceneAssRemuxArgs,
   createConcatCopyArgs,

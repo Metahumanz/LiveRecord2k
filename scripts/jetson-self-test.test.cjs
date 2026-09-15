@@ -13,6 +13,7 @@ const {
   resolveFfprobePath,
   runJetsonEndToEndSelfTest
 } = require('../src/server/recording/jetson-self-test.cjs');
+const { createJetsonNativeDecodeArgs } = require('../src/server/recording/ffmpeg.cjs');
 
 test('Jetson end-to-end self-test always covers H.264/HEVC plans and both required lead-ins', () => {
   assert.deepEqual(SELF_TEST_LEAD_INS, [0, 1.019]);
@@ -62,4 +63,16 @@ test('non-Jetson hosts never mark nvv4l2 as burn-ready', async () => {
   assert.equal(result.ok, false);
   assert.equal(result.stages.nativeDecode.status, 'skipped');
   assert.equal(result.stages.finalMux.status, 'skipped');
+});
+
+test('chunk-native decode carries the exact seek range into the native helper', () => {
+  const args = createJetsonNativeDecodeArgs({
+    cleanPath: '/recordings/source.mp4', sourceCodec: 'hevc', width: 2560, height: 1440, fps: 60,
+    converter: 'nvvidconv', helperMode: true, startTime: 40, duration: 20
+  });
+  assert.deepEqual(args, [
+    '--decode-native', '--input', '/recordings/source.mp4', '--codec', 'hevc',
+    '--width', '2560', '--height', '1440', '--fps', '60/1',
+    '--start', '40', '--duration', '20', '--converter', 'nvvidconv', '--output-fd', '3'
+  ]);
 });

@@ -391,6 +391,9 @@ def render(request, input_stream=None):
             flow = base.emit('push-buffer', buffer)
             if flow != Gst.FlowReturn.OK: fail('GL Scene 输入被拒绝：' + str(flow))
             frame_index += 1
+        expected_frames = max(1, int(math.ceil(number((request.get('input') or {}).get('duration'), 0) * number(output.get('fps'), 30))))
+        if frame_index < expected_frames:
+            fail('GPU Scene 仅收到 %d/%d 帧 I420 输入。' % (frame_index, expected_frames))
         base.emit('end-of-stream')
         bus = pipeline.get_bus()
         while True:
@@ -401,6 +404,91 @@ def render(request, input_stream=None):
         pipeline.set_state(Gst.State.NULL)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def decode_native(args):
+    """Seek and decode one finite source range through Jetson NVDEC.
+
+    gst-launch has no command-line equivalent for GstElement.seek_simple().
+    Keeping this tiny helper beside the Scene renderer lets every 20-second
+    export chunk begin at its real timeline position while retaining
+    qtdemux -> parser -> nvv4l2decoder -> nvvidconv as the decoder path.
+    Raw frames leave only via the inherited fd requested by Node; no raw file
+    is ever materialised on disk.
+    """
+    input_path = str(args.input or '')
+    if not os.path.isfile(input_path): fail('原生解码输入不存在：' + input_path)
+    width, height = int(args.width), int(args.height)
+    fps = max(1.0, number(args.fps, 30))
+    start = max(0.0, number(args.start, 0))
+    duration = max(0.001, number(args.duration, 0))
+    parser_factory = 'h265parse' if str(args.codec).lower() == 'hevc' else 'h264parse'
+    converter = str(args.converter or 'nvvidconv')
+    if converter not in ('nvvidconv', 'nvvideoconvert'): fail('不支持的 Jetson 色彩转换：' + converter)
+    output_fd = int(args.output_fd)
+    pipeline = Gst.Pipeline.new('br2k-native-decode')
+    source = make_element('filesrc', 'source')
+    source.set_property('location', input_path)
+    demux = make_element('qtdemux', 'demux')
+    parser = make_element(parser_factory, 'parser')
+    decoder = make_element('nvv4l2decoder', 'decoder')
+    convert = make_element(converter, 'convert')
+    caps = make_element('capsfilter', 'i420')
+    caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d' % (width, height)))
+    sink = make_element('appsink', 'sink')
+    sink.set_property('sync', False)
+    sink.set_property('max-buffers', 4)
+    sink.set_property('drop', False)
+    for element in [source, demux, parser, decoder, convert, caps, sink]: pipeline.add(element)
+    if not source.link(demux) or not link_many(parser, decoder, convert, caps, sink): fail('无法连接原生 NVDEC 链路。')
+    linked = {'value': False}
+    def on_pad_added(_demux, pad):
+        if linked['value'] or not pad.get_current_caps(): return
+        name = pad.get_current_caps().get_structure(0).get_name()
+        if not name.startswith('video/') or parser.get_static_pad('sink').is_linked(): return
+        if pad.link(parser.get_static_pad('sink')) == Gst.PadLinkReturn.OK: linked['value'] = True
+    demux.connect('pad-added', on_pad_added)
+    # nvv4l2decoder can wait for a downstream NVMM allocation while PAUSED on
+    # some H.264 JetPack builds. Start PLAYING first, then issue the flush
+    # seek; appsink provides the allocation once samples are requested below.
+    if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动原生 NVDEC 管线。')
+    deadline = GLib.get_monotonic_time() + 8 * GLib.USEC_PER_SEC
+    while not linked['value'] and GLib.get_monotonic_time() < deadline:
+        pipeline.get_state(100 * Gst.MSECOND)
+    if not linked['value']:
+        pipeline.set_state(Gst.State.NULL)
+        fail('原生 NVDEC 管线没有可用视频流。')
+    if start > 0.0001 and not pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(start * Gst.SECOND)):
+        pipeline.set_state(Gst.State.NULL)
+        fail('qtdemux 无法定位到分段起点。')
+    required_frames = max(1, int(math.ceil(duration * fps)))
+    written = 0
+    try:
+        with os.fdopen(output_fd, 'wb', closefd=False) as output:
+            while written < required_frames:
+                sample = sink.emit('try-pull-sample', 5 * Gst.SECOND)
+                if sample is None:
+                    message = pipeline.get_bus().timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                    if message and message.type == Gst.MessageType.ERROR:
+                        error, debug = message.parse_error()
+                        fail('原生 NVDEC：' + str(error) + ('；' + str(debug) if debug else ''))
+                    fail('原生 NVDEC 在 5 秒内未输出下一帧。')
+                buffer = sample.get_buffer()
+                ok, mapped = buffer.map(Gst.MapFlags.READ)
+                if not ok: fail('无法读取 NVDEC 输出帧。')
+                try:
+                    expected = width * height * 3 // 2
+                    if mapped.size < expected: fail('原生 NVDEC 输出帧尺寸不完整。')
+                    output.write(mapped.data[:expected])
+                    written += 1
+                finally:
+                    buffer.unmap(mapped)
+            output.flush()
+    finally:
+        pipeline.send_event(Gst.Event.new_eos())
+        pipeline.set_state(Gst.State.NULL)
+    if written < required_frames:
+        fail('原生 NVDEC 仅解出 %d/%d 帧。' % (written, required_frames))
 
 
 def probe():
@@ -423,10 +511,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--probe')
     parser.add_argument('--request')
+    parser.add_argument('--decode-native', action='store_true')
+    parser.add_argument('--input')
+    parser.add_argument('--codec')
+    parser.add_argument('--width', type=int)
+    parser.add_argument('--height', type=int)
+    parser.add_argument('--fps')
+    parser.add_argument('--start')
+    parser.add_argument('--duration')
+    parser.add_argument('--converter')
+    parser.add_argument('--output-fd')
     parser.add_argument('--self-test', action='store_true')
     args = parser.parse_args()
     Gst.init(None)
     if args.probe == 'json': return probe()
+    if args.decode_native:
+        decode_native(args)
+        return 0
     if args.self_test:
         target = '/tmp/br2k-gpu-scene-self-test.h264'
         try: os.unlink(target)
