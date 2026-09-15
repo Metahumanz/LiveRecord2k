@@ -142,6 +142,13 @@ def scene_state(entry, at, texture_width, texture_height):
         progress = clamp((at - start) / (end - start), 0, 1)
         kind = str(animation.get('type') or '')
         if kind == 'Move':
+            # A Scene object may carry a long list of future reflow moves.
+            # Treating a not-yet-started move as progress=0 incorrectly snaps
+            # the object to that future move's `from` position.  With a busy
+            # side stream that puts several cards on the same row.  Only the
+            # active move, or a completed earlier move, may affect this state.
+            if at < start:
+                continue
             for axis in ('x', 'y'):
                 begin = number((animation.get('from') or {}).get(axis), state[axis])
                 finish = number((animation.get('to') or {}).get(axis), begin)
@@ -151,6 +158,8 @@ def scene_state(entry, at, texture_width, texture_height):
             finish = number(animation.get('to'), begin)
             state['alpha'] = begin + (finish - begin) * progress
         elif kind == 'Scale':
+            if at < start:
+                continue
             for axis, key, base in [('x', 'width', texture_width), ('y', 'height', texture_height)]:
                 begin = number((animation.get('from') or {}).get(axis), 1)
                 finish = number((animation.get('to') or {}).get(axis), begin)
