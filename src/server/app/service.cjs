@@ -1594,6 +1594,14 @@ class LiveRecordService {
         : '';
     const software = { value: 'software', label: 'CPU', kind: 'software', codec: sourceCodec };
     if (!sourceCodec) return software;
+    // The Jetson nvv4l2 encoder is a GStreamer element, while its matching
+    // FFmpeg decoder is optional and frequently rejects otherwise valid HEVC
+    // recordings (or hangs before producing a first frame).  The production
+    // minimum path is deliberately CPU decode -> Scene Graph -> I420 ->
+    // nvvidconv -> nvv4l2 encode -> mux.  Do not make an optional native
+    // decoder an implicit prerequisite merely because the selected encoder is
+    // nvv4l2; its self-test result remains diagnostic/acceleration-only.
+    if (String(encoderCodec || '').includes('nvv4l2')) return software;
     const available = (this.ffmpegCapabilities?.hardwareDecoders || []).filter(
       (decoder) => decoder.codec === sourceCodec
     );
