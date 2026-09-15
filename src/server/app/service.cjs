@@ -51,6 +51,8 @@ const {
   createMp4FinalizeArgs,
   createBurnArgs,
   createBurnRawVideoArgs,
+  createJetsonNativeDecodeArgs,
+  createBurnRawSceneFromPipeArgs,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
   createBurnAudioMuxArgs,
@@ -59,6 +61,7 @@ const {
   clipAvatarOverlayEntries,
   createPreviewHlsArgs,
   runFfmpegToGstreamerJob,
+  runJetsonNativeDecodeSceneEncodeJob,
   createClipCopyArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
@@ -283,9 +286,9 @@ const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
 const RECORDING_LIBRARY_LIMIT = 160;
 const DEFAULT_PORT = 3263;
-// The CUDA Scene primitive bridge is kept installed for isolated hardware
-// tests, but is not a production renderer until visual conformance covers
-// dense H5 cards, avatar crops and every Scene style.
+// CUDA Scene remains an isolated visual/texture test path.  Production
+// Jetson exports use GStreamer NVDEC + ffmpeg-full Scene Graph + GStreamer
+// NVENC so UI rendering stays byte-for-byte on the established renderer.
 const CUDA_SCENE_PRODUCTION_ENABLED = false;
 const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
 const MIN_PLAYABLE_BYTES = 128 * 1024;
@@ -1295,7 +1298,7 @@ class LiveRecordService {
     this.log(
       gpuScene?.available ? 'success' : 'info',
       gpuScene?.available
-        ? gpuScene.backend === 'cuda-gstreamer' && CUDA_SCENE_PRODUCTION_ENABLED
+        ? gpuScene.backend === 'cuda-gstreamer'
           ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。短片与长片分段将使用 CUDA Scene 纹理合成；FFmpeg 仍负责视频解码。`
           : `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。视觉一致性验证未通过，当前保持 CPU Scene 导出。`
         : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
@@ -1617,14 +1620,6 @@ class LiveRecordService {
         : '';
     const software = { value: 'software', label: 'CPU', kind: 'software', codec: sourceCodec };
     if (!sourceCodec) return software;
-    // The Jetson nvv4l2 encoder is a GStreamer element, while its matching
-    // FFmpeg decoder is optional and frequently rejects otherwise valid HEVC
-    // recordings (or hangs before producing a first frame).  The production
-    // minimum path is deliberately CPU decode -> Scene Graph -> I420 ->
-    // nvvidconv -> nvv4l2 encode -> mux.  Do not make an optional native
-    // decoder an implicit prerequisite merely because the selected encoder is
-    // nvv4l2; its self-test result remains diagnostic/acceleration-only.
-    if (String(encoderCodec || '').includes('nvv4l2')) return software;
     const available = (this.ffmpegCapabilities?.hardwareDecoders || []).filter(
       (decoder) => decoder.codec === sourceCodec
     );
@@ -1632,8 +1627,7 @@ class LiveRecordService {
     const codec = String(encoderCodec || '');
     const preference = codec.includes('nvv4l2')
       ? [
-          sourceCodec === 'hevc' ? 'hevc_nvv4l2dec' : 'h264_nvv4l2dec',
-          sourceCodec === 'hevc' ? 'hevc_v4l2m2m' : 'h264_v4l2m2m',
+          'gstreamer-nvv4l2',
           'cuda',
           'qsv',
           'vaapi',
@@ -9363,7 +9357,7 @@ try {
       if (
         preferredDecoder === 'software' ||
         error?.code === 'BR2K_MEDIA_CANCELLED' ||
-        !isFfmpegHardwareDecodeError(error)
+        !(preferredDecoder === 'gstreamer-nvv4l2' || isFfmpegHardwareDecodeError(error))
       ) {
         throw error;
       }
@@ -9465,6 +9459,7 @@ try {
     createRawArgs,
     createMuxArgs,
     decoder = 'software',
+    nativeDecode = null,
     onStderr,
     onChild,
     beforeRetry,
@@ -9498,20 +9493,35 @@ try {
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     const run = async (nextDecoder) => {
       await fsp.rm(outputPath, { force: true }).catch(() => {});
-      await runFfmpegToGstreamerJob({
-        ffmpegPath: this.ffmpegPath,
-        ffmpegArgs: createRawArgs(nextDecoder),
-        gstreamerArgs,
-        gstreamerOutputPath: outputPath,
-        onFfmpegStderr: onStderr,
-        onGstreamerStderr: (text) => {
-          const label = /(?:\bargus\b|nvargus-daemon|socketclientdispatch|fileoperationfailed)/i.test(String(text || ''))
-            ? 'GStreamer Argus 附加诊断'
-            : 'GStreamer';
-          onStderr?.(`${label}: ${text}`);
-        },
-        onChild
-      });
+      const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.filterScriptPath;
+      const activeDecoder = nextDecoder === 'gstreamer-nvv4l2' && !useNativeDecode ? 'software' : nextDecoder;
+      if (useNativeDecode) {
+        this.log('info', `${label}：解码 Jetson nvv4l2decoder → I420 pipe；渲染 BiliRecord2K ffmpeg-full Scene Graph → I420 pipe；编码 Jetson ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}。`);
+        await runJetsonNativeDecodeSceneEncodeJob({
+          decoderArgs: createJetsonNativeDecodeArgs({
+            cleanPath: nativeDecode.cleanPath, sourceCodec: nativeDecode.sourceCodec, width, height, fps,
+            converter: codecInfo.converter
+          }),
+          ffmpegPath: this.ffmpegPath,
+          ffmpegArgs: createBurnRawSceneFromPipeArgs({ filterScriptPath: nativeDecode.filterScriptPath, fps, width, height, duration: nativeDecode.duration }),
+          encoderArgs: gstreamerArgs,
+          encodedVideoPath: outputPath,
+          onDecoderStderr: (text) => onStderr?.(`GStreamer 解码: ${text}`),
+          onFfmpegStderr: onStderr,
+          onEncoderStderr: (text) => onStderr?.(`GStreamer 编码: ${text}`),
+          onChild
+        });
+      } else {
+        await runFfmpegToGstreamerJob({
+          ffmpegPath: this.ffmpegPath,
+          ffmpegArgs: createRawArgs(activeDecoder),
+          gstreamerArgs,
+          gstreamerOutputPath: outputPath,
+          onFfmpegStderr: onStderr,
+          onGstreamerStderr: (text) => onStderr?.(`GStreamer: ${text}`),
+          onChild
+        });
+      }
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
     };
 
@@ -11302,7 +11312,7 @@ try {
       // exports retain the established audio/video alignment.
       const useCudaSceneRenderer = Boolean(
         CUDA_SCENE_PRODUCTION_ENABLED &&
-        !useChunkedJetsonScene &&
+          !useChunkedJetsonScene &&
           this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
           this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
       );
@@ -11390,6 +11400,14 @@ try {
                 copyAudio: copySourceAudio
               }),
             decoder: decoderInfo,
+            nativeDecode: startTime <= 0.001 && decoderInfo.value === 'gstreamer-nvv4l2'
+              ? {
+                  cleanPath: recording.cleanPath,
+                  sourceCodec: decoderInfo.codec,
+                  filterScriptPath: sceneLayer.filterScriptPath,
+                  duration
+                }
+              : null,
             onStderr,
             onChild,
             beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
