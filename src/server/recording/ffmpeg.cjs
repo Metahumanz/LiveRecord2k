@@ -1124,6 +1124,68 @@ function createBurnRawVideoArgs({
   return args;
 }
 
+// Native Jetson decoding deliberately lives in GStreamer.  NVIDIA's distro
+// FFmpeg is not the Scene Graph renderer: it is inconsistent across JetPack
+// releases and must never be used as the authority for NVDEC availability.
+// The downstream ffmpeg-full stage owns the finite output duration. It closes
+// the raw pipe once enough frames have been rendered; a decoder-side EPIPE is
+// therefore expected and must not be mistaken for an NVDEC failure.
+function createJetsonNativeDecodeArgs({
+  cleanPath,
+  sourceCodec,
+  width,
+  height,
+  fps,
+  converter = 'nvvidconv'
+} = {}) {
+  const normalizedConverter = String(converter || '').trim();
+  const parser = isHevcCodec(sourceCodec) ? 'h265parse' : 'h264parse';
+  const outputWidth = makeEvenDimension(width);
+  const outputHeight = makeEvenDimension(height);
+  if (!cleanPath || !outputWidth || !outputHeight || !['nvvidconv', 'nvvideoconvert'].includes(normalizedConverter)) {
+    throw new Error('Jetson GStreamer 硬解缺少输入、画面尺寸或 nvvidconv。');
+  }
+  return [
+    '-q', '-e', 'filesrc', `location=${cleanPath}`, '!', 'qtdemux', 'name=demux',
+    // Fragmented MP4s can name their first video pad video_1 rather than
+    // video_0. Let gst-launch select the parser-compatible dynamic pad.
+    'demux.', '!', parser, '!', 'nvv4l2decoder', '!', normalizedConverter, '!',
+    // Do not force the probe's rounded FPS back onto decoded NVMM frames:
+    // 59.99 metadata for a true 60/1 MP4 makes Jetson reject caps negotiation.
+    // The raw stream has no timestamps; ffmpeg-full assigns the requested CFR.
+    'video/x-raw,format=I420',
+    // Jetson multimedia libraries can print non-GStreamer diagnostics to
+    // stdout. Reserve fd 3 for raw frames so those messages cannot corrupt
+    // the I420 stream consumed by ffmpeg-full.
+    '!', 'fdsink', 'fd=3'
+  ];
+}
+
+// The middle stage of Jetson's production path.  It reads decoded I420 from
+// stdin, applies the *same* complete ffmpeg-full Scene Graph script as Web/ASS
+// exports, then writes I420 to the hardware encoder.  There is intentionally
+// no decoder selection here: decoding has already happened in GStreamer.
+function createBurnRawSceneFromPipeArgs({
+  filterScriptPath,
+  fps,
+  width,
+  height,
+  duration
+} = {}) {
+  const outputWidth = makeEvenDimension(width);
+  const outputHeight = makeEvenDimension(height);
+  const outputDuration = Math.max(0, Number(duration) || 0);
+  if (!filterScriptPath || !outputWidth || !outputHeight || !outputDuration) {
+    throw new Error('Jetson Scene Graph I420 渲染缺少滤镜脚本或画面尺寸。');
+  }
+  return [
+    '-hide_banner', '-y', '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
+    '-video_size', `${outputWidth}x${outputHeight}`, '-framerate', formatGstreamerFramerate(fps), '-i', 'pipe:0',
+    '-filter_complex_script', filterScriptPath, '-map', '[vout]', '-t', formatFfmpegSeconds(outputDuration), '-an', '-r', formatGstreamerFramerate(fps),
+    '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', 'pipe:1'
+  ];
+}
+
 function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false, converter = 'nvvidconv' }) {
   const encoder = getJetsonGstreamerEncoder(codec);
   const outputWidth = makeEvenDimension(width);
@@ -1634,6 +1696,79 @@ function runFfmpegToGstreamerJob({
       if (code !== 0 || gstreamerResult.error) stop(ffmpeg, 'ffmpeg', 'gstreamer-failed');
       finish();
     });
+  });
+}
+
+// `qtdemux → parser → nvv4l2decoder` and `nvvidconv → nvv4l2*enc` are both
+// GStreamer pipelines, with ffmpeg-full owning only Scene Graph rendering in
+// the middle.  Keep all three processes streaming so an hour-long export
+// never writes raw YUV to disk.
+function runJetsonNativeDecodeSceneEncodeJob({
+  decoderArgs,
+  ffmpegPath,
+  ffmpegArgs,
+  encoderArgs,
+  gstreamerPath = 'gst-launch-1.0',
+  onDecoderStderr,
+  onFfmpegStderr,
+  onEncoderStderr,
+  onChild,
+  timeoutMs = 0,
+  encodedVideoPath = ''
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const results = {
+      decoder: { code: null, stderr: '', error: null },
+      renderer: { code: null, stderr: '', error: null },
+      encoder: { code: null, stderr: '', error: null }
+    };
+    let decoder; let renderer; let encoder; let settled = false; let timer = null;
+    const children = () => [decoder, renderer, encoder].filter(Boolean);
+    const stopAll = () => children().forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
+    const finish = () => {
+      if (settled || !Object.values(results).every((item) => item.code !== null || item.error)) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      onChild?.(null);
+      // Once ffmpeg-full has rendered its requested duration it closes the
+      // raw stdin; fdsink then reports EPIPE while the decoder is being torn
+      // down. Renderer + encoder are the authoritative finite stages.
+      const failed = Object.entries(results).find(([role, item]) =>
+        role !== 'decoder' && (item.error || item.code !== 0)
+      );
+      if (!failed) return resolve();
+      const [role, item] = failed;
+      const error = new Error(`Jetson 原生硬解 / Scene Graph / 硬编链路失败（${role}）：${String(item.stderr || item.error?.message || `退出码 ${item.code}`).replace(/\s+/g, ' ').trim().slice(-3000)}`);
+      error.primaryProcess = role === 'renderer' ? 'ffmpeg' : 'gstreamer';
+      error.gstreamerStderr = `${results.decoder.stderr}\n${results.encoder.stderr}`.slice(-8000);
+      error.ffmpegStderr = results.renderer.stderr.slice(-8000);
+      reject(error);
+    };
+    const attach = (child, role, callback) => {
+      child.stderr.on('data', (chunk) => {
+        const text = chunk.toString('utf8'); results[role].stderr = `${results[role].stderr}${text}`.slice(-8000); callback?.(text);
+      });
+      child.on('error', (error) => { results[role].error = error; if (role !== 'decoder') stopAll(); finish(); });
+      // Node reports `null` for a SIGKILL exit. Store a concrete failing
+      // value so the bridge always settles instead of leaving export progress
+      // stuck after one leg aborts and the other legs are cleaned up.
+      child.on('close', (code) => { results[role].code = code === null ? -1 : code; if (code !== 0 && role !== 'decoder') stopAll(); finish(); });
+    };
+    try {
+      encoder = spawn(gstreamerPath, encoderArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+      renderer = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      decoder = spawn(gstreamerPath, decoderArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+      decoder.stdio[3].pipe(renderer.stdin);
+      renderer.stdout.pipe(encoder.stdin);
+      decoder.stdio[3].on('error', () => {}); renderer.stdout.on('error', () => {});
+      renderer.stdin.on('error', () => stopAll()); encoder.stdin.on('error', () => stopAll());
+      onChild?.(renderer);
+      attach(decoder, 'decoder', onDecoderStderr);
+      attach(renderer, 'renderer', onFfmpegStderr);
+      attach(encoder, 'encoder', onEncoderStderr);
+      const timeout = Math.max(0, Number(timeoutMs) || 0);
+      if (timeout) timer = setTimeout(() => { results.renderer.error = new Error(`Jetson 原生三段式链路超时（${timeout}ms）`); stopAll(); finish(); }, timeout);
+    } catch (error) { stopAll(); reject(error); }
   });
 }
 
@@ -2325,6 +2460,8 @@ module.exports = {
   createJetsonBurnLeadingVideoFilterGraph,
   createBurnArgs,
   createBurnRawVideoArgs,
+  createJetsonNativeDecodeArgs,
+  createBurnRawSceneFromPipeArgs,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
   createBurnAudioMuxArgs,
@@ -2333,6 +2470,7 @@ module.exports = {
   clipAvatarOverlayEntries,
   createPreviewHlsArgs,
   runFfmpegToGstreamerJob,
+  runJetsonNativeDecodeSceneEncodeJob,
   createClipCopyArgs,
   createSceneAssRemuxArgs,
   createConcatCopyArgs,
