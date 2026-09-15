@@ -10994,6 +10994,85 @@ try {
     });
   }
 
+  async runChunkedJetsonSceneGraphExport({
+    graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
+    startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
+    leadingAudioPaddingSec = 0, decoder, temporaryDir, onStderr, onChild, onProgress, onStage, isCancelled, label
+  }) {
+    const chunkSeconds = 120;
+    const chunkPaths = [];
+    const chunkDurations = [];
+    const scriptPaths = [];
+    const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
+    let completed = 0;
+    try {
+      while (completed < duration - 0.001) {
+        if (isCancelled?.()) {
+          const error = new Error('Scene Graph 导出已取消。');
+          error.code = 'BR2K_MEDIA_CANCELLED';
+          throw error;
+        }
+        const index = chunkPaths.length;
+        const chunkStart = startTime + completed;
+        const graphChunkStart = Math.max(0, Number(graph?.timeline?.start) || 0) + completed;
+        const chunkDuration = Math.min(chunkSeconds, duration - completed);
+        const chunkGraph = clipSceneGraph(graph, graphChunkStart, graphChunkStart + chunkDuration, { shiftTime: true });
+        const scriptPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.filter`);
+        const chunkPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
+        const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${isHevcCodec(codec) ? 'h265' : 'h264'}`;
+        onStage?.(`正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+        const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
+          duration: chunkDuration,
+          outputDuration: chunkDuration,
+          leadingVideoPaddingSec: index === 0 ? Math.min(leadingVideoPaddingSec, chunkDuration) : 0,
+          fps,
+          target: 'jetson'
+        });
+        scriptPaths.push(scriptPath);
+        await fsp.rm(chunkPath, { force: true }).catch(() => {});
+        await this.runJetsonGstreamerTranscode({
+          codec,
+          quality: crf,
+          width,
+          height,
+          fps,
+          encodedVideoPath,
+          createRawArgs: (nextDecoder) => createBurnRawVideoArgs({
+            cleanPath, assPath: '', fps, avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+            startTime: chunkStart, duration: chunkDuration, inputSeek: true, timelineOffset: 0,
+            leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
+          }),
+          createMuxArgs: () => createBurnEncodedVideoMuxArgs({
+            encodedVideoPath, cleanPath, outputPath: chunkPath, codec, sourceCodec, fps, startTime: chunkStart,
+            duration: chunkDuration, container: 'mkv', includeAudio: false
+          }),
+          decoder,
+          onStderr: (line) => {
+            onStderr?.(line);
+            const local = parseFfmpegProgressTime(line);
+            if (Number.isFinite(local)) onProgress?.(Math.min(duration, completed + Math.max(0, local)));
+          },
+          onChild,
+          beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
+          label: `${label} 分段 ${index + 1}`
+        });
+        if ((await getFileSize(chunkPath)) < 1024) throw new Error(`Scene Graph 分段 ${index + 1} 未产生有效视频。`);
+        chunkPaths.push(chunkPath);
+        chunkDurations.push(chunkDuration);
+        completed += chunkDuration;
+        onProgress?.(completed);
+      }
+      await writeConcatFile(concatPath, chunkPaths, { durations: chunkDurations });
+      onStage?.('正在无重编码拼接 Scene Graph 分段并封装源音频');
+      await runFfmpegJob(this.ffmpegPath, createBurnAudioMuxArgs({
+        concatPath, cleanPath, outputPath, codec, sourceCodec, startTime, duration, container: outputContainer,
+        leadingAudioPaddingSec, includeAudio, copyAudio
+      }), onStderr, { onChild });
+    } finally {
+      await Promise.all([...chunkPaths, ...scriptPaths, concatPath].map((file) => fsp.rm(file, { force: true }).catch(() => {})));
+    }
+  }
+
   async runSceneGraphClipExport({
     recording,
     burnCodec,
@@ -11045,13 +11124,20 @@ try {
         : String(burnCodec || '').includes('nvenc')
           ? 'cuda'
           : 'software';
-      const sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
-        duration,
-        outputDuration: duration,
-        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-        fps,
-        target
-      });
+      // A dense hour can otherwise expand to a 100MB+ filter script before
+      // FFmpeg is able to emit its first I420 frame.  Keep each direct Scene
+      // Graph composition bounded; every source frame is still composed and
+      // hardware-encoded exactly once, then the encoded chunks are copied.
+      const useChunkedJetsonScene = isJetsonGstreamerCodec(burnCodec) && graph.objects.length > 1200;
+      const sceneLayer = useChunkedJetsonScene
+        ? null
+        : await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
+            duration,
+            outputDuration: duration,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+            fps,
+            target
+          });
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -11098,9 +11184,23 @@ try {
       };
       throwIfExportCancelled();
       if (isJetsonGstreamerCodec(burnCodec)) {
-        const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
-          (isHevcCodec(burnCodec) ? 'h265' : 'h264');
-        await this.runJetsonGstreamerTranscode({
+        if (useChunkedJetsonScene) {
+          await this.runChunkedJetsonSceneGraphExport({
+            graph, cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, codec: burnCodec, crf: burnCrf,
+            fps, width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+            height: recording.videoInfo?.height || mediaInfo.videoInfo?.height, sourceCodec: decoderInfo.codec,
+            startTime, duration, outputContainer, includeAudio: Boolean(mediaInfo.audioInfo), copyAudio: copySourceAudio,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec, leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
+            decoder: decoderInfo, temporaryDir: sceneDirectory, onStderr, onChild,
+            onProgress: (value) => {
+              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) this.emitState('mediaJob');
+            },
+            onStage: setExportStage, isCancelled: () => this.exportCancelRequested, label: 'Jetson Scene Graph 烧录'
+          });
+        } else {
+          const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
+            (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+          await this.runJetsonGstreamerTranscode({
           codec: burnCodec,
           quality: burnCrf,
           width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
@@ -11143,7 +11243,8 @@ try {
           beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
           onFallback: onDecoderFallback,
           label: 'Jetson Scene Graph 烧录'
-        });
+          });
+        }
       } else {
         await this.runFfmpegWithHardwareDecodeFallback({
           decoder: decoderInfo,

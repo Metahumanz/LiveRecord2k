@@ -519,8 +519,15 @@ function clipSceneGraph(graph, startTime, endTime, options) {
   const start = Math.max(0, number(startTime));
   const end = Math.max(start, number(endTime, graph.timeline && graph.timeline.end));
   const shift = options && options.shiftTime === false ? 0 : start;
-  const output = clone(graph);
-  output.timeline = { start: round(start - shift, 4), end: round(end - shift, 4) };
+  // A long recording may contain thousands of objects. Do not deep-clone the
+  // whole graph before retaining only one time window: that turns Scene Graph
+  // chunking into quadratic work and can itself delay the first frame.
+  const output = Object.assign({}, graph, {
+    canvas: clone(graph.canvas || {}),
+    assets: clone(graph.assets || []),
+    metadata: Object.assign({}, graph.metadata || {}),
+    timeline: { start: round(start - shift, 4), end: round(end - shift, 4) }
+  });
   output.objects = graph.objects
     .filter((object) => number(object.end) >= start && number(object.start) <= end)
     .map((object) => {
