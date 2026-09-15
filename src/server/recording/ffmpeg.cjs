@@ -999,7 +999,8 @@ function createBurnRawVideoArgs({
   decoder = 'software',
   sourceCodec = '',
   videoWidth = 0,
-  videoHeight = 0
+  videoHeight = 0,
+  directRaw = false
 }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
@@ -1027,7 +1028,12 @@ function createBurnRawVideoArgs({
   args.push('-i', cleanPath);
   if (!inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
   if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
-  if (hasFilterScript) {
+  if (directRaw) {
+    // The CUDA Scene helper consumes clean I420 and owns all Scene drawing.
+    // Do not let the compatibility ASS/filter path leak into this producer:
+    // some Jetson system FFmpeg builds lack libass entirely.
+    args.push('-map', '0:v:0');
+  } else if (hasFilterScript) {
     args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]');
   } else {
     const jetsonLeadingGraph = createJetsonBurnLeadingVideoFilterGraph({
