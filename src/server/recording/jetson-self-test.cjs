@@ -6,8 +6,11 @@ const {
   createAssFilter,
   createBurnEncodedVideoMuxArgs,
   createBurnRawVideoArgs,
+  createBurnRawSceneFromPipeArgs,
+  createJetsonNativeDecodeArgs,
   createJetsonGstreamerEncodeArgs,
-  runFfmpegToGstreamerJob
+  runFfmpegToGstreamerJob,
+  runJetsonNativeDecodeSceneEncodeJob
 } = require('./ffmpeg.cjs');
 const { buildSceneGraph } = require('../danmaku/scene-graph.cjs');
 const { writeSceneFilterScript } = require('../danmaku/scene-renderer.cjs');
@@ -243,6 +246,18 @@ async function runJetsonEndToEndSelfTest(options = {}) {
     }
     return finish();
   }
+  // This runs before every dependent check. It is intentionally GStreamer,
+  // rather than FFmpeg's optional nvv4l2 wrappers, and finishes after 60 real
+  // decoded frames from the package-owned sample.
+  try {
+    await runCommand(runProcess, 'gst-launch-1.0', [
+      '-q', 'filesrc', 'location=' + sourcePath, '!', 'qtdemux', 'name=demux', 'demux.', '!', plan.parserElement, '!',
+      'nvv4l2decoder', '!', 'nvvidconv', '!', 'video/x-raw,format=I420', '!', 'identity', 'eos-after=60', '!', 'fakesink', 'sync=false'
+    ], { timeoutMs: 20_000, label: 'GStreamer nvv4l2decoder ' + plan.sourceCodec.toUpperCase() + ' 60 帧' });
+    setStage(stages.nativeDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 已由 qtdemux → ' + plan.parserElement + ' → nvv4l2decoder 实际解出 60 帧');
+  } catch (error) {
+    setStage(stages.nativeDecode, 'failed', error.message + '；CPU 解码回退链继续独立测试');
+  }
   const temporaryDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-jetson-e2e-'));
   const assPath = path.join(temporaryDir, 'probe.ass');
   const sceneFilterPath = path.join(temporaryDir, 'scene.filter');
@@ -434,6 +449,7 @@ async function runJetsonEndToEndSelfTest(options = {}) {
     const pipelineReady = rawReady && Boolean(converter) && encoderReady && stages.parser.status === 'passed' && Boolean(sceneLayer?.filterScriptPath) &&
       stages.cpuDecode.status === 'passed' && stages.sceneFilters.status === 'passed';
     const leadResults = {};
+    const nativeLeadResults = {};
     if (pipelineReady) {
       for (const leadIn of SELF_TEST_LEAD_INS) {
         const key = leadIn > 0 ? 'lead_1_019' : 'lead_0';
@@ -493,6 +509,41 @@ async function runJetsonEndToEndSelfTest(options = {}) {
             );
           }
           leadResults[key] = { status: 'passed', message: leadIn + ' 秒前导：FFmpeg → I420 → GStreamer → mux → ffprobe 通过' };
+          // Keep the GStreamer NVDEC path independently observable. A native
+          // failure must not erase the CPU bridge result above, but it does
+          // prevent production from preferring this exact three-stage route.
+          if (stages.nativeDecode.status === 'passed') {
+            const nativeEncodedPath = path.join(temporaryDir, key + '-native.' + plan.encodedExtension);
+            const nativeMuxPath = path.join(temporaryDir, key + '-native.mp4');
+            try {
+              await runJetsonNativeDecodeSceneEncodeJob({
+                decoderArgs: createJetsonNativeDecodeArgs({
+                  cleanPath: sourcePath, sourceCodec: plan.sourceCodec, width: 320, height: 180, fps: 30,
+                  converter
+                }),
+                ffmpegPath,
+                ffmpegArgs: createBurnRawSceneFromPipeArgs({ filterScriptPath: sceneLayer.filterScriptPath, fps: 30, width: 320, height: 180, duration: outputDuration }),
+                encoderArgs: createJetsonGstreamerEncodeArgs({ codec: plan.codec, width: 320, height: 180, fps: 30, quality: 28, outputPath: nativeEncodedPath, converter }),
+                encodedVideoPath: nativeEncodedPath,
+                timeoutMs: 45_000
+              });
+              await runCommand(runProcess, ffmpegPath, createBurnEncodedVideoMuxArgs({
+                encodedVideoPath: nativeEncodedPath, cleanPath: sourcePath, outputPath: nativeMuxPath, codec: plan.codec,
+                sourceCodec: plan.sourceCodec, fps: 30, duration: outputDuration, container: 'mp4', includeAudio: true
+              }), { timeoutMs: 30_000, label: key + ' 原生三段式最终 MP4 mux' });
+              const nativeProbe = await runCommand(runProcess, resolveFfprobePath(ffmpegPath, options.ffprobePath), [
+                '-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', nativeMuxPath
+              ], { timeoutMs: 15_000, label: key + ' 原生三段式 ffprobe' });
+              const nativeMetadata = JSON.parse(String(nativeProbe.stdout || '{}'));
+              const nativeStreams = Array.isArray(nativeMetadata.streams) ? nativeMetadata.streams : [];
+              if (!nativeStreams.some((stream) => stream.codec_type === 'video') || !nativeStreams.some((stream) => stream.codec_type === 'audio')) {
+                throw new Error('原生三段式 mux 未得到完整音视频流');
+              }
+              nativeLeadResults[key] = { status: 'passed', message: leadIn + ' 秒：nvv4l2decoder → ffmpeg-full Scene Graph → nvv4l2 编码 → mux 通过' };
+            } catch (error) {
+              nativeLeadResults[key] = { status: 'failed', message: compact(error.message) };
+            }
+          }
         } catch (error) {
           leadResults[key] = { status: 'failed', message: compact(error.message), primaryProcess: error.primaryProcess || '' };
         }
@@ -508,6 +559,7 @@ async function runJetsonEndToEndSelfTest(options = {}) {
       setStage(stages.parser, 'passed', plan.parserElement + ' 已输出可被 FFmpeg mux 的 H26x');
       setStage(stages.finalMux, 'passed', '两条最终 MP4 均已由 ffprobe 验证音视频流');
       result.converter = converter;
+      result.nativePipeline = nativeLeadResults;
     } else if (pipelineReady) {
       setStage(stages.leadingFilter, 'failed', '0 秒或 1.019 秒前导管线失败', leadResults);
       const failure = Object.values(leadResults).find((item) => item.status === 'failed');
@@ -528,17 +580,6 @@ async function runJetsonEndToEndSelfTest(options = {}) {
           );
         }
       }
-    }
-    // The CPU path above is the Jetson admission gate. Only after it has
-    // completed do we probe native decode as an optional acceleration.
-    try {
-      await runCommand(runProcess, ffmpegPath, [
-        '-hide_banner', '-loglevel', 'error', '-c:v', plan.nativeDecoder, '-i', sourcePath,
-        '-frames:v', '1', '-f', 'null', '-'
-      ], { label: plan.nativeDecoder + ' 原生解码' });
-      setStage(stages.nativeDecode, 'passed', plan.sourceCodec.toUpperCase() + ' 内置样本已由 ' + plan.nativeDecoder + ' 解码；生产烧录可额外启用硬解加速');
-    } catch (error) {
-      setStage(stages.nativeDecode, 'failed', error.message + '；CPU 解码烧录链不受影响');
     }
     return finish();
   } finally {

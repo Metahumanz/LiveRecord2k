@@ -713,11 +713,18 @@ async function detectFfmpegCapabilities(ffmpegPath, options = {}) {
     hwaccels,
     filterNames
   });
-  const hardwareDecoders = await detectFfmpegHardwareDecoders(ffmpegPath, {
-    encoderNames,
-    hwaccels,
-    videoAdapters
-  });
+  const [ffmpegHardwareDecoders, jetsonHardwareDecoders] = await Promise.all([
+    detectFfmpegHardwareDecoders(ffmpegPath, {
+      encoderNames,
+      hwaccels,
+      videoAdapters
+    }),
+    detectJetsonGstreamerDecoders()
+  ]);
+  const hardwareDecoders = [
+    ...jetsonHardwareDecoders,
+    ...ffmpegHardwareDecoders.filter((decoder) => !/^(?:h264|hevc)_(?:nvv4l2dec|v4l2m2m)$/.test(String(decoder.value || '')))
+  ];
 
   return {
     burnCodecs,
@@ -839,6 +846,46 @@ async function detectFfmpegHardwareDecoders(ffmpegPath, options = {}) {
     }
   }
   return supported;
+}
+
+// Jetson NVDEC is exposed reliably by the GStreamer nvv4l2decoder element,
+// not by whatever optional wrappers an NVIDIA-flavoured FFmpeg happens to
+// ship.  Probe the real device as the service account, then decode 60 frames
+// from each package-owned MP4 sample through qtdemux and the matching parser.
+async function testJetsonGstreamerDecoder(codec, samplePath, options = {}) {
+  if (String(options.platform || process.platform) !== 'linux') return { ok: false, reason: '仅在 Linux Jetson 上测试' };
+  try {
+    await fsp.access('/dev/v4l2-nvdec', fs.constants.R_OK | fs.constants.W_OK);
+  } catch (error) {
+    return { ok: false, reason: `/dev/v4l2-nvdec 对服务用户不可访问：${error.code || error.message}` };
+  }
+  const parser = String(codec) === 'hevc' ? 'h265parse' : 'h264parse';
+  const result = await runCapturedProcess(options.gstreamerPath || 'gst-launch-1.0', [
+    '-q', 'filesrc', `location=${samplePath}`, '!', 'qtdemux', 'name=demux', 'demux.', '!', parser, '!',
+    'nvv4l2decoder', '!', 'nvvidconv', '!', 'video/x-raw,format=I420', '!', 'identity', 'eos-after=60', '!', 'fakesink', 'sync=false'
+  ], { timeoutMs: 20_000, maxOutputBytes: 128 * 1024 });
+  if (result.status === 0 && !result.error && !result.timedOut) return { ok: true, reason: '' };
+  const detail = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+  return { ok: false, reason: result.timedOut ? 'GStreamer nvv4l2decoder 测试超时' : detail || result.error?.message || `退出码 ${result.status}` };
+}
+
+async function detectJetsonGstreamerDecoders(options = {}) {
+  if (String(options.platform || process.platform) !== 'linux') return [];
+  const result = [];
+  for (const codec of ['h264', 'hevc']) {
+    const samplePath = getJetsonSelfTestSamplePath(codec, options);
+    if (!samplePath) continue;
+    const probe = await testJetsonGstreamerDecoder(codec, samplePath, options);
+    if (probe.ok) result.push({
+      value: 'gstreamer-nvv4l2',
+      label: `Jetson NVDEC ${codec.toUpperCase()}（GStreamer nvv4l2decoder）`,
+      vendor: 'nvidia',
+      codec,
+      backend: 'gstreamer',
+      element: 'nvv4l2decoder'
+    });
+  }
+  return result;
 }
 
 async function runFfmpegProbe(ffmpegPath, args, options = {}) {
@@ -3737,6 +3784,8 @@ module.exports = {
   detectVideoAdapterVendor,
   hasVideoAdapterVendor,
   shouldTestHardwareEncoder,
+  testJetsonGstreamerDecoder,
+  detectJetsonGstreamerDecoders,
   testFfmpegEncoder,
   getJetsonSelfTestSamplePath,
   testJetsonGstreamerEncoder,
