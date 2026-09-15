@@ -459,6 +459,37 @@ function createJetsonBurnLeadingVideoFilterGraph({
   );
 }
 
+// CUDA Scene owns all visible UI composition.  For a leading video gap it
+// needs only a black-frame clock bridge, never an ASS filter.  Keeping this
+// graph separate prevents a minimal system FFmpeg from rejecting the GPU
+// route merely because it was built without libass.
+function createJetsonDirectRawLeadingVideoFilterGraph({
+  leadingVideoPaddingSec = 0,
+  outputDuration = 0,
+  fps,
+  videoWidth = 0,
+  videoHeight = 0
+} = {}) {
+  const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  const width = Math.floor(Math.max(0, Number(videoWidth) || 0) / 2) * 2;
+  const height = Math.floor(Math.max(0, Number(videoHeight) || 0) / 2) * 2;
+  if (padding <= 0.0005 || width < 2 || height < 2) return '';
+  const sourceLabel = '[jetson_cuda_scene_source]';
+  return (
+    `[0:v:0]settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p${sourceLabel};\n` +
+    createExplicitLeadingVideoPaddingGraph({
+      sourceLabel,
+      outputLabel: '[vout]',
+      leadingVideoPaddingSec: padding,
+      outputDuration,
+      fps,
+      videoWidth: width,
+      videoHeight: height,
+      prefix: 'jetson_cuda_scene_leading'
+    })
+  );
+}
+
 function avatarSegmentAt(segment, time, coordinateOne, coordinateTwo) {
   const start = Number(segment?.start);
   const end = Number(segment?.end);
@@ -1032,7 +1063,15 @@ function createBurnRawVideoArgs({
     // The CUDA Scene helper consumes clean I420 and owns all Scene drawing.
     // Do not let the compatibility ASS/filter path leak into this producer:
     // some Jetson system FFmpeg builds lack libass entirely.
-    args.push('-map', '0:v:0');
+    const leadingGraph = createJetsonDirectRawLeadingVideoFilterGraph({
+      leadingVideoPaddingSec,
+      outputDuration: duration,
+      fps,
+      videoWidth,
+      videoHeight
+    });
+    if (leadingGraph) args.push('-filter_complex', leadingGraph, '-map', '[vout]');
+    else args.push('-map', '0:v:0');
   } else if (hasFilterScript) {
     args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]');
   } else {

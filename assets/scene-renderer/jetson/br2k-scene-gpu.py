@@ -166,22 +166,23 @@ def prepare_cuda_timeline(request, work_dir):
     start/end, x/y/size/alpha at both ends, then a cached RGBA texture path.
     """
     rows = []
+    timeline_offset = max(0, number(request.get('timelineOffsetSec'), 0))
     for entry in sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex'))):
         png, texture_width, texture_height = draw_texture(entry, work_dir)
         raw_path = os.path.splitext(png)[0] + '.rgba'
         Image.open(png).convert('RGBA').tobytes()
         with open(raw_path, 'wb') as handle:
             handle.write(Image.open(png).convert('RGBA').tobytes())
-        start, end = number(entry.get('start')), max(number(entry.get('start')) + 0.0001, number(entry.get('end')))
-        points = {start, end}
+        scene_start, scene_end = number(entry.get('start')), max(number(entry.get('start')) + 0.0001, number(entry.get('end')))
+        points = {scene_start, scene_end}
         for animation in entry.get('animations') or []:
-            points.add(clamp(number(animation.get('start'), start), start, end))
-            points.add(clamp(number(animation.get('end'), end), start, end))
+            points.add(clamp(number(animation.get('start'), scene_start), scene_start, scene_end))
+            points.add(clamp(number(animation.get('end'), scene_end), scene_start, scene_end))
         ordered = sorted(points)
         for left, right in zip(ordered, ordered[1:]):
             initial = scene_state(entry, left, texture_width, texture_height)
             final = scene_state(entry, right, texture_width, texture_height)
-            rows.append([left, right, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
+            rows.append([left + timeline_offset, right + timeline_offset, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
                          final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height])
     manifest = os.path.join(work_dir, 'scene-cuda.timeline.tsv')
     with open(manifest, 'w', encoding='utf-8') as handle:

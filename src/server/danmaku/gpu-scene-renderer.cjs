@@ -56,6 +56,7 @@ function createGpuSceneRenderRequest(scene, options = {}) {
   const height = Math.max(2, Math.floor(finite(options.height, plan.canvas.height) / 2) * 2);
   const fps = Math.max(1, finite(options.fps, plan.canvas.fps || 30));
   const duration = Math.max(0.001, finite(options.duration, plan.duration));
+  const timelineOffsetSec = Math.max(0, finite(options.timelineOffsetSec));
   const input = String(options.inputPath || '').trim();
   const output = String(options.outputPath || '').trim();
   if (!input) throw new Error('GPU Scene 渲染缺少 clean 视频输入路径。');
@@ -78,6 +79,10 @@ function createGpuSceneRenderRequest(scene, options = {}) {
       pixelFormat: 'nv12'
     },
     scene: plan,
+    // A source with audio before its first decodable video frame gets an
+    // explicit black lead-in. The helper uses this to shift Scene time rather
+    // than drawing comments one second early over the black frames.
+    timelineOffsetSec,
     // A helper may only use local, already prepared avatar assets referenced
     // by the plan.  URL fetching remains the server's responsibility.
     guarantees: {

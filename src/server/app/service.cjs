@@ -1291,7 +1291,9 @@ class LiveRecordService {
     this.log(
       gpuScene?.available ? 'success' : 'info',
       gpuScene?.available
-        ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。尚未替代 CPU 导出，等待真实录像一致性验收。`
+        ? gpuScene.backend === 'cuda-gstreamer'
+          ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。短片与长片分段将使用 CUDA Scene 纹理合成；FFmpeg 仍负责视频解码。`
+          : `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。当前保持 CPU Scene 导出。`
         : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
     );
     const avatarComposite = this.getAvatarCompositeCapability();
@@ -11052,6 +11054,10 @@ try {
     const chunkDurations = [];
     const scriptPaths = [];
     const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
+    const useCudaSceneRenderer = Boolean(
+      this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
+      this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
+    );
     let completed = 0;
     try {
       while (completed < duration - 0.001) {
@@ -11064,6 +11070,7 @@ try {
         const chunkStart = startTime + completed;
         const graphChunkStart = Math.max(0, Number(graph?.timeline?.start) || 0) + completed;
         const chunkDuration = Math.min(chunkSeconds, duration - completed);
+        const chunkLeadingVideoPaddingSec = index === 0 ? Math.min(leadingVideoPaddingSec, chunkDuration) : 0;
         const chunkGraph = clipSceneGraph(graph, graphChunkStart, graphChunkStart + chunkDuration, { shiftTime: true });
         const scriptPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.filter`);
         const chunkPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
@@ -11072,24 +11079,19 @@ try {
         const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
           duration: chunkDuration,
           outputDuration: chunkDuration,
-          leadingVideoPaddingSec: index === 0 ? Math.min(leadingVideoPaddingSec, chunkDuration) : 0,
+          leadingVideoPaddingSec: chunkLeadingVideoPaddingSec,
           fps,
           target: 'jetson'
         });
         scriptPaths.push(scriptPath);
         await fsp.rm(chunkPath, { force: true }).catch(() => {});
-        await this.runJetsonGstreamerTranscode({
+        const common = {
           codec,
           quality: crf,
           width,
           height,
           fps,
           encodedVideoPath,
-          createRawArgs: (nextDecoder) => createBurnRawVideoArgs({
-            cleanPath, assPath: '', fps, avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
-            startTime: chunkStart, duration: chunkDuration, inputSeek: true, timelineOffset: 0,
-            leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
-          }),
           createMuxArgs: () => createBurnEncodedVideoMuxArgs({
             encodedVideoPath, cleanPath, outputPath: chunkPath, codec, sourceCodec, fps, startTime: chunkStart,
             duration: chunkDuration, container: 'mkv', includeAudio: false
@@ -11103,7 +11105,34 @@ try {
           onChild,
           beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
           label: `${label} 分段 ${index + 1}`
+        };
+        const createCpuRawArgs = (nextDecoder) => createBurnRawVideoArgs({
+          cleanPath, assPath: '', fps, avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+          startTime: chunkStart, duration: chunkDuration, inputSeek: true, timelineOffset: 0,
+          leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
         });
+        if (!useCudaSceneRenderer) {
+          await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+        } else {
+          try {
+            await this.runJetsonCudaSceneGraphTranscode({
+              ...common,
+              graph: chunkGraph,
+              cleanPath,
+              duration: chunkDuration,
+              timelineOffsetSec: chunkLeadingVideoPaddingSec,
+              createRawArgs: (nextDecoder) => createBurnRawVideoArgs({
+                cleanPath, assPath: '', fps, startTime: chunkStart, duration: chunkDuration, inputSeek: true,
+                timelineOffset: 0, leadingVideoPaddingSec: chunkLeadingVideoPaddingSec, decoder: nextDecoder,
+                sourceCodec, videoWidth: width, videoHeight: height, directRaw: true
+              })
+            });
+          } catch (error) {
+            if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
+            onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
+            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+          }
+        }
         if ((await getFileSize(chunkPath)) < 1024) throw new Error(`Scene Graph 分段 ${index + 1} 未产生有效视频。`);
         chunkPaths.push(chunkPath);
         chunkDurations.push(chunkDuration);
@@ -11133,6 +11162,7 @@ try {
     height,
     fps,
     duration,
+    timelineOffsetSec = 0,
     cleanPath,
     encodedVideoPath,
     createRawArgs,
@@ -11161,6 +11191,7 @@ try {
       height,
       fps,
       duration,
+      timelineOffsetSec,
       decoder: String(decoder?.value || decoder || 'software')
     });
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
@@ -11261,13 +11292,11 @@ try {
             fps,
             target
           });
-      // Scene rawvideo has no source PTS and cannot represent an initial
-      // sub-frame pad losslessly in the helper's frame-index clock. Keep the
-      // existing filter route for that rare alignment case and for chunked
-      // hour-long exports until their worker protocol is moved as a group.
+      // CUDA Scene now receives an explicit black lead-in and shifts its
+      // timeline by the same amount, so both ordinary and leading-keyframe
+      // exports retain the established audio/video alignment.
       const useCudaSceneRenderer = Boolean(
         !useChunkedJetsonScene &&
-          burnTimeline.videoPaddingSec < 0.001 &&
           this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
           this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
       );
@@ -11388,6 +11417,7 @@ try {
                 graph,
                 cleanPath: recording.cleanPath,
                 duration,
+                timelineOffsetSec: burnTimeline.videoPaddingSec,
                 createRawArgs: (decoder) =>
                   createBurnRawVideoArgs({
                     cleanPath: recording.cleanPath,
@@ -11397,7 +11427,7 @@ try {
                     duration,
                     inputSeek: true,
                     timelineOffset: 0,
-                    leadingVideoPaddingSec: 0,
+                    leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
                     decoder,
                     sourceCodec: decoderInfo.codec,
                     videoWidth: common.width,
