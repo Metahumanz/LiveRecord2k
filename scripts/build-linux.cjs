@@ -180,7 +180,7 @@ async function copyBundledJetsonCudaNvmmPlugins(appDir, arch) {
   if (arch !== 'arm64') return;
   const sourceDir = path.join(root, 'assets', 'scene-renderer', 'jetson', 'gst-plugins');
   const targetDir = path.join(appDir, 'gst-plugins');
-  const libraries = ['libgstbr2knvcodec.so', 'libgstbr2kcudaoverlay.so', 'libcudart.so.13.2.86'];
+  const libraries = ['libgstbr2knvcodec.so', 'libgstbr2kcudaoverlay.so', 'libbr2k-scene-cuda-process.so', 'libcudart.so.13.2.86'];
   await fsp.mkdir(targetDir, { recursive: true });
   for (const name of libraries) {
     const source = path.join(sourceDir, name);

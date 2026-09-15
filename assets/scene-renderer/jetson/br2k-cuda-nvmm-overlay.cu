@@ -232,6 +232,8 @@ static GstFlowReturn gst_br2k_cuda_overlay_transform_ip(
   }
   GstMemory *memory = gst_buffer_peek_memory(buffer, 0);
   if (!memory->allocator || g_strcmp0(memory->allocator->mem_type, "V4l2Memory") != 0) {
+    g_printerr("br2kcudaoverlay: unsupported NVMM allocator=%s\n",
+        memory->allocator ? memory->allocator->mem_type : "unknown");
     GST_ERROR_OBJECT(self, "NVMM buffer is not Jetson V4l2Memory (allocator=%s)",
         memory->allocator ? memory->allocator->mem_type : "unknown");
     return GST_FLOW_NOT_NEGOTIATED;

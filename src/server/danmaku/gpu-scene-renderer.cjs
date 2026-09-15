@@ -12,11 +12,11 @@ const { createSceneRenderPlan } = require('./scene-renderer.cjs');
 
 const GPU_SCENE_PROTOCOL = 'bili-record2k.gpu-scene-render/v1';
 const GPU_SCENE_BACKENDS = new Set(['cuda-gstreamer', 'vulkan-gstreamer', 'gl-gstreamer']);
-// JetPack 6 / GStreamer 1.24 does not ship cudacompositor.  The direct
-// NVMM backend imports NvBufSurface/EGLImage in our private CUDA element
-// instead of advertising a nonexistent upstream compositor as a dependency.
+// JetPack 6 / GStreamer 1.24 does not ship cudacompositor. nvivafilter is
+// NVIDIA's supported callback bridge for the NVMM allocator emitted by
+// nvvidconv, so the Scene CUDA library receives EGLImage without CPU mapping.
 const JETSON_CUDA_NVMM_REQUIRED_ELEMENTS = [
-  'br2kcudaoverlay',
+  'nvivafilter',
   'nvvidconv',
   'nvv4l2h264enc',
   'nvv4l2h265enc'

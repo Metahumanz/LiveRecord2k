@@ -39,7 +39,10 @@ except Exception as error:  # pragma: no cover - executed on the Jetson only
 PROTOCOL = 'bili-record2k.gpu-scene-render/v1'
 CAPABILITIES = ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale']
 REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoconvert', 'nvvidconv', 'nvv4l2h264enc', 'nvv4l2h265enc']
-CUDA_NVMM_REQUIRED_ELEMENTS = ['appsrc', 'nvvidconv', 'br2kcudaoverlay', 'nvv4l2h264enc', 'nvv4l2h265enc']
+# nvivafilter is Jetson's supported CUDA callback bridge for NVMM allocated by
+# nvvidconv.  Do not insert the direct V4l2Memory-only test element here.
+CUDA_NVMM_REQUIRED_ELEMENTS = ['appsrc', 'nvvidconv', 'nvivafilter', 'nvv4l2h264enc', 'nvv4l2h265enc']
+CUDA_SCENE_CUSTOMER_LIBRARY = os.path.join(PRIVATE_GST_PLUGIN_DIR, 'libbr2k-scene-cuda-process.so')
 
 
 def fail(message):
@@ -315,6 +318,13 @@ def create_cuda_nvmm_pipeline(request, work_dir):
     encoder = 'nvv4l2h265enc' if 'hevc' in codec or 'h265' in codec else 'nvv4l2h264enc'
     parser = 'h265parse' if encoder == 'nvv4l2h265enc' else 'h264parse'
     timeline = prepare_cuda_timeline(request, work_dir)
+    if not os.path.isfile(CUDA_SCENE_CUSTOMER_LIBRARY):
+        fail('缺少 Jetson CUDA Scene 客户端库：' + CUDA_SCENE_CUSTOMER_LIBRARY)
+    # The callback ABI exposes EGLImage but not GstBuffer PTS. Raw I420 has
+    # already lost source PTS at the FFmpeg boundary, so the helper's exact
+    # frame-index/FPS time base is passed explicitly to the CUDA library.
+    os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
+    os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
     pipeline = Gst.Pipeline.new('br2k-cuda-nvmm-scene')
     base = make_element('appsrc', 'base')
     base.set_property('format', Gst.Format.TIME)
@@ -328,15 +338,18 @@ def create_cuda_nvmm_pipeline(request, work_dir):
     convert = make_element('nvvidconv', 'scene-nvvidconv')
     nv_caps = make_element('capsfilter', 'scene-nvmm')
     nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
-    composite = make_element('br2kcudaoverlay', 'scene-cuda-composite')
-    composite.set_property('timeline-file', timeline)
+    composite = make_element('nvivafilter', 'scene-cuda-composite')
+    composite.set_property('cuda-process', True)
+    composite.set_property('customer-lib-name', CUDA_SCENE_CUSTOMER_LIBRARY)
+    out_caps = make_element('capsfilter', 'scene-cuda-nvmm')
+    out_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
     encode = make_element(encoder, 'scene-encode')
     encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
     parse = make_element(parser, 'scene-parse')
     sink = make_element('filesink', 'scene-output')
     sink.set_property('location', output['path'])
-    for element in [base, convert, nv_caps, composite, encode, parse, sink]: pipeline.add(element)
-    if not link_many(base, convert, nv_caps, composite, encode, parse, sink): fail('无法连接 I420 → NVMM → CUDA Scene → nvv4l2 管线。')
+    for element in [base, convert, nv_caps, composite, out_caps, encode, parse, sink]: pipeline.add(element)
+    if not link_many(base, convert, nv_caps, composite, out_caps, encode, parse, sink): fail('无法连接 I420 → NVMM → nvivafilter CUDA Scene → nvv4l2 管线。')
     return pipeline, base
 
 
@@ -382,16 +395,18 @@ def render(request, input_stream=None):
 
 def probe():
     Gst.init(None)
-    available = [name for name in REQUIRED_ELEMENTS if Gst.ElementFactory.find(name)]
+    cuda_available = [name for name in CUDA_NVMM_REQUIRED_ELEMENTS if Gst.ElementFactory.find(name)]
+    cuda_ready = len(cuda_available) == len(CUDA_NVMM_REQUIRED_ELEMENTS) and os.path.isfile(CUDA_SCENE_CUSTOMER_LIBRARY)
+    available = cuda_available if cuda_ready else [name for name in REQUIRED_ELEMENTS if Gst.ElementFactory.find(name)]
     payload = {
         'protocol': PROTOCOL,
-        'backend': 'gl-gstreamer',
+        'backend': 'cuda-gstreamer' if cuda_ready else 'gl-gstreamer',
         'version': '0.1.0',
         'capabilities': CAPABILITIES,
         'gstreamerElements': available
     }
     print(json.dumps(payload, ensure_ascii=False))
-    return 0 if len(available) == len(REQUIRED_ELEMENTS) else 3
+    return 0 if cuda_ready or len(available) == len(REQUIRED_ELEMENTS) else 3
 
 
 def main():
@@ -407,7 +422,7 @@ def main():
         try: os.unlink(target)
         except FileNotFoundError: pass
         request = {
-            'protocol': PROTOCOL, 'backend': 'gl-gstreamer',
+            'protocol': PROTOCOL, 'backend': 'cuda-gstreamer',
             'output': {'path': target, 'codec': 'h264_nvv4l2', 'width': 320, 'height': 180, 'fps': 30, 'bitrate': 1000000},
             'input': {'duration': 2}, 'scene': {'objects': [{
                 'id': 'self-test-card', 'type': 'Card', 'start': 0, 'end': 2,

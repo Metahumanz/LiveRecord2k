@@ -34,7 +34,7 @@ test('GPU Scene request preserves canonical objects and has no pixel intermediat
   assert.equal(request.guarantees.avoidsAssVideoIntermediate, true);
   assert.equal(request.guarantees.avoidsTransparentVideoIntermediate, true);
   assert.deepEqual(createGpuSceneProbeArgs(), ['--probe=json']);
-  assert.ok(JETSON_CUDA_NVMM_REQUIRED_ELEMENTS.includes('br2kcudaoverlay'));
+  assert.ok(JETSON_CUDA_NVMM_REQUIRED_ELEMENTS.includes('nvivafilter'));
   assert.equal(JETSON_CUDA_NVMM_REQUIRED_ELEMENTS.includes('cudacompositor'), false);
 });
 

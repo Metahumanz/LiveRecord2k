@@ -9,7 +9,8 @@ const {
   createGpuSceneProbeArgs,
   parseGpuSceneRendererProbe,
   resolveGpuSceneRenderer,
-  JETSON_GL_REQUIRED_ELEMENTS
+  JETSON_GL_REQUIRED_ELEMENTS,
+  JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
 } = require('../danmaku/gpu-scene-renderer.cjs');
 const {
   DanmakuClient,
@@ -1724,7 +1725,11 @@ class LiveRecordService {
     }
     const probe = parseGpuSceneRendererProbe(result.stdout || result.stderr);
     if (!probe.ok) return { available: false, helper, reason: probe.reason };
-    const required = probe.backend === 'gl-gstreamer' ? JETSON_GL_REQUIRED_ELEMENTS : [];
+    const required = probe.backend === 'gl-gstreamer'
+      ? JETSON_GL_REQUIRED_ELEMENTS
+      : probe.backend === 'cuda-gstreamer'
+        ? JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
+        : [];
     const available = new Set(probe.gstreamerElements || []);
     const missing = required.filter((element) => !available.has(element));
     if (missing.length) {

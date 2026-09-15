@@ -1,0 +1,259 @@
+/*
+ * BiliRecord2K CUDA customer library for Jetson's nvivafilter.
+ *
+ * nvivafilter owns the NVMM buffer plumbing (including the nvfilter allocator
+ * produced by nvvidconv).  This library only receives its EGLImage and draws
+ * cached Scene Graph RGBA textures in place.  It is deliberately separate
+ * from the br2kcudaoverlay GStreamer element: the latter is useful for direct
+ * V4L2 decoder tests, while this is the production CPU-I420 -> NVMM bridge.
+ *
+ * Environment supplied by the isolated renderer process:
+ *   BR2K_CUDA_SCENE_TIMELINE  piecewise-linear TSV emitted by the helper
+ *   BR2K_CUDA_SCENE_FPS       raw-I420 frame rate used as Scene time base
+ */
+
+#include <cuda.h>
+#include <cudaEGL.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+extern "C" {
+typedef enum { COLOR_FORMAT_Y8 = 0, COLOR_FORMAT_U8_V8, COLOR_FORMAT_RGBA, COLOR_FORMAT_NONE } ColorFormat;
+typedef struct {
+  void (*fGPUProcess)(EGLImageKHR image, void **userPtr);
+  void (*fPreProcess)(void **, unsigned int *, unsigned int *, unsigned int *, unsigned int *, ColorFormat *, unsigned int, void **);
+  void (*fPostProcess)(void **, unsigned int *, unsigned int *, unsigned int *, unsigned int *, ColorFormat *, unsigned int, void **);
+} CustomerFunction;
+}
+
+struct Texture {
+  std::string path;
+  unsigned width = 0, height = 0;
+  uchar4 *device = nullptr;
+};
+
+struct TimelineEntry {
+  double start, end;
+  double x0, y0, width0, height0, alpha0;
+  double x1, y1, width1, height1, alpha1;
+  Texture *texture;
+};
+
+struct SceneState {
+  std::vector<TimelineEntry> entries;
+  std::unordered_map<std::string, Texture> textures;
+  double fps = 30.0;
+  unsigned long long frame = 0;
+  bool ready = false;
+  std::mutex lock;
+
+  ~SceneState() {
+    for (auto &pair : textures) if (pair.second.device) cudaFree(pair.second.device);
+  }
+};
+
+static SceneState g_scene;
+
+__global__ static void blend_rgba_nv12_array(
+    cudaSurfaceObject_t y_surface, cudaSurfaceObject_t uv_surface,
+    const uchar4 *texture, int texture_width, int texture_height,
+    int frame_width, int frame_height, int left, int top, int draw_width,
+    int draw_height, float opacity) {
+  const int px = blockIdx.x * blockDim.x + threadIdx.x;
+  const int py = blockIdx.y * blockDim.y + threadIdx.y;
+  if (px >= draw_width || py >= draw_height) return;
+  const int x = left + px, y = top + py;
+  if (x < 0 || y < 0 || x >= frame_width || y >= frame_height) return;
+  const int source_x = min(texture_width - 1, max(0, px * texture_width / max(1, draw_width)));
+  const int source_y = min(texture_height - 1, max(0, py * texture_height / max(1, draw_height)));
+  const uchar4 source = texture[source_y * texture_width + source_x];
+  const float alpha = (source.w / 255.0f) * opacity;
+  if (alpha <= 0.0001f) return;
+  const float luma = 16.0f + 0.257f * source.x + 0.504f * source.y + 0.098f * source.z;
+  const unsigned char prior_y = surf2Dread<unsigned char>(y_surface, x, y);
+  surf2Dwrite<unsigned char>((unsigned char)(prior_y * (1.0f - alpha) + luma * alpha), y_surface, x, y);
+  if ((x & 1) == 0 && (y & 1) == 0) {
+    const float u = 128.0f - 0.148f * source.x - 0.291f * source.y + 0.439f * source.z;
+    const float v = 128.0f + 0.439f * source.x - 0.368f * source.y - 0.071f * source.z;
+    const uchar2 prior_uv = surf2Dread<uchar2>(uv_surface, x, y / 2);
+    surf2Dwrite<uchar2>(make_uchar2((unsigned char)(prior_uv.x * (1.0f - alpha) + u * alpha),
+                                    (unsigned char)(prior_uv.y * (1.0f - alpha) + v * alpha)), uv_surface, x, y / 2);
+  }
+}
+
+__global__ static void blend_rgba_nv12_pitch(
+    unsigned char *y_plane, unsigned char *uv_plane, int y_pitch, int uv_pitch,
+    const uchar4 *texture, int texture_width, int texture_height,
+    int frame_width, int frame_height, int left, int top, int draw_width,
+    int draw_height, float opacity) {
+  const int px = blockIdx.x * blockDim.x + threadIdx.x;
+  const int py = blockIdx.y * blockDim.y + threadIdx.y;
+  if (px >= draw_width || py >= draw_height) return;
+  const int x = left + px, y = top + py;
+  if (x < 0 || y < 0 || x >= frame_width || y >= frame_height) return;
+  const int source_x = min(texture_width - 1, max(0, px * texture_width / max(1, draw_width)));
+  const int source_y = min(texture_height - 1, max(0, py * texture_height / max(1, draw_height)));
+  const uchar4 source = texture[source_y * texture_width + source_x];
+  const float alpha = (source.w / 255.0f) * opacity;
+  if (alpha <= 0.0001f) return;
+  const float luma = 16.0f + 0.257f * source.x + 0.504f * source.y + 0.098f * source.z;
+  unsigned char *y_ptr = y_plane + y * y_pitch + x;
+  *y_ptr = (unsigned char)(*y_ptr * (1.0f - alpha) + luma * alpha);
+  if ((x & 1) == 0 && (y & 1) == 0) {
+    const float u = 128.0f - 0.148f * source.x - 0.291f * source.y + 0.439f * source.z;
+    const float v = 128.0f + 0.439f * source.x - 0.368f * source.y - 0.071f * source.z;
+    uchar2 *uv_ptr = (uchar2 *)(uv_plane + (y / 2) * uv_pitch + x);
+    *uv_ptr = make_uchar2((unsigned char)(uv_ptr->x * (1.0f - alpha) + u * alpha),
+                          (unsigned char)(uv_ptr->y * (1.0f - alpha) + v * alpha));
+  }
+}
+
+static bool parse_row(const std::string &line, std::vector<std::string> *fields) {
+  fields->clear();
+  size_t begin = 0;
+  while (true) {
+    const size_t end = line.find('\t', begin);
+    fields->push_back(line.substr(begin, end == std::string::npos ? end : end - begin));
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return fields->size() == 15;
+}
+
+static double as_number(const std::string &text) { return std::strtod(text.c_str(), nullptr); }
+
+static unsigned as_unsigned(const std::string &text) { return (unsigned)std::strtoul(text.c_str(), nullptr, 10); }
+
+static bool load_scene() {
+  const char *timeline_path = std::getenv("BR2K_CUDA_SCENE_TIMELINE");
+  const char *fps_value = std::getenv("BR2K_CUDA_SCENE_FPS");
+  if (fps_value && *fps_value) g_scene.fps = std::max(1.0, std::strtod(fps_value, nullptr));
+  if (!timeline_path || !*timeline_path) {
+    std::fprintf(stderr, "br2k CUDA Scene: BR2K_CUDA_SCENE_TIMELINE is not set\n");
+    return false;
+  }
+  std::ifstream file(timeline_path);
+  if (!file) {
+    std::fprintf(stderr, "br2k CUDA Scene: cannot open timeline %s\n", timeline_path);
+    return false;
+  }
+  std::string line;
+  std::vector<std::string> field;
+  unsigned line_number = 0;
+  while (std::getline(file, line)) {
+    ++line_number;
+    if (line.empty()) continue;
+    if (!parse_row(line, &field)) {
+      std::fprintf(stderr, "br2k CUDA Scene: invalid timeline row %u\n", line_number);
+      return false;
+    }
+    const unsigned width = as_unsigned(field[13]), height = as_unsigned(field[14]);
+    if (!width || !height) return false;
+    auto existing = g_scene.textures.find(field[12]);
+    if (existing == g_scene.textures.end()) {
+      std::ifstream raw(field[12], std::ios::binary | std::ios::ate);
+      const size_t expected = (size_t)width * height * 4;
+      if (!raw || (size_t)raw.tellg() != expected) {
+        std::fprintf(stderr, "br2k CUDA Scene: invalid RGBA texture at row %u\n", line_number);
+        return false;
+      }
+      std::vector<unsigned char> bytes(expected);
+      raw.seekg(0); raw.read((char *)bytes.data(), (std::streamsize)bytes.size());
+      Texture texture; texture.path = field[12]; texture.width = width; texture.height = height;
+      if (cudaMalloc((void **)&texture.device, expected) != cudaSuccess ||
+          cudaMemcpy(texture.device, bytes.data(), expected, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (texture.device) cudaFree(texture.device);
+        std::fprintf(stderr, "br2k CUDA Scene: texture upload failed at row %u\n", line_number);
+        return false;
+      }
+      existing = g_scene.textures.emplace(texture.path, texture).first;
+    }
+    TimelineEntry entry = {as_number(field[0]), as_number(field[1]), as_number(field[2]), as_number(field[3]),
+      as_number(field[4]), as_number(field[5]), as_number(field[6]), as_number(field[7]), as_number(field[8]),
+      as_number(field[9]), as_number(field[10]), as_number(field[11]), &existing->second};
+    if (entry.end > entry.start) g_scene.entries.push_back(entry);
+  }
+  g_scene.ready = true;
+  return true;
+}
+
+static void gpu_process(EGLImageKHR image, void **) {
+  std::lock_guard<std::mutex> guard(g_scene.lock);
+  if (!g_scene.ready && !load_scene()) return;
+  const double seconds = (double)g_scene.frame++ / g_scene.fps;
+  CUgraphicsResource resource = nullptr;
+  CUeglFrame egl_frame = {};
+  if (cuGraphicsEGLRegisterImage(&resource, image, CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE) != CUDA_SUCCESS ||
+      cuGraphicsResourceGetMappedEglFrame(&egl_frame, resource, 0, 0) != CUDA_SUCCESS) {
+    std::fprintf(stderr, "br2k CUDA Scene: failed to import nvivafilter EGLImage\n");
+    if (resource) cuGraphicsUnregisterResource(resource);
+    return;
+  }
+  if (egl_frame.planeCount < 2) {
+    std::fprintf(stderr, "br2k CUDA Scene: nvivafilter returned CUDA frame with too few planes\n");
+    cuGraphicsUnregisterResource(resource);
+    return;
+  }
+  cudaSurfaceObject_t y_surface = 0, uv_surface = 0;
+  cudaError_t result = cudaSuccess;
+  if (egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
+    cudaResourceDesc descriptor = {};
+    descriptor.resType = cudaResourceTypeArray;
+    descriptor.res.array.array = (cudaArray_t)egl_frame.frame.pArray[0];
+    result = cudaCreateSurfaceObject(&y_surface, &descriptor);
+    descriptor.res.array.array = (cudaArray_t)egl_frame.frame.pArray[1];
+    if (result == cudaSuccess) result = cudaCreateSurfaceObject(&uv_surface, &descriptor);
+  } else if (egl_frame.frameType != CU_EGL_FRAME_TYPE_PITCH) {
+    std::fprintf(stderr, "br2k CUDA Scene: unsupported CUDA frame type=%d\n", (int)egl_frame.frameType);
+    cuGraphicsUnregisterResource(resource);
+    return;
+  }
+  if (result == cudaSuccess) {
+    const dim3 block(16, 16);
+    for (const TimelineEntry &entry : g_scene.entries) {
+      if (seconds < entry.start || seconds > entry.end) continue;
+      const double progress = std::min(1.0, std::max(0.0, (seconds - entry.start) / (entry.end - entry.start)));
+      const int width = std::max(1, (int)std::lround(entry.width0 + (entry.width1 - entry.width0) * progress));
+      const int height = std::max(1, (int)std::lround(entry.height0 + (entry.height1 - entry.height0) * progress));
+      const int x = (int)std::lround(entry.x0 + (entry.x1 - entry.x0) * progress);
+      const int y = (int)std::lround(entry.y0 + (entry.y1 - entry.y0) * progress);
+      const float alpha = (float)std::min(1.0, std::max(0.0, entry.alpha0 + (entry.alpha1 - entry.alpha0) * progress));
+      const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+      if (egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
+        blend_rgba_nv12_array<<<grid, block>>>(y_surface, uv_surface, entry.texture->device,
+            entry.texture->width, entry.texture->height, (int)egl_frame.width, (int)egl_frame.height,
+            x, y, width, height, alpha);
+      } else {
+        blend_rgba_nv12_pitch<<<grid, block>>>((unsigned char *)egl_frame.frame.pPitch[0],
+            (unsigned char *)egl_frame.frame.pPitch[1], (int)egl_frame.pitch, (int)egl_frame.pitch,
+            entry.texture->device, entry.texture->width, entry.texture->height,
+            (int)egl_frame.width, (int)egl_frame.height, x, y, width, height, alpha);
+      }
+    }
+    result = cudaGetLastError();
+    if (result == cudaSuccess) result = cudaStreamSynchronize(0);
+  }
+  if (y_surface) cudaDestroySurfaceObject(y_surface);
+  if (uv_surface) cudaDestroySurfaceObject(uv_surface);
+  cuGraphicsUnregisterResource(resource);
+  if (result != cudaSuccess) std::fprintf(stderr, "br2k CUDA Scene: kernel failed: %s\n", cudaGetErrorString(result));
+}
+
+extern "C" void init(CustomerFunction *functions) {
+  cudaFree(0);
+  g_scene.frame = 0;
+  functions->fGPUProcess = gpu_process;
+  functions->fPreProcess = nullptr;
+  functions->fPostProcess = nullptr;
+}
+
+extern "C" void deinit(void) {}
