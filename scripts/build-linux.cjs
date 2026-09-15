@@ -97,6 +97,7 @@ async function populatePayload(targetRoot, { version, packageType, arch, serverB
   await fsp.copyFile(process.execPath, path.join(binDir, 'node'));
   await copyBundledArm64SceneGraphFfmpeg(binDir, arch);
   await copyBundledArm64GpuSceneRenderer(binDir, arch);
+  await copyBundledJetsonCudaNvmmPlugins(appDir, arch);
   await copyExecutable(path.join(packagingRoot, 'linux-update.cjs'), path.join(appDir, 'linux-update.cjs'));
   await copyTextFile(path.join(packagingRoot, 'update-public-key.pem'), path.join(appDir, 'update-public-key.pem'), 0o644);
   await copyExecutable(path.join(packagingRoot, 'provision.sh'), path.join(appDir, 'provision.sh'));
@@ -173,6 +174,27 @@ async function copyBundledArm64GpuSceneRenderer(binDir, arch) {
     throw new Error(`ARM64 Linux 安装包缺少 Jetson GPU Scene helper：${source}`);
   }
   await copyExecutable(source, path.join(binDir, 'br2k-scene-gpu'));
+}
+
+async function copyBundledJetsonCudaNvmmPlugins(appDir, arch) {
+  if (arch !== 'arm64') return;
+  const sourceDir = path.join(root, 'assets', 'scene-renderer', 'jetson', 'gst-plugins');
+  const targetDir = path.join(appDir, 'gst-plugins');
+  const libraries = ['libgstbr2knvcodec.so', 'libgstbr2kcudaoverlay.so', 'libcudart.so.13.2.86'];
+  await fsp.mkdir(targetDir, { recursive: true });
+  for (const name of libraries) {
+    const source = path.join(sourceDir, name);
+    if (!fs.existsSync(source)) {
+      throw new Error(`ARM64 Linux 安装包缺少 Jetson CUDA/NVMM 私有库：${source}`);
+    }
+    await fsp.copyFile(source, path.join(targetDir, name));
+    await fsp.chmod(path.join(targetDir, name), name.startsWith('libgst') ? 0o755 : 0o644);
+  }
+  for (const linkName of ['libcudart.so.13', 'libcudart.so']) {
+    const linkPath = path.join(targetDir, linkName);
+    await fsp.rm(linkPath, { force: true });
+    await fsp.symlink('libcudart.so.13.2.86', linkPath);
+  }
 }
 
 function normalizeNodeArch(value) {
