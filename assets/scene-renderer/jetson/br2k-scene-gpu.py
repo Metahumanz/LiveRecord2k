@@ -18,6 +18,14 @@ import subprocess
 import sys
 import tempfile
 
+# Private GPU plugins are packaged outside the system GStreamer directory so
+# an application update never mutates JetPack's files.
+PRIVATE_GST_PLUGIN_DIR = '/usr/lib/bili-record-2k/gst-plugins'
+if os.path.isdir(PRIVATE_GST_PLUGIN_DIR):
+    existing_plugin_path = os.environ.get('GST_PLUGIN_PATH_1_0', '')
+    if PRIVATE_GST_PLUGIN_DIR not in existing_plugin_path.split(os.pathsep):
+        os.environ['GST_PLUGIN_PATH_1_0'] = PRIVATE_GST_PLUGIN_DIR + (os.pathsep + existing_plugin_path if existing_plugin_path else '')
+
 try:
     import gi
     gi.require_version('Gst', '1.0')
@@ -31,6 +39,7 @@ except Exception as error:  # pragma: no cover - executed on the Jetson only
 PROTOCOL = 'bili-record2k.gpu-scene-render/v1'
 CAPABILITIES = ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale']
 REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoconvert', 'nvvidconv', 'nvv4l2h264enc', 'nvv4l2h265enc']
+CUDA_NVMM_REQUIRED_ELEMENTS = ['appsrc', 'nvvidconv', 'br2kcudaoverlay', 'nvv4l2h264enc', 'nvv4l2h265enc']
 
 
 def fail(message):
@@ -111,6 +120,71 @@ def draw_texture(entry, work_dir):
     target = os.path.join(work_dir, 'scene-' + str(entry.get('id') or 'object').replace('/', '_') + '.png')
     image.save(target, 'PNG')
     return target, width, height
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def scene_state(entry, at, texture_width, texture_height):
+    frame = entry.get('frame') or {}
+    style = entry.get('style') or {}
+    state = {
+        'x': number(frame.get('x')), 'y': number(frame.get('y')),
+        'width': texture_width, 'height': texture_height,
+        'alpha': number(style.get('opacity'), 1)
+    }
+    for animation in sorted(entry.get('animations') or [], key=lambda item: number(item.get('start'))):
+        start, end = number(animation.get('start')), max(number(animation.get('start')) + 0.0001, number(animation.get('end')))
+        progress = clamp((at - start) / (end - start), 0, 1)
+        kind = str(animation.get('type') or '')
+        if kind == 'Move':
+            for axis in ('x', 'y'):
+                begin = number((animation.get('from') or {}).get(axis), state[axis])
+                finish = number((animation.get('to') or {}).get(axis), begin)
+                state[axis] = begin + (finish - begin) * progress
+        elif kind == 'Fade':
+            begin = number(animation.get('from'), state['alpha'])
+            finish = number(animation.get('to'), begin)
+            state['alpha'] = begin + (finish - begin) * progress
+        elif kind == 'Scale':
+            for axis, key, base in [('x', 'width', texture_width), ('y', 'height', texture_height)]:
+                begin = number((animation.get('from') or {}).get(axis), 1)
+                finish = number((animation.get('to') or {}).get(axis), begin)
+                state[key] = base * (begin + (finish - begin) * progress)
+    return state
+
+
+def prepare_cuda_timeline(request, work_dir):
+    """Pre-render Scene assets once and emit GPU-friendly linear time spans.
+
+    The manifest is TSV rather than JSON so the private GStreamer element has
+    no JSON parser dependency. Each row is a piecewise-linear interval:
+    start/end, x/y/size/alpha at both ends, then a cached RGBA texture path.
+    """
+    rows = []
+    for entry in sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex'))):
+        png, texture_width, texture_height = draw_texture(entry, work_dir)
+        raw_path = os.path.splitext(png)[0] + '.rgba'
+        Image.open(png).convert('RGBA').tobytes()
+        with open(raw_path, 'wb') as handle:
+            handle.write(Image.open(png).convert('RGBA').tobytes())
+        start, end = number(entry.get('start')), max(number(entry.get('start')) + 0.0001, number(entry.get('end')))
+        points = {start, end}
+        for animation in entry.get('animations') or []:
+            points.add(clamp(number(animation.get('start'), start), start, end))
+            points.add(clamp(number(animation.get('end'), end), start, end))
+        ordered = sorted(points)
+        for left, right in zip(ordered, ordered[1:]):
+            initial = scene_state(entry, left, texture_width, texture_height)
+            final = scene_state(entry, right, texture_width, texture_height)
+            rows.append([left, right, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
+                         final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height])
+    manifest = os.path.join(work_dir, 'scene-cuda.timeline.tsv')
+    with open(manifest, 'w', encoding='utf-8') as handle:
+        for row in rows:
+            handle.write('\t'.join(str(item) for item in row) + '\n')
+    return manifest
 
 
 def animation_values(entry, field, base, start, end, scale=False):
@@ -234,9 +308,41 @@ def create_pipeline(request, work_dir):
     return pipeline, base
 
 
+def create_cuda_nvmm_pipeline(request, work_dir):
+    output = request['output']
+    width, height, fps = int(output['width']), int(output['height']), number(output['fps'], 30)
+    codec = str(output.get('codec') or '')
+    encoder = 'nvv4l2h265enc' if 'hevc' in codec or 'h265' in codec else 'nvv4l2h264enc'
+    parser = 'h265parse' if encoder == 'nvv4l2h265enc' else 'h264parse'
+    timeline = prepare_cuda_timeline(request, work_dir)
+    pipeline = Gst.Pipeline.new('br2k-cuda-nvmm-scene')
+    base = make_element('appsrc', 'base')
+    base.set_property('format', Gst.Format.TIME)
+    # File export is finite. A live appsrc can block Python in push-buffer
+    # before nvv4l2 starts consuming its first queued frame.
+    base.set_property('is-live', False)
+    # The finite exporter controls completion with EOS. Never let a full
+    # appsrc queue stall the Python producer before it can submit that EOS.
+    base.set_property('block', False)
+    base.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    convert = make_element('nvvidconv', 'scene-nvvidconv')
+    nv_caps = make_element('capsfilter', 'scene-nvmm')
+    nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    composite = make_element('br2kcudaoverlay', 'scene-cuda-composite')
+    composite.set_property('timeline-file', timeline)
+    encode = make_element(encoder, 'scene-encode')
+    encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
+    parse = make_element(parser, 'scene-parse')
+    sink = make_element('filesink', 'scene-output')
+    sink.set_property('location', output['path'])
+    for element in [base, convert, nv_caps, composite, encode, parse, sink]: pipeline.add(element)
+    if not link_many(base, convert, nv_caps, composite, encode, parse, sink): fail('无法连接 I420 → NVMM → CUDA Scene → nvv4l2 管线。')
+    return pipeline, base
+
+
 def check_request(request):
     if request.get('protocol') != PROTOCOL: fail('不支持的 GPU Scene 协议。')
-    if request.get('backend') != 'gl-gstreamer': fail('此 helper 仅支持 gl-gstreamer。')
+    if request.get('backend') not in ('gl-gstreamer', 'cuda-gstreamer'): fail('此 helper 不支持所选 GPU 后端。')
     if not request.get('output', {}).get('path'): fail('缺少输出路径。')
     if not isinstance(request.get('scene', {}).get('objects'), list): fail('缺少 Scene 对象。')
 
@@ -247,8 +353,8 @@ def render(request, input_stream=None):
     frame_size = int(output['width']) * int(output['height']) * 3 // 2
     work_dir = tempfile.mkdtemp(prefix='br2k-scene-gpu-')
     try:
-        pipeline, base = create_pipeline(request, work_dir)
-        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动 GL Scene 管线。')
+        pipeline, base = (create_cuda_nvmm_pipeline(request, work_dir) if request.get('backend') == 'cuda-gstreamer' else create_pipeline(request, work_dir))
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动 GPU Scene 管线。')
         frame_index = 0
         stream = input_stream or sys.stdin.buffer
         while True:
@@ -268,7 +374,7 @@ def render(request, input_stream=None):
             message = bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.ERROR | Gst.MessageType.EOS)
             if message.type == Gst.MessageType.EOS: break
             error, debug = message.parse_error()
-            fail('GL Scene GStreamer：' + str(error) + ('；' + str(debug) if debug else ''))
+            fail('GPU Scene GStreamer：' + str(error) + ('；' + str(debug) if debug else ''))
         pipeline.set_state(Gst.State.NULL)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
