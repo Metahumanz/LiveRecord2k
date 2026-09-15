@@ -283,6 +283,10 @@ const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
 const RECORDING_LIBRARY_LIMIT = 160;
 const DEFAULT_PORT = 3263;
+// The CUDA Scene primitive bridge is kept installed for isolated hardware
+// tests, but is not a production renderer until visual conformance covers
+// dense H5 cards, avatar crops and every Scene style.
+const CUDA_SCENE_PRODUCTION_ENABLED = false;
 const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
 const MIN_PLAYABLE_BYTES = 128 * 1024;
 const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
@@ -1291,9 +1295,9 @@ class LiveRecordService {
     this.log(
       gpuScene?.available ? 'success' : 'info',
       gpuScene?.available
-        ? gpuScene.backend === 'cuda-gstreamer'
+        ? gpuScene.backend === 'cuda-gstreamer' && CUDA_SCENE_PRODUCTION_ENABLED
           ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。短片与长片分段将使用 CUDA Scene 纹理合成；FFmpeg 仍负责视频解码。`
-          : `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。当前保持 CPU Scene 导出。`
+          : `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。视觉一致性验证未通过，当前保持 CPU Scene 导出。`
         : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
     );
     const avatarComposite = this.getAvatarCompositeCapability();
@@ -11055,6 +11059,7 @@ try {
     const scriptPaths = [];
     const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
     const useCudaSceneRenderer = Boolean(
+      CUDA_SCENE_PRODUCTION_ENABLED &&
       this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
       this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
     );
@@ -11296,6 +11301,7 @@ try {
       // timeline by the same amount, so both ordinary and leading-keyframe
       // exports retain the established audio/video alignment.
       const useCudaSceneRenderer = Boolean(
+        CUDA_SCENE_PRODUCTION_ENABLED &&
         !useChunkedJetsonScene &&
           this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
           this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
