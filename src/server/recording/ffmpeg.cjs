@@ -1511,7 +1511,12 @@ function runFfmpegToGstreamerJob({
           // consumer can back-pressure its stdout and make FFmpeg appear
           // idle. Prefer the missing encoded-file growth in that case so
           // diagnostics point at the process that is actually blocking.
-          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout) {
+          // An encoder is allowed to wait for its first keyframe while the
+          // Scene Graph renderer is still feeding sparse raw frames.  That is
+          // real end-to-end progress, not a GStreamer deadlock.  Once the
+          // consumer is actually frozen it back-pressures stdout, so FFmpeg
+          // becomes idle as well; require both signals before blaming GST.
+          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout && ffmpegIdleMs >= noProgressTimeout) {
             stalledProcess = 'gstreamer';
           } else if (!ffmpegClosed && ffmpegIdleMs >= noProgressTimeout) {
             stalledProcess = 'ffmpeg';

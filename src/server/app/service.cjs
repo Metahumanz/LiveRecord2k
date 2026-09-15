@@ -10999,7 +10999,7 @@ try {
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
     leadingAudioPaddingSec = 0, decoder, temporaryDir, onStderr, onChild, onProgress, onStage, isCancelled, label
   }) {
-    const chunkSeconds = 120;
+    const chunkSeconds = 20;
     const chunkPaths = [];
     const chunkDurations = [];
     const scriptPaths = [];
