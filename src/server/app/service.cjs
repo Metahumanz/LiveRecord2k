@@ -6,6 +6,12 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const QRCode = require('qrcode');
 const {
+  createGpuSceneProbeArgs,
+  parseGpuSceneRendererProbe,
+  resolveGpuSceneRenderer,
+  JETSON_GL_REQUIRED_ELEMENTS
+} = require('../danmaku/gpu-scene-renderer.cjs');
+const {
   DanmakuClient,
   requestBiliJsonWithCookies,
   fetchWithTimeout,
@@ -1143,6 +1149,7 @@ class LiveRecordService {
       videoAdapters: [],
       gstreamerEncoders: [],
       jetsonBurnTests: {},
+      sceneGpuRenderer: null,
       avatarComposite: null,
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
@@ -1246,6 +1253,7 @@ class LiveRecordService {
       }),
       isStartupEnabled()
     ]);
+    this.ffmpegCapabilities.sceneGpuRenderer = await this.probeGpuSceneRenderer();
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1277,6 +1285,13 @@ class LiveRecordService {
         }`
       );
     }
+    const gpuScene = this.ffmpegCapabilities.sceneGpuRenderer;
+    this.log(
+      gpuScene?.available ? 'success' : 'info',
+      gpuScene?.available
+        ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。尚未替代 CPU 导出，等待真实录像一致性验收。`
+        : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
+    );
     const avatarComposite = this.getAvatarCompositeCapability();
     this.log(
       avatarComposite ? 'info' : 'warn',
@@ -1689,6 +1704,33 @@ class LiveRecordService {
         entryCount <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
         this.getAvatarCompositeCapability()?.value === 'cuda'
     );
+  }
+
+  async probeGpuSceneRenderer() {
+    const helper = resolveGpuSceneRenderer();
+    if (!helper) return { available: false, reason: '未安装 Jetson GPU Scene helper。' };
+    const result = await runCapturedProcess(helper, createGpuSceneProbeArgs(), {
+      timeoutMs: 12_000,
+      maxOutputBytes: 32 * 1024
+    });
+    if (result.status !== 0 || result.error || result.timedOut) {
+      return {
+        available: false,
+        helper,
+        reason: result.timedOut
+          ? 'GPU Scene helper probe 超时。'
+          : compactLogLine(result.stderr || result.stdout || result.error?.message || 'GPU Scene helper probe 失败。')
+      };
+    }
+    const probe = parseGpuSceneRendererProbe(result.stdout || result.stderr);
+    if (!probe.ok) return { available: false, helper, reason: probe.reason };
+    const required = probe.backend === 'gl-gstreamer' ? JETSON_GL_REQUIRED_ELEMENTS : [];
+    const available = new Set(probe.gstreamerElements || []);
+    const missing = required.filter((element) => !available.has(element));
+    if (missing.length) {
+      return { available: false, helper, reason: 'GPU Scene helper 缺少 GStreamer 元件：' + missing.join('、') + '。' };
+    }
+    return Object.assign({ available: true, helper }, probe);
   }
 
   getAvatarCompositeCapability() {

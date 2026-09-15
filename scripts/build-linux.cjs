@@ -96,6 +96,7 @@ async function populatePayload(targetRoot, { version, packageType, arch, serverB
   await fsp.cp(path.join(root, 'assets'), path.join(appDir, 'assets'), { recursive: true });
   await fsp.copyFile(process.execPath, path.join(binDir, 'node'));
   await copyBundledArm64SceneGraphFfmpeg(binDir, arch);
+  await copyBundledArm64GpuSceneRenderer(binDir, arch);
   await copyExecutable(path.join(packagingRoot, 'linux-update.cjs'), path.join(appDir, 'linux-update.cjs'));
   await copyTextFile(path.join(packagingRoot, 'update-public-key.pem'), path.join(appDir, 'update-public-key.pem'), 0o644);
   await copyExecutable(path.join(packagingRoot, 'provision.sh'), path.join(appDir, 'provision.sh'));
@@ -163,6 +164,15 @@ async function copyBundledArm64SceneGraphFfmpeg(binDir, arch) {
     await fsp.copyFile(source, path.join(binDir, targetName));
     await fsp.chmod(path.join(binDir, targetName), 0o755);
   }
+}
+
+async function copyBundledArm64GpuSceneRenderer(binDir, arch) {
+  if (arch !== 'arm64') return;
+  const source = path.join(root, 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py');
+  if (!fs.existsSync(source)) {
+    throw new Error(`ARM64 Linux 安装包缺少 Jetson GPU Scene helper：${source}`);
+  }
+  await copyExecutable(source, path.join(binDir, 'br2k-scene-gpu'));
 }
 
 function normalizeNodeArch(value) {

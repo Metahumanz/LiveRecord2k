@@ -342,6 +342,15 @@ export type FfmpegCapabilities = {
   }>;
   gstreamerEncoders?: string[];
   jetsonBurnTests?: Record<string, JetsonBurnSelfTest>;
+  sceneGpuRenderer?: {
+    available: boolean;
+    helper?: string;
+    backend?: 'cuda-gstreamer' | 'vulkan-gstreamer' | 'gl-gstreamer';
+    version?: string;
+    capabilities?: string[];
+    gstreamerElements?: string[];
+    reason?: string;
+  } | null;
   probedAt: number;
   probeError?: string;
 };
