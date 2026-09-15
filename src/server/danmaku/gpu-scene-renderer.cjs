@@ -12,10 +12,11 @@ const { createSceneRenderPlan } = require('./scene-renderer.cjs');
 
 const GPU_SCENE_PROTOCOL = 'bili-record2k.gpu-scene-render/v1';
 const GPU_SCENE_BACKENDS = new Set(['cuda-gstreamer', 'vulkan-gstreamer', 'gl-gstreamer']);
-const JETSON_CUDA_REQUIRED_ELEMENTS = [
-  'cudaupload',
-  'cudacompositor',
-  'cudaconvertscale',
+// JetPack 6 / GStreamer 1.24 does not ship cudacompositor.  The direct
+// NVMM backend imports NvBufSurface/EGLImage in our private CUDA element
+// instead of advertising a nonexistent upstream compositor as a dependency.
+const JETSON_CUDA_NVMM_REQUIRED_ELEMENTS = [
+  'br2kcudaoverlay',
   'nvvidconv',
   'nvv4l2h264enc',
   'nvv4l2h265enc'
@@ -144,7 +145,7 @@ function createGpuSceneProbeArgs() {
 module.exports = {
   GPU_SCENE_PROTOCOL,
   GPU_SCENE_BACKENDS,
-  JETSON_CUDA_REQUIRED_ELEMENTS,
+  JETSON_CUDA_NVMM_REQUIRED_ELEMENTS,
   JETSON_GL_REQUIRED_ELEMENTS,
   normalizeBackend,
   createGpuSceneRenderRequest,

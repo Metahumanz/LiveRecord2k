@@ -5,7 +5,7 @@ const test = require('node:test');
 const { buildSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
 const {
   GPU_SCENE_PROTOCOL,
-  JETSON_CUDA_REQUIRED_ELEMENTS,
+  JETSON_CUDA_NVMM_REQUIRED_ELEMENTS,
   createGpuSceneRenderRequest,
   createGpuSceneProbeArgs,
   parseGpuSceneRendererProbe
@@ -34,7 +34,8 @@ test('GPU Scene request preserves canonical objects and has no pixel intermediat
   assert.equal(request.guarantees.avoidsAssVideoIntermediate, true);
   assert.equal(request.guarantees.avoidsTransparentVideoIntermediate, true);
   assert.deepEqual(createGpuSceneProbeArgs(), ['--probe=json']);
-  assert.ok(JETSON_CUDA_REQUIRED_ELEMENTS.includes('cudacompositor'));
+  assert.ok(JETSON_CUDA_NVMM_REQUIRED_ELEMENTS.includes('br2kcudaoverlay'));
+  assert.equal(JETSON_CUDA_NVMM_REQUIRED_ELEMENTS.includes('cudacompositor'), false);
 });
 
 test('GPU Scene helper is rejected unless it declares every Scene Graph primitive', () => {
@@ -46,7 +47,7 @@ test('GPU Scene helper is rejected unless it declares every Scene Graph primitiv
     backend: 'cuda-gstreamer',
     version: '0.1.0',
     capabilities: ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale'],
-    gstreamerElements: JETSON_CUDA_REQUIRED_ELEMENTS
+    gstreamerElements: JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
   }, 'cuda-gstreamer');
   assert.equal(full.ok, true);
   assert.equal(full.backend, 'cuda-gstreamer');
