@@ -13,6 +13,20 @@ const {
   totalGiftPrice,
   round
 } = require('./layout-engine.cjs');
+const {
+  getSideChatMetrics,
+  getMinimalSideChatMetrics,
+  getSideInteractionCardMetrics,
+  getMinimalSideInteractionMetrics,
+  getSideAvatarPlacement,
+  sideChatPalette,
+  sideInteractionPalette,
+  sideAvatarColor,
+  sideInteractionText,
+  sideInteractionPrice,
+  truncateTextToWidth,
+  estimateTextWidth
+} = require('./ass.cjs');
 
 const SCENE_GRAPH_SCHEMA = 'bili-record2k.scene/v1';
 const SCENE_GRAPH_VERSION = 1;
@@ -169,6 +183,180 @@ function rgbColor(value, fallback) {
   return '#' + Math.max(0, Math.min(0xffffff, Math.floor(raw))).toString(16).padStart(6, '0');
 }
 
+function legacyAssColor(value, fallback) {
+  const match = /^&H([0-9a-f]{8})&$/i.exec(String(value || ''));
+  if (!match) return { fill: fallback || '#ffffff', opacity: 1 };
+  const raw = match[1];
+  const alpha = parseInt(raw.slice(0, 2), 16);
+  return {
+    fill: '#' + raw.slice(6, 8) + raw.slice(4, 6) + raw.slice(2, 4),
+    opacity: round(1 - alpha / 255, 4)
+  };
+}
+
+function legacySegmentAnimations(segment, offsetX, offsetY) {
+  const x = number(offsetX);
+  const y = number(offsetY);
+  if (Math.abs(number(segment.x1) - number(segment.x2)) < 0.001 && Math.abs(number(segment.y1) - number(segment.y2)) < 0.001) {
+    return [];
+  }
+  return [{
+    type: 'Move',
+    start: round(segment.start, 4),
+    end: round(segment.end, 4),
+    from: { x: round(number(segment.x1) + x), y: round(number(segment.y1) + y) },
+    to: { x: round(number(segment.x2) + x), y: round(number(segment.y2) + y) },
+    easing: 'linear'
+  }];
+}
+
+function legacyShape(graph, id, segment, x, y, width, height, color, radius, zIndex, corners) {
+  const appearance = legacyAssColor(color);
+  graph.objects.push(sceneObject('Card', id, { start: segment.start, end: segment.end, zIndex }, {
+    zIndex,
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, height),
+    animations: legacySegmentAnimations(segment, x, y),
+    props: { role: 'legacy-ass-shape' },
+    style: {
+      fill: appearance.fill,
+      opacity: appearance.opacity,
+      cornerRadius: radius,
+      corners: corners || undefined,
+      // Legacy ASS shapes have no implicit Scene fade/scale or synthetic
+      // shadow.  This is deliberately explicit: it keeps the CPU and CUDA
+      // render plans anchored to the v0.6.7 appearance.
+      shadow: null
+    }
+  }));
+}
+
+function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, weight) {
+  const appearance = legacyAssColor(color);
+  const sourceText = String(text || '').replace(/\\N/g, '\n');
+  const lines = sourceText.split('\n');
+  const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
+  graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {
+    zIndex,
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, Math.max(1, fontSize * 1.25 * lines.length)),
+    animations: legacySegmentAnimations(segment, x, y),
+    props: {
+      text: sourceText,
+      fontFamily: process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei',
+      fontSize,
+      fontWeight: weight || 400,
+      lineHeight: fontSize * 1.13,
+      align: 'left'
+    },
+    style: { fill: appearance.fill, opacity: appearance.opacity, stroke: '', strokeWidth: 0, shadow: null }
+  }));
+}
+
+function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
+  const placement = getSideAvatarPlacement(event, style, segment);
+  if (!placement) return;
+  const outer = '&H88FFFFFF&';
+  const inner = sideAvatarColor(event);
+  const softWhite = '&H40FFFFFF&';
+  const size = placement.size;
+  const headSize = Math.max(4, size * 0.29);
+  const shouldersWidth = Math.max(6, size * 0.64);
+  const shouldersHeight = Math.max(4, size * 0.3);
+  legacyShape(graph, prefix + '-avatar-ring', segment, placement.offsetX, placement.offsetY, size, size, outer, size / 2, 20);
+  legacyShape(graph, prefix + '-avatar-fill', segment, placement.offsetX + placement.ringInset, placement.offsetY + placement.ringInset, placement.innerSize, placement.innerSize, inner, placement.innerSize / 2, 21);
+  legacyShape(graph, prefix + '-avatar-head', segment, placement.offsetX + (size - headSize) / 2, placement.offsetY + size * 0.21, headSize, headSize, softWhite, headSize / 2, 22);
+  legacyShape(graph, prefix + '-avatar-shoulders', segment, placement.offsetX + (size - shouldersWidth) / 2, placement.offsetY + size * 0.58, shouldersWidth, shouldersHeight, softWhite, shouldersHeight / 2, 22);
+  // v0.6.7 rendered this vector avatar as the safe ASS fallback, then placed
+  // a fetched headshot on top when one was available.  Keep both layers: a
+  // missing or failed download preserves the exact fallback, while a local
+  // asset retains the circular headshot in CPU and CUDA Scene paths.
+  const uid = Math.floor(Number(event.uid) || 0);
+  const avatarUrl = String(event.avatarUrl || '');
+  const supplied = avatarAssets && (avatarAssets[uid] || avatarAssets[avatarUrl]);
+  const assetPath = String(supplied && (supplied.filePath || supplied.path) || '');
+  if (assetPath) {
+    const assetId = avatarAsset(graph, event, avatarAssets);
+    graph.objects.push(sceneObject('Avatar', prefix + '-avatar-raster', { start: segment.start, end: segment.end, zIndex: 23 }, {
+      zIndex: 23,
+      frame: frame(number(segment.x1) + placement.offsetX + placement.ringInset, number(segment.y1) + placement.offsetY + placement.ringInset, placement.innerSize, placement.innerSize),
+      animations: legacySegmentAnimations(segment, placement.offsetX + placement.ringInset, placement.offsetY + placement.ringInset),
+      props: { assetId, uid: uid || undefined, shape: 'circle', role: 'legacy-ass-avatar-raster' },
+      style: { fill: '#707070', opacity: 1, cornerRadius: placement.innerSize / 2, shadow: null }
+    }));
+  }
+}
+
+function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
+  if (style.visualPreset === 'minimal') {
+    const metrics = getMinimalSideChatMetrics(style, event.text);
+    const username = truncateTextToWidth(event.user || '观众', metrics.textWidth * 0.35, metrics.fontSize);
+    const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+    const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    legacyShape(graph, prefix + '-dot', segment, 0, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
+    legacyText(graph, prefix + '-text', segment, metrics.dotSize + metrics.gap, 0, username + ' · ' + detail, metrics.fontSize, '&H00DCE8E8&', 23, 700);
+    return;
+  }
+  const metrics = getSideChatMetrics(style, event.text);
+  const palette = sideChatPalette(style);
+  const username = truncateTextToWidth(event.user || '观众', metrics.contentWidth * 0.72, metrics.metaFontSize);
+  const nameWidth = Math.min(metrics.contentWidth * 0.78, Math.max(metrics.metaFontSize * 2.3, estimateTextWidth(username, metrics.metaFontSize) + metrics.metaFontSize));
+  addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
+  if (metrics.metaHeight > 0) {
+    legacyShape(graph, prefix + '-meta-bg', segment, metrics.contentX, 0, nameWidth, metrics.metaHeight, metrics.metaHeight / 2, palette.metaBackground, 15);
+    legacyText(graph, prefix + '-meta', segment, metrics.contentX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2), username, metrics.metaFontSize, palette.metaText, 23, 700);
+  }
+  legacyShape(graph, prefix + '-bubble', segment, metrics.contentX, metrics.bubbleTop, metrics.bubbleWidth, metrics.bubbleHeight, palette.bubbleBackground, palette.radius, 16);
+  legacyText(graph, prefix + '-body', segment, metrics.contentX + metrics.paddingX, metrics.bubbleTop + metrics.paddingY, metrics.wrappedText, metrics.fontSize, palette.bubbleText, 23, 700);
+}
+
+function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets) {
+  if (style.visualPreset === 'minimal') {
+    const metrics = getMinimalSideInteractionMetrics(style, event);
+    const price = sideInteractionPrice(event);
+    const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
+    const username = truncateTextToWidth(event.user || '观众', textWidth * 0.35, metrics.fontSize);
+    const detail = truncateTextToWidth(sideInteractionText(event), textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+    const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, '&H250D1416&', metrics.radius, 16);
+    legacyShape(graph, prefix + '-dot', segment, metrics.gap, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
+    legacyText(graph, prefix + '-body', segment, metrics.dotSize + metrics.gap * 2, metrics.paddingY, username + ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23, 700);
+    if (price) {
+      const priceWidth = Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize);
+      const priceX = metrics.width - priceWidth;
+      legacyShape(graph, prefix + '-price-bg', segment, priceX, metrics.paddingY, priceWidth, metrics.fontSize, '&H10E9EFED&', metrics.fontSize / 2, 24);
+      legacyText(graph, prefix + '-price', segment, priceX + metrics.fontSize / 2, metrics.paddingY, price, metrics.fontSize * 0.82, '&H00323026&', 25, 700);
+    }
+    return;
+  }
+  const metrics = getSideInteractionCardMetrics(style, event);
+  const palette = sideInteractionPalette(style, event);
+  const price = sideInteractionPrice(event);
+  const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
+  const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
+  const detail = truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
+  const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
+  legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, palette.background, metrics.radius, 16);
+  addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
+  legacyText(graph, prefix + '-user', segment, metrics.contentX, textY, username, metrics.fontSize, palette.username, 23, 700);
+  legacyText(graph, prefix + '-detail', segment, metrics.contentX, textY + metrics.fontSize, detail, metrics.metaFontSize, palette.detail, 23);
+  if (price) {
+    const priceWidth = Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2);
+    const priceX = metrics.width - metrics.padding - priceWidth;
+    legacyShape(graph, prefix + '-price-bg', segment, priceX, metrics.padding, priceWidth, metrics.metaFontSize + metrics.padding, palette.priceBackground, (metrics.metaFontSize + metrics.padding) / 2, 24);
+    legacyText(graph, prefix + '-price', segment, priceX + metrics.metaFontSize * 0.6, metrics.padding + metrics.padding / 2, price, metrics.metaFontSize, palette.priceText, 25, 700);
+  }
+}
+
+function addLegacySideEntry(graph, entry, style, avatarAssets) {
+  const segments = Array.isArray(entry.segments) ? entry.segments : [];
+  segments.forEach((segment, index) => {
+    if (number(segment.end) - number(segment.start) < 0.001) return;
+    const event = segment.event || entry.event || {};
+    const prefix = stableId('legacy', entry.id + '|' + index + '|' + number(segment.start));
+    if (event.type === 'danmaku') addLegacySideChat(graph, prefix, event, style, segment, avatarAssets);
+    else addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets);
+  });
+}
+
 function addMessageNode(graph, entry, layout, avatarAssets) {
   const event = entry.event || {};
   const metrics = entry.metrics || {};
@@ -322,6 +510,7 @@ function buildSceneGraph(events, options) {
   };
   for (const entry of layout.entries) {
     if (entry.kind === 'rolling') addRollingNode(graph, entry, layout.style);
+    else if (entry.kind === 'legacy-side') addLegacySideEntry(graph, entry, layout.style, source.avatarAssets);
     else addMessageNode(graph, entry, layout, source.avatarAssets);
   }
   graph.timeline.end = round(graph.objects.reduce((maximum, object) => Math.max(maximum, number(object.end)), 0), 4);

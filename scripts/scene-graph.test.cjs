@@ -350,15 +350,15 @@ test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS
       3,
       { shiftTime: false }
     );
-    const changingText = graph.objects.find((object) => object.type === 'Text' && String(object.props && object.props.text || '').includes('赠送'));
-    assert.ok(changingText, 'gift detail text is represented as a Scene Text node');
+    const changingText = graph.objects.find((object) => object.type === 'Text' && Number(object.end) > 1.6 && String(object.props && object.props.text || '').includes('投喂'));
+    assert.ok(changingText, 'legacy gift detail text is represented as a Scene Text node');
     changingText.props.textKeyframes = [
       { time: 1, text: String(changingText.props.text) },
-      { time: 1.6, text: '赠送 花 x2' }
+      { time: 1.6, text: '投喂 花 x2' }
     ];
     const layer = await writeSceneFilterScript(filterPath, graph, { duration: 3, fps: 30 });
-    assert.ok(layer.script.includes('赠送 花 x2'), 'direct renderer splits Scene text keyframes without a video intermediate');
-    assert.match(compileSceneToAss(graph).ass, /赠送 花 x2/, 'ASS keeps the same semantic text update when it can express it');
+    assert.ok(layer.script.includes('投喂 花 x2'), 'direct renderer splits Scene text keyframes without a video intermediate');
+    assert.match(compileSceneToAss(graph).ass, /投喂 花 x2/, 'ASS keeps the same semantic text update when it can express it');
     const args = createBurnArgs({
       cleanPath,
       assPath: '',

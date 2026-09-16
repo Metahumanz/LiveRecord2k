@@ -7,6 +7,12 @@
 // their own placement decisions.
 
 const STYLE_PRESETS = require('../../shared/danmaku-style-presets.json');
+const {
+  createMessageTimeline: createLegacyMessageTimeline,
+  getMessageItemMetrics: getLegacyMessageItemMetrics,
+  resolveDanmakuStyle: resolveLegacyDanmakuStyle,
+  adaptDanmakuStyleToVideo: adaptLegacyDanmakuStyleToVideo
+} = require('./ass.cjs');
 
 const DEFAULT_STYLE = {
   playWidth: 1920,
@@ -574,7 +580,9 @@ class LayoutEngine {
     const source = options || {};
     this.overlayMode = normalizeOverlayMode(source.overlayMode);
     this.displayArea = normalizeDisplayArea(source.danmakuArea);
-    this.style = adaptStyleToCanvas(resolveStyle(source.style, source.stylePreset, source.styleLayout), source.videoInfo);
+    this.sourceStyle = resolveStyle(source.style, source.stylePreset, source.styleLayout);
+    this.style = adaptStyleToCanvas(this.sourceStyle, source.videoInfo);
+    this.videoInfo = source.videoInfo;
   }
 
   layout(events) {
@@ -584,12 +592,24 @@ class LayoutEngine {
       .map((event) => Object.assign({}, event, { videoTime: eventTime(event), time: eventTime(event) }))
       .sort((left, right) => eventTime(left) - eventTime(right));
     const sideStream = this.style.visualPreset !== 'current' && SCENE_STYLE_PRESETS.includes(this.style.visualPreset);
+    // The three alternate styles originated in the ASS renderer.  Their
+    // spacing, fixed queue lifetime and future reflow rules are observable
+    // output semantics, so do not approximate them in a second layout engine.
+    // Use the legacy timeline as the single source of truth and let Scene
+    // Graph only translate that resolved geometry into renderer primitives.
+    const legacyStyle = adaptLegacyDanmakuStyleToVideo(
+      resolveLegacyDanmakuStyle(this.sourceStyle, this.sourceStyle.visualPreset),
+      this.videoInfo || { width: this.style.playWidth, height: this.style.playHeight }
+    );
     const entries = sideStream
-      ? layoutMessages(sorted, this.style, true)
+      ? createLegacyMessageTimeline(sorted, legacyStyle, { includeDanmaku: true, sideStream: true }).items.map((item) => Object.assign(item, {
+          kind: 'legacy-side',
+          metrics: getLegacyMessageItemMetrics(item.event, legacyStyle, { sideStream: true })
+        }))
       : layoutRolling(sorted, this.style, this.displayArea).concat(layoutMessages(sorted.filter((event) => event.type !== 'danmaku'), this.style, false));
     return {
       canvas: { width: this.style.playWidth, height: this.style.playHeight },
-      style: this.style,
+      style: sideStream ? legacyStyle : this.style,
       overlayMode: this.overlayMode,
       displayArea: this.displayArea,
       sideStream,
