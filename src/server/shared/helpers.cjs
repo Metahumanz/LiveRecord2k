@@ -2411,14 +2411,22 @@ async function preferSceneGraphCapableFfmpeg(ffmpegPath) {
   const current = String(ffmpegPath || '').trim() || 'ffmpeg';
   const bundled = findBundledSceneGraphFfmpegPath();
   if (!bundled || bundled === current) return { path: current, fallbackReason: '' };
-  const probe = await runFfmpegProbe(current, [
+  const [drawtextProbe, filtersProbe] = await Promise.all([
+    runFfmpegProbe(current, [
     '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=0.1',
     '-vf', 'drawtext=text=Scene:fontsize=8:x=1:y=1', '-frames:v', '1', '-f', 'null', '-'
-  ], { timeoutMs: 8000, maxOutputBytes: 64 * 1024 });
-  if (probe.ok) return { path: current, fallbackReason: '' };
+    ], { timeoutMs: 8000, maxOutputBytes: 64 * 1024 }),
+    runFfmpegProbe(current, ['-hide_banner', '-filters'], { timeoutMs: 8000, maxOutputBytes: 512 * 1024 })
+  ]);
+  // The three legacy side styles are a libass visual contract. A binary with
+  // drawtext alone produces a plausible but wrong font weight, price-label
+  // centering and ASS override handling; it is not Scene Graph capable.
+  const hasAss = filtersProbe.ok && /^\s*\.\.\.\s+ass\s+V->V\s+/m.test(filtersProbe.output || '');
+  if (drawtextProbe.ok && hasAss) return { path: current, fallbackReason: '' };
+  const missing = [drawtextProbe.ok ? '' : 'drawtext', hasAss ? '' : 'libass'].filter(Boolean).join('、');
   return {
     path: bundled,
-    fallbackReason: `系统 FFmpeg 不满足 Scene Graph 绘制要求，已自动切换内置完整 ARM64 FFmpeg：${probe.error || 'drawtext 实命令失败'}`
+    fallbackReason: `系统 FFmpeg 不满足 Scene Graph 绘制要求（缺少 ${missing || '必要滤镜'}），已自动切换内置完整 ARM64 FFmpeg。`
   };
 }
 

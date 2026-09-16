@@ -232,7 +232,10 @@ function legacyShape(graph, id, segment, x, y, width, height, color, radius, zIn
 
 function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, weight) {
   const appearance = legacyAssColor(color);
-  const sourceText = String(text || '').replace(/\\N/g, '\n');
+  // ASS tags are formatting instructions, never message content.  In
+  // particular the minimal preset used `\b1...\b0` inside one legacy dialogue;
+  // stripping them here prevents a literal `\b0` from reaching drawtext.
+  const sourceText = String(text || '').replace(/\\b[01]/g, '').replace(/\\N/g, '\n');
   const lines = sourceText.split('\n');
   const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
   graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {

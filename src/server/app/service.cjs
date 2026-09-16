@@ -224,6 +224,9 @@ const {
 const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safety.cjs');
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
+const { createAss } = require('../danmaku/ass.cjs');
+
+const LEGACY_ASS_SCENE_PRESETS = new Set(['h5-card', 'bubble', 'minimal']);
 
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -5740,7 +5743,39 @@ try {
       sourceCachePath: normalized.sceneCachePath || '',
       capturedEventCount: events.length
     });
-    return { graph, eventCount: events.length, scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath) };
+    return {
+      graph,
+      // The legacy ASS compatibility renderer must consume the exact same
+      // normalized event list as the graph.  Do not re-read JSONL later: a
+      // recording may still receive a final buffered event while an export is
+      // being prepared.
+      events,
+      eventCount: events.length,
+      scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath)
+    };
+  }
+
+  async writeLegacySceneCompatibilityAss(filePath, events, options = {}) {
+    const stylePreset = this.resolveSceneGraphStylePreset(options.stylePreset || this.settings.sceneGraphDefaultStyle);
+    if (!LEGACY_ASS_SCENE_PRESETS.has(stylePreset)) return '';
+    // First apply the clip bounds in the recording clock.  The renderer then
+    // offsets source PTS before libass when there is a video lead-in, exactly
+    // as the pre-Scene-Graph ASS pipeline did.
+    const prepared = prepareAssEvents(events, {
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode,
+      startTime: options.startTime,
+      endTime: options.endTime,
+      shiftTime: options.shiftTime === true
+    });
+    const body = createAss(prepared, {
+      stylePreset,
+      styleLayout: options.styleLayout || this.settings.burnDanmakuStyleLayout,
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode,
+      danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea,
+      videoInfo: options.videoInfo || null
+    });
+    await fsp.writeFile(filePath, body, { encoding: 'utf8', mode: 0o660 });
+    return filePath;
   }
 
   async finalizeSceneGraphForRecording(recording, options = {}) {
@@ -9996,6 +10031,18 @@ try {
         durationSec
       });
       const graph = durationSec > 0 ? clipSceneGraph(sceneResult.graph, 0, durationSec, { shiftTime: false }) : sceneResult.graph;
+      const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+        path.join(sceneDirectory, 'scene.legacy.ass'),
+        sceneResult.events,
+        {
+          overlayMode,
+          danmakuArea,
+          stylePreset,
+          styleLayout,
+          videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+          endTime: durationSec > 0 ? durationSec : undefined
+        }
+      );
       const target = isJetsonGstreamerCodec(burnCodec)
         ? 'jetson'
         : String(burnCodec || '').includes('nvenc')
@@ -10006,7 +10053,8 @@ try {
         outputDuration: durationSec || graph.timeline.end,
         leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
         fps: burnFps,
-        target
+        target,
+        legacyAssPath
       });
       const progress = createFfmpegJobProgress({
         kind: 'burn',
@@ -11099,7 +11147,8 @@ try {
   async runChunkedJetsonSceneGraphExport({
     graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
-    leadingAudioPaddingSec = 0, decoder, temporaryDir, onStderr, onChild, onProgress, onStage, isCancelled, label
+    leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
+    onStderr, onChild, onProgress, onStage, isCancelled, label
   }) {
     const chunkSeconds = 20;
     const chunkPaths = [];
@@ -11108,6 +11157,7 @@ try {
     const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
     const useCudaSceneRenderer = Boolean(
       CUDA_SCENE_PRODUCTION_ENABLED &&
+      !LEGACY_ASS_SCENE_PRESETS.has(this.resolveSceneGraphStylePreset(legacySceneOptions.stylePreset || this.settings.sceneGraphDefaultStyle)) &&
       this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
       this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
     );
@@ -11129,15 +11179,27 @@ try {
         const scriptPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.filter`);
         const chunkPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
         const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${isHevcCodec(codec) ? 'h265' : 'h264'}`;
+        const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+          path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.legacy.ass`),
+          legacyEvents,
+          {
+            ...legacySceneOptions,
+            startTime: chunkStart,
+            endTime: chunkStart + chunkDuration,
+            shiftTime: true
+          }
+        );
         onStage?.(`正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
         const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
           duration: chunkDuration,
           outputDuration: chunkDuration,
           leadingVideoPaddingSec: chunkLeadingVideoPaddingSec,
           fps,
-          target: 'jetson'
+          target: 'jetson',
+          legacyAssPath
         });
         scriptPaths.push(scriptPath);
+        if (legacyAssPath) scriptPaths.push(legacyAssPath);
         await fsp.rm(chunkPath, { force: true }).catch(() => {});
         const common = {
           codec,
@@ -11376,6 +11438,20 @@ try {
       const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
       const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
       const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+        path.join(sceneDirectory, 'scene.legacy.ass'),
+        sceneResult.events,
+        {
+          overlayMode,
+          danmakuArea,
+          stylePreset,
+          styleLayout,
+          videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+          startTime,
+          endTime,
+          shiftTime: true
+        }
+      );
       const target = isJetsonGstreamerCodec(burnCodec)
         ? 'jetson'
         : String(burnCodec || '').includes('nvenc')
@@ -11393,7 +11469,8 @@ try {
             outputDuration: duration,
             leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
             fps,
-            target
+            target,
+            legacyAssPath
           });
       // CUDA Scene now receives an explicit black lead-in and shifts its
       // timeline by the same amount, so both ordinary and leading-keyframe
@@ -11401,6 +11478,7 @@ try {
       const useCudaSceneRenderer = Boolean(
         CUDA_SCENE_PRODUCTION_ENABLED &&
           !useChunkedJetsonScene &&
+          !legacyAssPath &&
           this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
           this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
       );
@@ -11458,6 +11536,8 @@ try {
             startTime, duration, outputContainer, includeAudio: Boolean(mediaInfo.audioInfo), copyAudio: copySourceAudio,
             leadingVideoPaddingSec: burnTimeline.videoPaddingSec, leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
             decoder: decoderInfo, temporaryDir: sceneDirectory, onStderr, onChild,
+            legacyEvents: sceneResult.events,
+            legacySceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
             onProgress: (value) => {
               if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) this.emitState('mediaJob');
             },
