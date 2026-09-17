@@ -138,6 +138,7 @@ function parseGpuSceneRendererProbe(value, expectedBackend = '') {
     ok: true,
     backend,
     version: String(probe.version || '').trim(),
+    nativeNvmmScene: probe.nativeNvmmScene === true,
     capabilities: [...capabilities].sort(),
     gstreamerElements: Array.isArray(probe.gstreamerElements) ? probe.gstreamerElements.map(String).sort() : []
   };

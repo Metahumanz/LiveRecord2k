@@ -11354,6 +11354,10 @@ try {
       timelineOffsetSec,
       decoder: String(decoder?.value || decoder || 'software')
     });
+    if (nativeDecode) {
+      request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
+      request.input.codec = String(nativeDecode.sourceCodec || '').toLowerCase();
+    }
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
     this.log('info', `${label}：将在子进程实际启动后报告 CUDA Scene 运行链路。`);
     const preferredDecoder = String(decoder?.value || decoder || 'software');
@@ -11368,7 +11372,15 @@ try {
         encoder: `Jetson ${isHevcCodec(codec) ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}`
       });
       if (useNativeDecode) {
-        await runJetsonNativeDecodeCudaSceneJob({
+        if (renderer.nativeNvmmScene) {
+          const nativeResult = await runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
+            timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024
+          });
+          if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) {
+            throw new Error(compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。'));
+          }
+          onStageMetrics?.({ decode: 0, scene: 0, encode: 0, total: 0, final: true });
+        } else await runJetsonNativeDecodeCudaSceneJob({
           decoderPath: nativeDecode.decoderPath,
           decoderArgs: createJetsonNativeDecodeArgs({
             cleanPath: nativeDecode.cleanPath, sourceCodec: nativeDecode.sourceCodec, width, height, fps,

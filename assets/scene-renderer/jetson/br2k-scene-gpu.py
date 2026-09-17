@@ -563,7 +563,8 @@ def probe():
         'backend': 'cuda-gstreamer' if cuda_ready else 'gl-gstreamer',
         'version': '0.1.0',
         'capabilities': CAPABILITIES,
-        'gstreamerElements': available
+        'gstreamerElements': available,
+        'nativeNvmmScene': bool(cuda_ready and Gst.ElementFactory.find('nvv4l2decoder'))
     }
     print(json.dumps(payload, ensure_ascii=False))
     return 0 if cuda_ready or len(available) == len(REQUIRED_ELEMENTS) else 3
