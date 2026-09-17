@@ -190,11 +190,25 @@ static void gpu_process(EGLImageKHR image, void **) {
   std::lock_guard<std::mutex> guard(g_scene.lock);
   if (!g_scene.ready && !load_scene()) return;
   const double seconds = (double)g_scene.frame++ / g_scene.fps;
+  // nvivafilter can invoke fGPUProcess from a worker thread different from
+  // init(). Make the Runtime primary context current on this callback thread
+  // before using the Driver API's EGL interop entry points. Without this,
+  // JetPack 6.2 returns CUDA_ERROR_INVALID_CONTEXT for every frame.
+  const cudaError_t context_result = cudaFree(0);
+  if (context_result != cudaSuccess) {
+    std::fprintf(stderr, "br2k CUDA Scene: cannot bind CUDA context: %s\n", cudaGetErrorString(context_result));
+    return;
+  }
   CUgraphicsResource resource = nullptr;
   CUeglFrame egl_frame = {};
-  if (cuGraphicsEGLRegisterImage(&resource, image, CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE) != CUDA_SUCCESS ||
-      cuGraphicsResourceGetMappedEglFrame(&egl_frame, resource, 0, 0) != CUDA_SUCCESS) {
-    std::fprintf(stderr, "br2k CUDA Scene: failed to import nvivafilter EGLImage\n");
+  CUresult egl_result = cuGraphicsEGLRegisterImage(&resource, image, CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE);
+  if (egl_result == CUDA_SUCCESS) {
+    egl_result = cuGraphicsResourceGetMappedEglFrame(&egl_frame, resource, 0, 0);
+  }
+  if (egl_result != CUDA_SUCCESS) {
+    const char *error_name = "unknown";
+    cuGetErrorName(egl_result, &error_name);
+    std::fprintf(stderr, "br2k CUDA Scene: failed to import nvivafilter EGLImage: %s (%d)\n", error_name, (int)egl_result);
     if (resource) cuGraphicsUnregisterResource(resource);
     return;
   }

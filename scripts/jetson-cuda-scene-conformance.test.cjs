@@ -90,7 +90,10 @@ function pixelDelta(left, right) {
 }
 
 async function decodeFrame(ffmpeg, inputPath, at, outputPath) {
-  await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', inputPath, '-ss', String(at), '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', outputPath]);
+  // A raw elementary H.265 stream has no container time base. Pin it to the
+  // renderer's contract before seeking; otherwise FFmpeg guesses 25fps and
+  // the 1.019s cases compare different physical frames.
+  await run(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-r', String(CANVAS.fps), '-i', inputPath, '-ss', String(at), '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', outputPath]);
   const pixels = await fs.readFile(outputPath);
   assert.equal(pixels.length, CANVAS.width * CANVAS.height * 3, `无法从 ${path.basename(inputPath)} 抽取 ${at}s 的 RGB 截图`);
   return pixels;
@@ -151,6 +154,15 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
           const metrics = pixelDelta(assPixels, cudaPixels);
           allMetrics.push(metrics);
           caseResult.samples.push({ time: sampleTime, ...metrics });
+          const artifactDirectory = String(process.env.BR2K_CUDA_SCENE_CONFORMANCE_ARTIFACT_DIR || '').trim();
+          if (artifactDirectory) {
+            await fs.mkdir(artifactDirectory, { recursive: true });
+            const frameId = `${id}-${sampleTime.toFixed(3)}`;
+            await Promise.all([
+              fs.writeFile(path.join(artifactDirectory, `${frameId}-ass.rgb`), assPixels),
+              fs.writeFile(path.join(artifactDirectory, `${frameId}-cuda.rgb`), cudaPixels)
+            ]);
+          }
         }
         caseResult.metrics.meanAbsRgb = Math.max(...allMetrics.map((value) => value.meanAbsRgb));
         caseResult.metrics.changedRatio = Math.max(...allMetrics.map((value) => value.changedRatio));

@@ -294,8 +294,13 @@ function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
     const username = truncateTextToWidth(event.user || '观众', metrics.textWidth * 0.35, metrics.fontSize);
     const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
     const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    const textX = metrics.dotSize + metrics.gap;
     legacyShape(graph, prefix + '-dot', segment, 0, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
-    legacyText(graph, prefix + '-text', segment, metrics.dotSize + metrics.gap, 0, username + ' · ' + detail, metrics.fontSize, '&H00DCE8E8&', 23, 700);
+    // The frozen ASS uses \b1 only for the username, then switches back to
+    // \b0 for the separator and body. Model that as two Scene text nodes so
+    // CUDA does not make the whole minimal line visibly heavier.
+    legacyText(graph, prefix + '-user', segment, textX, 0, username, metrics.fontSize, '&H00DCE8E8&', 23, 700);
+    legacyText(graph, prefix + '-detail', segment, textX + estimateTextWidth(username, metrics.fontSize), 0, ' · ' + detail, metrics.fontSize, '&H00DCE8E8&', 23);
     return;
   }
   const metrics = getSideChatMetrics(style, event.text);
@@ -308,7 +313,7 @@ function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
     legacyText(graph, prefix + '-meta', segment, metrics.contentX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2), username, metrics.metaFontSize, palette.metaText, 23, 700);
   }
   legacyShape(graph, prefix + '-bubble', segment, metrics.contentX, metrics.bubbleTop, metrics.bubbleWidth, metrics.bubbleHeight, palette.bubbleBackground, palette.radius, 16);
-  legacyText(graph, prefix + '-body', segment, metrics.contentX + metrics.paddingX, metrics.bubbleTop + metrics.paddingY, metrics.wrappedText, metrics.fontSize, palette.bubbleText, 23, 700);
+  legacyText(graph, prefix + '-body', segment, metrics.contentX + metrics.paddingX, metrics.bubbleTop + metrics.paddingY, metrics.wrappedText, metrics.fontSize, palette.bubbleText, 23);
 }
 
 function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets) {
@@ -319,9 +324,11 @@ function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAs
     const username = truncateTextToWidth(event.user || '观众', textWidth * 0.35, metrics.fontSize);
     const detail = truncateTextToWidth(sideInteractionText(event), textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
     const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    const textX = metrics.dotSize + metrics.gap * 2;
     legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, '&H250D1416&', metrics.radius, 16);
     legacyShape(graph, prefix + '-dot', segment, metrics.gap, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
-    legacyText(graph, prefix + '-body', segment, metrics.dotSize + metrics.gap * 2, metrics.paddingY, username + ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23, 700);
+    legacyText(graph, prefix + '-user', segment, textX, metrics.paddingY, username, metrics.fontSize, '&H00FFFFFF&', 23, 700);
+    legacyText(graph, prefix + '-detail', segment, textX + estimateTextWidth(username, metrics.fontSize), metrics.paddingY, ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23);
     if (price) {
       const priceWidth = Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize);
       const priceX = metrics.width - priceWidth;
