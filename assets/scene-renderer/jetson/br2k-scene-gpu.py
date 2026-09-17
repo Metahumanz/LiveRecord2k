@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 # Private GPU plugins are packaged outside the system GStreamer directory so
 # an application update never mutates JetPack's files.
@@ -380,10 +381,16 @@ def render(request, input_stream=None):
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动 GPU Scene 管线。')
         frame_index = 0
         stream = input_stream or sys.stdin.buffer
+        pending = b''
         while True:
-            payload = stream.read(frame_size)
-            if not payload: break
-            if len(payload) != frame_size: fail('收到不完整 I420 帧。')
+            chunk = stream.read(frame_size - len(pending))
+            if not chunk:
+                if pending: fail('收到不完整 I420 帧。')
+                break
+            pending += chunk
+            if len(pending) < frame_size:
+                continue
+            payload, pending = pending, b''
             buffer = Gst.Buffer.new_allocate(None, frame_size, None)
             buffer.fill(0, payload)
             buffer.pts = int(frame_index * Gst.SECOND / number(output.get('fps'), 30))
@@ -491,6 +498,61 @@ def decode_native(args):
         fail('原生 NVDEC 仅解出 %d/%d 帧。' % (written, required_frames))
 
 
+def render_native_nvmm(request):
+    """Decode, composite and encode entirely in NVMM for one finite request."""
+    check_request(request)
+    if request.get('backend') != 'cuda-gstreamer': fail('原生零拷贝仅支持 cuda-gstreamer。')
+    source = request.get('input') or {}
+    output = request.get('output') or {}
+    input_path = str(source.get('path') or '')
+    if not os.path.isfile(input_path): fail('原生零拷贝输入不存在：' + input_path)
+    width, height, fps = int(output['width']), int(output['height']), number(output.get('fps'), 30)
+    codec = str(source.get('codec') or '').lower()
+    parser_factory = 'h265parse' if codec in ('hevc', 'h265') else 'h264parse'
+    encoder = 'nvv4l2h265enc' if ('hevc' in str(output.get('codec') or '') or 'h265' in str(output.get('codec') or '')) else 'nvv4l2h264enc'
+    parser_out = 'h265parse' if encoder == 'nvv4l2h265enc' else 'h264parse'
+    work_dir = tempfile.mkdtemp(prefix='br2k-native-nvmm-')
+    try:
+        timeline = prepare_cuda_timeline(request, work_dir)
+        os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
+        os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
+        pipeline = Gst.Pipeline.new('br2k-native-nvmm-scene')
+        filesrc, demux = make_element('filesrc', 'source'), make_element('qtdemux', 'demux')
+        parser, decoder = make_element(parser_factory, 'parser'), make_element('nvv4l2decoder', 'decoder')
+        composite = make_element('nvivafilter', 'cuda-scene')
+        composite.set_property('cuda-process', True); composite.set_property('customer-lib-name', CUDA_SCENE_CUSTOMER_LIBRARY)
+        caps = make_element('capsfilter', 'nvmm')
+        caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+        encode, parse, sink = make_element(encoder, 'encode'), make_element(parser_out, 'parse'), make_element('filesink', 'output')
+        filesrc.set_property('location', input_path); sink.set_property('location', str(output['path']))
+        encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
+        for element in [filesrc, demux, parser, decoder, composite, caps, encode, parse, sink]: pipeline.add(element)
+        if not filesrc.link(demux) or not link_many(parser, decoder, composite, caps, encode, parse, sink): fail('无法连接 NVDEC → CUDA Scene → NVENC。')
+        linked = {'value': False}
+        def on_pad_added(_demux, pad):
+            if linked['value'] or not pad.get_current_caps(): return
+            if pad.get_current_caps().get_structure(0).get_name().startswith('video/') and pad.link(parser.get_static_pad('sink')) == Gst.PadLinkReturn.OK: linked['value'] = True
+        demux.connect('pad-added', on_pad_added)
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动原生 NVMM 管线。')
+        start, duration = max(0, number(source.get('startTime'), 0)), max(0.001, number(source.get('duration'), 0.001))
+        deadline = GLib.get_monotonic_time() + 8 * GLib.USEC_PER_SEC
+        while not linked['value'] and GLib.get_monotonic_time() < deadline: pipeline.get_state(100 * Gst.MSECOND)
+        if not linked['value']: fail('原生 NVMM 管线没有可用视频流。')
+        if start > 0.0001 and not pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(start * Gst.SECOND)): fail('原生 NVMM seek 失败。')
+        eos_timer = threading.Timer(duration, lambda: pipeline.send_event(Gst.Event.new_eos()))
+        eos_timer.daemon = True; eos_timer.start()
+        bus = pipeline.get_bus()
+        try:
+            while True:
+                message = bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                if message.type == Gst.MessageType.EOS: break
+                error, debug = message.parse_error(); fail('原生 NVMM：' + str(error) + ('；' + str(debug) if debug else ''))
+        finally:
+            eos_timer.cancel(); pipeline.set_state(Gst.State.NULL)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def probe():
     Gst.init(None)
     cuda_available = [name for name in CUDA_NVMM_REQUIRED_ELEMENTS if Gst.ElementFactory.find(name)]
@@ -511,6 +573,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--probe')
     parser.add_argument('--request')
+    parser.add_argument('--native-scene-request')
     parser.add_argument('--decode-native', action='store_true')
     parser.add_argument('--input')
     parser.add_argument('--codec')
@@ -527,6 +590,9 @@ def main():
     if args.probe == 'json': return probe()
     if args.decode_native:
         decode_native(args)
+        return 0
+    if args.native_scene_request:
+        with open(args.native_scene_request, 'r', encoding='utf-8') as handle: render_native_nvmm(json.load(handle))
         return 0
     if args.self_test:
         target = '/tmp/br2k-gpu-scene-self-test.h264'
