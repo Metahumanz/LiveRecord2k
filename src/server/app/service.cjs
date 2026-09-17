@@ -14,6 +14,10 @@ const {
   JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
 } = require('../danmaku/gpu-scene-renderer.cjs');
 const {
+  createCudaSceneConformanceUnavailable,
+  canUseCudaSceneProduction
+} = require('../danmaku/gpu-scene-conformance.cjs');
+const {
   DanmakuClient,
   requestBiliJsonWithCookies,
   fetchWithTimeout,
@@ -291,10 +295,6 @@ const APP_NAME = 'BiliRecord2K';
 const STORE_FILE = 'settings.json';
 const RECORDING_LIBRARY_LIMIT = 160;
 const DEFAULT_PORT = 3263;
-// CUDA Scene remains an isolated visual/texture test path.  Production
-// Jetson exports use GStreamer NVDEC + ffmpeg-full Scene Graph + GStreamer
-// NVENC so UI rendering stays byte-for-byte on the established renderer.
-const CUDA_SCENE_PRODUCTION_ENABLED = false;
 const STREAM_QN_PROBES = [25000, 20000, 15000, 10000, 400, 250, 150];
 const MIN_PLAYABLE_BYTES = 128 * 1024;
 const NO_MEDIA_TIMEOUT_MS = 70 * 1000;
@@ -1164,6 +1164,7 @@ class LiveRecordService {
       gstreamerEncoders: [],
       jetsonBurnTests: {},
       sceneGpuRenderer: null,
+      sceneGpuVisualConformance: createCudaSceneConformanceUnavailable(),
       avatarComposite: null,
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
@@ -1268,6 +1269,8 @@ class LiveRecordService {
       isStartupEnabled()
     ]);
     this.ffmpegCapabilities.sceneGpuRenderer = await this.probeGpuSceneRenderer();
+    this.ffmpegCapabilities.sceneGpuVisualConformance = this.ffmpegCapabilities.sceneGpuRenderer.visualConformance ||
+      createCudaSceneConformanceUnavailable();
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1300,11 +1303,12 @@ class LiveRecordService {
       );
     }
     const gpuScene = this.ffmpegCapabilities.sceneGpuRenderer;
+    const cudaSceneProduction = canUseCudaSceneProduction(gpuScene, this.ffmpegCapabilities.sceneGpuVisualConformance);
     this.log(
       gpuScene?.available ? 'success' : 'info',
       gpuScene?.available
         ? gpuScene.backend === 'cuda-gstreamer'
-          ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。生产 CUDA Scene 仍保持关闭，待视觉一致性自检通过后才会启用。`
+          ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。${cudaSceneProduction.ok ? '视觉一致性自检通过，可用于生产 CUDA Scene。' : `尚未取得生产资格：${cudaSceneProduction.reason}`}`
           : `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。视觉一致性验证未通过，当前保持 CPU Scene 导出。`
         : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
     );
@@ -1732,7 +1736,13 @@ class LiveRecordService {
 
   async probeGpuSceneRenderer() {
     const helper = resolveGpuSceneRenderer();
-    if (!helper) return { available: false, reason: '未安装 Jetson GPU Scene helper。' };
+    if (!helper) {
+      return {
+        available: false,
+        reason: '未安装 Jetson GPU Scene helper。',
+        visualConformance: createCudaSceneConformanceUnavailable()
+      };
+    }
     const result = await runCapturedProcess(helper, createGpuSceneProbeArgs(), {
       timeoutMs: 12_000,
       maxOutputBytes: 32 * 1024
@@ -1741,13 +1751,21 @@ class LiveRecordService {
       return {
         available: false,
         helper,
+        visualConformance: createCudaSceneConformanceUnavailable(),
         reason: result.timedOut
           ? 'GPU Scene helper probe 超时。'
           : compactLogLine(result.stderr || result.stdout || result.error?.message || 'GPU Scene helper probe 失败。')
       };
     }
     const probe = parseGpuSceneRendererProbe(result.stdout || result.stderr);
-    if (!probe.ok) return { available: false, helper, reason: probe.reason };
+    if (!probe.ok) {
+      return {
+        available: false,
+        helper,
+        reason: probe.reason,
+        visualConformance: createCudaSceneConformanceUnavailable()
+      };
+    }
     const required = probe.backend === 'gl-gstreamer'
       ? JETSON_GL_REQUIRED_ELEMENTS
       : probe.backend === 'cuda-gstreamer'
@@ -1756,9 +1774,14 @@ class LiveRecordService {
     const available = new Set(probe.gstreamerElements || []);
     const missing = required.filter((element) => !available.has(element));
     if (missing.length) {
-      return { available: false, helper, reason: 'GPU Scene helper 缺少 GStreamer 元件：' + missing.join('、') + '。' };
+      return {
+        available: false,
+        helper,
+        reason: 'GPU Scene helper 缺少 GStreamer 元件：' + missing.join('、') + '。',
+        visualConformance: createCudaSceneConformanceUnavailable()
+      };
     }
-    return Object.assign({ available: true, helper }, probe);
+    return Object.assign({ available: true, helper, visualConformance: createCudaSceneConformanceUnavailable() }, probe);
   }
 
   getAvatarCompositeCapability() {
@@ -11155,12 +11178,10 @@ try {
     const chunkDurations = [];
     const scriptPaths = [];
     const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
-    const useCudaSceneRenderer = Boolean(
-      CUDA_SCENE_PRODUCTION_ENABLED &&
-      !LEGACY_ASS_SCENE_PRESETS.has(this.resolveSceneGraphStylePreset(legacySceneOptions.stylePreset || this.settings.sceneGraphDefaultStyle)) &&
-      this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
-      this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
-    );
+    const useCudaSceneRenderer = canUseCudaSceneProduction(
+      this.ffmpegCapabilities?.sceneGpuRenderer,
+      this.ffmpegCapabilities?.sceneGpuVisualConformance
+    ).ok;
     const nativeDecoderPath = resolveGpuSceneRenderer();
     let completed = 0;
     try {
@@ -11475,13 +11496,10 @@ try {
       // CUDA Scene now receives an explicit black lead-in and shifts its
       // timeline by the same amount, so both ordinary and leading-keyframe
       // exports retain the established audio/video alignment.
-      const useCudaSceneRenderer = Boolean(
-        CUDA_SCENE_PRODUCTION_ENABLED &&
-          !useChunkedJetsonScene &&
-          !legacyAssPath &&
-          this.ffmpegCapabilities?.sceneGpuRenderer?.available &&
-          this.ffmpegCapabilities.sceneGpuRenderer.backend === 'cuda-gstreamer'
-      );
+      const useCudaSceneRenderer = !useChunkedJetsonScene && !legacyAssPath && canUseCudaSceneProduction(
+        this.ffmpegCapabilities?.sceneGpuRenderer,
+        this.ffmpegCapabilities?.sceneGpuVisualConformance
+      ).ok;
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
