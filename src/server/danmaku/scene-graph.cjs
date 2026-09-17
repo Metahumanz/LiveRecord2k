@@ -309,7 +309,7 @@ function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
   const nameWidth = Math.min(metrics.contentWidth * 0.78, Math.max(metrics.metaFontSize * 2.3, estimateTextWidth(username, metrics.metaFontSize) + metrics.metaFontSize));
   addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
   if (metrics.metaHeight > 0) {
-    legacyShape(graph, prefix + '-meta-bg', segment, metrics.contentX, 0, nameWidth, metrics.metaHeight, metrics.metaHeight / 2, palette.metaBackground, 15);
+    legacyShape(graph, prefix + '-meta-bg', segment, metrics.contentX, 0, nameWidth, metrics.metaHeight, palette.metaBackground, metrics.metaHeight / 2, 15);
     legacyText(graph, prefix + '-meta', segment, metrics.contentX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2), username, metrics.metaFontSize, palette.metaText, 23, 700);
   }
   legacyShape(graph, prefix + '-bubble', segment, metrics.contentX, metrics.bubbleTop, metrics.bubbleWidth, metrics.bubbleHeight, palette.bubbleBackground, palette.radius, 16);
