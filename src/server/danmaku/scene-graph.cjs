@@ -254,6 +254,28 @@ function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, wei
   }));
 }
 
+function legacyRichText(graph, id, segment, x, y, assText, fontSize, color, zIndex) {
+  const appearance = legacyAssColor(color);
+  const visible = String(assText || '').replace(/\\b[01]/g, '').replace(/\\N/g, '\n');
+  const lines = visible.split('\n');
+  const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
+  graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {
+    zIndex,
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, Math.max(1, fontSize * 1.25 * lines.length)),
+    animations: legacySegmentAnimations(segment, x, y),
+    props: {
+      text: visible,
+      assText: String(assText || ''),
+      fontFamily: process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei',
+      fontSize,
+      fontWeight: 400,
+      lineHeight: fontSize * 1.13,
+      align: 'left'
+    },
+    style: { fill: appearance.fill, opacity: appearance.opacity, stroke: '', strokeWidth: 0, shadow: null }
+  }));
+}
+
 function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
   const placement = getSideAvatarPlacement(event, style, segment);
   if (!placement) return;
@@ -264,10 +286,18 @@ function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
   const headSize = Math.max(4, size * 0.29);
   const shouldersWidth = Math.max(6, size * 0.64);
   const shouldersHeight = Math.max(4, size * 0.3);
-  legacyShape(graph, prefix + '-avatar-ring', segment, placement.offsetX, placement.offsetY, size, size, outer, size / 2, 20);
-  legacyShape(graph, prefix + '-avatar-fill', segment, placement.offsetX + placement.ringInset, placement.offsetY + placement.ringInset, placement.innerSize, placement.innerSize, inner, placement.innerSize / 2, 21);
-  legacyShape(graph, prefix + '-avatar-head', segment, placement.offsetX + (size - headSize) / 2, placement.offsetY + size * 0.21, headSize, headSize, softWhite, headSize / 2, 22);
-  legacyShape(graph, prefix + '-avatar-shoulders', segment, placement.offsetX + (size - shouldersWidth) / 2, placement.offsetY + size * 0.58, shouldersWidth, shouldersHeight, softWhite, shouldersHeight / 2, 22);
+  // Keep the ASS vector avatar in one texture.  Rendering four separately
+  // rounded layers makes independent pixel rounding visible while cards move.
+  graph.objects.push(sceneObject('Avatar', prefix + '-avatar-vector', { start: segment.start, end: segment.end, zIndex: 20 }, {
+    zIndex: 20,
+    frame: frame(number(segment.x1) + placement.offsetX, number(segment.y1) + placement.offsetY, size, size),
+    animations: legacySegmentAnimations(segment, placement.offsetX, placement.offsetY),
+    props: {
+      role: 'legacy-ass-avatar-vector',
+      vector: { outer, inner, softWhite, ringInset: placement.ringInset, headSize, shouldersWidth, shouldersHeight }
+    },
+    style: { fill: '#ffffff', opacity: 1, cornerRadius: size / 2, shadow: null }
+  }));
   // v0.6.7 rendered this vector avatar as the safe ASS fallback, then placed
   // a fetched headshot on top when one was available.  Keep both layers: a
   // missing or failed download preserves the exact fallback, while a local
@@ -299,8 +329,7 @@ function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
     // The frozen ASS uses \b1 only for the username, then switches back to
     // \b0 for the separator and body. Model that as two Scene text nodes so
     // CUDA does not make the whole minimal line visibly heavier.
-    legacyText(graph, prefix + '-user', segment, textX, 0, username, metrics.fontSize, '&H00DCE8E8&', 23, 700);
-    legacyText(graph, prefix + '-detail', segment, textX + estimateTextWidth(username, metrics.fontSize), 0, ' · ' + detail, metrics.fontSize, '&H00DCE8E8&', 23);
+    legacyRichText(graph, prefix + '-line', segment, textX, 0, `\\b1${username}\\b0 · ${detail}`, metrics.fontSize, '&H00DCE8E8&', 23);
     return;
   }
   const metrics = getSideChatMetrics(style, event.text);
@@ -356,7 +385,8 @@ function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAs
   }
 }
 
-function addLegacySideEntry(graph, entry, style, avatarAssets) {
+function addLegacySideEntry(graph, entry, style, avatarAssets, clip) {
+  const firstObjectIndex = graph.objects.length;
   const segments = Array.isArray(entry.segments) ? entry.segments : [];
   segments.forEach((segment, index) => {
     if (number(segment.end) - number(segment.start) < 0.001) return;
@@ -365,6 +395,14 @@ function addLegacySideEntry(graph, entry, style, avatarAssets) {
     if (event.type === 'danmaku') addLegacySideChat(graph, prefix, event, style, segment, avatarAssets);
     else addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets);
   });
+  // The ASS oracle clips every side-stream primitive to the card panel while
+  // it is reflowing.  Preserve that exact safety boundary for CUDA too: a
+  // newly arriving gift must not paint below the panel before it moves in.
+  if (clip) {
+    for (let index = firstObjectIndex; index < graph.objects.length; index += 1) {
+      graph.objects[index].style.clip = { ...clip };
+    }
+  }
 }
 
 function addMessageNode(graph, entry, layout, avatarAssets) {
@@ -518,9 +556,15 @@ function buildSceneGraph(events, options) {
       layoutVersion: 1
     }
   };
+  const legacySideClip = {
+    x: Number(layout.style.panelLeft) || 0,
+    y: 0,
+    width: Math.max(1, Number(layout.style.superChatWidth) || layout.canvas.width),
+    height: Math.max(1, Number(layout.style.superChatBottom) || layout.canvas.height)
+  };
   for (const entry of layout.entries) {
     if (entry.kind === 'rolling') addRollingNode(graph, entry, layout.style);
-    else if (entry.kind === 'legacy-side') addLegacySideEntry(graph, entry, layout.style, source.avatarAssets);
+    else if (entry.kind === 'legacy-side') addLegacySideEntry(graph, entry, layout.style, source.avatarAssets, legacySideClip);
     else addMessageNode(graph, entry, layout, source.avatarAssets);
   }
   graph.timeline.end = round(graph.objects.reduce((maximum, object) => Math.max(maximum, number(object.end)), 0), 4);
