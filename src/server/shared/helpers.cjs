@@ -597,6 +597,78 @@ async function testFfmpegAvatarCompositeBackend(ffmpegPath, backend, options = {
   }
 }
 
+// A filter/encoder inventory is not evidence that a desktop NVIDIA card can
+// actually create CUDA surfaces, alpha-blend them, then start an NVENC
+// session. This probe performs all three on ordinary GeForce desktop and
+// laptop GPUs. It intentionally has no Jetson NVMM/V4L2 dependency.
+async function testFfmpegDesktopCudaPipeline(ffmpegPath, options = {}) {
+  const codec = /^(?:h264|hevc)_nvenc$/.test(String(options.codec || ''))
+    ? String(options.codec)
+    : 'hevc_nvenc';
+  const deviceName = 'br2k_desktop_cuda_probe';
+  const runner = typeof options.runCapturedProcess === 'function' ? options.runCapturedProcess : runCapturedProcess;
+  try {
+    const result = await runner(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-init_hw_device', `cuda=${deviceName}:0`, '-filter_hw_device', deviceName,
+        '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=30:d=1,format=yuv420p',
+        '-f', 'lavfi', '-i', 'color=c=white@0.5:s=48x48:r=30:d=1,format=rgba',
+        '-filter_complex',
+        '[0:v]format=yuv420p,hwupload_cuda[base];' +
+          '[1:v]format=yuva420p,hwupload_cuda[overlay];' +
+          '[base][overlay]overlay_cuda=x=20:y=20,scale_cuda=format=yuv420p[out]',
+        '-map', '[out]', '-frames:v', '30', '-an', '-c:v', codec, '-f', 'null', '-'
+      ],
+      { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 15_000)), maxOutputBytes: 128 * 1024 }
+    );
+    if (result.status === 0 && !result.error && !result.timedOut) return { ok: true, codec, reason: '' };
+    const detail = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+    return {
+      ok: false,
+      codec,
+      reason: result.timedOut ? '桌面 CUDA 合成/NVENC 自检超时' : detail || result.error?.message || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, codec, reason: error.message };
+  }
+}
+
+async function detectDesktopCudaCapability(ffmpegPath, options = {}) {
+  // NVMM is Jetson-specific. Never relabel an ARM64 Jetson as a desktop CUDA
+  // backend simply because its FFmpeg happens to expose CUDA.
+  const platform = String(options.platform || process.platform);
+  const arch = String(options.arch || process.arch);
+  if (platform === 'linux' && arch === 'arm64') {
+    return { available: false, reason: '当前为 Jetson 平台，使用 NVMM CUDA 能力模型。' };
+  }
+  const hwaccels = Array.isArray(options.hwaccels) ? options.hwaccels : [];
+  const filterNames = options.filterNames instanceof Set ? options.filterNames : new Set(options.filterNames || []);
+  const burnCodecs = Array.isArray(options.burnCodecs) ? options.burnCodecs : [];
+  if (!hwaccels.includes('cuda')) return { available: false, reason: 'ffmpeg 未检测到 CUDA 硬件设备。' };
+  const missing = ['hwupload_cuda', 'overlay_cuda', 'scale_cuda'].filter((filter) => !filterNames.has(filter));
+  if (missing.length) return { available: false, reason: `ffmpeg 缺少 CUDA 滤镜：${missing.join('、')}。` };
+  const encoder = burnCodecs.find((candidate) => /^(?:hevc|h264)_nvenc$/.test(String(candidate?.value || '')));
+  if (!encoder) return { available: false, reason: '没有通过真实自检的 NVIDIA NVENC 编码器。' };
+  const test = await testFfmpegDesktopCudaPipeline(ffmpegPath, {
+    codec: encoder.value,
+    runCapturedProcess: options.runCapturedProcess
+  });
+  if (!test.ok) return { available: false, reason: test.reason, encoder: encoder.value };
+  const decoders = Array.isArray(options.hardwareDecoders) ? options.hardwareDecoders : [];
+  return {
+    available: true,
+    backend: 'cuda-ffmpeg',
+    encoder: encoder.value,
+    compositor: 'overlay_cuda',
+    decoder: decoders.some((entry) => entry?.value === 'cuda') ? 'cuda' : '',
+    // This admits CUDA texture upload/blend/NVENC only. Complete text/card
+    // Scene production stays behind the independent visual conformance gate.
+    fullSceneProduction: false,
+    reason: ''
+  };
+}
+
 async function detectFfmpegAvatarCompositeBackend(ffmpegPath, { hwaccels = [], filterNames = new Set() } = {}) {
   const attempts = [];
   let cudaReason = '';
@@ -725,6 +797,12 @@ async function detectFfmpegCapabilities(ffmpegPath, options = {}) {
     ...jetsonHardwareDecoders,
     ...ffmpegHardwareDecoders.filter((decoder) => !/^(?:h264|hevc)_(?:nvv4l2dec|v4l2m2m)$/.test(String(decoder.value || '')))
   ];
+  const desktopCuda = await detectDesktopCudaCapability(ffmpegPath, {
+    hwaccels,
+    filterNames,
+    burnCodecs,
+    hardwareDecoders
+  });
 
   return {
     burnCodecs,
@@ -744,6 +822,7 @@ async function detectFfmpegCapabilities(ffmpegPath, options = {}) {
       avatarComposite.backend?.value === 'cuda'
         ? ''
         : avatarComposite.cudaReason || avatarComposite.reason || '',
+    desktopCuda,
     probedAt: Date.now(),
     probeError: encoderProbe.ok ? '' : encoderProbe.error
   };
@@ -3810,7 +3889,9 @@ module.exports = {
   findVaapiRenderDevice,
   getAvatarCompositeDeviceSpec,
   testFfmpegAvatarCompositeBackend,
+  testFfmpegDesktopCudaPipeline,
   detectFfmpegAvatarCompositeBackend,
+  detectDesktopCudaCapability,
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,

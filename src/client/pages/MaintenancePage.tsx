@@ -78,6 +78,7 @@ export function MaintenancePage({
     .map((codec) => `${codec.label}：${codec.reason || '不可用'}`)
     .join('；');
   const jetsonBurnTests = Object.values(state.ffmpegCapabilities?.jetsonBurnTests || {});
+  const desktopCuda = state.ffmpegCapabilities?.desktopCuda;
 
   function updateSetting(nextSettings: Partial<AppSettings>, saveMode: 'immediate' | 'debounced' | 'commit' = 'immediate') {
     updateSettingsDraft(nextSettings, { saveMode });
@@ -459,6 +460,19 @@ export function MaintenancePage({
             value={`${currentCodec?.kind === 'hardware' ? '硬件' : '软件'} ${state.settings.burnCodec}`}
           />
           <PathLine label="不可用硬编" value={unavailableCodecText || '无'} />
+          {desktopCuda ? (
+            <div className={`maintenance-section ${desktopCuda.available ? '' : 'error'}`}>
+              <h3>通用 NVIDIA CUDA 自检</h3>
+              {desktopCuda.available ? (
+                <p className="field-help">
+                  已真实验证 {desktopCuda.decoder ? 'CUDA 硬解、' : ''}{desktopCuda.compositor || 'CUDA 合成'} 和 {desktopCuda.encoder || 'NVENC'}。
+                  旧样式完整文字继续遵循 ASS 金标准；CUDA 用于硬编、头像和非文字图元，不会被误报为 Jetson NVMM。
+                </p>
+              ) : (
+                <p className="field-help">未启用：{desktopCuda.reason || '尚未完成 CUDA 合成/NVENC 自检。'}</p>
+              )}
+            </div>
+          ) : null}
           {jetsonBurnTests.length ? (
             <div className="maintenance-section">
               <h3>Jetson 端到端烧录自检</h3>

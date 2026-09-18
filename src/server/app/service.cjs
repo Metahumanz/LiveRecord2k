@@ -1173,6 +1173,7 @@ class LiveRecordService {
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
       cudaAvatarCompositeReason: '',
+      desktopCuda: { available: false, reason: '尚未执行桌面 CUDA 合成/NVENC 自检。' },
       probedAt: 0,
       probeError: ''
     };
@@ -1329,6 +1330,15 @@ class LiveRecordService {
               : ''
           }`
     );
+    const desktopCuda = this.ffmpegCapabilities.desktopCuda;
+    if (desktopCuda?.available) {
+      this.log(
+        'success',
+        `桌面 NVIDIA CUDA 已通过真实自检：${desktopCuda.decoder ? 'CUDA 硬解、' : ''}${desktopCuda.compositor || 'overlay_cuda'} 合成、${desktopCuda.encoder}。当前用于 NVENC 与真实头像/非文字图元合成；旧样式完整文字仍保持 ASS 金标准。`
+      );
+    } else if (process.platform !== 'linux' || process.arch !== 'arm64') {
+      this.log('info', `桌面 NVIDIA CUDA 合成链未启用：${desktopCuda?.reason || '尚未完成自检。'}`);
+    }
     this.emitState();
   }
 

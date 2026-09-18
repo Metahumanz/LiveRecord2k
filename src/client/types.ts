@@ -351,6 +351,15 @@ export type FfmpegCapabilities = {
     gstreamerElements?: string[];
     reason?: string;
   } | null;
+  desktopCuda?: {
+    available: boolean;
+    backend?: 'cuda-ffmpeg';
+    encoder?: string;
+    decoder?: string;
+    compositor?: string;
+    fullSceneProduction?: boolean;
+    reason?: string;
+  };
   probedAt: number;
   probeError?: string;
 };
