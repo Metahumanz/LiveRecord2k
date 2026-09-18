@@ -1622,6 +1622,18 @@ function setFfmpegJobStageFps(progress, stageFps) {
   }
   if (!Object.keys(normalized).length) return false;
   progress.stageFps = normalized;
+  // Native NVMM reports structured stage rates instead of FFmpeg's textual
+  // progress lines.  Surface that same measurement as render speed and ETA
+  // so the UI remains meaningful while a CUDA-only chunk is in flight.
+  const totalFps = Number(normalized.total);
+  const sourceFps = Number(progress.sourceFps || 0);
+  if (Number.isFinite(totalFps) && totalFps > 0 && Number.isFinite(sourceFps) && sourceFps > 0) {
+    const realtimeFactor = totalFps / sourceFps;
+    const remainingSec = Math.max(0, Number(progress.durationSec || 0) - Math.max(0, Number(progress.currentTimeSec || 0)));
+    progress.renderFps = totalFps;
+    progress.realtimeFactor = realtimeFactor;
+    progress.estimatedRemainingSec = Number(progress.durationSec || 0) > 0 ? remainingSec / realtimeFactor : null;
+  }
   progress.updatedAt = Date.now();
   return true;
 }
