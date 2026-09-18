@@ -1015,6 +1015,10 @@ class LiveRecordService {
         ? process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
         : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
     this.storePath = path.join(appData, 'BiliRecord2K', STORE_FILE);
+    // The Jetson runner persists a real ASS-vs-CUDA fixture report here.
+    // Runtime probing alone never grants CUDA production eligibility.
+    this.cudaSceneConformanceReportPath = String(process.env.BILI_RECORD_CUDA_SCENE_CONFORMANCE_REPORT || '').trim() ||
+      path.join(appData, 'BiliRecord2K', 'cuda-scene-conformance.json');
     this.stateStore = new AtomicJsonStore(this.storePath);
     this.storeExists = false;
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
@@ -1735,12 +1739,13 @@ class LiveRecordService {
   }
 
   async probeGpuSceneRenderer() {
+    const visualConformance = await this.readCudaSceneConformanceReport();
     const helper = resolveGpuSceneRenderer();
     if (!helper) {
       return {
         available: false,
         reason: '未安装 Jetson GPU Scene helper。',
-        visualConformance: createCudaSceneConformanceUnavailable()
+        visualConformance
       };
     }
     const result = await runCapturedProcess(helper, createGpuSceneProbeArgs(), {
@@ -1751,7 +1756,7 @@ class LiveRecordService {
       return {
         available: false,
         helper,
-        visualConformance: createCudaSceneConformanceUnavailable(),
+        visualConformance,
         reason: result.timedOut
           ? 'GPU Scene helper probe 超时。'
           : compactLogLine(result.stderr || result.stdout || result.error?.message || 'GPU Scene helper probe 失败。')
@@ -1763,7 +1768,7 @@ class LiveRecordService {
         available: false,
         helper,
         reason: probe.reason,
-        visualConformance: createCudaSceneConformanceUnavailable()
+        visualConformance
       };
     }
     const required = probe.backend === 'gl-gstreamer'
@@ -1778,10 +1783,10 @@ class LiveRecordService {
         available: false,
         helper,
         reason: 'GPU Scene helper 缺少 GStreamer 元件：' + missing.join('、') + '。',
-        visualConformance: createCudaSceneConformanceUnavailable()
+        visualConformance
       };
     }
-    const capability = Object.assign({ available: true, helper, visualConformance: createCudaSceneConformanceUnavailable() }, probe);
+    const capability = Object.assign({ available: true, helper, visualConformance }, probe);
     // Element discovery only proves that GStreamer can construct the bins.
     // Exercise both real Jetson decoder paths before allowing the fully NVMM
     // route; the I420 CUDA bridge remains a valid fallback when this fails.
@@ -1817,6 +1822,19 @@ class LiveRecordService {
         ? '原生 NVMM 双编码自检超时。'
         : nativeFailureSummary || compactLogLine(nativeTest.stderr || nativeTest.stdout || nativeTest.error?.message || '原生 NVMM 双编码自检失败。')
     };
+  }
+
+  async readCudaSceneConformanceReport() {
+    try {
+      const report = JSON.parse(await fsp.readFile(this.cudaSceneConformanceReportPath, 'utf8'));
+      if (!report || typeof report !== 'object') throw new Error('报告不是 JSON 对象。');
+      return report;
+    } catch (error) {
+      const reason = error?.code === 'ENOENT'
+        ? '尚未执行 CUDA Scene 像素一致性自检。'
+        : `CUDA Scene 像素一致性报告不可读取：${compactLogLine(error.message || error)}`;
+      return createCudaSceneConformanceUnavailable(reason);
+    }
   }
 
   getAvatarCompositeCapability() {
