@@ -25,7 +25,8 @@ const {
   sideInteractionText,
   sideInteractionPrice,
   truncateTextToWidth,
-  estimateTextWidth
+  estimateTextWidth,
+  roundedRectPath
 } = require('./ass.cjs');
 
 const SCENE_GRAPH_SCHEMA = 'bili-record2k.scene/v1';
@@ -216,7 +217,15 @@ function legacyShape(graph, id, segment, x, y, width, height, color, radius, zIn
     zIndex,
     frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, height),
     animations: legacySegmentAnimations(segment, x, y),
-    props: { role: 'legacy-ass-shape' },
+    // The frozen oracle rasterises these paths through libass.  Keep the
+    // original drawing and colour alongside the generic Scene data so the
+    // CUDA helper can make an identical cached texture instead of asking
+    // Pillow to approximate libass rounded-corner coverage.
+    props: {
+      role: 'legacy-ass-shape',
+      assDrawing: roundedRectPath(width, height, radius, corners),
+      assColor: String(color || '')
+    },
     style: {
       fill: appearance.fill,
       opacity: appearance.opacity,
@@ -291,6 +300,12 @@ function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
   const headSize = Math.max(4, size * 0.29);
   const shouldersWidth = Math.max(6, size * 0.64);
   const shouldersHeight = Math.max(4, size * 0.3);
+  const assDrawings = [
+    { x: 0, y: 0, path: roundedRectPath(size, size, size / 2), color: outer, layer: 5 },
+    { x: placement.ringInset, y: placement.ringInset, path: roundedRectPath(placement.innerSize, placement.innerSize, placement.innerSize / 2), color: inner, layer: 6 },
+    { x: (size - headSize) / 2, y: size * 0.21, path: roundedRectPath(headSize, headSize, headSize / 2), color: softWhite, layer: 7 },
+    { x: (size - shouldersWidth) / 2, y: size * 0.58, path: roundedRectPath(shouldersWidth, shouldersHeight, shouldersHeight / 2), color: softWhite, layer: 7 }
+  ];
   // Keep the ASS vector avatar in one texture.  Rendering four separately
   // rounded layers makes independent pixel rounding visible while cards move.
   graph.objects.push(sceneObject('Avatar', prefix + '-avatar-vector', { start: segment.start, end: segment.end, zIndex: 20 }, {
@@ -299,7 +314,8 @@ function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
     animations: legacySegmentAnimations(segment, placement.offsetX, placement.offsetY),
     props: {
       role: 'legacy-ass-avatar-vector',
-      vector: { outer, inner, softWhite, ringInset: placement.ringInset, headSize, shouldersWidth, shouldersHeight }
+      vector: { outer, inner, softWhite, ringInset: placement.ringInset, headSize, shouldersWidth, shouldersHeight },
+      assDrawings
     },
     style: { fill: '#ffffff', opacity: 1, cornerRadius: size / 2, shadow: null }
   }));
@@ -347,7 +363,10 @@ function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
     legacyText(graph, prefix + '-meta', segment, metrics.contentX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2), username, metrics.metaFontSize, palette.metaText, 23, 700);
   }
   legacyShape(graph, prefix + '-bubble', segment, metrics.contentX, metrics.bubbleTop, metrics.bubbleWidth, metrics.bubbleHeight, palette.bubbleBackground, palette.radius, 16);
-  legacyText(graph, prefix + '-body', segment, metrics.contentX + metrics.paddingX, metrics.bubbleTop + metrics.paddingY, metrics.wrappedText, metrics.fontSize, palette.bubbleText, 23);
+  // The frozen ASS dialogue emits its chat body with \b1.  Preserve that
+  // semantic weight in the graph: leaving this at the default 400 makes the
+  // CUDA/libass texture visibly thinner even when it resolves the same font.
+  legacyText(graph, prefix + '-body', segment, metrics.contentX + metrics.paddingX, metrics.bubbleTop + metrics.paddingY, metrics.wrappedText, metrics.fontSize, palette.bubbleText, 23, 700);
 }
 
 function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets) {

@@ -84,12 +84,36 @@ __global__ static void blend_rgba_nv12_array(
   const float luma = 16.0f + 0.257f * source.x + 0.504f * source.y + 0.098f * source.z;
   const unsigned char prior_y = surf2Dread<unsigned char>(y_surface, x, y);
   surf2Dwrite<unsigned char>((unsigned char)(prior_y * (1.0f - alpha) + luma * alpha), y_surface, x, y);
-  if ((x & 1) == 0 && (y & 1) == 0) {
-    const float u = 128.0f - 0.148f * source.x - 0.291f * source.y + 0.439f * source.z;
-    const float v = 128.0f + 0.439f * source.x - 0.368f * source.y - 0.071f * source.z;
-    const uchar2 prior_uv = surf2Dread<uchar2>(uv_surface, x, y / 2);
-    surf2Dwrite<uchar2>(make_uchar2((unsigned char)(prior_uv.x * (1.0f - alpha) + u * alpha),
-                                    (unsigned char)(prior_uv.y * (1.0f - alpha) + v * alpha)), uv_surface, x, y / 2);
+  // NV12 stores one U/V pair for a 2x2 luma cell.  Sampling only this
+  // thread's top-left texel gives coloured glyph edges and rounded corners
+  // the wrong chroma.  Own every partially covered global 2x2 cell once,
+  // then blend U/V from all covered texels by their actual alpha.
+  const int uv_x = x & ~1, uv_y = y & ~1;
+  const bool owns_uv_x = x == uv_x || px == 0;
+  const bool owns_uv_y = y == uv_y || py == 0;
+  if (owns_uv_x && owns_uv_y) {
+    float alpha_sum = 0.0f, u_sum = 0.0f, v_sum = 0.0f;
+    for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
+      const int sample_x = uv_x + dx, sample_y = uv_y + dy;
+      const int texture_x = sample_x - left, texture_y = sample_y - top;
+      if (texture_x < 0 || texture_y < 0 || texture_x >= draw_width || texture_y >= draw_height ||
+          sample_x < 0 || sample_y < 0 || sample_x >= frame_width || sample_y >= frame_height ||
+          (clip_width > 0 && clip_height > 0 &&
+           (sample_x < clip_x || sample_y < clip_y || sample_x >= clip_x + clip_width || sample_y >= clip_y + clip_height))) continue;
+      const int tex_x = min(texture_width - 1, max(0, texture_x * texture_width / max(1, draw_width)));
+      const int tex_y = min(texture_height - 1, max(0, texture_y * texture_height / max(1, draw_height)));
+      const uchar4 texel = texture[tex_y * texture_width + tex_x];
+      const float texel_alpha = (texel.w / 255.0f) * opacity;
+      alpha_sum += texel_alpha;
+      u_sum += (128.0f - 0.148f * texel.x - 0.291f * texel.y + 0.439f * texel.z) * texel_alpha;
+      v_sum += (128.0f + 0.439f * texel.x - 0.368f * texel.y - 0.071f * texel.z) * texel_alpha;
+    }
+    if (alpha_sum > 0.0001f) {
+      const float cell_alpha = min(1.0f, alpha_sum * 0.25f);
+      const uchar2 prior_uv = surf2Dread<uchar2>(uv_surface, uv_x, uv_y / 2);
+      surf2Dwrite<uchar2>(make_uchar2((unsigned char)(prior_uv.x * (1.0f - cell_alpha) + u_sum * 0.25f),
+                                      (unsigned char)(prior_uv.y * (1.0f - cell_alpha) + v_sum * 0.25f)), uv_surface, uv_x, uv_y / 2);
+    }
   }
 }
 
@@ -113,12 +137,32 @@ __global__ static void blend_rgba_nv12_pitch(
   const float luma = 16.0f + 0.257f * source.x + 0.504f * source.y + 0.098f * source.z;
   unsigned char *y_ptr = y_plane + y * y_pitch + x;
   *y_ptr = (unsigned char)(*y_ptr * (1.0f - alpha) + luma * alpha);
-  if ((x & 1) == 0 && (y & 1) == 0) {
-    const float u = 128.0f - 0.148f * source.x - 0.291f * source.y + 0.439f * source.z;
-    const float v = 128.0f + 0.439f * source.x - 0.368f * source.y - 0.071f * source.z;
-    uchar2 *uv_ptr = (uchar2 *)(uv_plane + (y / 2) * uv_pitch + x);
-    *uv_ptr = make_uchar2((unsigned char)(uv_ptr->x * (1.0f - alpha) + u * alpha),
-                          (unsigned char)(uv_ptr->y * (1.0f - alpha) + v * alpha));
+  const int uv_x = x & ~1, uv_y = y & ~1;
+  const bool owns_uv_x = x == uv_x || px == 0;
+  const bool owns_uv_y = y == uv_y || py == 0;
+  if (owns_uv_x && owns_uv_y) {
+    float alpha_sum = 0.0f, u_sum = 0.0f, v_sum = 0.0f;
+    for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
+      const int sample_x = uv_x + dx, sample_y = uv_y + dy;
+      const int texture_x = sample_x - left, texture_y = sample_y - top;
+      if (texture_x < 0 || texture_y < 0 || texture_x >= draw_width || texture_y >= draw_height ||
+          sample_x < 0 || sample_y < 0 || sample_x >= frame_width || sample_y >= frame_height ||
+          (clip_width > 0 && clip_height > 0 &&
+           (sample_x < clip_x || sample_y < clip_y || sample_x >= clip_x + clip_width || sample_y >= clip_y + clip_height))) continue;
+      const int tex_x = min(texture_width - 1, max(0, texture_x * texture_width / max(1, draw_width)));
+      const int tex_y = min(texture_height - 1, max(0, texture_y * texture_height / max(1, draw_height)));
+      const uchar4 texel = texture[tex_y * texture_width + tex_x];
+      const float texel_alpha = (texel.w / 255.0f) * opacity;
+      alpha_sum += texel_alpha;
+      u_sum += (128.0f - 0.148f * texel.x - 0.291f * texel.y + 0.439f * texel.z) * texel_alpha;
+      v_sum += (128.0f + 0.439f * texel.x - 0.368f * texel.y - 0.071f * texel.z) * texel_alpha;
+    }
+    if (alpha_sum > 0.0001f) {
+      const float cell_alpha = min(1.0f, alpha_sum * 0.25f);
+      uchar2 *uv_ptr = (uchar2 *)(uv_plane + (uv_y / 2) * uv_pitch + uv_x);
+      *uv_ptr = make_uchar2((unsigned char)(uv_ptr->x * (1.0f - cell_alpha) + u_sum * 0.25f),
+                            (unsigned char)(uv_ptr->y * (1.0f - cell_alpha) + v_sum * 0.25f));
+    }
   }
 }
 

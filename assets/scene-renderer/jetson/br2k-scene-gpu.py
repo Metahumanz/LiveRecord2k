@@ -44,7 +44,11 @@ REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoc
 # nvivafilter is Jetson's supported CUDA callback bridge for NVMM allocated by
 # nvvidconv.  Do not insert the direct V4l2Memory-only test element here.
 CUDA_NVMM_REQUIRED_ELEMENTS = ['appsrc', 'nvvidconv', 'nvivafilter', 'nvv4l2h264enc', 'nvv4l2h265enc']
-CUDA_SCENE_CUSTOMER_LIBRARY = os.path.join(PRIVATE_GST_PLUGIN_DIR, 'libbr2k-scene-cuda-process.so')
+# A test-only override lets the Orin visual gate exercise a freshly compiled
+# CUDA customer library before it replaces the packaged production binary.
+CUDA_SCENE_CUSTOMER_LIBRARY = str(os.environ.get('BR2K_CUDA_SCENE_CUSTOMER_LIBRARY') or '').strip() or os.path.join(
+    PRIVATE_GST_PLUGIN_DIR, 'libbr2k-scene-cuda-process.so'
+)
 
 
 def fail(message):
@@ -157,25 +161,18 @@ class LibassTextRenderer:
         red, green, blue, alpha = rgba(value, 1)
         return '&H%02X%02X%02X%02X&' % (255 - alpha, blue, green, red)
 
-    def render(self, props, style, width, height):
-        family = str(props.get('fontFamily') or 'Noto Sans CJK SC').replace(',', ' ').strip() or 'Noto Sans CJK SC'
-        size = max(1, number(props.get('fontSize'), 20))
-        bold = -1 if number(props.get('fontWeight'), 400) >= 600 else 0
-        stroke = max(0, number(style.get('strokeWidth'), 0))
-        primary = self.ass_color(style.get('fill') or '#ffffff')
-        outline = self.ass_color(style.get('stroke') or '#000000')
-        content = str(props.get('assText') or self.escape(props.get('text')))
-        script = '''[Script Info]
-ScriptType: v4.00+
-PlayResX: %d
-PlayResY: %d
-[V4+ Styles]
-Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: SceneText,%s,%.4f,%s,&H00000000&,%s,&H00000000&,%d,0,0,0,100,100,0,0,1,%.4f,0,7,0,0,0,1
-[Events]
-Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(0,0)\\bord%.4f\\shad0}%s
-''' % (width, height, family, size, primary, outline, bold, stroke, stroke, content)
+    @staticmethod
+    def drawing_color(value, fallback='#ffffff'):
+        """Return the exact \1c/\1a form used by legacy ASS vector lines."""
+        match = __import__('re').match(r'^&H([0-9a-fA-F]{6}|[0-9a-fA-F]{8})&$', str(value or ''))
+        if match:
+            raw = match.group(1).upper()
+            if len(raw) == 8:
+                return r'\1c&H%s&\1a&H%s&' % (raw[2:], raw[:2])
+            return r'\1c&H%s&' % raw
+        return r'\1c%s&' % LibassTextRenderer.ass_color(value or fallback)
+
+    def render_script(self, script, width, height):
         encoded = script.encode('utf-8')
         track = self.lib.ass_read_memory(self.library, encoded, len(encoded), None)
         if not track:
@@ -202,6 +199,45 @@ Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(0,0)\\bord%.4f\\
             return output
         finally:
             self.lib.ass_free_track(track)
+
+    def render(self, props, style, width, height):
+        family = str(props.get('fontFamily') or 'Noto Sans CJK SC').replace(',', ' ').strip() or 'Noto Sans CJK SC'
+        size = max(1, number(props.get('fontSize'), 20))
+        bold = -1 if number(props.get('fontWeight'), 400) >= 600 else 0
+        stroke = max(0, number(style.get('strokeWidth'), 0))
+        primary = self.ass_color(style.get('fill') or '#ffffff')
+        outline = self.ass_color(style.get('stroke') or '#000000')
+        content = str(props.get('assText') or self.escape(props.get('text')))
+        script = '''[Script Info]
+ScriptType: v4.00+
+PlayResX: %d
+PlayResY: %d
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: SceneText,%s,%.4f,%s,&H00000000&,%s,&H00000000&,%d,0,0,0,100,100,0,0,1,%.4f,0,7,0,0,0,1
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(0,0)\\bord%.4f\\shad0}%s
+''' % (width, height, family, size, primary, outline, bold, stroke, stroke, content)
+        return self.render_script(script, width, height)
+
+    def render_drawings(self, drawings, width, height):
+        lines = [
+            '[Script Info]', 'ScriptType: v4.00+', 'PlayResX: %d' % width, 'PlayResY: %d' % height,
+            '[V4+ Styles]',
+            'Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding',
+            'Style: SceneShape,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1',
+            '[Events]', 'Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text'
+        ]
+        for drawing in drawings:
+            path = str(drawing.get('path') or '').strip()
+            if not path:
+                continue
+            layer = max(0, int(number(drawing.get('layer'), 0)))
+            x, y = number(drawing.get('x')), number(drawing.get('y'))
+            tags = r'{\an7\p1\pos(%s,%s)\bord0\shad0%s}' % (x, y, self.drawing_color(drawing.get('color')))
+            lines.append('Dialogue: %d,0:00:00.00,0:00:01.00,SceneShape,,0,0,0,,%s%s' % (layer, tags, path))
+        return self.render_script('\n'.join(lines) + '\n', width, height)
 
 
 try:
@@ -232,7 +268,11 @@ def draw_texture(entry, work_dir):
                                 fill=rgba(style.get('fill'), 1), stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
     elif kind == 'Avatar':
         vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
-        if isinstance(vector, dict):
+        drawings = props.get('assDrawings') if isinstance(props.get('assDrawings'), list) else None
+        if drawings and LIBASS_TEXT:
+            image = LIBASS_TEXT.render_drawings(drawings, width, height)
+            source = ''
+        elif isinstance(vector, dict):
             ring_inset = max(0, number(vector.get('ringInset'), 0))
             inner_size = max(1, width - ring_inset * 2)
             draw.ellipse((0, 0, width - 1, height - 1), fill=ass_rgba(vector.get('outer')))
@@ -260,8 +300,12 @@ def draw_texture(entry, work_dir):
             except Exception:
                 draw.ellipse((0, 0, width - 1, height - 1), fill=rgba(style.get('fill') or '#707070', 1))
     else:
-        radius = max(0, min(min(width, height) // 2, round(number(style.get('cornerRadius'), 0))))
-        draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=rgba(style.get('fill'), 1))
+        drawing = str(props.get('assDrawing') or '').strip()
+        if drawing and LIBASS_TEXT:
+            image = LIBASS_TEXT.render_drawings([{'path': drawing, 'color': props.get('assColor')}], width, height)
+        else:
+            radius = max(0, min(min(width, height) // 2, round(number(style.get('cornerRadius'), 0))))
+            draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=rgba(style.get('fill'), 1))
     shadow = style.get('shadow') if isinstance(style.get('shadow'), dict) else None
     if shadow and number(shadow.get('opacity'), 0) > 0:
         blur = max(0, number(shadow.get('blur'), 0))

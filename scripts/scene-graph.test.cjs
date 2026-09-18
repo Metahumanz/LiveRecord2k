@@ -299,6 +299,18 @@ test('a legacy style request is migrated to one-pass Scene Graph MP4 export', as
   }
 });
 
+test('legacy h5-card and bubble chat body retain the ASS bold semantic', () => {
+  for (const stylePreset of ['h5-card', 'bubble']) {
+    const graph = buildSceneGraph(
+      [{ type: 'danmaku', time: 0, uid: 1, user: '观众', text: '旧样式正文粗细基准' }],
+      { stylePreset, videoInfo: { width: 640, height: 360, fps: 60 }, durationSec: 2 }
+    );
+    const body = graph.objects.find((object) => object.type === 'Text' && String(object.props && object.props.text || '').includes('旧样式正文'));
+    assert.ok(body, `${stylePreset} 应包含旧 ASS 对应的正文节点`);
+    assert.equal(body.props.fontWeight, 700, `${stylePreset} 的正文必须与 ASS \\b1 一致`);
+  }
+});
+
 test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS video input', async (t) => {
   const sceneGraphFfmpegPath = await getSceneGraphFfmpegPath();
   if (!sceneGraphFfmpegPath) return t.skip('当前测试环境没有可实际执行 drawtext 的 FFmpeg');
