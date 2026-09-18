@@ -43,7 +43,9 @@ CAPABILITIES = ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', '
 REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoconvert', 'nvvidconv', 'nvv4l2h264enc', 'nvv4l2h265enc']
 # nvivafilter is Jetson's supported CUDA callback bridge for NVMM allocated by
 # nvvidconv.  Do not insert the direct V4l2Memory-only test element here.
-CUDA_NVMM_REQUIRED_ELEMENTS = ['appsrc', 'nvvidconv', 'nvivafilter', 'nvv4l2h264enc', 'nvv4l2h265enc']
+CUDA_NVMM_REQUIRED_ELEMENTS = [
+    'appsrc', 'videotestsrc', 'concat', 'queue', 'nvvidconv', 'nvivafilter', 'nvv4l2h264enc', 'nvv4l2h265enc'
+]
 # A test-only override lets the Orin visual gate exercise a freshly compiled
 # CUDA customer library before it replaces the packaged production binary.
 CUDA_SCENE_CUSTOMER_LIBRARY = str(os.environ.get('BR2K_CUDA_SCENE_CUSTOMER_LIBRARY') or '').strip() or os.path.join(
@@ -715,12 +717,27 @@ def render_native_nvmm(request):
     encoder = 'nvv4l2h265enc' if ('hevc' in str(output.get('codec') or '') or 'h265' in str(output.get('codec') or '')) else 'nvv4l2h264enc'
     parser_out = 'h265parse' if encoder == 'nvv4l2h265enc' else 'h264parse'
     start, duration = max(0, number(source.get('startTime'), 0)), max(0.001, number(source.get('duration'), 0.001))
+    # `timelineOffsetSec` is the exact leading-video gap used by the canonical
+    # Scene Graph path. It must be physical media here, not just a shift of
+    # the CUDA texture timeline: the final audio mux starts at t=0 too.
+    # Convert the already frame-aligned request value into a finite number of
+    # black NVMM frames so the elementary H26x stream begins at PTS zero and
+    # its first source frame begins at the same clock as the original audio.
+    leading_video_sec = min(duration, max(0, number(request.get('timelineOffsetSec'), 0)))
+    leading_video_frames = max(0, int(round(leading_video_sec * fps)))
+    # A video stream can only represent the lead in whole frames. Make CUDA's
+    # texture timeline use that exact materialized duration too; otherwise a
+    # 1.019-second request at 30 fps would draw UI about 14 ms before the
+    # first non-black video frame.
+    materialized_lead_sec = leading_video_frames / fps if leading_video_frames else 0
     def launch_quote(value):
         return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
     work_dir = tempfile.mkdtemp(prefix='br2k-native-nvmm-')
     pipeline = None
     try:
-        timeline = prepare_cuda_timeline(request, work_dir)
+        timeline_request = dict(request)
+        timeline_request['timelineOffsetSec'] = materialized_lead_sec
+        timeline = prepare_cuda_timeline(timeline_request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
         os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
         # Let GStreamer's delayed-link machinery bind qtdemux.video_0 before
@@ -732,13 +749,31 @@ def render_native_nvmm(request):
         # rational rate; constraining it to a decimal approximation makes the
         # demux pad fail with "not-linked" before CUDA receives a frame.
         caps = 'video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d' % (width, height)
-        launch = (
+        source_branch = (
             'filesrc name=source location=%s ! qtdemux name=demux demux.video_0 ! %s name=parser ! '
-            'nvv4l2decoder name=decoder ! nvvidconv name=nvmm-rewrap ! %s ! '
+            'nvv4l2decoder name=decoder ! nvvidconv name=nvmm-rewrap ! %s'
+        ) % (launch_quote(input_path), parser_factory, caps)
+        encoder_branch = (
             'nvivafilter name=cuda-scene cuda-process=true customer-lib-name=%s ! %s ! '
             '%s name=encode bitrate=%d ! %s name=parse ! filesink name=output async=false location=%s'
-        ) % (launch_quote(input_path), parser_factory, caps, launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps,
-             encoder, max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, launch_quote(output['path']))
+        ) % (launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps, encoder,
+             max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, launch_quote(output['path']))
+        if leading_video_frames:
+            # concat adjusts the source branch's segment base after the finite
+            # black branch. Both inputs are NVMM/NV12 before nvivafilter, so
+            # neither black frames nor decoded video are mapped through CPU.
+            # This is intentionally one pipeline: appending a separate H26x
+            # black stream would discard its timestamp continuity at remux.
+            native_nvmm_trace('insert NVMM black lead frames=%d seconds=%.6f' % (leading_video_frames, leading_video_sec))
+            launch = (
+                'concat name=timeline_lead adjust-base=true ! queue ! %s '
+                'videotestsrc name=black-lead pattern=black num-buffers=%d ! '
+                'video/x-raw,format=I420,width=%d,height=%d,framerate=%s ! nvvidconv ! %s ! queue ! timeline_lead. '
+                '%s ! queue ! timeline_lead.'
+            ) % (encoder_branch, leading_video_frames, width, height, fps_caps(fps), caps, source_branch)
+        else:
+            launch = source_branch + ' ! ' + encoder_branch
+        native_nvmm_trace('pipeline=' + launch)
         try:
             pipeline = Gst.parse_launch(launch)
         except GLib.Error as error:

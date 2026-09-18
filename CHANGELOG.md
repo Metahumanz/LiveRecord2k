@@ -1,5 +1,10 @@
 # 更新日志
 
+## 0.8.1 - 2026-09-18
+
+- 修复 Jetson 原生 NVMM CUDA Scene 在源录像有 0 秒或 1.019 秒视频前导时，仅平移图元却未生成真实黑帧的问题。现由同一条 `NVDEC → CUDA Scene（NVMM）→ NVENC` 管线生成有限黑场并与解码视频连续拼接，最终回封后音频、视频均从 PTS 0 开始，不再把视频内容提前到原始音频之前。
+- 新增 AGX Orin 实机 PTS 回归：使用 `nvv4l2decoder → CUDA Scene（NVMM）→ nvv4l2h265enc` 验证黑场前导、视频/音频起始 PTS 与抽帧黑色结果；CUDA 图元时间轴也按实际落地的整帧前导对齐。
+
 ## 0.8.0 - 2026-09-18
 
 - Jetson CUDA Scene 生产链完成原生 NVMM 准入：硬解使用 GStreamer `nvv4l2decoder`，完整链路可直接走 `NVDEC → CUDA Scene（NVMM）→ nvv4l2h264enc/h265enc`；仅在真实双编码自检或运行失败时，才回退至 I420 bridge 或 CPU Scene 兼容链。长录像保留 20 秒媒体时间分段，不再由 wall-clock 截断，并正确处理 59.94 等非整数帧率。
