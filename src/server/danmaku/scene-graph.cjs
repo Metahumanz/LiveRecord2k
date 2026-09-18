@@ -256,7 +256,12 @@ function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, wei
 
 function legacyRichText(graph, id, segment, x, y, assText, fontSize, color, zIndex) {
   const appearance = legacyAssColor(color);
-  const visible = String(assText || '').replace(/\\b[01]/g, '').replace(/\\N/g, '\n');
+  const raw = String(assText || '');
+  const visible = raw.replace(/\\b[01]/g, '').replace(/\\N/g, '\n');
+  // Rich-text callers use compact weight transitions. libass recognises
+  // them only inside override blocks; ordinary dialogue text would render
+  // the sequence visibly in both the CPU oracle and CUDA text texture.
+  const libassText = raw.replace(/\\b([01])/g, '{\\b$1}');
   const lines = visible.split('\n');
   const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
   graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {
@@ -265,7 +270,7 @@ function legacyRichText(graph, id, segment, x, y, assText, fontSize, color, zInd
     animations: legacySegmentAnimations(segment, x, y),
     props: {
       text: visible,
-      assText: String(assText || ''),
+      assText: libassText,
       fontFamily: process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei',
       fontSize,
       fontWeight: 400,
