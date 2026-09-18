@@ -664,106 +664,75 @@ def render_native_nvmm(request):
     parser_factory = 'h265parse' if codec in ('hevc', 'h265') else 'h264parse'
     encoder = 'nvv4l2h265enc' if ('hevc' in str(output.get('codec') or '') or 'h265' in str(output.get('codec') or '')) else 'nvv4l2h264enc'
     parser_out = 'h265parse' if encoder == 'nvv4l2h265enc' else 'h264parse'
+    start, duration = max(0, number(source.get('startTime'), 0)), max(0.001, number(source.get('duration'), 0.001))
+    def launch_quote(value):
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
     work_dir = tempfile.mkdtemp(prefix='br2k-native-nvmm-')
+    pipeline = None
     try:
         timeline = prepare_cuda_timeline(request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
         os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
-        pipeline = Gst.Pipeline.new('br2k-native-nvmm-scene')
-        filesrc, demux = make_element('filesrc', 'source'), make_element('qtdemux', 'demux')
-        parser, decoder = make_element(parser_factory, 'parser'), make_element('nvv4l2decoder', 'decoder')
-        # nvivafilter consumes an EGL-backed NVMM allocation. NVDEC's direct
-        # surface is not transformable by nvivafilter on JetPack 6.2, whereas
-        # nvvidconv re-wraps it entirely in NVMM (no I420/system-memory hop).
-        convert = make_element('nvvidconv', 'nvmm-rewrap')
-        composite = make_element('nvivafilter', 'cuda-scene')
-        composite.set_property('cuda-process', True); composite.set_property('customer-lib-name', CUDA_SCENE_CUSTOMER_LIBRARY)
-        nv_caps = make_element('capsfilter', 'nvmm-before-cuda')
-        nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
-        out_caps = make_element('capsfilter', 'nvmm-after-cuda')
-        out_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
-        encode, parse, sink = make_element(encoder, 'encode'), make_element(parser_out, 'parse'), make_element('filesink', 'output')
-        # qtdemux stops its streaming task with NOT_LINKED when an audio track
-        # is exposed but has no consumer.  Drain it explicitly so that a
-        # leading audio pad cannot prevent the subsequent video pad from being
-        # announced and connected to NVDEC.
-        discard_audio = make_element('fakesink', 'discard-audio')
-        discard_audio.set_property('sync', False)
-        filesrc.set_property('location', input_path); sink.set_property('location', str(output['path']))
-        encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
-        for element in [filesrc, demux, parser, decoder, convert, nv_caps, composite, out_caps, encode, parse, sink, discard_audio]: pipeline.add(element)
-        # This is the same EGL-backed NVMM contract as the proven I420 CUDA
-        # route, with NVDEC replacing only the appsrc/I420 upload. Both caps
-        # filters stay in NVMM; they are allocation boundaries, not copies.
-        if not filesrc.link(demux) or not link_many(parser, decoder, convert, nv_caps, composite, out_caps, encode, parse, sink): fail('无法连接 NVDEC → CUDA Scene → NVENC。')
-        linked = {'value': False, 'detail': '等待 qtdemux 视频 pad', 'seen': []}
-        def on_pad_added(_demux, pad):
-            # qtmux commonly announces its audio pad first.  More
-            # importantly, qtdemux can emit pad-added before current caps are
-            # available; do not try to link that transient pad, because a
-            # failed link stops the demux task with NOT_LINKED before its
-            # video pad is announced.
-            # nvv4l2decoder is slow to advertise allocation caps during the
-            # first state transition. qtdemux still knows the stream caps on
-            # its pad template, so query them when current caps have not been
-            # fixed yet instead of dropping the one and only pad-added signal.
-            current_caps = pad.get_current_caps() or pad.query_caps(None)
-            pad_name = pad.get_name()
-            if linked['value']:
-                return
-            caps_name = current_caps.get_structure(0).get_name() if current_caps and current_caps.get_size() else 'unknown'
-            linked['seen'].append('%s=%s' % (pad_name, caps_name))
-            is_video = caps_name.startswith('video/') or pad_name.startswith('video_')
-            if not is_video:
-                if not discard_audio.get_static_pad('sink').is_linked():
-                    result = pad.link(discard_audio.get_static_pad('sink'))
-                    linked['detail'] = '丢弃 %s：%s' % (caps_name, result.value_nick)
-                return
-            if parser.get_static_pad('sink').is_linked():
-                linked['detail'] = '视频 parser 已连接：' + caps_name
-                return
-            # The decoder branch has not reached its final NVMM allocation
-            # caps at qtdemux's pad-added time.  Normal pad.link() rejects
-            # that transient state as NOFORMAT even though the exact
-            # qtdemux ! h26xparse pipeline negotiates correctly afterwards.
-            # Keep hierarchy checks, but defer caps compatibility to normal
-            # GStreamer negotiation once the pipeline is PLAYING.
-            result = pad.link_full(parser.get_static_pad('sink'), Gst.PadLinkCheck.HIERARCHY)
-            linked['seen'].append('%s 链接 parser=%s' % (pad_name, result.value_nick))
-            linked['detail'] = '链接 %s：%s' % (caps_name, result.value_nick)
-            if result == Gst.PadLinkReturn.OK:
-                linked['value'] = True
-        demux.connect('pad-added', on_pad_added)
-        # nvivafilter needs PLAYING (rather than a PAUSED preroll) before it
-        # allocates its CUDA/EGL output surface. The downstream PTS probe
-        # supplies the media-time end condition after the dynamic video pad
-        # has linked.
-        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动原生 NVMM 管线。')
+        # Let GStreamer's delayed-link machinery bind qtdemux.video_0 before
+        # streaming begins. This is the same graph syntax that succeeds under
+        # gst-launch; hand-written pad-added linkage could admit one frame and
+        # then stall the decoder on JetPack 6.2.
+        caps = 'video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))
+        launch = (
+            'filesrc name=source location=%s ! qtdemux name=demux demux.video_0 ! %s name=parser ! '
+            'nvv4l2decoder name=decoder ! nvvidconv name=nvmm-rewrap ! %s ! '
+            'nvivafilter name=cuda-scene cuda-process=true customer-lib-name=%s ! %s ! '
+            '%s name=encode bitrate=%d ! %s name=parse ! filesink name=output async=false location=%s'
+        ) % (launch_quote(input_path), parser_factory, caps, launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps,
+             encoder, max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, launch_quote(output['path']))
+        try:
+            pipeline = Gst.parse_launch(launch)
+        except GLib.Error as error:
+            fail('无法组装 NVDEC → CUDA Scene → NVENC：' + str(error))
+        decoder = pipeline.get_by_name('decoder')
+        composite = pipeline.get_by_name('cuda-scene')
+        encode = pipeline.get_by_name('encode')
+        if not decoder or not composite or not encode:
+            fail('原生 NVMM 管线缺少必需元件。')
+        # For a non-zero chunk, hold the first Scene buffer long enough for
+        # qtdemux to become seekable. Seeking the fully running NVENC graph
+        # races the encoder; seeking while PAUSED never prerolls nvivafilter
+        # on JetPack. A downstream block gives the demux a real segment while
+        # preventing pre-seek media from reaching the output.
+        startup_gate = {'reached': False}
+        startup_pad = composite.get_static_pad('src')
+        startup_probe = None
+        if start > 0.0001:
+            def hold_first_scene_buffer(_pad, _info):
+                startup_gate['reached'] = True
+                native_nvmm_trace('startup scene buffer held for seek')
+                return Gst.PadProbeReturn.OK
+            startup_probe = startup_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, hold_first_scene_buffer)
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            fail('无法启动原生 NVMM 管线。')
         native_nvmm_trace('pipeline PLAYING')
-        start, duration = max(0, number(source.get('startTime'), 0)), max(0.001, number(source.get('duration'), 0.001))
-        deadline = GLib.get_monotonic_time() + 8 * GLib.USEC_PER_SEC
-        context = GLib.MainContext.default()
-        while not linked['value'] and GLib.get_monotonic_time() < deadline:
-            while context.pending():
-                context.iteration(False)
-            pipeline.get_state(100 * Gst.MSECOND)
-        if not linked['value']:
-            seen = '，'.join(linked['seen']) or '无 pad-added 事件'
-            fail('原生 NVMM 管线没有可用视频流：' + linked['detail'] + '；已见 ' + seen)
-        native_nvmm_trace('video linked: ' + linked['detail'])
         # A wall-clock timer cuts a fast NVMM pipeline short.  JetPack's
         # nvivafilter does not accept a pipeline-wide stop segment on every
         # release, so seek the media start and use the CUDA Scene output PTS
         # to inject EOS at the requested end instead.
-        stop = start + duration
-        if start > 0.0001 and not pipeline.seek_simple(
-                Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
-                int(start * Gst.SECOND)):
-            fail('原生 NVMM 无法定位到分段起点。')
+        if start > 0.0001:
+            deadline = GLib.get_monotonic_time() + 5 * GLib.USEC_PER_SEC
+            while not startup_gate['reached'] and GLib.get_monotonic_time() < deadline:
+                message = pipeline.get_bus().timed_pop_filtered(10 * Gst.MSECOND, Gst.MessageType.ERROR)
+                if message:
+                    error, debug = message.parse_error()
+                    fail('原生 NVMM 分段定位预热失败：' + str(error) + ('；' + str(debug) if debug else ''))
+            if not startup_gate['reached']:
+                fail('原生 NVMM 分段定位预热超时。')
+            if not pipeline.seek_simple(
+                    Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
+                    int(start * Gst.SECOND)):
+                fail('原生 NVMM 无法定位到分段起点。')
+            startup_pad.remove_probe(startup_probe)
         counters = {'decode': 0, 'scene': 0, 'encode': 0}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
-        target_pts = int(stop * Gst.SECOND)
+        scene_first_pts = {'value': None}
         def count_buffer(_pad, info, key):
             buffer = info.get_buffer()
             if not buffer:
@@ -774,12 +743,20 @@ def render_native_nvmm(request):
             # reaches the requested media PTS. It is deliberately not a
             # GLib timeout: a 4x realtime pipeline still emits exactly the
             # same 20 seconds of media as a realtime one.
-            if key == 'scene' and buffer.pts != Gst.CLOCK_TIME_NONE and buffer.pts >= target_pts:
-                if not eos_at_target['sent']:
-                    eos_at_target['sent'] = True
-                    native_nvmm_trace('send EOS at scene pts=' + str(buffer.pts))
-                    pipeline.send_event(Gst.Event.new_eos())
-                return Gst.PadProbeReturn.DROP
+            if key == 'scene' and buffer.pts != Gst.CLOCK_TIME_NONE:
+                # Container tracks need not begin at PTS 0 (the HEVC fixture
+                # begins at 66.7ms). Anchor the finite chunk at the first
+                # output scene PTS, rather than an assumed absolute zero, so
+                # every chunk contains its requested media duration.
+                if scene_first_pts['value'] is None:
+                    scene_first_pts['value'] = buffer.pts
+                target_pts = scene_first_pts['value'] + int(duration * Gst.SECOND)
+                if buffer.pts >= target_pts:
+                    if not eos_at_target['sent']:
+                        eos_at_target['sent'] = True
+                        native_nvmm_trace('send EOS at scene pts=' + str(buffer.pts))
+                        pipeline.send_event(Gst.Event.new_eos())
+                    return Gst.PadProbeReturn.DROP
             counters[key] += 1
             if key == 'encode' and buffer.pts != Gst.CLOCK_TIME_NONE:
                 if encoded_pts['first'] is None:
@@ -827,6 +804,8 @@ def render_native_nvmm(request):
             'encode': total, 'total': total
         }
     finally:
+        if pipeline:
+            pipeline.set_state(Gst.State.NULL)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
