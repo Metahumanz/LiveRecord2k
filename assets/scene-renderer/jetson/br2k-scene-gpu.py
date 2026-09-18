@@ -9,6 +9,7 @@ for final audio muxing.
 """
 
 import argparse
+import ctypes
 import io
 import json
 import math
@@ -17,7 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
+from fractions import Fraction
 
 # Private GPU plugins are packaged outside the system GStreamer directory so
 # an application update never mutates JetPack's files.
@@ -58,6 +59,11 @@ def number(value, default=0.0):
         return default
 
 
+def fps_caps(value):
+    fraction = Fraction(max(1.0, number(value, 30))).limit_denominator(1001)
+    return '%d/%d' % (fraction.numerator, fraction.denominator)
+
+
 def rgba(value, opacity=1.0):
     text = str(value or '#ffffff').lstrip('#')
     if len(text) != 6 or any(char not in '0123456789abcdefABCDEF' for char in text):
@@ -66,21 +72,138 @@ def rgba(value, opacity=1.0):
     return tuple(int(text[offset:offset + 2], 16) for offset in (0, 2, 4)) + (alpha,)
 
 
+def ass_rgba(value):
+    match = __import__('re').match(r'^&H([0-9a-fA-F]{8})&$', str(value or ''))
+    if not match:
+        return rgba(value, 1)
+    raw = match.group(1)
+    return (int(raw[6:8], 16), int(raw[4:6], 16), int(raw[2:4], 16), 255 - int(raw[0:2], 16))
+
+
 def font_for(props, size):
     family = str(props.get('fontFamily') or 'sans-serif').replace('\n', ' ').replace('\r', ' ').strip() or 'sans-serif'
-    path = ''
+    # Fontconfig resolves both the CJK face within a TTC and its weight.  PIL
+    # otherwise silently loads face 0 (Japanese for NotoSansCJK) and regular
+    # weight for every node, which visibly diverges from libass on Chinese
+    # glyphs, usernames and price pills.
+    weight = number(props.get('fontWeight'), 400)
+    pattern = family + (':style=Bold' if weight >= 600 else ':style=Regular')
+    path, face_index = '', 0
     try:
-        result = subprocess.run(['fc-match', '-f', '%{file}', family], capture_output=True, text=True, timeout=3, check=False)
-        path = result.stdout.strip()
+        result = subprocess.run(['fc-match', '-f', '%{file}\t%{index}', pattern], capture_output=True, text=True, timeout=3, check=False)
+        fields = result.stdout.strip().split('\t', 1)
+        path = fields[0]
+        face_index = int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else 0
     except Exception:
         pass
-    for candidate in [path, '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf']:
+    fallback = '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc' if weight >= 600 else '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
+    for candidate, index in [(path, face_index), (fallback, 2), ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 0)]:
         try:
             if candidate and os.path.isfile(candidate):
-                return ImageFont.truetype(candidate, max(1, round(size)))
+                return ImageFont.truetype(candidate, max(1, round(size)), index=index)
         except Exception:
             pass
     return ImageFont.load_default()
+
+
+class AssImage(ctypes.Structure):
+    pass
+
+
+AssImage._fields_ = [
+    ('w', ctypes.c_int), ('h', ctypes.c_int), ('stride', ctypes.c_int), ('bitmap', ctypes.POINTER(ctypes.c_ubyte)),
+    ('color', ctypes.c_uint32), ('dst_x', ctypes.c_int), ('dst_y', ctypes.c_int), ('next', ctypes.POINTER(AssImage)),
+    ('type', ctypes.c_int)
+]
+
+
+class LibassTextRenderer:
+    """Render text through the same libass rasterizer as the frozen oracle.
+
+    CUDA only receives the resulting immutable RGBA glyph texture and still
+    performs every per-frame blend/animation.  This avoids Pillow selecting a
+    different TTC face or using different CJK hinting from ASS.
+    """
+    def __init__(self):
+        self.lib = ctypes.CDLL('libass.so.9')
+        self.lib.ass_library_init.restype = ctypes.c_void_p
+        self.lib.ass_renderer_init.argtypes = [ctypes.c_void_p]
+        self.lib.ass_renderer_init.restype = ctypes.c_void_p
+        self.lib.ass_set_frame_size.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self.lib.ass_set_fonts.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        self.lib.ass_read_memory.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
+        self.lib.ass_read_memory.restype = ctypes.c_void_p
+        self.lib.ass_render_frame.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong, ctypes.POINTER(ctypes.c_int)]
+        self.lib.ass_render_frame.restype = ctypes.POINTER(AssImage)
+        self.lib.ass_free_track.argtypes = [ctypes.c_void_p]
+        self.library = self.lib.ass_library_init()
+        self.renderer = self.lib.ass_renderer_init(self.library)
+        if not self.library or not self.renderer:
+            fail('无法初始化 libass 文字栅格器。')
+        self.lib.ass_set_fonts(self.renderer, None, b'Noto Sans CJK SC', 1, None, 1)
+
+    @staticmethod
+    def escape(value):
+        return str(value or '').replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}').replace('\n', '\\N')
+
+    @staticmethod
+    def ass_color(value):
+        red, green, blue, alpha = rgba(value, 1)
+        return '&H%02X%02X%02X%02X&' % (255 - alpha, blue, green, red)
+
+    def render(self, props, style, width, height):
+        family = str(props.get('fontFamily') or 'Noto Sans CJK SC').replace(',', ' ').strip() or 'Noto Sans CJK SC'
+        size = max(1, number(props.get('fontSize'), 20))
+        bold = -1 if number(props.get('fontWeight'), 400) >= 600 else 0
+        stroke = max(0, number(style.get('strokeWidth'), 0))
+        primary = self.ass_color(style.get('fill') or '#ffffff')
+        outline = self.ass_color(style.get('stroke') or '#000000')
+        content = str(props.get('assText') or self.escape(props.get('text')))
+        script = '''[Script Info]
+ScriptType: v4.00+
+PlayResX: %d
+PlayResY: %d
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: SceneText,%s,%.4f,%s,&H00000000&,%s,&H00000000&,%d,0,0,0,100,100,0,0,1,%.4f,0,7,0,0,0,1
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(0,0)\\bord%.4f\\shad0}%s
+''' % (width, height, family, size, primary, outline, bold, stroke, stroke, content)
+        encoded = script.encode('utf-8')
+        track = self.lib.ass_read_memory(self.library, encoded, len(encoded), None)
+        if not track:
+            fail('libass 无法读取文字纹理脚本。')
+        try:
+            self.lib.ass_set_frame_size(self.renderer, width, height)
+            changed = ctypes.c_int(0)
+            image_ptr = self.lib.ass_render_frame(self.renderer, track, 0, ctypes.byref(changed))
+            output = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+            while image_ptr:
+                item = image_ptr.contents
+                if item.w > 0 and item.h > 0 and item.bitmap:
+                    raw = ctypes.string_at(item.bitmap, item.stride * item.h)
+                    coverage = Image.frombytes('L', (item.w, item.h), raw, 'raw', 'L', item.stride, 1)
+                    color = item.color
+                    red, green, blue = (color >> 24) & 255, (color >> 16) & 255, (color >> 8) & 255
+                    transparency = color & 255
+                    if transparency:
+                        coverage = coverage.point(lambda value: value * (255 - transparency) // 255)
+                    glyph = Image.new('RGBA', (item.w, item.h), (red, green, blue, 0))
+                    glyph.putalpha(coverage)
+                    output.alpha_composite(glyph, (item.dst_x, item.dst_y))
+                image_ptr = item.next
+            return output
+        finally:
+            self.lib.ass_free_track(track)
+
+
+try:
+    LIBASS_TEXT = LibassTextRenderer()
+except Exception:
+    # Keep the helper usable on a deliberately minimal recovery image.  The
+    # runtime probe/conformance gate will keep this fallback out of production.
+    LIBASS_TEXT = None
 
 
 def draw_texture(entry, work_dir):
@@ -94,31 +217,50 @@ def draw_texture(entry, work_dir):
     kind = str(entry.get('type') or '')
     if kind == 'Text':
         font_size = max(1, number(props.get('fontSize'), 20))
-        font = font_for(props, font_size)
         stroke = max(0, round(number(style.get('strokeWidth'), 0)))
-        draw.multiline_text((0, 0), str(props.get('text') or ''), font=font, fill=rgba(style.get('fill'), 1),
-                            stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
+        if LIBASS_TEXT:
+            image = LIBASS_TEXT.render(props, style, width, height)
+        else:
+            font = font_for(props, font_size)
+            draw.multiline_text((0, 0), str(props.get('text') or ''), font=font,
+                                fill=rgba(style.get('fill'), 1), stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
     elif kind == 'Avatar':
-        source = str((entry.get('asset') or {}).get('path') or '')
-        try:
-            avatar = Image.open(source).convert('RGBA')
-            edge = min(avatar.width, avatar.height)
-            avatar = avatar.crop(((avatar.width - edge) // 2, (avatar.height - edge) // 2,
-                                  (avatar.width + edge) // 2, (avatar.height + edge) // 2)).resize((width, height), Image.Resampling.LANCZOS)
-            mask = Image.new('L', (width, height), 0)
-            ImageDraw.Draw(mask).ellipse((0, 0, width - 1, height - 1), fill=255)
-            image.alpha_composite(avatar)
-            image.putalpha(mask)
-        except Exception:
-            draw.ellipse((0, 0, width - 1, height - 1), fill=rgba(style.get('fill') or '#707070', style.get('opacity', 1)))
+        vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
+        if isinstance(vector, dict):
+            ring_inset = max(0, number(vector.get('ringInset'), 0))
+            inner_size = max(1, width - ring_inset * 2)
+            draw.ellipse((0, 0, width - 1, height - 1), fill=ass_rgba(vector.get('outer')))
+            draw.ellipse((ring_inset, ring_inset, ring_inset + inner_size - 1, ring_inset + inner_size - 1), fill=ass_rgba(vector.get('inner')))
+            head_size = max(1, number(vector.get('headSize'), width * 0.29))
+            head_x, head_y = (width - head_size) / 2, height * 0.21
+            draw.ellipse((head_x, head_y, head_x + head_size - 1, head_y + head_size - 1), fill=ass_rgba(vector.get('softWhite')))
+            shoulders_width = max(1, number(vector.get('shouldersWidth'), width * 0.64))
+            shoulders_height = max(1, number(vector.get('shouldersHeight'), height * 0.3))
+            shoulders_x, shoulders_y = (width - shoulders_width) / 2, height * 0.58
+            draw.rounded_rectangle((shoulders_x, shoulders_y, shoulders_x + shoulders_width - 1, shoulders_y + shoulders_height - 1), radius=shoulders_height / 2, fill=ass_rgba(vector.get('softWhite')))
+            source = ''
+        else:
+            source = str((entry.get('asset') or {}).get('path') or '')
+        if not vector:
+            try:
+                avatar = Image.open(source).convert('RGBA')
+                edge = min(avatar.width, avatar.height)
+                avatar = avatar.crop(((avatar.width - edge) // 2, (avatar.height - edge) // 2,
+                                      (avatar.width + edge) // 2, (avatar.height + edge) // 2)).resize((width, height), Image.Resampling.LANCZOS)
+                mask = Image.new('L', (width, height), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, width - 1, height - 1), fill=255)
+                image.alpha_composite(avatar)
+                image.putalpha(mask)
+            except Exception:
+                draw.ellipse((0, 0, width - 1, height - 1), fill=rgba(style.get('fill') or '#707070', 1))
     else:
         radius = max(0, min(min(width, height) // 2, round(number(style.get('cornerRadius'), 0))))
-        draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=rgba(style.get('fill'), style.get('opacity', 1)))
+        draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=rgba(style.get('fill'), 1))
     shadow = style.get('shadow') if isinstance(style.get('shadow'), dict) else None
     if shadow and number(shadow.get('opacity'), 0) > 0:
         blur = max(0, number(shadow.get('blur'), 0))
         alpha = image.getchannel('A').filter(ImageFilter.GaussianBlur(blur))
-        shadow_image = Image.new('RGBA', image.size, rgba(shadow.get('color') or '#000000', shadow.get('opacity', 0)))
+        shadow_image = Image.new('RGBA', image.size, rgba(shadow.get('color') or '#000000', 1))
         shadow_image.putalpha(alpha.point(lambda value: int(value * number(shadow.get('opacity'), 0))))
         image = Image.alpha_composite(shadow_image, image)
     target = os.path.join(work_dir, 'scene-' + str(entry.get('id') or 'object').replace('/', '_') + '.png')
@@ -178,6 +320,7 @@ def prepare_cuda_timeline(request, work_dir):
     rows = []
     timeline_offset = max(0, number(request.get('timelineOffsetSec'), 0))
     for entry in sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex'))):
+        style = entry.get('style') or {}
         png, texture_width, texture_height = draw_texture(entry, work_dir)
         raw_path = os.path.splitext(png)[0] + '.rgba'
         Image.open(png).convert('RGBA').tobytes()
@@ -192,8 +335,12 @@ def prepare_cuda_timeline(request, work_dir):
         for left, right in zip(ordered, ordered[1:]):
             initial = scene_state(entry, left, texture_width, texture_height)
             final = scene_state(entry, right, texture_width, texture_height)
+            clip = style.get('clip') if isinstance(style.get('clip'), dict) else {}
+            clip_width = number(clip.get('width'), -1)
+            clip_height = number(clip.get('height'), -1)
             rows.append([left + timeline_offset, right + timeline_offset, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
-                         final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height])
+                         final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height,
+                         number(clip.get('x'), 0), number(clip.get('y'), 0), clip_width, clip_height])
     manifest = os.path.join(work_dir, 'scene-cuda.timeline.tsv')
     with open(manifest, 'w', encoding='utf-8') as handle:
         for row in rows:
@@ -522,7 +669,7 @@ def render_native_nvmm(request):
         composite = make_element('nvivafilter', 'cuda-scene')
         composite.set_property('cuda-process', True); composite.set_property('customer-lib-name', CUDA_SCENE_CUSTOMER_LIBRARY)
         caps = make_element('capsfilter', 'nvmm')
-        caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+        caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
         encode, parse, sink = make_element(encoder, 'encode'), make_element(parser_out, 'parse'), make_element('filesink', 'output')
         filesrc.set_property('location', input_path); sink.set_property('location', str(output['path']))
         encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
@@ -538,9 +685,32 @@ def render_native_nvmm(request):
         deadline = GLib.get_monotonic_time() + 8 * GLib.USEC_PER_SEC
         while not linked['value'] and GLib.get_monotonic_time() < deadline: pipeline.get_state(100 * Gst.MSECOND)
         if not linked['value']: fail('原生 NVMM 管线没有可用视频流。')
-        if start > 0.0001 and not pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(start * Gst.SECOND)): fail('原生 NVMM seek 失败。')
-        eos_timer = threading.Timer(duration, lambda: pipeline.send_event(Gst.Event.new_eos()))
-        eos_timer.daemon = True; eos_timer.start()
+        # A wall-clock timer cuts a fast NVMM pipeline short.  A bounded
+        # TIME segment instead makes EOS depend on media PTS, irrespective of
+        # how many times faster than realtime the encoder happens to run.
+        stop = start + duration
+        if not pipeline.seek(1.0, Gst.Format.TIME,
+                             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
+                             Gst.SeekType.SET, int(start * Gst.SECOND), Gst.SeekType.SET, int(stop * Gst.SECOND)):
+            fail('原生 NVMM segment seek 失败。')
+        counters = {'decode': 0, 'scene': 0, 'encode': 0}
+        encoded_pts = {'first': None, 'end': None}
+        def count_buffer(_pad, info, key):
+            buffer = info.get_buffer()
+            if not buffer:
+                return Gst.PadProbeReturn.OK
+            counters[key] += 1
+            if key == 'encode' and buffer.pts != Gst.CLOCK_TIME_NONE:
+                if encoded_pts['first'] is None:
+                    encoded_pts['first'] = buffer.pts
+                end = buffer.pts
+                if buffer.duration != Gst.CLOCK_TIME_NONE:
+                    end += buffer.duration
+                encoded_pts['end'] = max(encoded_pts['end'] or end, end)
+            return Gst.PadProbeReturn.OK
+        for name, element in [('decode', decoder), ('scene', composite), ('encode', encode)]:
+            element.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, count_buffer, name)
+        wall_started = GLib.get_monotonic_time()
         bus = pipeline.get_bus()
         try:
             while True:
@@ -548,7 +718,23 @@ def render_native_nvmm(request):
                 if message.type == Gst.MessageType.EOS: break
                 error, debug = message.parse_error(); fail('原生 NVMM：' + str(error) + ('；' + str(debug) if debug else ''))
         finally:
-            eos_timer.cancel(); pipeline.set_state(Gst.State.NULL)
+            pipeline.set_state(Gst.State.NULL)
+        wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
+        measured_media_seconds = 0.0
+        if encoded_pts['first'] is not None and encoded_pts['end'] is not None:
+            measured_media_seconds = max(0.0, (encoded_pts['end'] - encoded_pts['first']) / Gst.SECOND)
+        # Some JetPack parser/encoder combinations do not retain a duration on
+        # the final access unit.  Frame count at the negotiated rational fps
+        # is still media time, never wall time.
+        if measured_media_seconds <= 0:
+            measured_media_seconds = counters['encode'] * Fraction(fps_caps(fps)) ** -1
+            measured_media_seconds = float(measured_media_seconds)
+        total = counters['encode'] / wall_seconds
+        return {
+            'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'wallSeconds': wall_seconds,
+            'decode': counters['decode'] / wall_seconds, 'scene': counters['scene'] / wall_seconds,
+            'encode': total, 'total': total
+        }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -575,6 +761,7 @@ def main():
     parser.add_argument('--probe')
     parser.add_argument('--request')
     parser.add_argument('--native-scene-request')
+    parser.add_argument('--native-nvmm-self-test', action='store_true')
     parser.add_argument('--decode-native', action='store_true')
     parser.add_argument('--input')
     parser.add_argument('--codec')
@@ -593,7 +780,27 @@ def main():
         decode_native(args)
         return 0
     if args.native_scene_request:
-        with open(args.native_scene_request, 'r', encoding='utf-8') as handle: render_native_nvmm(json.load(handle))
+        with open(args.native_scene_request, 'r', encoding='utf-8') as handle:
+            metrics = render_native_nvmm(json.load(handle))
+        print(json.dumps({'nativeNvmmMetrics': metrics}, ensure_ascii=False))
+        return 0
+    if args.native_nvmm_self_test:
+        source = '/usr/lib/bili-record-2k/assets/jetson-self-test/h264-sample.mp4'
+        target = '/tmp/br2k-native-nvmm-self-test.h265'
+        try: os.unlink(target)
+        except FileNotFoundError: pass
+        request = {
+            'protocol': PROTOCOL, 'backend': 'cuda-gstreamer',
+            'input': {'path': source, 'codec': 'h264', 'startTime': 0, 'duration': 2.5},
+            'output': {'path': target, 'codec': 'hevc_nvv4l2', 'width': 320, 'height': 180, 'fps': 30000 / 1001, 'bitrate': 1000000},
+            'scene': {'objects': [{'id': 'native-self-test-card', 'type': 'Card', 'start': 0, 'end': 2.5,
+                'frame': {'x': 18, 'y': 18, 'width': 180, 'height': 72}, 'zIndex': 1,
+                'style': {'fill': '#3d70dd', 'opacity': 1, 'cornerRadius': 16}, 'props': {}}]}
+        }
+        metrics = render_native_nvmm(request)
+        if not os.path.isfile(target) or os.path.getsize(target) < 1024:
+            fail('原生 NVMM 自检没有生成有效 H.265。')
+        print(json.dumps({'ok': True, 'output': target, 'nativeNvmmMetrics': metrics}, ensure_ascii=False))
         return 0
     if args.self_test:
         target = '/tmp/br2k-gpu-scene-self-test.h264'

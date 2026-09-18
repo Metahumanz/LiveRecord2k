@@ -45,6 +45,7 @@ struct TimelineEntry {
   double start, end;
   double x0, y0, width0, height0, alpha0;
   double x1, y1, width1, height1, alpha1;
+  double clip_x, clip_y, clip_width, clip_height;
   Texture *texture;
 };
 
@@ -67,12 +68,14 @@ __global__ static void blend_rgba_nv12_array(
     cudaSurfaceObject_t y_surface, cudaSurfaceObject_t uv_surface,
     const uchar4 *texture, int texture_width, int texture_height,
     int frame_width, int frame_height, int left, int top, int draw_width,
-    int draw_height, float opacity) {
+    int draw_height, float opacity, int clip_x, int clip_y, int clip_width, int clip_height) {
   const int px = blockIdx.x * blockDim.x + threadIdx.x;
   const int py = blockIdx.y * blockDim.y + threadIdx.y;
   if (px >= draw_width || py >= draw_height) return;
   const int x = left + px, y = top + py;
   if (x < 0 || y < 0 || x >= frame_width || y >= frame_height) return;
+  if (clip_width > 0 && clip_height > 0 &&
+      (x < clip_x || y < clip_y || x >= clip_x + clip_width || y >= clip_y + clip_height)) return;
   const int source_x = min(texture_width - 1, max(0, px * texture_width / max(1, draw_width)));
   const int source_y = min(texture_height - 1, max(0, py * texture_height / max(1, draw_height)));
   const uchar4 source = texture[source_y * texture_width + source_x];
@@ -94,12 +97,14 @@ __global__ static void blend_rgba_nv12_pitch(
     unsigned char *y_plane, unsigned char *uv_plane, int y_pitch, int uv_pitch,
     const uchar4 *texture, int texture_width, int texture_height,
     int frame_width, int frame_height, int left, int top, int draw_width,
-    int draw_height, float opacity) {
+    int draw_height, float opacity, int clip_x, int clip_y, int clip_width, int clip_height) {
   const int px = blockIdx.x * blockDim.x + threadIdx.x;
   const int py = blockIdx.y * blockDim.y + threadIdx.y;
   if (px >= draw_width || py >= draw_height) return;
   const int x = left + px, y = top + py;
   if (x < 0 || y < 0 || x >= frame_width || y >= frame_height) return;
+  if (clip_width > 0 && clip_height > 0 &&
+      (x < clip_x || y < clip_y || x >= clip_x + clip_width || y >= clip_y + clip_height)) return;
   const int source_x = min(texture_width - 1, max(0, px * texture_width / max(1, draw_width)));
   const int source_y = min(texture_height - 1, max(0, py * texture_height / max(1, draw_height)));
   const uchar4 source = texture[source_y * texture_width + source_x];
@@ -126,7 +131,7 @@ static bool parse_row(const std::string &line, std::vector<std::string> *fields)
     if (end == std::string::npos) break;
     begin = end + 1;
   }
-  return fields->size() == 15;
+  return fields->size() == 19;
 }
 
 static double as_number(const std::string &text) { return std::strtod(text.c_str(), nullptr); }
@@ -179,7 +184,8 @@ static bool load_scene() {
     }
     TimelineEntry entry = {as_number(field[0]), as_number(field[1]), as_number(field[2]), as_number(field[3]),
       as_number(field[4]), as_number(field[5]), as_number(field[6]), as_number(field[7]), as_number(field[8]),
-      as_number(field[9]), as_number(field[10]), as_number(field[11]), &existing->second};
+      as_number(field[9]), as_number(field[10]), as_number(field[11]), as_number(field[15]), as_number(field[16]),
+      as_number(field[17]), as_number(field[18]), &existing->second};
     if (entry.end > entry.start) g_scene.entries.push_back(entry);
   }
   g_scene.ready = true;
@@ -241,16 +247,20 @@ static void gpu_process(EGLImageKHR image, void **) {
       const int x = (int)std::lround(entry.x0 + (entry.x1 - entry.x0) * progress);
       const int y = (int)std::lround(entry.y0 + (entry.y1 - entry.y0) * progress);
       const float alpha = (float)std::min(1.0, std::max(0.0, entry.alpha0 + (entry.alpha1 - entry.alpha0) * progress));
+      const int clip_x = (int)std::lround(entry.clip_x);
+      const int clip_y = (int)std::lround(entry.clip_y);
+      const int clip_width = (int)std::lround(entry.clip_width);
+      const int clip_height = (int)std::lround(entry.clip_height);
       const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
       if (egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
         blend_rgba_nv12_array<<<grid, block>>>(y_surface, uv_surface, entry.texture->device,
             entry.texture->width, entry.texture->height, (int)egl_frame.width, (int)egl_frame.height,
-            x, y, width, height, alpha);
+            x, y, width, height, alpha, clip_x, clip_y, clip_width, clip_height);
       } else {
         blend_rgba_nv12_pitch<<<grid, block>>>((unsigned char *)egl_frame.frame.pPitch[0],
             (unsigned char *)egl_frame.frame.pPitch[1], (int)egl_frame.pitch, (int)egl_frame.pitch,
             entry.texture->device, entry.texture->width, entry.texture->height,
-            (int)egl_frame.width, (int)egl_frame.height, x, y, width, height, alpha);
+            (int)egl_frame.width, (int)egl_frame.height, x, y, width, height, alpha, clip_x, clip_y, clip_width, clip_height);
       }
     }
     result = cudaGetLastError();
