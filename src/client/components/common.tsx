@@ -142,12 +142,12 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const codecLabel = progress.codec
     ? `${progress.codecKind === 'hardware' ? '硬件' : '软件'}编码 ${progress.codec}`
     : '';
-  const encoderBackendLabel = progress.encoderBackend || codecLabel;
-  const decoderLabel = progress.decoder
-    ? progress.decoderKind === 'hardware'
-      ? `硬件解码 ${progress.decoderLabel || progress.decoder}`
-      : 'CPU 解码'
-    : '';
+  const pipeline = progress.activePipeline;
+  // These labels deliberately come from the children that were started, not
+  // from the capability probe or merely selected settings.
+  const encoderBackendLabel = pipeline?.encoder || '';
+  const decoderLabel = pipeline?.decoder || '';
+  const sceneRendererLabel = pipeline?.sceneRenderer || '';
   const renderFps = Number(progress.renderFps);
   const renderFpsLabel = Number.isFinite(renderFps) && renderFps > 0 ? `渲染 ${renderFps.toFixed(renderFps >= 10 ? 1 : 2)} fps` : '';
   const realtimeFactor = Number(progress.realtimeFactor);
@@ -168,7 +168,14 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
           : '处理中';
   const primaryMessage = progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
   const timingDetails = [hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : ''].filter(Boolean);
-  const rateDetails = [renderFpsLabel, realtimeLabel].filter(Boolean);
+  const stageFps = progress.stageFps;
+  const stageFpsLabel = stageFps
+    ? [
+        ['解码', stageFps.decode], ['Scene', stageFps.scene], ['编码', stageFps.encode], ['总计', stageFps.total]
+      ].filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+        .map(([name, value]) => `${name} ${(value as number).toFixed((value as number) >= 10 ? 1 : 2)} fps`).join(' · ')
+    : '';
+  const rateDetails = [stageFpsLabel, renderFpsLabel, realtimeLabel].filter(Boolean);
   const avatarDiagnostics = progress.avatarDiagnostics;
   const avatarDiagnosticsLabel = avatarDiagnostics
     ? `头像 ${avatarDiagnostics.prepared}/${avatarDiagnostics.requested}，通用回退 ${avatarDiagnostics.fallback}（无源 ${
@@ -178,7 +185,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
       }`
     : '';
   const backendDetails = [
-    progress.avatarCompositeBackend || '',
+    pipeline ? (sceneRendererLabel || progress.avatarCompositeBackend || '') : '实际管线启动中',
     avatarDiagnosticsLabel,
     progress.fallbackReason ? `回退：${progress.fallbackReason}` : '',
     decoderLabel,

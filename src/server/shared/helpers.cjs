@@ -597,6 +597,78 @@ async function testFfmpegAvatarCompositeBackend(ffmpegPath, backend, options = {
   }
 }
 
+// A filter/encoder inventory is not evidence that a desktop NVIDIA card can
+// actually create CUDA surfaces, alpha-blend them, then start an NVENC
+// session. This probe performs all three on ordinary GeForce desktop and
+// laptop GPUs. It intentionally has no Jetson NVMM/V4L2 dependency.
+async function testFfmpegDesktopCudaPipeline(ffmpegPath, options = {}) {
+  const codec = /^(?:h264|hevc)_nvenc$/.test(String(options.codec || ''))
+    ? String(options.codec)
+    : 'hevc_nvenc';
+  const deviceName = 'br2k_desktop_cuda_probe';
+  const runner = typeof options.runCapturedProcess === 'function' ? options.runCapturedProcess : runCapturedProcess;
+  try {
+    const result = await runner(
+      ffmpegPath,
+      [
+        '-hide_banner', '-loglevel', 'error', '-init_hw_device', `cuda=${deviceName}:0`, '-filter_hw_device', deviceName,
+        '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=30:d=1,format=yuv420p',
+        '-f', 'lavfi', '-i', 'color=c=white@0.5:s=48x48:r=30:d=1,format=rgba',
+        '-filter_complex',
+        '[0:v]format=yuv420p,hwupload_cuda[base];' +
+          '[1:v]format=yuva420p,hwupload_cuda[overlay];' +
+          '[base][overlay]overlay_cuda=x=20:y=20,scale_cuda=format=yuv420p[out]',
+        '-map', '[out]', '-frames:v', '30', '-an', '-c:v', codec, '-f', 'null', '-'
+      ],
+      { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 15_000)), maxOutputBytes: 128 * 1024 }
+    );
+    if (result.status === 0 && !result.error && !result.timedOut) return { ok: true, codec, reason: '' };
+    const detail = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+    return {
+      ok: false,
+      codec,
+      reason: result.timedOut ? '桌面 CUDA 合成/NVENC 自检超时' : detail || result.error?.message || `ffmpeg 退出码 ${result.status}`
+    };
+  } catch (error) {
+    return { ok: false, codec, reason: error.message };
+  }
+}
+
+async function detectDesktopCudaCapability(ffmpegPath, options = {}) {
+  // NVMM is Jetson-specific. Never relabel an ARM64 Jetson as a desktop CUDA
+  // backend simply because its FFmpeg happens to expose CUDA.
+  const platform = String(options.platform || process.platform);
+  const arch = String(options.arch || process.arch);
+  if (platform === 'linux' && arch === 'arm64') {
+    return { available: false, reason: '当前为 Jetson 平台，使用 NVMM CUDA 能力模型。' };
+  }
+  const hwaccels = Array.isArray(options.hwaccels) ? options.hwaccels : [];
+  const filterNames = options.filterNames instanceof Set ? options.filterNames : new Set(options.filterNames || []);
+  const burnCodecs = Array.isArray(options.burnCodecs) ? options.burnCodecs : [];
+  if (!hwaccels.includes('cuda')) return { available: false, reason: 'ffmpeg 未检测到 CUDA 硬件设备。' };
+  const missing = ['hwupload_cuda', 'overlay_cuda', 'scale_cuda'].filter((filter) => !filterNames.has(filter));
+  if (missing.length) return { available: false, reason: `ffmpeg 缺少 CUDA 滤镜：${missing.join('、')}。` };
+  const encoder = burnCodecs.find((candidate) => /^(?:hevc|h264)_nvenc$/.test(String(candidate?.value || '')));
+  if (!encoder) return { available: false, reason: '没有通过真实自检的 NVIDIA NVENC 编码器。' };
+  const test = await testFfmpegDesktopCudaPipeline(ffmpegPath, {
+    codec: encoder.value,
+    runCapturedProcess: options.runCapturedProcess
+  });
+  if (!test.ok) return { available: false, reason: test.reason, encoder: encoder.value };
+  const decoders = Array.isArray(options.hardwareDecoders) ? options.hardwareDecoders : [];
+  return {
+    available: true,
+    backend: 'cuda-ffmpeg',
+    encoder: encoder.value,
+    compositor: 'overlay_cuda',
+    decoder: decoders.some((entry) => entry?.value === 'cuda') ? 'cuda' : '',
+    // This admits CUDA texture upload/blend/NVENC only. Complete text/card
+    // Scene production stays behind the independent visual conformance gate.
+    fullSceneProduction: false,
+    reason: ''
+  };
+}
+
 async function detectFfmpegAvatarCompositeBackend(ffmpegPath, { hwaccels = [], filterNames = new Set() } = {}) {
   const attempts = [];
   let cudaReason = '';
@@ -713,10 +785,23 @@ async function detectFfmpegCapabilities(ffmpegPath, options = {}) {
     hwaccels,
     filterNames
   });
-  const hardwareDecoders = await detectFfmpegHardwareDecoders(ffmpegPath, {
-    encoderNames,
+  const [ffmpegHardwareDecoders, jetsonHardwareDecoders] = await Promise.all([
+    detectFfmpegHardwareDecoders(ffmpegPath, {
+      encoderNames,
+      hwaccels,
+      videoAdapters
+    }),
+    detectJetsonGstreamerDecoders()
+  ]);
+  const hardwareDecoders = [
+    ...jetsonHardwareDecoders,
+    ...ffmpegHardwareDecoders.filter((decoder) => !/^(?:h264|hevc)_(?:nvv4l2dec|v4l2m2m)$/.test(String(decoder.value || '')))
+  ];
+  const desktopCuda = await detectDesktopCudaCapability(ffmpegPath, {
     hwaccels,
-    videoAdapters
+    filterNames,
+    burnCodecs,
+    hardwareDecoders
   });
 
   return {
@@ -737,6 +822,7 @@ async function detectFfmpegCapabilities(ffmpegPath, options = {}) {
       avatarComposite.backend?.value === 'cuda'
         ? ''
         : avatarComposite.cudaReason || avatarComposite.reason || '',
+    desktopCuda,
     probedAt: Date.now(),
     probeError: encoderProbe.ok ? '' : encoderProbe.error
   };
@@ -839,6 +925,46 @@ async function detectFfmpegHardwareDecoders(ffmpegPath, options = {}) {
     }
   }
   return supported;
+}
+
+// Jetson NVDEC is exposed reliably by the GStreamer nvv4l2decoder element,
+// not by whatever optional wrappers an NVIDIA-flavoured FFmpeg happens to
+// ship.  Probe the real device as the service account, then decode 60 frames
+// from each package-owned MP4 sample through qtdemux and the matching parser.
+async function testJetsonGstreamerDecoder(codec, samplePath, options = {}) {
+  if (String(options.platform || process.platform) !== 'linux') return { ok: false, reason: '仅在 Linux Jetson 上测试' };
+  try {
+    await fsp.access('/dev/v4l2-nvdec', fs.constants.R_OK | fs.constants.W_OK);
+  } catch (error) {
+    return { ok: false, reason: `/dev/v4l2-nvdec 对服务用户不可访问：${error.code || error.message}` };
+  }
+  const parser = String(codec) === 'hevc' ? 'h265parse' : 'h264parse';
+  const result = await runCapturedProcess(options.gstreamerPath || 'gst-launch-1.0', [
+    '-q', 'filesrc', `location=${samplePath}`, '!', 'qtdemux', 'name=demux', 'demux.', '!', parser, '!',
+    'nvv4l2decoder', '!', 'nvvidconv', '!', 'video/x-raw,format=I420', '!', 'identity', 'eos-after=60', '!', 'fakesink', 'sync=false'
+  ], { timeoutMs: 20_000, maxOutputBytes: 128 * 1024 });
+  if (result.status === 0 && !result.error && !result.timedOut) return { ok: true, reason: '' };
+  const detail = compactLogLine(`${result.stderr || ''}\n${result.stdout || ''}`);
+  return { ok: false, reason: result.timedOut ? 'GStreamer nvv4l2decoder 测试超时' : detail || result.error?.message || `退出码 ${result.status}` };
+}
+
+async function detectJetsonGstreamerDecoders(options = {}) {
+  if (String(options.platform || process.platform) !== 'linux') return [];
+  const result = [];
+  for (const codec of ['h264', 'hevc']) {
+    const samplePath = getJetsonSelfTestSamplePath(codec, options);
+    if (!samplePath) continue;
+    const probe = await testJetsonGstreamerDecoder(codec, samplePath, options);
+    if (probe.ok) result.push({
+      value: 'gstreamer-nvv4l2',
+      label: `Jetson NVDEC ${codec.toUpperCase()}（GStreamer nvv4l2decoder）`,
+      vendor: 'nvidia',
+      codec,
+      backend: 'gstreamer',
+      element: 'nvv4l2decoder'
+    });
+  }
+  return result;
 }
 
 async function runFfmpegProbe(ffmpegPath, args, options = {}) {
@@ -1547,6 +1673,10 @@ function createFfmpegJobProgress({
     sourceFps: Number.isFinite(Number(sourceFps)) && Number(sourceFps) > 0 ? Number(sourceFps) : undefined,
     encoderBackend: encoderBackend || undefined,
     avatarCompositeBackend: avatarCompositeBackend || undefined,
+    // Filled only after the child processes have actually been started.  Do
+    // not turn capability-probe results into a claim about the active export.
+    activePipeline: undefined,
+    stageFps: undefined,
     fallbackReason: undefined,
     startedAt: now,
     updatedAt: now,
@@ -1560,6 +1690,38 @@ function createFfmpegJobProgress({
   };
   resetFfmpegJobProgressRate(progress);
   return progress;
+}
+
+function setFfmpegJobStageFps(progress, stageFps) {
+  if (!progress || progress.status !== 'running' || !stageFps || typeof stageFps !== 'object') return false;
+  const normalized = {};
+  for (const key of ['decode', 'scene', 'encode', 'total']) {
+    const value = Number(stageFps[key]);
+    if (Number.isFinite(value) && value >= 0) normalized[key] = value;
+  }
+  if (!Object.keys(normalized).length) return false;
+  progress.stageFps = normalized;
+  // Native NVMM reports structured stage rates instead of FFmpeg's textual
+  // progress lines.  Surface that same measurement as render speed and ETA
+  // so the UI remains meaningful while a CUDA-only chunk is in flight.
+  const totalFps = Number(normalized.total);
+  const sourceFps = Number(progress.sourceFps || 0);
+  if (Number.isFinite(totalFps) && totalFps > 0 && Number.isFinite(sourceFps) && sourceFps > 0) {
+    const realtimeFactor = totalFps / sourceFps;
+    const remainingSec = Math.max(0, Number(progress.durationSec || 0) - Math.max(0, Number(progress.currentTimeSec || 0)));
+    progress.renderFps = totalFps;
+    progress.realtimeFactor = realtimeFactor;
+    progress.estimatedRemainingSec = Number(progress.durationSec || 0) > 0 ? remainingSec / realtimeFactor : null;
+  }
+  progress.updatedAt = Date.now();
+  return true;
+}
+
+function getFfmpegJobStructuredRealtimeFactor(progress) {
+  const totalFps = Number(progress?.stageFps?.total);
+  const sourceFps = Number(progress?.sourceFps || 0);
+  if (!Number.isFinite(totalFps) || totalFps <= 0 || !Number.isFinite(sourceFps) || sourceFps <= 0) return null;
+  return totalFps / sourceFps;
 }
 
 function updateFfmpegJobProgress(progress, text) {
@@ -1581,7 +1743,12 @@ function updateFfmpegJobProgress(progress, text) {
   }
   const processedSec = Math.max(0, currentTimeSec);
   const remainingSec = duration > 0 ? Math.max(0, duration - processedSec) : 0;
-  const realtimeFactor = updateFfmpegJobProgressRate(progress, processedSec, now);
+  // A native NVMM chunk publishes its structured stage FPS only when that
+  // chunk exits. The following concat/mux progress line often arrives before
+  // there are enough FFmpeg samples for a wall-clock rate. Do not erase the
+  // already-real CUDA rate (and its ETA) in that gap.
+  const sampledRealtimeFactor = updateFfmpegJobProgressRate(progress, processedSec, now);
+  const realtimeFactor = sampledRealtimeFactor || getFfmpegJobStructuredRealtimeFactor(progress);
   progress.currentTimeSec = Math.max(0, currentTimeSec);
   progress.percent = percent;
   progress.realtimeFactor = realtimeFactor;
@@ -2347,14 +2514,22 @@ async function preferSceneGraphCapableFfmpeg(ffmpegPath) {
   const current = String(ffmpegPath || '').trim() || 'ffmpeg';
   const bundled = findBundledSceneGraphFfmpegPath();
   if (!bundled || bundled === current) return { path: current, fallbackReason: '' };
-  const probe = await runFfmpegProbe(current, [
+  const [drawtextProbe, filtersProbe] = await Promise.all([
+    runFfmpegProbe(current, [
     '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=16x16:d=0.1',
     '-vf', 'drawtext=text=Scene:fontsize=8:x=1:y=1', '-frames:v', '1', '-f', 'null', '-'
-  ], { timeoutMs: 8000, maxOutputBytes: 64 * 1024 });
-  if (probe.ok) return { path: current, fallbackReason: '' };
+    ], { timeoutMs: 8000, maxOutputBytes: 64 * 1024 }),
+    runFfmpegProbe(current, ['-hide_banner', '-filters'], { timeoutMs: 8000, maxOutputBytes: 512 * 1024 })
+  ]);
+  // The three legacy side styles are a libass visual contract. A binary with
+  // drawtext alone produces a plausible but wrong font weight, price-label
+  // centering and ASS override handling; it is not Scene Graph capable.
+  const hasAss = filtersProbe.ok && /^\s*\.\.\.\s+ass\s+V->V\s+/m.test(filtersProbe.output || '');
+  if (drawtextProbe.ok && hasAss) return { path: current, fallbackReason: '' };
+  const missing = [drawtextProbe.ok ? '' : 'drawtext', hasAss ? '' : 'libass'].filter(Boolean).join('、');
   return {
     path: bundled,
-    fallbackReason: `系统 FFmpeg 不满足 Scene Graph 绘制要求，已自动切换内置完整 ARM64 FFmpeg：${probe.error || 'drawtext 实命令失败'}`
+    fallbackReason: `系统 FFmpeg 不满足 Scene Graph 绘制要求（缺少 ${missing || '必要滤镜'}），已自动切换内置完整 ARM64 FFmpeg。`
   };
 }
 
@@ -3726,7 +3901,9 @@ module.exports = {
   findVaapiRenderDevice,
   getAvatarCompositeDeviceSpec,
   testFfmpegAvatarCompositeBackend,
+  testFfmpegDesktopCudaPipeline,
   detectFfmpegAvatarCompositeBackend,
+  detectDesktopCudaCapability,
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,
@@ -3737,6 +3914,8 @@ module.exports = {
   detectVideoAdapterVendor,
   hasVideoAdapterVendor,
   shouldTestHardwareEncoder,
+  testJetsonGstreamerDecoder,
+  detectJetsonGstreamerDecoders,
   testFfmpegEncoder,
   getJetsonSelfTestSamplePath,
   testJetsonGstreamerEncoder,
@@ -3767,6 +3946,7 @@ module.exports = {
   createFfmpegJobProgress,
   resetFfmpegJobProgressRate,
   updateFfmpegJobProgress,
+  setFfmpegJobStageFps,
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
   parseFfmpegTime,

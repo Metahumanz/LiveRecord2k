@@ -299,6 +299,18 @@ test('a legacy style request is migrated to one-pass Scene Graph MP4 export', as
   }
 });
 
+test('legacy h5-card and bubble chat body retain the ASS bold semantic', () => {
+  for (const stylePreset of ['h5-card', 'bubble']) {
+    const graph = buildSceneGraph(
+      [{ type: 'danmaku', time: 0, uid: 1, user: '观众', text: '旧样式正文粗细基准' }],
+      { stylePreset, videoInfo: { width: 640, height: 360, fps: 60 }, durationSec: 2 }
+    );
+    const body = graph.objects.find((object) => object.type === 'Text' && String(object.props && object.props.text || '').includes('旧样式正文'));
+    assert.ok(body, `${stylePreset} 应包含旧 ASS 对应的正文节点`);
+    assert.equal(body.props.fontWeight, 700, `${stylePreset} 的正文必须与 ASS \\b1 一致`);
+  }
+});
+
 test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS video input', async (t) => {
   const sceneGraphFfmpegPath = await getSceneGraphFfmpegPath();
   if (!sceneGraphFfmpegPath) return t.skip('当前测试环境没有可实际执行 drawtext 的 FFmpeg');
@@ -350,15 +362,15 @@ test('direct Scene Graph filter burns clean video in one FFmpeg pass without ASS
       3,
       { shiftTime: false }
     );
-    const changingText = graph.objects.find((object) => object.type === 'Text' && String(object.props && object.props.text || '').includes('赠送'));
-    assert.ok(changingText, 'gift detail text is represented as a Scene Text node');
+    const changingText = graph.objects.find((object) => object.type === 'Text' && Number(object.end) > 1.6 && String(object.props && object.props.text || '').includes('投喂'));
+    assert.ok(changingText, 'legacy gift detail text is represented as a Scene Text node');
     changingText.props.textKeyframes = [
       { time: 1, text: String(changingText.props.text) },
-      { time: 1.6, text: '赠送 花 x2' }
+      { time: 1.6, text: '投喂 花 x2' }
     ];
     const layer = await writeSceneFilterScript(filterPath, graph, { duration: 3, fps: 30 });
-    assert.ok(layer.script.includes('赠送 花 x2'), 'direct renderer splits Scene text keyframes without a video intermediate');
-    assert.match(compileSceneToAss(graph).ass, /赠送 花 x2/, 'ASS keeps the same semantic text update when it can express it');
+    assert.ok(layer.script.includes('投喂 花 x2'), 'direct renderer splits Scene text keyframes without a video intermediate');
+    assert.match(compileSceneToAss(graph).ass, /投喂 花 x2/, 'ASS keeps the same semantic text update when it can express it');
     const args = createBurnArgs({
       cleanPath,
       assPath: '',

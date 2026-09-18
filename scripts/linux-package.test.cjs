@@ -706,6 +706,17 @@ test('software decode explicitly selects native H.264/HEVC and skipped seek guar
   assert.match(skipped, /trim=start=2:end=12,setpts=PTS-STARTPTS,ass=filename=/);
 });
 
+test('Jetson GStreamer burning always starts from the CPU Scene Graph minimum path', () => {
+  const service = new LiveRecordService();
+  service.ffmpegCapabilities = {
+    hardwareDecoders: [{ value: 'hevc_nvv4l2dec', codec: 'hevc', label: 'Jetson HEVC', kind: 'hardware' }]
+  };
+  assert.deepEqual(
+    service.getHardwareDecoder({ codec: 'hevc (Main)' }, 'hevc_nvv4l2'),
+    { value: 'software', label: 'CPU', kind: 'software', codec: 'hevc' }
+  );
+});
+
 test('JetPack R35-compatible raw burn uses explicit black-frame concat for the full 1.019-second lead-in', () => {
   const graph = createJetsonBurnLeadingVideoFilterGraph({
     assPath: '/recordings/danmaku.ass',

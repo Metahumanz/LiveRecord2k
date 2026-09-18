@@ -15,6 +15,7 @@ const {
   probeMediaTimelineInfo,
   runFfmpegJob,
   runCapturedProcess,
+  setFfmpegJobStageFps,
   updateFfmpegJobProgress
 } = require('../src/server/shared/helpers.cjs');
 
@@ -146,6 +147,29 @@ test('FFmpeg progress reports recent rendering speed and uses it for a smoothed 
   } finally {
     Date.now = originalNow;
   }
+});
+
+test('native NVMM stage metrics provide realtime speed and ETA without FFmpeg progress lines', () => {
+  const progress = createFfmpegJobProgress({
+    kind: 'export',
+    label: 'cuda',
+    outputPath: '/tmp/cuda.mp4',
+    durationSec: 3600,
+    sourceFps: 60
+  });
+  progress.currentTimeSec = 120;
+  assert.equal(setFfmpegJobStageFps(progress, { decode: 132, scene: 120, encode: 120, total: 120 }), true);
+  assert.equal(progress.renderFps, 120);
+  assert.equal(progress.realtimeFactor, 2);
+  assert.equal(progress.estimatedRemainingSec, 1740);
+
+  // A chunk boundary can advance the media timestamp before the FFmpeg
+  // wall-clock sampler has enough samples. Keep the native CUDA measurement
+  // instead of clearing the ETA while the next chunk starts.
+  assert.equal(updateFfmpegJobProgress(progress, 'time=00:02:10.000'), true);
+  assert.equal(progress.renderFps, 120);
+  assert.equal(progress.realtimeFactor, 2);
+  assert.equal(progress.estimatedRemainingSec, 1735);
 });
 
 test('structured FFmpeg progress and merge resource waiting remain observable and cancellable', async () => {

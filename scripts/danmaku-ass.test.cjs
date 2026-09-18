@@ -128,7 +128,8 @@ test('non-default presets turn ordinary danmaku into a fixed side conversation s
   assert.match(bubble, /\\clip\(54,0,474,1018\)/);
   assert.match(bubble, /\\1c&H2F2230&\\1a&H12&/);
   assert.match(minimal, /\\clip\(24,0,384,1052\)/);
-  assert.match(minimal, /预览用户\\b0 · 普通弹幕也要有样式/);
+  assert.match(minimal, /预览用户\{\\b0\} · 普通弹幕也要有样式/);
+  assert.doesNotMatch(minimal, /预览用户\\b0 · 普通弹幕也要有样式/);
   assert.doesNotMatch(minimal, /\\1c&H191710&\\1a&H30&/);
   assert.doesNotMatch(h5Card, /\\move\(1968,/);
   assert.doesNotMatch(bubble, /\\move\(1968,/);

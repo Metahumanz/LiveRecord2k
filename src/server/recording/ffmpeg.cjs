@@ -459,6 +459,37 @@ function createJetsonBurnLeadingVideoFilterGraph({
   );
 }
 
+// CUDA Scene owns all visible UI composition.  For a leading video gap it
+// needs only a black-frame clock bridge, never an ASS filter.  Keeping this
+// graph separate prevents a minimal system FFmpeg from rejecting the GPU
+// route merely because it was built without libass.
+function createJetsonDirectRawLeadingVideoFilterGraph({
+  leadingVideoPaddingSec = 0,
+  outputDuration = 0,
+  fps,
+  videoWidth = 0,
+  videoHeight = 0
+} = {}) {
+  const padding = Math.max(0, Number(leadingVideoPaddingSec) || 0);
+  const width = Math.floor(Math.max(0, Number(videoWidth) || 0) / 2) * 2;
+  const height = Math.floor(Math.max(0, Number(videoHeight) || 0) / 2) * 2;
+  if (padding <= 0.0005 || width < 2 || height < 2) return '';
+  const sourceLabel = '[jetson_cuda_scene_source]';
+  return (
+    `[0:v:0]settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p${sourceLabel};\n` +
+    createExplicitLeadingVideoPaddingGraph({
+      sourceLabel,
+      outputLabel: '[vout]',
+      leadingVideoPaddingSec: padding,
+      outputDuration,
+      fps,
+      videoWidth: width,
+      videoHeight: height,
+      prefix: 'jetson_cuda_scene_leading'
+    })
+  );
+}
+
 function avatarSegmentAt(segment, time, coordinateOne, coordinateTwo) {
   const start = Number(segment?.start);
   const end = Number(segment?.end);
@@ -999,7 +1030,8 @@ function createBurnRawVideoArgs({
   decoder = 'software',
   sourceCodec = '',
   videoWidth = 0,
-  videoHeight = 0
+  videoHeight = 0,
+  directRaw = false
 }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
@@ -1027,7 +1059,20 @@ function createBurnRawVideoArgs({
   args.push('-i', cleanPath);
   if (!inputSeek && hasStart) args.push('-ss', formatFfmpegSeconds(startTime));
   if (hasDuration) args.push('-t', formatFfmpegSeconds(duration));
-  if (hasFilterScript) {
+  if (directRaw) {
+    // The CUDA Scene helper consumes clean I420 and owns all Scene drawing.
+    // Do not let the compatibility ASS/filter path leak into this producer:
+    // some Jetson system FFmpeg builds lack libass entirely.
+    const leadingGraph = createJetsonDirectRawLeadingVideoFilterGraph({
+      leadingVideoPaddingSec,
+      outputDuration: duration,
+      fps,
+      videoWidth,
+      videoHeight
+    });
+    if (leadingGraph) args.push('-filter_complex', leadingGraph, '-map', '[vout]');
+    else args.push('-map', '0:v:0');
+  } else if (hasFilterScript) {
     args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]');
   } else {
     const jetsonLeadingGraph = createJetsonBurnLeadingVideoFilterGraph({
@@ -1077,6 +1122,79 @@ function createBurnRawVideoArgs({
     'pipe:1'
   );
   return args;
+}
+
+// Native Jetson decoding deliberately lives in GStreamer.  NVIDIA's distro
+// FFmpeg is not the Scene Graph renderer: it is inconsistent across JetPack
+// releases and must never be used as the authority for NVDEC availability.
+// The downstream ffmpeg-full stage owns the finite output duration. It closes
+// the raw pipe once enough frames have been rendered; a decoder-side EPIPE is
+// therefore expected and must not be mistaken for an NVDEC failure.
+function createJetsonNativeDecodeArgs({
+  cleanPath,
+  sourceCodec,
+  width,
+  height,
+  fps,
+  converter = 'nvvidconv',
+  helperMode = false,
+  startTime = 0,
+  duration = 0
+} = {}) {
+  const normalizedConverter = String(converter || '').trim();
+  const parser = isHevcCodec(sourceCodec) ? 'h265parse' : 'h264parse';
+  const outputWidth = makeEvenDimension(width);
+  const outputHeight = makeEvenDimension(height);
+  if (!cleanPath || !outputWidth || !outputHeight || !['nvvidconv', 'nvvideoconvert'].includes(normalizedConverter)) {
+    throw new Error('Jetson GStreamer 硬解缺少输入、画面尺寸或 nvvidconv。');
+  }
+  if (helperMode) {
+    return [
+      '--decode-native', '--input', String(cleanPath), '--codec', isHevcCodec(sourceCodec) ? 'hevc' : 'h264',
+      '--width', String(outputWidth), '--height', String(outputHeight), '--fps', String(formatGstreamerFramerate(fps)),
+      '--start', String(Math.max(0, Number(startTime) || 0)), '--duration', String(Math.max(0.001, Number(duration) || 0)),
+      '--converter', normalizedConverter, '--output-fd', '3'
+    ];
+  }
+  return [
+    '-q', '-e', 'filesrc', `location=${cleanPath}`, '!', 'qtdemux', 'name=demux',
+    // Fragmented MP4s can name their first video pad video_1 rather than
+    // video_0. Let gst-launch select the parser-compatible dynamic pad.
+    'demux.', '!', parser, '!', 'nvv4l2decoder', '!', normalizedConverter, '!',
+    // Do not force the probe's rounded FPS back onto decoded NVMM frames:
+    // 59.99 metadata for a true 60/1 MP4 makes Jetson reject caps negotiation.
+    // The raw stream has no timestamps; ffmpeg-full assigns the requested CFR.
+    'video/x-raw,format=I420',
+    // Jetson multimedia libraries can print non-GStreamer diagnostics to
+    // stdout. Reserve fd 3 for raw frames so those messages cannot corrupt
+    // the I420 stream consumed by ffmpeg-full.
+    '!', 'fdsink', 'fd=3'
+  ];
+}
+
+// The middle stage of Jetson's production path.  It reads decoded I420 from
+// stdin, applies the *same* complete ffmpeg-full Scene Graph script as Web/ASS
+// exports, then writes I420 to the hardware encoder.  There is intentionally
+// no decoder selection here: decoding has already happened in GStreamer.
+function createBurnRawSceneFromPipeArgs({
+  filterScriptPath,
+  fps,
+  width,
+  height,
+  duration
+} = {}) {
+  const outputWidth = makeEvenDimension(width);
+  const outputHeight = makeEvenDimension(height);
+  const outputDuration = Math.max(0, Number(duration) || 0);
+  if (!filterScriptPath || !outputWidth || !outputHeight || !outputDuration) {
+    throw new Error('Jetson Scene Graph I420 渲染缺少滤镜脚本或画面尺寸。');
+  }
+  return [
+    '-hide_banner', '-y', '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
+    '-video_size', `${outputWidth}x${outputHeight}`, '-framerate', formatGstreamerFramerate(fps), '-i', 'pipe:0',
+    '-filter_complex_script', filterScriptPath, '-map', '[vout]', '-t', formatFfmpegSeconds(outputDuration), '-an', '-r', formatGstreamerFramerate(fps),
+    '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p', '-f', 'rawvideo', 'pipe:1'
+  ];
 }
 
 function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false, converter = 'nvvidconv' }) {
@@ -1511,7 +1629,12 @@ function runFfmpegToGstreamerJob({
           // consumer can back-pressure its stdout and make FFmpeg appear
           // idle. Prefer the missing encoded-file growth in that case so
           // diagnostics point at the process that is actually blocking.
-          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout) {
+          // An encoder is allowed to wait for its first keyframe while the
+          // Scene Graph renderer is still feeding sparse raw frames.  That is
+          // real end-to-end progress, not a GStreamer deadlock.  Once the
+          // consumer is actually frozen it back-pressures stdout, so FFmpeg
+          // becomes idle as well; require both signals before blaming GST.
+          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout && ffmpegIdleMs >= noProgressTimeout) {
             stalledProcess = 'gstreamer';
           } else if (!ffmpegClosed && ffmpegIdleMs >= noProgressTimeout) {
             stalledProcess = 'ffmpeg';
@@ -1584,6 +1707,160 @@ function runFfmpegToGstreamerJob({
       if (code !== 0 || gstreamerResult.error) stop(ffmpeg, 'ffmpeg', 'gstreamer-failed');
       finish();
     });
+  });
+}
+
+// `qtdemux → parser → nvv4l2decoder` and `nvvidconv → nvv4l2*enc` are both
+// GStreamer pipelines, with ffmpeg-full owning only Scene Graph rendering in
+// the middle.  Keep all three processes streaming so an hour-long export
+// never writes raw YUV to disk.
+function runJetsonNativeDecodeSceneEncodeJob({
+  decoderArgs,
+  ffmpegPath,
+  ffmpegArgs,
+  encoderArgs,
+  gstreamerPath = 'gst-launch-1.0',
+  decoderPath = gstreamerPath,
+  onDecoderStderr,
+  onFfmpegStderr,
+  onEncoderStderr,
+  onChild,
+  timeoutMs = 0,
+  encodedVideoPath = '',
+  frameSize = 0,
+  onStageMetrics
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const results = {
+      decoder: { code: null, stderr: '', error: null },
+      renderer: { code: null, stderr: '', error: null },
+      encoder: { code: null, stderr: '', error: null }
+    };
+    let decoder; let renderer; let encoder; let settled = false; let timer = null;
+    const startedAt = Date.now();
+    const counters = { decodedBytes: 0, sceneBytes: 0 };
+    let metricsTimer = null;
+    const reportMetrics = (final = false) => {
+      const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+      const bytesPerFrame = Math.max(1, Number(frameSize) || 1);
+      const decode = counters.decodedBytes / bytesPerFrame / elapsed;
+      const scene = counters.sceneBytes / bytesPerFrame / elapsed;
+      // renderer stdout is back-pressured by encoder.stdin; this is the rate
+      // at which raw frames are actually accepted by nvv4l2, not a probe.
+      onStageMetrics?.({ decode, scene, encode: scene, total: scene, elapsed, final });
+    };
+    const children = () => [decoder, renderer, encoder].filter(Boolean);
+    const stopAll = () => children().forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
+    const finish = () => {
+      if (settled || !Object.values(results).every((item) => item.code !== null || item.error)) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (metricsTimer) clearInterval(metricsTimer);
+      reportMetrics(true);
+      onChild?.(null);
+      // Once ffmpeg-full has rendered its requested duration it closes the
+      // raw stdin; fdsink then reports EPIPE while the decoder is being torn
+      // down. Renderer + encoder are the authoritative finite stages.
+      const failed = Object.entries(results).find(([role, item]) =>
+        role !== 'decoder' && (item.error || item.code !== 0)
+      );
+      if (!failed) return resolve();
+      const [role, item] = failed;
+      const error = new Error(`Jetson 原生硬解 / Scene Graph / 硬编链路失败（${role}）：${String(item.stderr || item.error?.message || `退出码 ${item.code}`).replace(/\s+/g, ' ').trim().slice(-3000)}`);
+      error.primaryProcess = role === 'renderer' ? 'ffmpeg' : 'gstreamer';
+      error.gstreamerStderr = `${results.decoder.stderr}\n${results.encoder.stderr}`.slice(-8000);
+      error.ffmpegStderr = results.renderer.stderr.slice(-8000);
+      reject(error);
+    };
+    const attach = (child, role, callback) => {
+      child.stderr.on('data', (chunk) => {
+        const text = chunk.toString('utf8'); results[role].stderr = `${results[role].stderr}${text}`.slice(-8000); callback?.(text);
+      });
+      child.on('error', (error) => { results[role].error = error; if (role !== 'decoder') stopAll(); finish(); });
+      // Node reports `null` for a SIGKILL exit. Store a concrete failing
+      // value so the bridge always settles instead of leaving export progress
+      // stuck after one leg aborts and the other legs are cleaned up.
+      child.on('close', (code) => { results[role].code = code === null ? -1 : code; if (code !== 0 && role !== 'decoder') stopAll(); finish(); });
+    };
+    try {
+      encoder = spawn(gstreamerPath, encoderArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+      renderer = spawn(ffmpegPath, ffmpegArgs, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      decoder = spawn(decoderPath, decoderArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+      decoder.stdio[3].pipe(renderer.stdin);
+      renderer.stdout.pipe(encoder.stdin);
+      decoder.stdio[3].on('data', (chunk) => { counters.decodedBytes += Math.max(0, Number(chunk?.length) || 0); });
+      renderer.stdout.on('data', (chunk) => { counters.sceneBytes += Math.max(0, Number(chunk?.length) || 0); });
+      decoder.stdio[3].on('error', () => {}); renderer.stdout.on('error', () => {});
+      renderer.stdin.on('error', () => stopAll()); encoder.stdin.on('error', () => stopAll());
+      onChild?.(renderer);
+      attach(decoder, 'decoder', onDecoderStderr);
+      attach(renderer, 'renderer', onFfmpegStderr);
+      attach(encoder, 'encoder', onEncoderStderr);
+      metricsTimer = setInterval(() => reportMetrics(false), 1000);
+      metricsTimer.unref?.();
+      const timeout = Math.max(0, Number(timeoutMs) || 0);
+      if (timeout) timer = setTimeout(() => { results.renderer.error = new Error(`Jetson 原生三段式链路超时（${timeout}ms）`); stopAll(); finish(); }, timeout);
+    } catch (error) { stopAll(); reject(error); }
+  });
+}
+
+// CUDA Scene owns its own NVMM encoder, so its middle and final stages are a
+// single helper process.  This still keeps the video decoder native: the only
+// bridge is the currently necessary I420 pipe, never a raw temporary file.
+function runJetsonNativeDecodeCudaSceneJob({
+  decoderPath = 'gst-launch-1.0',
+  decoderArgs,
+  helperPath,
+  helperArgs,
+  onDecoderStderr,
+  onHelperStderr,
+  onChild,
+  frameSize = 0,
+  onStageMetrics
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const result = { decoder: { code: null, stderr: '', error: null }, helper: { code: null, stderr: '', error: null } };
+    let decoder; let helper; let settled = false;
+    const startedAt = Date.now();
+    let decodedBytes = 0;
+    const report = (final = false) => {
+      const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+      const fps = decodedBytes / Math.max(1, Number(frameSize) || 1) / elapsed;
+      onStageMetrics?.({ decode: fps, scene: fps, encode: fps, total: fps, elapsed, final });
+    };
+    let timer = null;
+    const stop = () => [decoder, helper].filter(Boolean).forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
+    const finish = () => {
+      if (settled || !Object.values(result).every((item) => item.code !== null || item.error)) return;
+      settled = true;
+      if (timer) clearInterval(timer);
+      report(true);
+      onChild?.(null);
+      if (result.helper.code === 0 && !result.helper.error) return resolve();
+      const failed = result.helper.error || result.helper.code !== 0 ? result.helper : result.decoder;
+      const error = new Error(`Jetson 原生 NVDEC / CUDA Scene 链路失败：${String(failed.stderr || failed.error?.message || `退出码 ${failed.code}`).replace(/\s+/g, ' ').trim().slice(-3000)}`);
+      error.primaryProcess = result.helper.error || result.helper.code !== 0 ? 'cuda-scene' : 'decoder';
+      reject(error);
+    };
+    const attach = (child, name, callback) => {
+      child.stderr.on('data', (chunk) => {
+        const text = chunk.toString('utf8'); result[name].stderr = `${result[name].stderr}${text}`.slice(-8000); callback?.(text);
+      });
+      child.on('error', (error) => { result[name].error = error; stop(); finish(); });
+      child.on('close', (code) => { result[name].code = code === null ? -1 : code; if (code !== 0 && name !== 'decoder') stop(); finish(); });
+    };
+    try {
+      helper = spawn(helperPath, helperArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+      decoder = spawn(decoderPath, decoderArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+      decoder.stdio[3].pipe(helper.stdin);
+      decoder.stdio[3].on('data', (chunk) => { decodedBytes += Math.max(0, Number(chunk?.length) || 0); });
+      decoder.stdio[3].on('error', () => {}); helper.stdin.on('error', () => stop());
+      onChild?.(helper);
+      attach(decoder, 'decoder', onDecoderStderr);
+      attach(helper, 'helper', onHelperStderr);
+      timer = setInterval(() => report(false), 1000);
+      timer.unref?.();
+    } catch (error) { stop(); reject(error); }
   });
 }
 
@@ -2275,6 +2552,8 @@ module.exports = {
   createJetsonBurnLeadingVideoFilterGraph,
   createBurnArgs,
   createBurnRawVideoArgs,
+  createJetsonNativeDecodeArgs,
+  createBurnRawSceneFromPipeArgs,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
   createBurnAudioMuxArgs,
@@ -2283,6 +2562,8 @@ module.exports = {
   clipAvatarOverlayEntries,
   createPreviewHlsArgs,
   runFfmpegToGstreamerJob,
+  runJetsonNativeDecodeSceneEncodeJob,
+  runJetsonNativeDecodeCudaSceneJob,
   createClipCopyArgs,
   createSceneAssRemuxArgs,
   createConcatCopyArgs,

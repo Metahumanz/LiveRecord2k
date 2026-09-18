@@ -13,6 +13,21 @@ const {
   totalGiftPrice,
   round
 } = require('./layout-engine.cjs');
+const {
+  getSideChatMetrics,
+  getMinimalSideChatMetrics,
+  getSideInteractionCardMetrics,
+  getMinimalSideInteractionMetrics,
+  getSideAvatarPlacement,
+  sideChatPalette,
+  sideInteractionPalette,
+  sideAvatarColor,
+  sideInteractionText,
+  sideInteractionPrice,
+  truncateTextToWidth,
+  estimateTextWidth,
+  roundedRectPath
+} = require('./ass.cjs');
 
 const SCENE_GRAPH_SCHEMA = 'bili-record2k.scene/v1';
 const SCENE_GRAPH_VERSION = 1;
@@ -169,6 +184,251 @@ function rgbColor(value, fallback) {
   return '#' + Math.max(0, Math.min(0xffffff, Math.floor(raw))).toString(16).padStart(6, '0');
 }
 
+function legacyAssColor(value, fallback) {
+  const match = /^&H([0-9a-f]{8})&$/i.exec(String(value || ''));
+  if (!match) return { fill: fallback || '#ffffff', opacity: 1 };
+  const raw = match[1];
+  const alpha = parseInt(raw.slice(0, 2), 16);
+  return {
+    fill: '#' + raw.slice(6, 8) + raw.slice(4, 6) + raw.slice(2, 4),
+    opacity: round(1 - alpha / 255, 4)
+  };
+}
+
+function legacySegmentAnimations(segment, offsetX, offsetY) {
+  const x = number(offsetX);
+  const y = number(offsetY);
+  if (Math.abs(number(segment.x1) - number(segment.x2)) < 0.001 && Math.abs(number(segment.y1) - number(segment.y2)) < 0.001) {
+    return [];
+  }
+  return [{
+    type: 'Move',
+    start: round(segment.start, 4),
+    end: round(segment.end, 4),
+    from: { x: round(number(segment.x1) + x), y: round(number(segment.y1) + y) },
+    to: { x: round(number(segment.x2) + x), y: round(number(segment.y2) + y) },
+    easing: 'linear'
+  }];
+}
+
+function legacyShape(graph, id, segment, x, y, width, height, color, radius, zIndex, corners) {
+  const appearance = legacyAssColor(color);
+  graph.objects.push(sceneObject('Card', id, { start: segment.start, end: segment.end, zIndex }, {
+    zIndex,
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, height),
+    animations: legacySegmentAnimations(segment, x, y),
+    // The frozen oracle rasterises these paths through libass.  Keep the
+    // original drawing and colour alongside the generic Scene data so the
+    // CUDA helper can make an identical cached texture instead of asking
+    // Pillow to approximate libass rounded-corner coverage.
+    props: {
+      role: 'legacy-ass-shape',
+      assDrawing: roundedRectPath(width, height, radius, corners),
+      assColor: String(color || '')
+    },
+    style: {
+      fill: appearance.fill,
+      opacity: appearance.opacity,
+      cornerRadius: radius,
+      corners: corners || undefined,
+      // Legacy ASS shapes have no implicit Scene fade/scale or synthetic
+      // shadow.  This is deliberately explicit: it keeps the CPU and CUDA
+      // render plans anchored to the v0.6.7 appearance.
+      shadow: null
+    }
+  }));
+}
+
+function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, weight) {
+  const appearance = legacyAssColor(color);
+  // ASS tags are formatting instructions, never message content.  In
+  // particular the minimal preset used `\b1...\b0` inside one legacy dialogue;
+  // stripping them here prevents a literal `\b0` from reaching drawtext.
+  const sourceText = String(text || '').replace(/\\b[01]/g, '').replace(/\\N/g, '\n');
+  const lines = sourceText.split('\n');
+  const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
+  graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {
+    zIndex,
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, Math.max(1, fontSize * 1.25 * lines.length)),
+    animations: legacySegmentAnimations(segment, x, y),
+    props: {
+      text: sourceText,
+      fontFamily: process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei',
+      fontSize,
+      fontWeight: weight || 400,
+      lineHeight: fontSize * 1.13,
+      align: 'left'
+    },
+    style: { fill: appearance.fill, opacity: appearance.opacity, stroke: '', strokeWidth: 0, shadow: null }
+  }));
+}
+
+function legacyRichText(graph, id, segment, x, y, assText, fontSize, color, zIndex) {
+  const appearance = legacyAssColor(color);
+  const raw = String(assText || '');
+  const visible = raw.replace(/\\b[01]/g, '').replace(/\\N/g, '\n');
+  // Rich-text callers use compact weight transitions. libass recognises
+  // them only inside override blocks; ordinary dialogue text would render
+  // the sequence visibly in both the CPU oracle and CUDA text texture.
+  const libassText = raw.replace(/\\b([01])/g, '{\\b$1}');
+  const lines = visible.split('\n');
+  const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
+  graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {
+    zIndex,
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, Math.max(1, fontSize * 1.25 * lines.length)),
+    animations: legacySegmentAnimations(segment, x, y),
+    props: {
+      text: visible,
+      assText: libassText,
+      fontFamily: process.platform === 'linux' ? 'Noto Sans CJK SC' : 'Microsoft YaHei',
+      fontSize,
+      fontWeight: 400,
+      lineHeight: fontSize * 1.13,
+      align: 'left'
+    },
+    style: { fill: appearance.fill, opacity: appearance.opacity, stroke: '', strokeWidth: 0, shadow: null }
+  }));
+}
+
+function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
+  const placement = getSideAvatarPlacement(event, style, segment);
+  if (!placement) return;
+  const outer = '&H88FFFFFF&';
+  const inner = sideAvatarColor(event);
+  const softWhite = '&H40FFFFFF&';
+  const size = placement.size;
+  const headSize = Math.max(4, size * 0.29);
+  const shouldersWidth = Math.max(6, size * 0.64);
+  const shouldersHeight = Math.max(4, size * 0.3);
+  const assDrawings = [
+    { x: 0, y: 0, path: roundedRectPath(size, size, size / 2), color: outer, layer: 5 },
+    { x: placement.ringInset, y: placement.ringInset, path: roundedRectPath(placement.innerSize, placement.innerSize, placement.innerSize / 2), color: inner, layer: 6 },
+    { x: (size - headSize) / 2, y: size * 0.21, path: roundedRectPath(headSize, headSize, headSize / 2), color: softWhite, layer: 7 },
+    { x: (size - shouldersWidth) / 2, y: size * 0.58, path: roundedRectPath(shouldersWidth, shouldersHeight, shouldersHeight / 2), color: softWhite, layer: 7 }
+  ];
+  // Keep the ASS vector avatar in one texture.  Rendering four separately
+  // rounded layers makes independent pixel rounding visible while cards move.
+  graph.objects.push(sceneObject('Avatar', prefix + '-avatar-vector', { start: segment.start, end: segment.end, zIndex: 20 }, {
+    zIndex: 20,
+    frame: frame(number(segment.x1) + placement.offsetX, number(segment.y1) + placement.offsetY, size, size),
+    animations: legacySegmentAnimations(segment, placement.offsetX, placement.offsetY),
+    props: {
+      role: 'legacy-ass-avatar-vector',
+      vector: { outer, inner, softWhite, ringInset: placement.ringInset, headSize, shouldersWidth, shouldersHeight },
+      assDrawings
+    },
+    style: { fill: '#ffffff', opacity: 1, cornerRadius: size / 2, shadow: null }
+  }));
+  // v0.6.7 rendered this vector avatar as the safe ASS fallback, then placed
+  // a fetched headshot on top when one was available.  Keep both layers: a
+  // missing or failed download preserves the exact fallback, while a local
+  // asset retains the circular headshot in CPU and CUDA Scene paths.
+  const uid = Math.floor(Number(event.uid) || 0);
+  const avatarUrl = String(event.avatarUrl || '');
+  const supplied = avatarAssets && (avatarAssets[uid] || avatarAssets[avatarUrl]);
+  const assetPath = String(supplied && (supplied.filePath || supplied.path) || '');
+  if (assetPath) {
+    const assetId = avatarAsset(graph, event, avatarAssets);
+    graph.objects.push(sceneObject('Avatar', prefix + '-avatar-raster', { start: segment.start, end: segment.end, zIndex: 23 }, {
+      zIndex: 23,
+      frame: frame(number(segment.x1) + placement.offsetX + placement.ringInset, number(segment.y1) + placement.offsetY + placement.ringInset, placement.innerSize, placement.innerSize),
+      animations: legacySegmentAnimations(segment, placement.offsetX + placement.ringInset, placement.offsetY + placement.ringInset),
+      props: { assetId, uid: uid || undefined, shape: 'circle', role: 'legacy-ass-avatar-raster' },
+      style: { fill: '#707070', opacity: 1, cornerRadius: placement.innerSize / 2, shadow: null }
+    }));
+  }
+}
+
+function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
+  if (style.visualPreset === 'minimal') {
+    const metrics = getMinimalSideChatMetrics(style, event.text);
+    const username = truncateTextToWidth(event.user || '观众', metrics.textWidth * 0.35, metrics.fontSize);
+    const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+    const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    const textX = metrics.dotSize + metrics.gap;
+    legacyShape(graph, prefix + '-dot', segment, 0, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
+    // The frozen ASS uses \b1 only for the username, then switches back to
+    // \b0 for the separator and body. Model that as two Scene text nodes so
+    // CUDA does not make the whole minimal line visibly heavier.
+    legacyRichText(graph, prefix + '-line', segment, textX, 0, `\\b1${username}\\b0 · ${detail}`, metrics.fontSize, '&H00DCE8E8&', 23);
+    return;
+  }
+  const metrics = getSideChatMetrics(style, event.text);
+  const palette = sideChatPalette(style);
+  const username = truncateTextToWidth(event.user || '观众', metrics.contentWidth * 0.72, metrics.metaFontSize);
+  const nameWidth = Math.min(metrics.contentWidth * 0.78, Math.max(metrics.metaFontSize * 2.3, estimateTextWidth(username, metrics.metaFontSize) + metrics.metaFontSize));
+  addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
+  if (metrics.metaHeight > 0) {
+    legacyShape(graph, prefix + '-meta-bg', segment, metrics.contentX, 0, nameWidth, metrics.metaHeight, palette.metaBackground, metrics.metaHeight / 2, 15);
+    legacyText(graph, prefix + '-meta', segment, metrics.contentX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2), username, metrics.metaFontSize, palette.metaText, 23, 700);
+  }
+  legacyShape(graph, prefix + '-bubble', segment, metrics.contentX, metrics.bubbleTop, metrics.bubbleWidth, metrics.bubbleHeight, palette.bubbleBackground, palette.radius, 16);
+  // The frozen ASS dialogue emits its chat body with \b1.  Preserve that
+  // semantic weight in the graph: leaving this at the default 400 makes the
+  // CUDA/libass texture visibly thinner even when it resolves the same font.
+  legacyText(graph, prefix + '-body', segment, metrics.contentX + metrics.paddingX, metrics.bubbleTop + metrics.paddingY, metrics.wrappedText, metrics.fontSize, palette.bubbleText, 23, 700);
+}
+
+function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets) {
+  if (style.visualPreset === 'minimal') {
+    const metrics = getMinimalSideInteractionMetrics(style, event);
+    const price = sideInteractionPrice(event);
+    const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
+    const username = truncateTextToWidth(event.user || '观众', textWidth * 0.35, metrics.fontSize);
+    const detail = truncateTextToWidth(sideInteractionText(event), textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+    const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    const textX = metrics.dotSize + metrics.gap * 2;
+    legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, '&H250D1416&', metrics.radius, 16);
+    legacyShape(graph, prefix + '-dot', segment, metrics.gap, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
+    legacyText(graph, prefix + '-user', segment, textX, metrics.paddingY, username, metrics.fontSize, '&H00FFFFFF&', 23, 700);
+    legacyText(graph, prefix + '-detail', segment, textX + estimateTextWidth(username, metrics.fontSize), metrics.paddingY, ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23);
+    if (price) {
+      const priceWidth = Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize);
+      const priceX = metrics.width - priceWidth;
+      legacyShape(graph, prefix + '-price-bg', segment, priceX, metrics.paddingY, priceWidth, metrics.fontSize, '&H10E9EFED&', metrics.fontSize / 2, 24);
+      legacyText(graph, prefix + '-price', segment, priceX + metrics.fontSize / 2, metrics.paddingY, price, metrics.fontSize * 0.82, '&H00323026&', 25, 700);
+    }
+    return;
+  }
+  const metrics = getSideInteractionCardMetrics(style, event);
+  const palette = sideInteractionPalette(style, event);
+  const price = sideInteractionPrice(event);
+  const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
+  const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
+  const detail = truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
+  const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
+  legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, palette.background, metrics.radius, 16);
+  addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
+  legacyText(graph, prefix + '-user', segment, metrics.contentX, textY, username, metrics.fontSize, palette.username, 23, 700);
+  legacyText(graph, prefix + '-detail', segment, metrics.contentX, textY + metrics.fontSize, detail, metrics.metaFontSize, palette.detail, 23);
+  if (price) {
+    const priceWidth = Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2);
+    const priceX = metrics.width - metrics.padding - priceWidth;
+    legacyShape(graph, prefix + '-price-bg', segment, priceX, metrics.padding, priceWidth, metrics.metaFontSize + metrics.padding, palette.priceBackground, (metrics.metaFontSize + metrics.padding) / 2, 24);
+    legacyText(graph, prefix + '-price', segment, priceX + metrics.metaFontSize * 0.6, metrics.padding + metrics.padding / 2, price, metrics.metaFontSize, palette.priceText, 25, 700);
+  }
+}
+
+function addLegacySideEntry(graph, entry, style, avatarAssets, clip) {
+  const firstObjectIndex = graph.objects.length;
+  const segments = Array.isArray(entry.segments) ? entry.segments : [];
+  segments.forEach((segment, index) => {
+    if (number(segment.end) - number(segment.start) < 0.001) return;
+    const event = segment.event || entry.event || {};
+    const prefix = stableId('legacy', entry.id + '|' + index + '|' + number(segment.start));
+    if (event.type === 'danmaku') addLegacySideChat(graph, prefix, event, style, segment, avatarAssets);
+    else addLegacySideInteraction(graph, prefix, event, style, segment, avatarAssets);
+  });
+  // The ASS oracle clips every side-stream primitive to the card panel while
+  // it is reflowing.  Preserve that exact safety boundary for CUDA too: a
+  // newly arriving gift must not paint below the panel before it moves in.
+  if (clip) {
+    for (let index = firstObjectIndex; index < graph.objects.length; index += 1) {
+      graph.objects[index].style.clip = { ...clip };
+    }
+  }
+}
+
 function addMessageNode(graph, entry, layout, avatarAssets) {
   const event = entry.event || {};
   const metrics = entry.metrics || {};
@@ -320,8 +580,15 @@ function buildSceneGraph(events, options) {
       layoutVersion: 1
     }
   };
+  const legacySideClip = {
+    x: Number(layout.style.panelLeft) || 0,
+    y: 0,
+    width: Math.max(1, Number(layout.style.superChatWidth) || layout.canvas.width),
+    height: Math.max(1, Number(layout.style.superChatBottom) || layout.canvas.height)
+  };
   for (const entry of layout.entries) {
     if (entry.kind === 'rolling') addRollingNode(graph, entry, layout.style);
+    else if (entry.kind === 'legacy-side') addLegacySideEntry(graph, entry, layout.style, source.avatarAssets, legacySideClip);
     else addMessageNode(graph, entry, layout, source.avatarAssets);
   }
   graph.timeline.end = round(graph.objects.reduce((maximum, object) => Math.max(maximum, number(object.end)), 0), 4);
@@ -519,8 +786,15 @@ function clipSceneGraph(graph, startTime, endTime, options) {
   const start = Math.max(0, number(startTime));
   const end = Math.max(start, number(endTime, graph.timeline && graph.timeline.end));
   const shift = options && options.shiftTime === false ? 0 : start;
-  const output = clone(graph);
-  output.timeline = { start: round(start - shift, 4), end: round(end - shift, 4) };
+  // A long recording may contain thousands of objects. Do not deep-clone the
+  // whole graph before retaining only one time window: that turns Scene Graph
+  // chunking into quadratic work and can itself delay the first frame.
+  const output = Object.assign({}, graph, {
+    canvas: clone(graph.canvas || {}),
+    assets: clone(graph.assets || []),
+    metadata: Object.assign({}, graph.metadata || {}),
+    timeline: { start: round(start - shift, 4), end: round(end - shift, 4) }
+  });
   output.objects = graph.objects
     .filter((object) => number(object.end) >= start && number(object.start) <= end)
     .map((object) => {

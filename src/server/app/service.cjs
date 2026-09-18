@@ -6,6 +6,18 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const QRCode = require('qrcode');
 const {
+  createGpuSceneProbeArgs,
+  createGpuSceneRenderRequest,
+  parseGpuSceneRendererProbe,
+  resolveGpuSceneRenderer,
+  JETSON_GL_REQUIRED_ELEMENTS,
+  JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
+} = require('../danmaku/gpu-scene-renderer.cjs');
+const {
+  createCudaSceneConformanceUnavailable,
+  canUseCudaSceneProduction
+} = require('../danmaku/gpu-scene-conformance.cjs');
+const {
   DanmakuClient,
   requestBiliJsonWithCookies,
   fetchWithTimeout,
@@ -43,6 +55,8 @@ const {
   createMp4FinalizeArgs,
   createBurnArgs,
   createBurnRawVideoArgs,
+  createJetsonNativeDecodeArgs,
+  createBurnRawSceneFromPipeArgs,
   createJetsonGstreamerEncodeArgs,
   createBurnEncodedVideoMuxArgs,
   createBurnAudioMuxArgs,
@@ -51,6 +65,8 @@ const {
   clipAvatarOverlayEntries,
   createPreviewHlsArgs,
   runFfmpegToGstreamerJob,
+  runJetsonNativeDecodeSceneEncodeJob,
+  runJetsonNativeDecodeCudaSceneJob,
   createClipCopyArgs,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
@@ -130,6 +146,7 @@ const {
   createFfmpegJobProgress,
   resetFfmpegJobProgressRate,
   updateFfmpegJobProgress,
+  setFfmpegJobStageFps,
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
   parseFfmpegTime,
@@ -211,6 +228,9 @@ const {
 const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safety.cjs');
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
+const { createAss } = require('../danmaku/ass.cjs');
+
+const LEGACY_ASS_SCENE_PRESETS = new Set(['h5-card', 'bubble', 'minimal']);
 
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -995,6 +1015,10 @@ class LiveRecordService {
         ? process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming')
         : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
     this.storePath = path.join(appData, 'BiliRecord2K', STORE_FILE);
+    // The Jetson runner persists a real ASS-vs-CUDA fixture report here.
+    // Runtime probing alone never grants CUDA production eligibility.
+    this.cudaSceneConformanceReportPath = String(process.env.BILI_RECORD_CUDA_SCENE_CONFORMANCE_REPORT || '').trim() ||
+      path.join(appData, 'BiliRecord2K', 'cuda-scene-conformance.json');
     this.stateStore = new AtomicJsonStore(this.storePath);
     this.storeExists = false;
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
@@ -1143,10 +1167,13 @@ class LiveRecordService {
       videoAdapters: [],
       gstreamerEncoders: [],
       jetsonBurnTests: {},
+      sceneGpuRenderer: null,
+      sceneGpuVisualConformance: createCudaSceneConformanceUnavailable(),
       avatarComposite: null,
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
       cudaAvatarCompositeReason: '',
+      desktopCuda: { available: false, reason: '尚未执行桌面 CUDA 合成/NVENC 自检。' },
       probedAt: 0,
       probeError: ''
     };
@@ -1246,6 +1273,9 @@ class LiveRecordService {
       }),
       isStartupEnabled()
     ]);
+    this.ffmpegCapabilities.sceneGpuRenderer = await this.probeGpuSceneRenderer();
+    this.ffmpegCapabilities.sceneGpuVisualConformance = this.ffmpegCapabilities.sceneGpuRenderer.visualConformance ||
+      createCudaSceneConformanceUnavailable();
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1277,6 +1307,16 @@ class LiveRecordService {
         }`
       );
     }
+    const gpuScene = this.ffmpegCapabilities.sceneGpuRenderer;
+    const cudaSceneProduction = canUseCudaSceneProduction(gpuScene, this.ffmpegCapabilities.sceneGpuVisualConformance);
+    this.log(
+      gpuScene?.available ? 'success' : 'info',
+      gpuScene?.available
+        ? gpuScene.backend === 'cuda-gstreamer'
+          ? `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。${cudaSceneProduction.ok ? '视觉一致性自检通过，可用于生产 CUDA Scene。' : `尚未取得生产资格：${cudaSceneProduction.reason}`}`
+          : `Jetson GPU Scene renderer 已通过运行时 probe：${gpuScene.backend}（${gpuScene.helper}）。视觉一致性验证未通过，当前保持 CPU Scene 导出。`
+        : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
+    );
     const avatarComposite = this.getAvatarCompositeCapability();
     this.log(
       avatarComposite ? 'info' : 'warn',
@@ -1290,6 +1330,15 @@ class LiveRecordService {
               : ''
           }`
     );
+    const desktopCuda = this.ffmpegCapabilities.desktopCuda;
+    if (desktopCuda?.available) {
+      this.log(
+        'success',
+        `桌面 NVIDIA CUDA 已通过真实自检：${desktopCuda.decoder ? 'CUDA 硬解、' : ''}${desktopCuda.compositor || 'overlay_cuda'} 合成、${desktopCuda.encoder}。当前用于 NVENC 与真实头像/非文字图元合成；旧样式完整文字仍保持 ASS 金标准。`
+      );
+    } else if (process.platform !== 'linux' || process.arch !== 'arm64') {
+      this.log('info', `桌面 NVIDIA CUDA 合成链未启用：${desktopCuda?.reason || '尚未完成自检。'}`);
+    }
     this.emitState();
   }
 
@@ -1601,8 +1650,7 @@ class LiveRecordService {
     const codec = String(encoderCodec || '');
     const preference = codec.includes('nvv4l2')
       ? [
-          sourceCodec === 'hevc' ? 'hevc_nvv4l2dec' : 'h264_nvv4l2dec',
-          sourceCodec === 'hevc' ? 'hevc_v4l2m2m' : 'h264_v4l2m2m',
+          'gstreamer-nvv4l2',
           'cuda',
           'qsv',
           'vaapi',
@@ -1674,6 +1722,23 @@ class LiveRecordService {
     progress.updatedAt = Date.now();
   }
 
+  setProgressPipeline(progress, pipeline = {}) {
+    if (!progress) return;
+    const decoder = pipeline.decoder && typeof pipeline.decoder === 'object' ? pipeline.decoder : null;
+    const activePipeline = {
+      decoder: String(decoder?.label || pipeline.decoder || '').trim(),
+      sceneRenderer: String(pipeline.sceneRenderer || '').trim(),
+      encoder: String(pipeline.encoder || '').trim()
+    };
+    if (!activePipeline.decoder || !activePipeline.sceneRenderer || !activePipeline.encoder) return;
+    progress.activePipeline = activePipeline;
+    this.setProgressDecoder(progress, decoder || { value: 'software', label: activePipeline.decoder, kind: 'software' });
+    // Keep legacy fields in sync; the UI prioritizes activePipeline.
+    progress.avatarCompositeBackend = activePipeline.sceneRenderer;
+    progress.encoderBackend = activePipeline.encoder;
+    progress.updatedAt = Date.now();
+  }
+
   shouldUseCudaAvatarComposite(_codec, avatarPlan) {
     const entryCount = Array.isArray(avatarPlan?.entries) ? avatarPlan.entries.length : 0;
     return Boolean(
@@ -1681,6 +1746,105 @@ class LiveRecordService {
         entryCount <= MAX_CUDA_AVATAR_OVERLAY_ENTRIES &&
         this.getAvatarCompositeCapability()?.value === 'cuda'
     );
+  }
+
+  async probeGpuSceneRenderer() {
+    const visualConformance = await this.readCudaSceneConformanceReport();
+    const helper = resolveGpuSceneRenderer();
+    if (!helper) {
+      return {
+        available: false,
+        reason: '未安装 Jetson GPU Scene helper。',
+        visualConformance
+      };
+    }
+    const result = await runCapturedProcess(helper, createGpuSceneProbeArgs(), {
+      timeoutMs: 12_000,
+      maxOutputBytes: 32 * 1024
+    });
+    if (result.status !== 0 || result.error || result.timedOut) {
+      return {
+        available: false,
+        helper,
+        visualConformance,
+        reason: result.timedOut
+          ? 'GPU Scene helper probe 超时。'
+          : compactLogLine(result.stderr || result.stdout || result.error?.message || 'GPU Scene helper probe 失败。')
+      };
+    }
+    const probe = parseGpuSceneRendererProbe(result.stdout || result.stderr);
+    if (!probe.ok) {
+      return {
+        available: false,
+        helper,
+        reason: probe.reason,
+        visualConformance
+      };
+    }
+    const required = probe.backend === 'gl-gstreamer'
+      ? JETSON_GL_REQUIRED_ELEMENTS
+      : probe.backend === 'cuda-gstreamer'
+        ? JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
+        : [];
+    const available = new Set(probe.gstreamerElements || []);
+    const missing = required.filter((element) => !available.has(element));
+    if (missing.length) {
+      return {
+        available: false,
+        helper,
+        reason: 'GPU Scene helper 缺少 GStreamer 元件：' + missing.join('、') + '。',
+        visualConformance
+      };
+    }
+    const capability = Object.assign({ available: true, helper, visualConformance }, probe);
+    // Element discovery only proves that GStreamer can construct the bins.
+    // Exercise both real Jetson decoder paths before allowing the fully NVMM
+    // route; the I420 CUDA bridge remains a valid fallback when this fails.
+    if (!capability.nativeNvmmScene || capability.backend !== 'cuda-gstreamer') return capability;
+    const nativeTest = await runCapturedProcess(helper, ['--native-nvmm-self-test'], {
+      timeoutMs: 30_000,
+      maxOutputBytes: 64 * 1024
+    });
+    let nativeReport = null;
+    for (const line of String(nativeTest.stdout || '').trim().split(/\r?\n/).reverse()) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed?.nativeNvmmMetrics || parsed?.nativeNvmmFailures) {
+          nativeReport = parsed;
+          break;
+        }
+      } catch {
+        // Native GStreamer may log non-JSON lines before its final report.
+      }
+    }
+    if (nativeTest.status === 0 && !nativeTest.error && !nativeTest.timedOut && nativeReport?.ok === true && nativeReport.nativeNvmmMetrics) {
+      return { ...capability, nativeNvmmSelfTest: nativeReport };
+    }
+    const nativeFailureSummary = nativeReport?.nativeNvmmFailures && typeof nativeReport.nativeNvmmFailures === 'object'
+      ? Object.entries(nativeReport.nativeNvmmFailures)
+        .map(([codec, reason]) => `${String(codec).toUpperCase()}：${compactLogLine(reason)}`)
+        .join('；')
+      : '';
+    return {
+      ...capability,
+      nativeNvmmScene: false,
+      nativeNvmmReason: nativeTest.timedOut
+        ? '原生 NVMM 双编码自检超时。'
+        : nativeFailureSummary || compactLogLine(nativeTest.stderr || nativeTest.stdout || nativeTest.error?.message || '原生 NVMM 双编码自检失败。')
+    };
+  }
+
+  async readCudaSceneConformanceReport() {
+    try {
+      const report = JSON.parse(await fsp.readFile(this.cudaSceneConformanceReportPath, 'utf8'));
+      if (!report || typeof report !== 'object') throw new Error('报告不是 JSON 对象。');
+      return report;
+    } catch (error) {
+      const reason = error?.code === 'ENOENT'
+        ? '尚未执行 CUDA Scene 像素一致性自检。'
+        : `CUDA Scene 像素一致性报告不可读取：${compactLogLine(error.message || error)}`;
+      return createCudaSceneConformanceUnavailable(reason);
+    }
   }
 
   getAvatarCompositeCapability() {
@@ -5665,7 +5829,39 @@ try {
       sourceCachePath: normalized.sceneCachePath || '',
       capturedEventCount: events.length
     });
-    return { graph, eventCount: events.length, scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath) };
+    return {
+      graph,
+      // The legacy ASS compatibility renderer must consume the exact same
+      // normalized event list as the graph.  Do not re-read JSONL later: a
+      // recording may still receive a final buffered event while an export is
+      // being prepared.
+      events,
+      eventCount: events.length,
+      scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath)
+    };
+  }
+
+  async writeLegacySceneCompatibilityAss(filePath, events, options = {}) {
+    const stylePreset = this.resolveSceneGraphStylePreset(options.stylePreset || this.settings.sceneGraphDefaultStyle);
+    if (!LEGACY_ASS_SCENE_PRESETS.has(stylePreset)) return '';
+    // First apply the clip bounds in the recording clock.  The renderer then
+    // offsets source PTS before libass when there is a video lead-in, exactly
+    // as the pre-Scene-Graph ASS pipeline did.
+    const prepared = prepareAssEvents(events, {
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode,
+      startTime: options.startTime,
+      endTime: options.endTime,
+      shiftTime: options.shiftTime === true
+    });
+    const body = createAss(prepared, {
+      stylePreset,
+      styleLayout: options.styleLayout || this.settings.burnDanmakuStyleLayout,
+      overlayMode: options.overlayMode || this.settings.burnOverlayMode,
+      danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea,
+      videoInfo: options.videoInfo || null
+    });
+    await fsp.writeFile(filePath, body, { encoding: 'utf8', mode: 0o660 });
+    return filePath;
   }
 
   async finalizeSceneGraphForRecording(recording, options = {}) {
@@ -9301,7 +9497,7 @@ try {
       if (
         preferredDecoder === 'software' ||
         error?.code === 'BR2K_MEDIA_CANCELLED' ||
-        !isFfmpegHardwareDecodeError(error)
+        !(preferredDecoder === 'gstreamer-nvv4l2' || isFfmpegHardwareDecodeError(error))
       ) {
         throw error;
       }
@@ -9403,8 +9599,11 @@ try {
     createRawArgs,
     createMuxArgs,
     decoder = 'software',
+    nativeDecode = null,
     onStderr,
     onChild,
+    onPipeline,
+    onStageMetrics,
     beforeRetry,
     onFallback,
     label = 'Jetson 媒体处理',
@@ -9431,25 +9630,57 @@ try {
     });
     this.log(
       'info',
-      `${label}：选中的编码器 ${codec}，实际后端 Jetson GStreamer ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}（${codecInfo.converter || 'nvvidconv'}）；FFmpeg 负责解码/滤镜，原始 I420 流式送入硬编。`
+      `${label}：已准备 Jetson ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'} 编码；将在子进程实际启动后更新运行链路。`
     );
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     const run = async (nextDecoder) => {
       await fsp.rm(outputPath, { force: true }).catch(() => {});
-      await runFfmpegToGstreamerJob({
-        ffmpegPath: this.ffmpegPath,
-        ffmpegArgs: createRawArgs(nextDecoder),
-        gstreamerArgs,
-        gstreamerOutputPath: outputPath,
-        onFfmpegStderr: onStderr,
-        onGstreamerStderr: (text) => {
-          const label = /(?:\bargus\b|nvargus-daemon|socketclientdispatch|fileoperationfailed)/i.test(String(text || ''))
-            ? 'GStreamer Argus 附加诊断'
-            : 'GStreamer';
-          onStderr?.(`${label}: ${text}`);
-        },
-        onChild
-      });
+      const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.filterScriptPath;
+      const activeDecoder = nextDecoder === 'gstreamer-nvv4l2' && !useNativeDecode ? 'software' : nextDecoder;
+      if (useNativeDecode) {
+        const encoderLabel = `Jetson ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}`;
+        onPipeline?.({
+          decoder: { value: 'gstreamer-nvv4l2', label: 'Jetson nvv4l2decoder', kind: 'hardware' },
+          sceneRenderer: 'BiliRecord2K ffmpeg-full Scene Graph',
+          encoder: encoderLabel
+        });
+        this.log('info', `${label}：解码 Jetson nvv4l2decoder → I420 pipe；渲染 BiliRecord2K ffmpeg-full Scene Graph → I420 pipe；编码 Jetson ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}。`);
+        await runJetsonNativeDecodeSceneEncodeJob({
+          decoderArgs: createJetsonNativeDecodeArgs({
+            cleanPath: nativeDecode.cleanPath, sourceCodec: nativeDecode.sourceCodec, width, height, fps,
+            converter: codecInfo.converter, helperMode: Boolean(nativeDecode.decoderPath),
+            startTime: nativeDecode.startTime, duration: nativeDecode.duration
+          }),
+          decoderPath: nativeDecode.decoderPath || undefined,
+          ffmpegPath: this.ffmpegPath,
+          ffmpegArgs: createBurnRawSceneFromPipeArgs({ filterScriptPath: nativeDecode.filterScriptPath, fps, width, height, duration: nativeDecode.duration }),
+          encoderArgs: gstreamerArgs,
+          encodedVideoPath: outputPath,
+          onDecoderStderr: (text) => onStderr?.(`GStreamer 解码: ${text}`),
+          onFfmpegStderr: onStderr,
+          onEncoderStderr: (text) => onStderr?.(`GStreamer 编码: ${text}`),
+          onChild,
+          frameSize: Math.max(1, Math.floor(Number(width) || 0) * Math.floor(Number(height) || 0) * 3 / 2),
+          onStageMetrics
+        });
+      } else {
+        onPipeline?.({
+          decoder: activeDecoder === 'software'
+            ? { value: 'software', label: 'BiliRecord2K ffmpeg-full CPU', kind: 'software' }
+            : { value: activeDecoder, label: String(activeDecoder), kind: 'hardware' },
+          sceneRenderer: 'BiliRecord2K ffmpeg-full Scene Graph',
+          encoder: `Jetson ${gstreamerArgs.includes('nvv4l2h265enc') ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}`
+        });
+        await runFfmpegToGstreamerJob({
+          ffmpegPath: this.ffmpegPath,
+          ffmpegArgs: createRawArgs(activeDecoder),
+          gstreamerArgs,
+          gstreamerOutputPath: outputPath,
+          onFfmpegStderr: onStderr,
+          onGstreamerStderr: (text) => onStderr?.(`GStreamer: ${text}`),
+          onChild
+        });
+      }
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
     };
 
@@ -9886,6 +10117,18 @@ try {
         durationSec
       });
       const graph = durationSec > 0 ? clipSceneGraph(sceneResult.graph, 0, durationSec, { shiftTime: false }) : sceneResult.graph;
+      const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+        path.join(sceneDirectory, 'scene.legacy.ass'),
+        sceneResult.events,
+        {
+          overlayMode,
+          danmakuArea,
+          stylePreset,
+          styleLayout,
+          videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+          endTime: durationSec > 0 ? durationSec : undefined
+        }
+      );
       const target = isJetsonGstreamerCodec(burnCodec)
         ? 'jetson'
         : String(burnCodec || '').includes('nvenc')
@@ -9896,7 +10139,8 @@ try {
         outputDuration: durationSec || graph.timeline.end,
         leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
         fps: burnFps,
-        target
+        target,
+        legacyAssPath
       });
       const progress = createFfmpegJobProgress({
         kind: 'burn',
@@ -10986,6 +11230,282 @@ try {
     });
   }
 
+  async runChunkedJetsonSceneGraphExport({
+    graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
+    startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
+    leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
+    onStderr, onChild, onProgress, onStage, isCancelled, label
+  }) {
+    const chunkSeconds = 20;
+    const chunkPaths = [];
+    const chunkDurations = [];
+    const scriptPaths = [];
+    const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
+    const useCudaSceneRenderer = canUseCudaSceneProduction(
+      this.ffmpegCapabilities?.sceneGpuRenderer,
+      this.ffmpegCapabilities?.sceneGpuVisualConformance
+    ).ok;
+    const nativeDecoderPath = resolveGpuSceneRenderer();
+    let completed = 0;
+    try {
+      while (completed < duration - 0.001) {
+        if (isCancelled?.()) {
+          const error = new Error('Scene Graph 导出已取消。');
+          error.code = 'BR2K_MEDIA_CANCELLED';
+          throw error;
+        }
+        const index = chunkPaths.length;
+        const chunkStart = startTime + completed;
+        const graphChunkStart = Math.max(0, Number(graph?.timeline?.start) || 0) + completed;
+        const chunkDuration = Math.min(chunkSeconds, duration - completed);
+        const chunkLeadingVideoPaddingSec = index === 0 ? Math.min(leadingVideoPaddingSec, chunkDuration) : 0;
+        const chunkGraph = clipSceneGraph(graph, graphChunkStart, graphChunkStart + chunkDuration, { shiftTime: true });
+        const scriptPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.filter`);
+        const chunkPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
+        const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${isHevcCodec(codec) ? 'h265' : 'h264'}`;
+        const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+          path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.legacy.ass`),
+          legacyEvents,
+          {
+            ...legacySceneOptions,
+            startTime: chunkStart,
+            endTime: chunkStart + chunkDuration,
+            shiftTime: true
+          }
+        );
+        onStage?.(`正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+        const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
+          duration: chunkDuration,
+          outputDuration: chunkDuration,
+          leadingVideoPaddingSec: chunkLeadingVideoPaddingSec,
+          fps,
+          target: 'jetson',
+          legacyAssPath
+        });
+        scriptPaths.push(scriptPath);
+        if (legacyAssPath) scriptPaths.push(legacyAssPath);
+        await fsp.rm(chunkPath, { force: true }).catch(() => {});
+        const common = {
+          codec,
+          quality: crf,
+          width,
+          height,
+          fps,
+          encodedVideoPath,
+          createMuxArgs: () => createBurnEncodedVideoMuxArgs({
+            encodedVideoPath, cleanPath, outputPath: chunkPath, codec, sourceCodec, fps, startTime: chunkStart,
+            duration: chunkDuration, container: 'mkv', includeAudio: false
+          }),
+          decoder,
+          nativeDecode: decoder?.value === 'gstreamer-nvv4l2' && nativeDecoderPath
+            ? {
+                cleanPath,
+                sourceCodec,
+                filterScriptPath: sceneLayer.filterScriptPath,
+                startTime: chunkStart,
+                duration: chunkDuration,
+                decoderPath: nativeDecoderPath
+              }
+            : null,
+          onStderr: (line) => {
+            onStderr?.(line);
+            const local = parseFfmpegProgressTime(line);
+            if (Number.isFinite(local)) onProgress?.(Math.min(duration, completed + Math.max(0, local)));
+          },
+          onChild,
+          onPipeline: (pipeline) => this.setProgressPipeline(this.exportProgress, pipeline),
+          onStageMetrics: (metrics) => {
+            if (this.exportProgress?.status !== 'running') return;
+            if (setFfmpegJobStageFps(this.exportProgress, metrics)) this.emitState('mediaJob');
+            if (metrics?.final) {
+              const rate = ['decode', 'scene', 'encode', 'total']
+                .map((name) => `${name} ${Number(metrics[name] || 0).toFixed(2)}fps`).join(' / ');
+              this.log('info', `${label} 分段 ${index + 1} 性能：${rate}`);
+            }
+          },
+          beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
+          label: `${label} 分段 ${index + 1}`
+        };
+        const createCpuRawArgs = (nextDecoder) => createBurnRawVideoArgs({
+          cleanPath, assPath: '', fps, avatarOverlay: { filterScriptPath: sceneLayer.filterScriptPath },
+          startTime: chunkStart, duration: chunkDuration, inputSeek: true, timelineOffset: 0,
+          leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
+        });
+        if (!useCudaSceneRenderer) {
+          await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+        } else {
+          try {
+            await this.runJetsonCudaSceneGraphTranscode({
+              ...common,
+              graph: chunkGraph,
+              cleanPath,
+              duration: chunkDuration,
+              timelineOffsetSec: chunkLeadingVideoPaddingSec,
+              createRawArgs: (nextDecoder) => createBurnRawVideoArgs({
+                cleanPath, assPath: '', fps, startTime: chunkStart, duration: chunkDuration, inputSeek: true,
+                timelineOffset: 0, leadingVideoPaddingSec: chunkLeadingVideoPaddingSec, decoder: nextDecoder,
+                sourceCodec, videoWidth: width, videoHeight: height, directRaw: true
+              })
+            });
+          } catch (error) {
+            if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
+            onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
+            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+          }
+        }
+        if ((await getFileSize(chunkPath)) < 1024) throw new Error(`Scene Graph 分段 ${index + 1} 未产生有效视频。`);
+        chunkPaths.push(chunkPath);
+        chunkDurations.push(chunkDuration);
+        completed += chunkDuration;
+        onProgress?.(completed);
+      }
+      await writeConcatFile(concatPath, chunkPaths, { durations: chunkDurations });
+      onStage?.('正在无重编码拼接 Scene Graph 分段并封装源音频');
+      await runFfmpegJob(this.ffmpegPath, createBurnAudioMuxArgs({
+        concatPath, cleanPath, outputPath, codec, sourceCodec, startTime, duration, container: outputContainer,
+        leadingAudioPaddingSec, includeAudio, copyAudio
+      }), onStderr, { onChild });
+    } finally {
+      await Promise.all([...chunkPaths, ...scriptPaths, concatPath].map((file) => fsp.rm(file, { force: true }).catch(() => {})));
+    }
+  }
+
+  // The CUDA Scene helper owns only NVMM composition and nvv4l2 encoding.
+  // FFmpeg stays the decoder and final audio muxer, so this preserves the
+  // established failure/PTS policy while removing the CPU scene.filter work
+  // from the raw-I420 producer.
+  async runJetsonCudaSceneGraphTranscode({
+    graph,
+    codec,
+    quality,
+    width,
+    height,
+    fps,
+    duration,
+    timelineOffsetSec = 0,
+    cleanPath,
+    encodedVideoPath,
+    createRawArgs,
+    createMuxArgs,
+    decoder = 'software',
+    nativeDecode = null,
+    onStderr,
+    onChild,
+    onPipeline,
+    onStageMetrics,
+    beforeRetry,
+    onFallback,
+    label = 'Jetson CUDA Scene Graph 烧录'
+  } = {}) {
+    const renderer = this.ffmpegCapabilities?.sceneGpuRenderer;
+    if (!renderer?.available || renderer.backend !== 'cuda-gstreamer' || !renderer.helper) {
+      throw new Error('Jetson CUDA Scene renderer 未通过运行时自检。');
+    }
+    if (!isJetsonGstreamerCodec(codec) || typeof createRawArgs !== 'function' || typeof createMuxArgs !== 'function') {
+      throw new Error('Jetson CUDA Scene Graph 编码缺少有效参数。');
+    }
+    const requestPath = `${encodedVideoPath}.scene-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`;
+    const request = createGpuSceneRenderRequest(graph, {
+      backend: 'cuda-gstreamer',
+      inputPath: cleanPath,
+      outputPath: encodedVideoPath,
+      codec,
+      width,
+      height,
+      fps,
+      duration,
+      timelineOffsetSec,
+      decoder: String(decoder?.value || decoder || 'software')
+    });
+    if (nativeDecode) {
+      request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
+      request.input.codec = String(nativeDecode.sourceCodec || '').toLowerCase();
+    }
+    await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
+    this.log('info', `${label}：将在子进程实际启动后报告 CUDA Scene 运行链路。`);
+    const preferredDecoder = String(decoder?.value || decoder || 'software');
+    const run = async (nextDecoder) => {
+      await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
+      const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.decoderPath;
+      onPipeline?.({
+        decoder: useNativeDecode
+          ? { value: 'gstreamer-nvv4l2', label: 'Jetson nvv4l2decoder', kind: 'hardware' }
+          : { value: 'software', label: 'BiliRecord2K ffmpeg-full CPU', kind: 'software' },
+        sceneRenderer: useNativeDecode && renderer.nativeNvmmScene
+          ? 'CUDA Scene（NVMM）'
+          : 'Jetson CUDA Scene（I420 bridge）',
+        encoder: `Jetson ${isHevcCodec(codec) ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}`
+      });
+      if (useNativeDecode) {
+        if (renderer.nativeNvmmScene) {
+          const nativeResult = await runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
+            timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024
+          });
+          if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) {
+            throw new Error(compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。'));
+          }
+          let metrics = null;
+          for (const line of String(nativeResult.stdout || '').trim().split(/\r?\n/).reverse()) {
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed?.nativeNvmmMetrics && typeof parsed.nativeNvmmMetrics === 'object') {
+                metrics = parsed.nativeNvmmMetrics;
+                break;
+              }
+            } catch {
+              // Ignore ordinary GStreamer diagnostics before the JSON report.
+            }
+          }
+          if (!metrics) throw new Error('原生 NVMM CUDA Scene 未返回真实性能统计。');
+          onStageMetrics?.({
+            decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total),
+            frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds), final: true
+          });
+        } else await runJetsonNativeDecodeCudaSceneJob({
+          decoderPath: nativeDecode.decoderPath,
+          decoderArgs: createJetsonNativeDecodeArgs({
+            cleanPath: nativeDecode.cleanPath, sourceCodec: nativeDecode.sourceCodec, width, height, fps,
+            converter: this.getBurnCodecInfo(codec).converter, helperMode: true,
+            startTime: nativeDecode.startTime, duration: nativeDecode.duration || duration
+          }),
+          helperPath: renderer.helper,
+          helperArgs: ['--request', requestPath],
+          onDecoderStderr: (text) => onStderr?.(`GStreamer 解码: ${text}`),
+          onHelperStderr: (text) => onStderr?.(`CUDA Scene helper: ${text}`),
+          onChild,
+          frameSize: Math.max(1, Math.floor(Number(width) || 0) * Math.floor(Number(height) || 0) * 3 / 2),
+          onStageMetrics
+        });
+      } else {
+        await runFfmpegToGstreamerJob({
+          ffmpegPath: this.ffmpegPath,
+          ffmpegArgs: createRawArgs(nextDecoder),
+          gstreamerPath: renderer.helper,
+          gstreamerArgs: ['--request', requestPath],
+          gstreamerOutputPath: encodedVideoPath,
+          onFfmpegStderr: onStderr,
+          onGstreamerStderr: (text) => onStderr?.(`CUDA Scene helper: ${text}`),
+          onChild
+        });
+      }
+      await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
+    };
+    try {
+      await run(preferredDecoder);
+      return preferredDecoder;
+    } catch (error) {
+      if (preferredDecoder === 'software' || error?.code === 'BR2K_MEDIA_CANCELLED' || !isFfmpegHardwareDecodeError(error)) throw error;
+      this.log('warn', `${label} 的 ${decoder?.label || preferredDecoder} 不可用，改用 CPU 解码并保留 CUDA Scene 合成：${compactLogLine(error.message)}`);
+      await beforeRetry?.();
+      onFallback?.();
+      await run('software');
+      return 'software';
+    } finally {
+      await fsp.rm(requestPath, { force: true }).catch(() => {});
+      await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
+    }
+  }
+
   async runSceneGraphClipExport({
     recording,
     burnCodec,
@@ -11032,18 +11552,47 @@ try {
       const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
       const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
       const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+        path.join(sceneDirectory, 'scene.legacy.ass'),
+        sceneResult.events,
+        {
+          overlayMode,
+          danmakuArea,
+          stylePreset,
+          styleLayout,
+          videoInfo: recording.videoInfo || mediaInfo.videoInfo,
+          startTime,
+          endTime,
+          shiftTime: true
+        }
+      );
       const target = isJetsonGstreamerCodec(burnCodec)
         ? 'jetson'
         : String(burnCodec || '').includes('nvenc')
           ? 'cuda'
           : 'software';
-      const sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
-        duration,
-        outputDuration: duration,
-        leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
-        fps,
-        target
-      });
+      // A dense hour can otherwise expand to a 100MB+ filter script before
+      // FFmpeg is able to emit its first I420 frame.  Keep each direct Scene
+      // Graph composition bounded; every source frame is still composed and
+      // hardware-encoded exactly once, then the encoded chunks are copied.
+      const useChunkedJetsonScene = isJetsonGstreamerCodec(burnCodec) && graph.objects.length > 1200;
+      const sceneLayer = useChunkedJetsonScene
+        ? null
+        : await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
+            duration,
+            outputDuration: duration,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+            fps,
+            target,
+            legacyAssPath
+          });
+      // CUDA Scene now receives an explicit black lead-in and shifts its
+      // timeline by the same amount, so both ordinary and leading-keyframe
+      // exports retain the established audio/video alignment.
+      const useCudaSceneRenderer = !useChunkedJetsonScene && canUseCudaSceneProduction(
+        this.ffmpegCapabilities?.sceneGpuRenderer,
+        this.ffmpegCapabilities?.sceneGpuVisualConformance
+      ).ok;
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -11090,16 +11639,67 @@ try {
       };
       throwIfExportCancelled();
       if (isJetsonGstreamerCodec(burnCodec)) {
-        const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
-          (isHevcCodec(burnCodec) ? 'h265' : 'h264');
-        await this.runJetsonGstreamerTranscode({
-          codec: burnCodec,
-          quality: burnCrf,
-          width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
-          height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
-          fps,
-          encodedVideoPath,
-          createRawArgs: (decoder) =>
+        if (useChunkedJetsonScene) {
+          await this.runChunkedJetsonSceneGraphExport({
+            graph, cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, codec: burnCodec, crf: burnCrf,
+            fps, width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+            height: recording.videoInfo?.height || mediaInfo.videoInfo?.height, sourceCodec: decoderInfo.codec,
+            startTime, duration, outputContainer, includeAudio: Boolean(mediaInfo.audioInfo), copyAudio: copySourceAudio,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec, leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
+            decoder: decoderInfo, temporaryDir: sceneDirectory, onStderr, onChild,
+            legacyEvents: sceneResult.events,
+            legacySceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
+            onProgress: (value) => {
+              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) this.emitState('mediaJob');
+            },
+            onStage: setExportStage, isCancelled: () => this.exportCancelRequested, label: 'Jetson Scene Graph 烧录'
+          });
+        } else {
+          const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
+            (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+          const common = {
+            codec: burnCodec,
+            quality: burnCrf,
+            width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+            height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
+            fps,
+            encodedVideoPath,
+            createMuxArgs: () =>
+              createBurnEncodedVideoMuxArgs({
+                encodedVideoPath,
+                cleanPath: recording.cleanPath,
+                outputPath: temporaryOutputPath,
+                codec: burnCodec,
+                sourceCodec: mediaInfo.videoInfo?.codec,
+                fps,
+                startTime,
+                duration,
+                container: outputContainer,
+                includeAudio: Boolean(mediaInfo.audioInfo),
+                copyAudio: copySourceAudio
+              }),
+            decoder: decoderInfo,
+            nativeDecode: decoderInfo.value === 'gstreamer-nvv4l2' && resolveGpuSceneRenderer()
+              ? {
+                  cleanPath: recording.cleanPath,
+                  sourceCodec: decoderInfo.codec,
+                  filterScriptPath: sceneLayer.filterScriptPath,
+                  startTime,
+                  duration,
+                  decoderPath: resolveGpuSceneRenderer()
+                }
+              : null,
+            onStderr,
+            onChild,
+            onPipeline: (pipeline) => this.setProgressPipeline(progress, pipeline),
+            onStageMetrics: (metrics) => {
+              if (this.exportProgress?.id === progress.id && setFfmpegJobStageFps(progress, metrics)) this.emitState('mediaJob');
+            },
+            beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+            onFallback: onDecoderFallback,
+            label: 'Jetson Scene Graph 烧录'
+          };
+          const createCpuRawArgs = (decoder) =>
             createBurnRawVideoArgs({
               cleanPath: recording.cleanPath,
               assPath: '',
@@ -11112,30 +11712,46 @@ try {
               leadingVideoPaddingSec: 0,
               decoder,
               sourceCodec: decoderInfo.codec,
-              videoWidth: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
-              videoHeight: recording.videoInfo?.height || mediaInfo.videoInfo?.height
-            }),
-          createMuxArgs: () =>
-            createBurnEncodedVideoMuxArgs({
-              encodedVideoPath,
-              cleanPath: recording.cleanPath,
-              outputPath: temporaryOutputPath,
-              codec: burnCodec,
-              sourceCodec: mediaInfo.videoInfo?.codec,
-              fps,
-              startTime,
-              duration,
-              container: outputContainer,
-              includeAudio: Boolean(mediaInfo.audioInfo),
-              copyAudio: copySourceAudio
-            }),
-          decoder: decoderInfo,
-          onStderr,
-          onChild,
-          beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
-          onFallback: onDecoderFallback,
-          label: 'Jetson Scene Graph 烧录'
-        });
+              videoWidth: common.width,
+              videoHeight: common.height
+            });
+          if (!useCudaSceneRenderer) {
+            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+          } else {
+            try {
+              progress.avatarCompositeBackend = 'CUDA Scene 纹理合成（nvivafilter）';
+              setExportStage('正在 CUDA 合成 Scene Graph 纹理');
+              await this.runJetsonCudaSceneGraphTranscode({
+                ...common,
+                graph,
+                cleanPath: recording.cleanPath,
+                duration,
+                timelineOffsetSec: burnTimeline.videoPaddingSec,
+                createRawArgs: (decoder) =>
+                  createBurnRawVideoArgs({
+                    cleanPath: recording.cleanPath,
+                    assPath: '',
+                    fps,
+                    startTime,
+                    duration,
+                    inputSeek: true,
+                    timelineOffset: 0,
+                    leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+                    decoder,
+                    sourceCodec: decoderInfo.codec,
+                    videoWidth: common.width,
+                    videoHeight: common.height,
+                    directRaw: true
+                  })
+              });
+            } catch (error) {
+              if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
+              this.log('warn', 'CUDA Scene Graph 失败，回退到兼容 Scene filter：' + compactLogLine(error.message));
+              progress.avatarCompositeBackend = 'Scene Graph 直接合成（CPU 回退）';
+              await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+            }
+          }
+        }
       } else {
         await this.runFfmpegWithHardwareDecodeFallback({
           decoder: decoderInfo,

@@ -1702,7 +1702,7 @@ function renderMinimalSideChatSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap, 0)}\\fs${assNumber(metrics.fontSize)}\\1c&H00DCE8E8&\\b1}${assEscape(
         username
-      )}\\b0 · ${assEscape(detail)}`
+      )}{\\b0} · ${assEscape(detail)}`
     )
   ];
 }
@@ -1823,7 +1823,7 @@ function renderMinimalSideInteractionCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap * 2, metrics.paddingY)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c&H00FFFFFF&\\b1}${assEscape(username)}\\b0 · ${assEscape(detail)}`
+      )}\\1c&H00FFFFFF&\\b1}${assEscape(username)}{\\b0} · ${assEscape(detail)}`
     ),
     ...(price
       ? [
@@ -2576,6 +2576,22 @@ module.exports = {
   getRollingDanmakuDuration,
   chooseRollingDanmakuLane,
   createMessageTimeline,
+  getMessageItemMetrics,
+  getSideChatMetrics,
+  getMinimalSideChatMetrics,
+  getSideInteractionCardMetrics,
+  getMinimalSideInteractionMetrics,
+  getSideAvatarPlacement,
+  sideChatPalette,
+  sideInteractionPalette,
+  sideAvatarColor,
+  sideInteractionText,
+  sideInteractionPrice,
+  superChatPalette,
+  guardCardPalette,
+  giftCardPalette,
+  formatSuperChatPrice,
+  visualPresetFromStyle,
   createAvatarOverlayPlan,
   createAss,
   drawRect,
@@ -2588,9 +2604,6 @@ module.exports = {
   assColorFromRgb,
   assShapeColorTags,
   hex2,
-  superChatPalette,
-  guardCardPalette,
-  giftCardPalette,
   chooseLane,
   chooseLaneWithoutOverlap,
   estimateTextWidth,

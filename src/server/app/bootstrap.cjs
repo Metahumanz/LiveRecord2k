@@ -21,6 +21,15 @@ async function start() {
 
   const server = http.createServer((request, response) => {
     handleRequest(service, vite, port, request, response).catch((error) => {
+      // A client may disconnect while an expensive Scene Graph request is
+      // still being built.  Its handler can already have started or
+      // completed a response by the time this outer safety net runs; a
+      // second writeHead would otherwise throw ERR_HTTP_HEADERS_SENT and
+      // take the entire managed service down.
+      if (response.headersSent || response.writableEnded || response.destroyed) {
+        response.destroy();
+        return;
+      }
       writeJson(response, error.statusCode || 500, { error: error.message || String(error) });
     });
   });

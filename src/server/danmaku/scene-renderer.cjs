@@ -327,6 +327,32 @@ function createSceneFilterScript(scene, options) {
   const leadingVideoPaddingSec = Math.max(0, number(source.leadingVideoPaddingSec, 0));
   const canvasWidth = Math.max(2, Math.floor(number(plan.canvas?.width, 2) / 2) * 2);
   const canvasHeight = Math.max(2, Math.floor(number(plan.canvas?.height, 2) / 2) * 2);
+  const legacyAssPath = String(source.legacyAssPath || '').trim();
+  // Preserve the exact legacy filter topology. In particular, do not
+  // round-trip through RGBA before libass: that shifts antialiasing and makes
+  // two otherwise identical ASS renders differ.
+  if (legacyAssPath) {
+    if (leadingVideoPaddingSec > 0.0005) {
+      const lead = ff(leadingVideoPaddingSec);
+      return {
+        plan,
+        script: [
+          'color=c=black:s=' + canvasWidth + 'x' + canvasHeight + ':r=' + ff(fps) + ':d=' + lead +
+            ',format=yuv420p,setpts=PTS-STARTPTS[scene_legacy_lead]',
+          "[0:v]settb=AVTB,setpts=PTS-STARTPTS+" + lead + "/TB,ass=filename='" + quoteFilter(legacyAssPath) +
+            "'[scene_legacy_source]",
+          '[scene_legacy_lead][scene_legacy_source]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
+            ',setpts=PTS-STARTPTS,format=yuv420p[vout]'
+        ].join(';\n') + '\n',
+        renderer: 'libass-legacy-compatibility'
+      };
+    }
+    return {
+      plan,
+      script: "[0:v]ass=filename='" + quoteFilter(legacyAssPath) + "'[vout]\n",
+      renderer: 'libass-legacy-compatibility'
+    };
+  }
   // Scene Graph is rendered directly on the clean-video input. If that video
   // starts later than the source audio, prepend explicit black frames here so
   // the Scene clock and final mux remain aligned. This avoids tpad, which is

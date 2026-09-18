@@ -342,6 +342,24 @@ export type FfmpegCapabilities = {
   }>;
   gstreamerEncoders?: string[];
   jetsonBurnTests?: Record<string, JetsonBurnSelfTest>;
+  sceneGpuRenderer?: {
+    available: boolean;
+    helper?: string;
+    backend?: 'cuda-gstreamer' | 'vulkan-gstreamer' | 'gl-gstreamer';
+    version?: string;
+    capabilities?: string[];
+    gstreamerElements?: string[];
+    reason?: string;
+  } | null;
+  desktopCuda?: {
+    available: boolean;
+    backend?: 'cuda-ffmpeg';
+    encoder?: string;
+    decoder?: string;
+    compositor?: string;
+    fullSceneProduction?: boolean;
+    reason?: string;
+  };
   probedAt: number;
   probeError?: string;
 };
@@ -376,6 +394,17 @@ export type FfmpegJobProgress = {
   sourceFps?: number;
   encoderBackend?: string;
   avatarCompositeBackend?: string;
+  activePipeline?: {
+    decoder: string;
+    sceneRenderer: string;
+    encoder: string;
+  };
+  stageFps?: {
+    decode?: number;
+    scene?: number;
+    encode?: number;
+    total?: number;
+  };
   avatarDiagnostics?: AvatarPreparationDiagnostics;
   fallbackReason?: string;
   startedAt: number;
