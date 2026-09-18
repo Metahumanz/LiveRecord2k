@@ -725,12 +725,19 @@ def render_native_nvmm(request):
     # its first source frame begins at the same clock as the original audio.
     leading_video_sec = min(duration, max(0, number(request.get('timelineOffsetSec'), 0)))
     leading_video_frames = max(0, int(round(leading_video_sec * fps)))
+    # A video stream can only represent the lead in whole frames. Make CUDA's
+    # texture timeline use that exact materialized duration too; otherwise a
+    # 1.019-second request at 30 fps would draw UI about 14 ms before the
+    # first non-black video frame.
+    materialized_lead_sec = leading_video_frames / fps if leading_video_frames else 0
     def launch_quote(value):
         return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
     work_dir = tempfile.mkdtemp(prefix='br2k-native-nvmm-')
     pipeline = None
     try:
-        timeline = prepare_cuda_timeline(request, work_dir)
+        timeline_request = dict(request)
+        timeline_request['timelineOffsetSec'] = materialized_lead_sec
+        timeline = prepare_cuda_timeline(timeline_request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
         os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
         # Let GStreamer's delayed-link machinery bind qtdemux.video_0 before
