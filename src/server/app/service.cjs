@@ -1781,7 +1781,42 @@ class LiveRecordService {
         visualConformance: createCudaSceneConformanceUnavailable()
       };
     }
-    return Object.assign({ available: true, helper, visualConformance: createCudaSceneConformanceUnavailable() }, probe);
+    const capability = Object.assign({ available: true, helper, visualConformance: createCudaSceneConformanceUnavailable() }, probe);
+    // Element discovery only proves that GStreamer can construct the bins.
+    // Exercise both real Jetson decoder paths before allowing the fully NVMM
+    // route; the I420 CUDA bridge remains a valid fallback when this fails.
+    if (!capability.nativeNvmmScene || capability.backend !== 'cuda-gstreamer') return capability;
+    const nativeTest = await runCapturedProcess(helper, ['--native-nvmm-self-test'], {
+      timeoutMs: 30_000,
+      maxOutputBytes: 64 * 1024
+    });
+    let nativeReport = null;
+    for (const line of String(nativeTest.stdout || '').trim().split(/\r?\n/).reverse()) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed?.nativeNvmmMetrics || parsed?.nativeNvmmFailures) {
+          nativeReport = parsed;
+          break;
+        }
+      } catch {
+        // Native GStreamer may log non-JSON lines before its final report.
+      }
+    }
+    if (nativeTest.status === 0 && !nativeTest.error && !nativeTest.timedOut && nativeReport?.ok === true && nativeReport.nativeNvmmMetrics) {
+      return { ...capability, nativeNvmmSelfTest: nativeReport };
+    }
+    const nativeFailureSummary = nativeReport?.nativeNvmmFailures && typeof nativeReport.nativeNvmmFailures === 'object'
+      ? Object.entries(nativeReport.nativeNvmmFailures)
+        .map(([codec, reason]) => `${String(codec).toUpperCase()}：${compactLogLine(reason)}`)
+        .join('；')
+      : '';
+    return {
+      ...capability,
+      nativeNvmmScene: false,
+      nativeNvmmReason: nativeTest.timedOut
+        ? '原生 NVMM 双编码自检超时。'
+        : nativeFailureSummary || compactLogLine(nativeTest.stderr || nativeTest.stdout || nativeTest.error?.message || '原生 NVMM 双编码自检失败。')
+    };
   }
 
   getAvatarCompositeCapability() {
@@ -11368,7 +11403,9 @@ try {
         decoder: useNativeDecode
           ? { value: 'gstreamer-nvv4l2', label: 'Jetson nvv4l2decoder', kind: 'hardware' }
           : { value: 'software', label: 'BiliRecord2K ffmpeg-full CPU', kind: 'software' },
-        sceneRenderer: 'Jetson CUDA Scene（nvivafilter）',
+        sceneRenderer: useNativeDecode && renderer.nativeNvmmScene
+          ? 'CUDA Scene（NVMM）'
+          : 'Jetson CUDA Scene（I420 bridge）',
         encoder: `Jetson ${isHevcCodec(codec) ? 'nvv4l2h265enc' : 'nvv4l2h264enc'}`
       });
       if (useNativeDecode) {
@@ -11379,7 +11416,23 @@ try {
           if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) {
             throw new Error(compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。'));
           }
-          onStageMetrics?.({ decode: 0, scene: 0, encode: 0, total: 0, final: true });
+          let metrics = null;
+          for (const line of String(nativeResult.stdout || '').trim().split(/\r?\n/).reverse()) {
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed?.nativeNvmmMetrics && typeof parsed.nativeNvmmMetrics === 'object') {
+                metrics = parsed.nativeNvmmMetrics;
+                break;
+              }
+            } catch {
+              // Ignore ordinary GStreamer diagnostics before the JSON report.
+            }
+          }
+          if (!metrics) throw new Error('原生 NVMM CUDA Scene 未返回真实性能统计。');
+          onStageMetrics?.({
+            decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total),
+            frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds), final: true
+          });
         } else await runJetsonNativeDecodeCudaSceneJob({
           decoderPath: nativeDecode.decoderPath,
           decoderArgs: createJetsonNativeDecodeArgs({
@@ -11508,7 +11561,7 @@ try {
       // CUDA Scene now receives an explicit black lead-in and shifts its
       // timeline by the same amount, so both ordinary and leading-keyframe
       // exports retain the established audio/video alignment.
-      const useCudaSceneRenderer = !useChunkedJetsonScene && !legacyAssPath && canUseCudaSceneProduction(
+      const useCudaSceneRenderer = !useChunkedJetsonScene && canUseCudaSceneProduction(
         this.ffmpegCapabilities?.sceneGpuRenderer,
         this.ffmpegCapabilities?.sceneGpuVisualConformance
       ).ok;
