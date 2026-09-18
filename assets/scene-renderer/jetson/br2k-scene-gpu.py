@@ -727,7 +727,11 @@ def render_native_nvmm(request):
         # streaming begins. This is the same graph syntax that succeeds under
         # gst-launch; hand-written pad-added linkage could admit one frame and
         # then stall the decoder on JetPack 6.2.
-        caps = 'video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))
+        # Do not force a rounded UI fps (for example 59.99) into the native
+        # decoder caps.  qtdemux/nvv4l2decoder exposes the stream's own exact
+        # rational rate; constraining it to a decimal approximation makes the
+        # demux pad fail with "not-linked" before CUDA receives a frame.
+        caps = 'video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d' % (width, height)
         launch = (
             'filesrc name=source location=%s ! qtdemux name=demux demux.video_0 ! %s name=parser ! '
             'nvv4l2decoder name=decoder ! nvvidconv name=nvmm-rewrap ! %s ! '
@@ -780,6 +784,7 @@ def render_native_nvmm(request):
                 fail('原生 NVMM 无法定位到分段起点。')
             startup_pad.remove_probe(startup_probe)
         counters = {'decode': 0, 'scene': 0, 'encode': 0}
+        negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
         scene_first_pts = {'value': None}
@@ -787,6 +792,23 @@ def render_native_nvmm(request):
             buffer = info.get_buffer()
             if not buffer:
                 return Gst.PadProbeReturn.OK
+            if key == 'decode' and not negotiated_fps['value']:
+                # This probe executes before the buffer reaches nvivafilter.
+                # The CUDA customer library reads this environment value on
+                # its first callback, so it receives the negotiated rational
+                # rate rather than the lossy decimal displayed by FFmpeg.
+                caps = _pad.get_current_caps()
+                caps_text = caps.to_string() if caps else ''
+                match = __import__('re').search(r'framerate=\(fraction\)(\d+)/(\d+)', caps_text)
+                if match and int(match.group(2)) > 0:
+                    negotiated_fps['value'] = match.group(1) + '/' + match.group(2)
+                    os.environ['BR2K_CUDA_SCENE_FPS'] = negotiated_fps['value']
+                    native_nvmm_trace('negotiated source fps=' + negotiated_fps['value'])
+                elif caps_text:
+                    # Avoid re-querying once per decoded frame on unusual
+                    # streams whose negotiated caps omit framerate.
+                    negotiated_fps['value'] = 'unavailable'
+                    native_nvmm_trace('decoder caps omit framerate: ' + caps_text)
             if counters[key] == 0:
                 native_nvmm_trace('first ' + key + ' buffer pts=' + str(buffer.pts))
             # EOS is sent from the streaming thread when the scene output
