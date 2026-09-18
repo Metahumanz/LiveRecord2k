@@ -99,10 +99,10 @@ async function decodeFrame(ffmpeg, inputPath, at, outputPath) {
   return pixels;
 }
 
-function helperRequest(scene, outputPath, duration) {
+function helperRequest(scene, outputPath, duration, timelineOffsetSec = 0) {
   return createGpuSceneRenderRequest(scene, {
     backend: 'cuda-gstreamer', inputPath: '/dev/null', outputPath, codec: 'hevc_nvv4l2',
-    width: CANVAS.width, height: CANVAS.height, fps: CANVAS.fps, duration
+    width: CANVAS.width, height: CANVAS.height, fps: CANVAS.fps, duration, timelineOffsetSec
   });
 }
 
@@ -135,8 +135,7 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
         const baselinePath = path.join(directory, `${id}.ass.h265`);
         const cudaPath = path.join(directory, `${id}.cuda.h265`);
         const baselineRequest = helperRequest({ ...scene, objects: [] }, baselinePath, helperDuration);
-        const cudaRequest = helperRequest(scene, cudaPath, helperDuration);
-        cudaRequest.timelineOffsetSec = leadingVideoPaddingSec;
+        const cudaRequest = helperRequest(scene, cudaPath, helperDuration, leadingVideoPaddingSec);
         const baselineRequestPath = path.join(directory, `${id}.ass.json`);
         const cudaRequestPath = path.join(directory, `${id}.cuda.json`);
         await Promise.all([

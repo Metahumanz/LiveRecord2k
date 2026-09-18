@@ -56,7 +56,12 @@ function createGpuSceneRenderRequest(scene, options = {}) {
   const height = Math.max(2, Math.floor(finite(options.height, plan.canvas.height) / 2) * 2);
   const fps = Math.max(1, finite(options.fps, plan.canvas.fps || 30));
   const duration = Math.max(0.001, finite(options.duration, plan.duration));
-  const timelineOffsetSec = Math.max(0, finite(options.timelineOffsetSec));
+  const requestedTimelineOffsetSec = Math.max(0, finite(options.timelineOffsetSec));
+  // The colour source used for an I420 lead emits whole frames and keeps its
+  // requested end timestamp.  At 60fps 1.019s therefore reaches the next
+  // frame boundary (62/60), not 61/60; matching that boundary keeps CUDA
+  // animations in phase with the frozen ASS/FFmpeg reference.
+  const timelineOffsetSec = Math.ceil(requestedTimelineOffsetSec * fps - 1e-7) / fps;
   const input = String(options.inputPath || '').trim();
   const output = String(options.outputPath || '').trim();
   if (!input) throw new Error('GPU Scene 渲染缺少 clean 视频输入路径。');

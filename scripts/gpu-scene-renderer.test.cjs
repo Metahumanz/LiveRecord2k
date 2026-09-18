@@ -38,6 +38,13 @@ test('GPU Scene request preserves canonical objects and has no pixel intermediat
   assert.equal(JETSON_CUDA_NVMM_REQUIRED_ELEMENTS.includes('cudacompositor'), false);
 });
 
+test('GPU Scene aligns a fractional lead-in to the next I420 frame boundary', () => {
+  const request = createGpuSceneRenderRequest(sampleGraph(), {
+    inputPath: '/recording/clean.mp4', outputPath: '/tmp/out.h265', duration: 3, fps: 60, timelineOffsetSec: 1.019
+  });
+  assert.equal(request.timelineOffsetSec, 62 / 60);
+});
+
 test('GPU Scene helper is rejected unless it declares every Scene Graph primitive', () => {
   const insufficient = parseGpuSceneRendererProbe({ protocol: GPU_SCENE_PROTOCOL, backend: 'cuda-gstreamer', capabilities: ['Text'] });
   assert.equal(insufficient.ok, false);

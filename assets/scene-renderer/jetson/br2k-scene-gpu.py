@@ -200,7 +200,7 @@ class LibassTextRenderer:
         finally:
             self.lib.ass_free_track(track)
 
-    def render(self, props, style, width, height):
+    def render(self, props, style, width, height, offset_x=0.0, offset_y=0.0):
         family = str(props.get('fontFamily') or 'Noto Sans CJK SC').replace(',', ' ').strip() or 'Noto Sans CJK SC'
         size = max(1, number(props.get('fontSize'), 20))
         bold = -1 if number(props.get('fontWeight'), 400) >= 600 else 0
@@ -217,8 +217,8 @@ Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackC
 Style: SceneText,%s,%.4f,%s,&H00000000&,%s,&H00000000&,%d,0,0,0,100,100,0,0,1,%.4f,0,7,0,0,0,1
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(0,0)\\bord%.4f\\shad0}%s
-''' % (width, height, family, size, primary, outline, bold, stroke, stroke, content)
+Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(%.4f,%.4f)\\bord%.4f\\shad0}%s
+''' % (width, height, family, size, primary, outline, bold, stroke, offset_x, offset_y, stroke, content)
         return self.render_script(script, width, height)
 
     def render_drawings(self, drawings, width, height):
@@ -261,7 +261,13 @@ def draw_texture(entry, work_dir):
         font_size = max(1, number(props.get('fontSize'), 20))
         stroke = max(0, round(number(style.get('strokeWidth'), 0)))
         if LIBASS_TEXT:
-            image = LIBASS_TEXT.render(props, style, width, height)
+            # The CUDA callback places Scene objects at rounded NV12 pixels,
+            # while the ASS oracle rasterises at fractional \pos coordinates.
+            # Preserve that residual phase inside the libass texture so glyph
+            # coverage does not jump a third of a pixel from the oracle.
+            phase_x = number(frame.get('x')) - math.floor(number(frame.get('x')) + 0.5)
+            phase_y = number(frame.get('y')) - math.floor(number(frame.get('y')) + 0.5)
+            image = LIBASS_TEXT.render(props, style, width, height, phase_x, phase_y)
         else:
             font = font_for(props, font_size)
             draw.multiline_text((0, 0), str(props.get('text') or ''), font=font,
