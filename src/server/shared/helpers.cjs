@@ -1717,6 +1717,13 @@ function setFfmpegJobStageFps(progress, stageFps) {
   return true;
 }
 
+function getFfmpegJobStructuredRealtimeFactor(progress) {
+  const totalFps = Number(progress?.stageFps?.total);
+  const sourceFps = Number(progress?.sourceFps || 0);
+  if (!Number.isFinite(totalFps) || totalFps <= 0 || !Number.isFinite(sourceFps) || sourceFps <= 0) return null;
+  return totalFps / sourceFps;
+}
+
 function updateFfmpegJobProgress(progress, text) {
   if (!progress || progress.status !== 'running') {
     return false;
@@ -1736,7 +1743,12 @@ function updateFfmpegJobProgress(progress, text) {
   }
   const processedSec = Math.max(0, currentTimeSec);
   const remainingSec = duration > 0 ? Math.max(0, duration - processedSec) : 0;
-  const realtimeFactor = updateFfmpegJobProgressRate(progress, processedSec, now);
+  // A native NVMM chunk publishes its structured stage FPS only when that
+  // chunk exits. The following concat/mux progress line often arrives before
+  // there are enough FFmpeg samples for a wall-clock rate. Do not erase the
+  // already-real CUDA rate (and its ETA) in that gap.
+  const sampledRealtimeFactor = updateFfmpegJobProgressRate(progress, processedSec, now);
+  const realtimeFactor = sampledRealtimeFactor || getFfmpegJobStructuredRealtimeFactor(progress);
   progress.currentTimeSec = Math.max(0, currentTimeSec);
   progress.percent = percent;
   progress.realtimeFactor = realtimeFactor;

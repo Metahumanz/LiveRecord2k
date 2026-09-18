@@ -162,6 +162,14 @@ test('native NVMM stage metrics provide realtime speed and ETA without FFmpeg pr
   assert.equal(progress.renderFps, 120);
   assert.equal(progress.realtimeFactor, 2);
   assert.equal(progress.estimatedRemainingSec, 1740);
+
+  // A chunk boundary can advance the media timestamp before the FFmpeg
+  // wall-clock sampler has enough samples. Keep the native CUDA measurement
+  // instead of clearing the ETA while the next chunk starts.
+  assert.equal(updateFfmpegJobProgress(progress, 'time=00:02:10.000'), true);
+  assert.equal(progress.renderFps, 120);
+  assert.equal(progress.realtimeFactor, 2);
+  assert.equal(progress.estimatedRemainingSec, 1735);
 });
 
 test('structured FFmpeg progress and merge resource waiting remain observable and cancellable', async () => {
