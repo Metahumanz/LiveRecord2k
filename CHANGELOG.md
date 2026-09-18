@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.8.0 - 2026-09-18
+
+- Jetson CUDA Scene 生产链完成原生 NVMM 准入：硬解使用 GStreamer `nvv4l2decoder`，完整链路可直接走 `NVDEC → CUDA Scene（NVMM）→ nvv4l2h264enc/h265enc`；仅在真实双编码自检或运行失败时，才回退至 I420 bridge 或 CPU Scene 兼容链。长录像保留 20 秒媒体时间分段，不再由 wall-clock 截断，并正确处理 59.94 等非整数帧率。
+- 三套旧样式以 ASS 输出冻结为视觉金标准，补齐 CPU Scene Graph 的富文本、字体字重、裁剪、卡片、头像、圆角、阴影、移动和淡入淡出语义。CUDA Scene 只有在 runtime probe 与三套样式、0 秒/1.019 秒前导的像素一致性门禁均通过后才可生产启用；失败自动保持兼容渲染。
+- 导出进度现在显示真实解码、Scene、编码与总 fps、实时倍速和预计剩余时间。原生 NVMM 分段会保留上一段结构化测速，避免下一段 FFmpeg 采样尚未建立时 ETA、倍速和渲染帧率消失。
+- 新增通用 NVIDIA 消费显卡 CUDA 能力模型：桌面与笔记本 GeForce 通过真实 `hwupload_cuda → overlay_cuda → NVENC` 自检后，可使用 CUDA 硬解、NVENC、真实头像和非文字图元合成；明确与 Jetson NVMM 分离。旧样式完整文字继续走 ASS 金标准，不会因检测到 CUDA 而错误替换。
+- 修复服务端在客户端断连后重复写响应可能导致退出的问题；维护页与进度页均只显示当前实际启动的解码器、Scene renderer 与编码器，不再拿能力探测结果冒充运行管线。
+
 ## 0.7.1 - 2026-09-14
 
 - 修复 Linux 受控自动更新可能把已安装的软件包留在 `iF` 配置失败状态的问题：更新环境不再通过 `runuser` 对外部录像目录执行权限探针，避免 systemd 受限环境中的身份/PAM 切换失败阻断 `dpkg` 配置。更新后仍由正常运行的主服务以真实服务用户验证录像目录。
