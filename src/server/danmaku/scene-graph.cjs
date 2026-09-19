@@ -560,14 +560,7 @@ function addMessageNode(graph, entry, layout, avatarAssets) {
 function buildSceneGraph(events, options) {
   const source = options || {};
   const layout = new LayoutEngine(source).layout(events);
-  const resolvedArea = layout.sideStream
-    ? {
-        top: layout.style.danmakuAreaTop !== null && layout.style.danmakuAreaTop !== undefined
-          ? Number(layout.style.danmakuAreaTop)
-          : 0,
-        bottom: Number(layout.style.superChatBottom) || layout.canvas.height
-      }
-    : displayAreaMetrics(layout.style, layout.displayArea);
+  const resolvedArea = layout.layoutBounds || displayAreaMetrics(layout.style, layout.displayArea);
   const graph = {
     schema: SCENE_GRAPH_SCHEMA,
     version: SCENE_GRAPH_VERSION,
@@ -597,14 +590,11 @@ function buildSceneGraph(events, options) {
   };
   const legacySideClip = {
     x: Number(layout.style.panelLeft) || 0,
-    y: layout.style.danmakuAreaTop !== null && layout.style.danmakuAreaTop !== undefined && Number.isFinite(Number(layout.style.danmakuAreaTop)) ? Number(layout.style.danmakuAreaTop) : 0,
+    y: Number(resolvedArea.top) || 0,
     width: Math.max(1, Number(layout.style.superChatWidth) || layout.canvas.width),
     height: Math.max(
       1,
-      (layout.style.danmakuAreaBottom !== null && layout.style.danmakuAreaBottom !== undefined && Number.isFinite(Number(layout.style.danmakuAreaBottom))
-        ? Number(layout.style.danmakuAreaBottom)
-        : Number(layout.style.superChatBottom) || layout.canvas.height) -
-        (layout.style.danmakuAreaTop !== null && layout.style.danmakuAreaTop !== undefined && Number.isFinite(Number(layout.style.danmakuAreaTop)) ? Number(layout.style.danmakuAreaTop) : 0)
+      Number(resolvedArea.bottom || layout.canvas.height) - Number(resolvedArea.top || 0)
     )
   };
   for (const entry of layout.entries) {

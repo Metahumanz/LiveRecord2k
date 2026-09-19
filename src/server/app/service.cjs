@@ -839,16 +839,14 @@ function deriveTimelineBoundaryDelta(timeline, boundary) {
   return audio !== null && video !== null ? audio - video : null;
 }
 
-// A live fMP4/HLS segment can legitimately carry audio from t=0 while its
-// first decodable video keyframe is later.  A burn filter resets video PTS so
-// it can render ASS, therefore it must explicitly restore that leading gap or
-// the video content is pulled forward against the audio (and repeated at the
-// first chunk boundary).  Export callers pass an actual clean-file clip probe;
-// persisted recording metadata is only a compatibility fallback for older
-// background-burn callers that do not have a fresh probe yet.
+// A clean recording already has one media clock.  The first decodable video
+// packet may start after the first audio packet because of keyframe/reorder
+// metadata; that difference is not proof that playback is out of sync.  Keep
+// the probe values for diagnostics, but never synthesize black/silence from
+// firstVideoPts-firstAudioPts.  Clip callers reset both tracks from the same
+// source origin (clipStart), so the renderer receives a zero-based clock.
 function getBurnTimelineAlignment(recording, startTime = 0, duration = 0, actualTimeline = null) {
   const clipStart = Math.max(0, Number(startTime) || 0);
-  const clipDuration = Math.max(0, Number(duration) || 0);
   // Once an export has attempted the authoritative clean-file clip probe,
   // its result is the complete source of truth.  In particular, a failed or
   // incomplete probe must not fall back to stale sidecar PTS and synthesize a
@@ -869,35 +867,12 @@ function getBurnTimelineAlignment(recording, startTime = 0, duration = 0, actual
   };
   const firstVideoPts = firstFinite('firstVideoPts');
   const firstAudioPts = firstFinite('firstAudioPts');
-  const capPadding = (value) => {
-    if (!Number.isFinite(value) || value <= 0) return 0;
-    return clipDuration > 0 ? Math.min(value, clipDuration) : value;
-  };
-  // Do not use absolute packet PTS as padding: some HLS/fMP4 inputs start at
-  // a non-zero timestamp.  Only the *relative* audio/video start offset is
-  // meaningful after filters reset each track to zero.  Preserve that offset
-  // with black video or silence so reconnect boundaries stay in sync.
-  const relativeVideoStart = firstVideoPts !== null ? Math.max(0, Number(firstVideoPts) - clipStart) : null;
-  const relativeAudioStart = firstAudioPts !== null ? Math.max(0, Number(firstAudioPts) - clipStart) : null;
-  const measuredDelta = actualTimeline && Number.isFinite(Number(actualTimeline.avStartDeltaSec))
-    ? Number(actualTimeline.avStartDeltaSec)
-    : relativeAudioStart !== null && relativeVideoStart !== null
-      ? relativeAudioStart - relativeVideoStart
-      : null;
-  const tolerance = Math.max(0.04, Number(actualTimeline?.avBoundaryToleranceSec || 0));
-  const confirmedDelta = actualTimeline?.actualClipProbe === true
-    ? (measuredDelta !== null && Math.abs(measuredDelta) > tolerance ? measuredDelta : 0)
-    : measuredDelta;
-  const videoPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null && confirmedDelta !== 0
-    ? capPadding(confirmedDelta < 0 ? -confirmedDelta : 0)
-    : 0;
-  const audioPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null && confirmedDelta !== 0
-    ? capPadding(confirmedDelta > 0 ? confirmedDelta : 0)
-    : 0;
   return {
-    videoPaddingSec,
-    audioPaddingSec,
-    videoClockStartSec: clipStart + videoPaddingSec,
+    videoPaddingSec: 0,
+    audioPaddingSec: 0,
+    sourceClockOriginSec: clipStart,
+    videoClockStartSec: 0,
+    audioClockStartSec: 0,
     firstVideoPts,
     firstAudioPts
   };
@@ -11339,7 +11314,6 @@ try {
     leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
     onStderr, onChild, onProgress, onStage, isCancelled, label
   }) {
-    const chunkSeconds = 20;
     const chunkPaths = [];
     const chunkDurations = [];
     const scriptPaths = [];
@@ -11356,6 +11330,10 @@ try {
     // one output, or later chunks will steadily pull audio ahead of video.
     const nativeTimestampedAdmission = useCudaSceneRenderer && decoder?.value === 'gstreamer-nvv4l2' &&
       Boolean(this.ffmpegCapabilities?.sceneGpuRenderer?.nativeNvmmScene);
+    // Native NVMM keeps one media clock for the entire export. The historical
+    // 20s loop remains only for the CPU/I420 compatibility path; splitting a
+    // timestamped NVDEC stream would make every concat boundary a new clock.
+    const chunkSeconds = nativeTimestampedAdmission ? Math.max(0.001, Number(duration) || 0.001) : 20;
     let nativeTimestampedPass = nativeTimestampedAdmission;
     if (useCudaSceneRenderer && decoder?.value === 'gstreamer-nvv4l2' && nativeDecoderPath && this.exportProgress?.status === 'running') {
       this.exportProgress.estimateFromWholeJob = true;
@@ -11396,7 +11374,9 @@ try {
             shiftTime: true
           }
         );
-        onStage?.(`正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+        onStage?.(nativeTimestampedAdmission
+          ? `正在连续合成 CUDA Scene Graph（${chunkGraph.objects.length} 个对象）`
+          : `正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
         const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
           duration: chunkDuration,
           outputDuration: chunkDuration,
@@ -11445,7 +11425,9 @@ try {
           onProgress: (localSeconds) => {
             if (!nativeRenderingReported && Number(localSeconds) > 0.001) {
               nativeRenderingReported = true;
-              onStage?.(`正在直接合成 CUDA Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+              onStage?.(nativeTimestampedAdmission
+                ? `正在连续合成 CUDA Scene Graph（${chunkGraph.objects.length} 个对象）`
+                : `正在直接合成 CUDA Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
             }
             onProgress?.(Math.min(duration, completed + Math.max(0, Number(localSeconds) || 0)));
           },
@@ -11521,8 +11503,19 @@ try {
           const bridge = nativeMetrics?.ptsBridge || {};
           const encodedFrames = Number(bridge.encodedFrames ?? nativeMetrics?.frames);
           const minimumFrames = Number(bridge.minimumFrames);
+          const sourceToSceneFrames = Number(bridge.sourceToSceneFrames);
+          const sceneToEncodeFrames = Number(bridge.sceneToEncodeFrames);
+          const sourceToEncodeFrames = Number(bridge.sourceToEncodeFrames);
+          const sourceToSceneMismatches = Number(bridge.sourceToSceneMismatches || 0);
+          const sceneToEncodeMismatches = Number(bridge.sceneToEncodeMismatches || 0);
+          const sourceToEncodeMismatches = Number(bridge.sourceToEncodeMismatches || 0);
           if (!Number.isFinite(encodedFrames) || !Number.isFinite(minimumFrames) || encodedFrames < minimumFrames) {
             throw new Error(`原生 NVMM 分段 ${index + 1} 帧预算不足：${Number.isFinite(encodedFrames) ? encodedFrames : '?'} / ${Number.isFinite(minimumFrames) ? minimumFrames : '?'}。`);
+          }
+          if (!Number.isFinite(sourceToSceneFrames) || !Number.isFinite(sceneToEncodeFrames) || !Number.isFinite(sourceToEncodeFrames) ||
+              sourceToSceneFrames <= 0 || sceneToEncodeFrames <= 0 || sourceToEncodeFrames <= 0 ||
+              sourceToSceneMismatches > 0 || sceneToEncodeMismatches > 0 || sourceToEncodeMismatches > 0) {
+            throw new Error(`原生 NVMM 分段 ${index + 1} PTS 映射不足：source→Scene ${Number.isFinite(sourceToSceneFrames) ? sourceToSceneFrames : '?'} 帧/${sourceToSceneMismatches} 个偏差，Scene→编码 ${Number.isFinite(sceneToEncodeFrames) ? sceneToEncodeFrames : '?'} 帧/${sceneToEncodeMismatches} 个偏差，source→编码 ${Number.isFinite(sourceToEncodeFrames) ? sourceToEncodeFrames : '?'} 帧/${sourceToEncodeMismatches} 个偏差。`);
           }
           // JetPack NVENC can omit packet duration metadata on the final
           // access units. Its FFprobe presentation duration is therefore a
@@ -11533,7 +11526,7 @@ try {
           const coverage = Number(timeline.videoPresentationDurationSec || timeline.videoDurationSec || 0);
           this.log(
             'info',
-            `${label} 分段 ${index + 1} 帧时钟：${encodedFrames}/${minimumFrames} 帧；封装 PTS 诊断 ${coverage.toFixed(3)}s / ${chunkDuration.toFixed(3)}s。`
+            `${label} ${nativeTimestampedAdmission ? '连续链路' : `分段 ${index + 1}`} PTS 映射：source→Scene ${sourceToSceneFrames} 帧（最大 ${(Number(bridge.sourceToSceneMaxDeltaSec || 0) * 1000).toFixed(3)}ms），Scene→编码 ${sceneToEncodeFrames} 帧（最大 ${(Number(bridge.sceneToEncodeMaxDeltaSec || 0) * 1000).toFixed(3)}ms），source→编码 ${sourceToEncodeFrames} 帧（最大 ${(Number(bridge.sourceToEncodeMaxDeltaSec || 0) * 1000).toFixed(3)}ms）；封装诊断 ${coverage.toFixed(3)}s / ${chunkDuration.toFixed(3)}s。`
           );
         }
         chunkPaths.push(chunkPath);
@@ -11590,6 +11583,7 @@ try {
       throw new Error('Jetson CUDA Scene Graph 编码缺少有效参数。');
     }
     const requestPath = `${encodedVideoPath}.scene-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`;
+    const keepSceneRequestForDiagnostics = process.env.BR2K_KEEP_SCENE_REQUEST === '1';
     const request = createGpuSceneRenderRequest(graph, {
       backend: 'cuda-gstreamer',
       inputPath: cleanPath,
@@ -11672,7 +11666,10 @@ try {
           }
           if (nativeStdoutRemainder) consumeNativeReportLine(nativeStdoutRemainder);
           if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) {
-            throw new Error(compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。'));
+            const nativeDiagnostic = compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。');
+            onStderr?.(`原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
+            this.log('warn', `${label}：原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
+            throw new Error(nativeDiagnostic);
           }
           let metrics = null;
           for (const line of String(nativeResult.stdout || '').trim().split(/\r?\n/).reverse()) {
@@ -11741,7 +11738,13 @@ try {
       await run('software');
       return { decoder: 'software', nativeMetrics: null };
     } finally {
-      await fsp.rm(requestPath, { force: true }).catch(() => {});
+      if (keepSceneRequestForDiagnostics) {
+        const preservedRequestPath = path.join('/tmp', `br2k-scene-request-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`);
+        await fsp.copyFile(requestPath, preservedRequestPath).catch(() => {});
+        this.log('warn', `${label}：保留原生 Scene 请求用于诊断：${preservedRequestPath}`);
+      } else {
+        await fsp.rm(requestPath, { force: true }).catch(() => {});
+      }
       await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
     }
   }
@@ -12322,10 +12325,10 @@ try {
         avatarMode,
         startTime,
         endTime,
-        // Keep ASS/avatar timings on the source recording clock. The burn
-        // command seeks at input time, then shifts the decoded chunk back to
-        // this clock before applying the overlays.
-        shiftTime: false,
+        // A clip has one source media origin.  Shift ASS/avatar events by the
+        // requested clip start so both the video filter and the audio muxer
+        // begin at zero; do not retain an absolute recording-clock offset.
+        shiftTime: true,
         cssPath: options.cssPath || recording.cssPath,
         assPath: temporaryAssPath
       });
@@ -12346,7 +12349,7 @@ try {
         assPath,
         fps: exportFps,
         duration: startTime + duration,
-        timelineOffset: burnTimeline.videoClockStartSec,
+        timelineOffset: 0,
         leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
         outputDuration: duration,
         skipInitialKeyframeGuard: true,
@@ -12379,7 +12382,7 @@ try {
             fps: exportFps,
             avatarOverlay: nextAvatarLayer,
             inputSeek: true,
-            timelineOffset: burnTimeline.videoClockStartSec,
+            timelineOffset: 0,
             leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
             leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
             copyAudio: copySourceAudio,
@@ -12507,7 +12510,7 @@ try {
                     startTime,
                     duration,
                     inputSeek: true,
-                    timelineOffset: burnTimeline.videoClockStartSec,
+                    timelineOffset: 0,
                     leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
                     decoder,
                     sourceCodec: decoderInfo.codec,
@@ -13274,6 +13277,7 @@ module.exports = {
   BusinessError,
   isBusinessError,
   isFfmpegMemoryPressureError,
+  getBurnTimelineAlignment,
   getMergeSegmentTimingAssessment,
   getMonitorPollDelayMs,
   createUiCapabilities,

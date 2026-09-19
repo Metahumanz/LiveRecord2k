@@ -281,6 +281,20 @@ function displayAreaMetrics(style, area) {
   };
 }
 
+// Resolve 1/4, 1/2 and 3/4 into one pixel-space contract. Lane count is only
+// derived metadata; preview, ASS and Scene Graph all consume these bounds.
+// Explicit top/bottom values remain authoritative for dragged layouts.
+function resolveLayoutBounds(style, area) {
+  const metrics = displayAreaMetrics(style, area);
+  const top = Math.max(0, Number(metrics.top) || 0);
+  return {
+    top,
+    bottom: Math.max(top + 1, Number(metrics.bottom) || top + 1),
+    lanes: Math.max(1, Number(metrics.lanes) || 1),
+    avoidOverlap: metrics.avoidOverlap === true
+  };
+}
+
 function layoutRolling(events, style, area) {
   const metrics = displayAreaMetrics(style, area);
   const rows = Array(metrics.lanes).fill(null);
@@ -606,9 +620,14 @@ class LayoutEngine {
       resolveLegacyDanmakuStyle(this.sourceStyle, this.sourceStyle.visualPreset),
       this.videoInfo || { width: this.style.playWidth, height: this.style.playHeight }
     );
-    const boundedLegacyStyle = legacyStyle.danmakuAreaBottom !== null && legacyStyle.danmakuAreaBottom !== undefined && Number.isFinite(Number(legacyStyle.danmakuAreaBottom))
-      ? { ...legacyStyle, superChatBottom: Number(legacyStyle.danmakuAreaBottom) }
-      : legacyStyle;
+    const nativeBounds = resolveLayoutBounds(this.style, this.displayArea);
+    const legacyBounds = resolveLayoutBounds(legacyStyle, this.displayArea);
+    const boundedLegacyStyle = {
+      ...legacyStyle,
+      danmakuAreaTop: legacyBounds.top,
+      danmakuAreaBottom: legacyBounds.bottom,
+      superChatBottom: legacyBounds.bottom
+    };
     const entries = sideStream
       ? createLegacyMessageTimeline(sorted, boundedLegacyStyle, { includeDanmaku: true, sideStream: true }).items.map((item) => Object.assign(item, {
           kind: 'legacy-side',
@@ -621,6 +640,7 @@ class LayoutEngine {
       overlayMode: this.overlayMode,
       displayArea: this.displayArea,
       sideStream,
+      layoutBounds: sideStream ? legacyBounds : nativeBounds,
       entries
     };
   }
@@ -648,6 +668,7 @@ module.exports = {
   wrapTextToWidthLines,
   rollingDuration,
   displayAreaMetrics,
+  resolveLayoutBounds,
   messageMetrics,
   layoutRolling,
   layoutMessages,
