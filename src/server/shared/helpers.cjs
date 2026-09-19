@@ -1031,9 +1031,11 @@ function runCapturedProcess(command, args, options = {}) {
 
     child.stdout?.on('data', (chunk) => {
       stdout = appendOutput(stdout, chunk);
+      options.onStdout?.(chunk.toString('utf8'));
     });
     child.stderr?.on('data', (chunk) => {
       stderr = appendOutput(stderr, chunk);
+      options.onStderr?.(chunk.toString('utf8'));
     });
     child.on('error', (error) => finish(null, null, error));
     child.on('close', (status, signal) => finish(status, signal));
@@ -1615,6 +1617,19 @@ function resetFfmpegJobProgressRate(progress) {
 }
 
 function updateFfmpegJobProgressRate(progress, currentTimeSec, now) {
+  // Native NVMM Scene exports spend meaningful time preparing texture assets
+  // before each finite chunk can produce a media PTS. A short sliding window
+  // drops that cost after a few seconds and reports the encoder's burst rate
+  // as if it were the whole-job rate. Keep their ETA honest by measuring from
+  // the actual export start through every preparation and mux stage.
+  if (progress?.estimateFromWholeJob === true) {
+    const startedAt = Number(progress.workStartedAt || progress.startedAt || now);
+    const elapsedSec = Math.max(0, (now - startedAt) / 1000);
+    const mediaSec = Math.max(0, Number(currentTimeSec) || 0);
+    if (elapsedSec < 3 || mediaSec < 0.25) return null;
+    const realtimeFactor = mediaSec / elapsedSec;
+    return Number.isFinite(realtimeFactor) && realtimeFactor > 0 ? realtimeFactor : null;
+  }
   let samples = ffmpegJobProgressSamples.get(progress);
   if (!samples) {
     samples = [{ at: Number(progress.workStartedAt || progress.startedAt || now), timeSec: Math.max(0, Number(progress.currentTimeSec) || 0) }];
@@ -1706,7 +1721,12 @@ function setFfmpegJobStageFps(progress, stageFps) {
   // so the UI remains meaningful while a CUDA-only chunk is in flight.
   const totalFps = Number(normalized.total);
   const sourceFps = Number(progress.sourceFps || 0);
-  if (Number.isFinite(totalFps) && totalFps > 0 && Number.isFinite(sourceFps) && sourceFps > 0) {
+  // Stage rates describe the most recent chunk. They intentionally exclude
+  // graph preparation, concat and remux time, so they are useful diagnostic
+  // data but optimistic as an ETA source. Prefer the PTS/wall-clock samples
+  // recorded by updateFfmpegJobProgress whenever they exist.
+  const hasObservedProgressRate = Number.isFinite(Number(progress.realtimeFactor)) && Number(progress.realtimeFactor) > 0;
+  if (!hasObservedProgressRate && Number.isFinite(totalFps) && totalFps > 0 && Number.isFinite(sourceFps) && sourceFps > 0) {
     const realtimeFactor = totalFps / sourceFps;
     const remainingSec = Math.max(0, Number(progress.durationSec || 0) - Math.max(0, Number(progress.currentTimeSec || 0)));
     progress.renderFps = totalFps;
@@ -1738,7 +1758,10 @@ function updateFfmpegJobProgress(progress, text) {
   const previousPercent = Number(progress.percent ?? 0);
   const previousTime = Number(progress.currentTimeSec || 0);
   const percentChanged = percent === null ? Math.abs(currentTimeSec - previousTime) >= 1 : Math.abs(percent - previousPercent) >= 0.4;
-  if (!percentChanged && now - Number(progress.updatedAt || 0) < 500) {
+  // Native NVMM emits PTS telemetry every 250 ms. Keep that cadence through
+  // to SSE so long recordings do not appear frozen between rounded percent
+  // changes, while still bounding UI/state churn.
+  if (!percentChanged && now - Number(progress.updatedAt || 0) < 250) {
     return false;
   }
   const processedSec = Math.max(0, currentTimeSec);

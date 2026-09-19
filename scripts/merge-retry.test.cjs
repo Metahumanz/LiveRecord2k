@@ -172,6 +172,69 @@ test('native NVMM stage metrics provide realtime speed and ETA without FFmpeg pr
   assert.equal(progress.estimatedRemainingSec, 1735);
 });
 
+test('observed media progress wins over instantaneous NVMM chunk FPS when estimating ETA', () => {
+  const originalNow = Date.now;
+  let now = 2_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 120, sourceFps: 60 });
+    now += 4_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=2000000');
+    assert.equal(progress.realtimeFactor, 0.5);
+    // A late first-chunk rate deliberately does not pretend that setup time
+    // did not happen. It remains visible in stageFps, but cannot overwrite
+    // the whole-job wall-clock ETA.
+    assert.equal(setFfmpegJobStageFps(progress, { decode: 500, scene: 500, encode: 500, total: 500 }), true);
+    assert.equal(progress.stageFps.total, 500);
+    assert.equal(progress.realtimeFactor, 0.5);
+    assert.equal(progress.renderFps, 30);
+    assert.equal(Math.round(progress.estimatedRemainingSec), 236);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('native NVMM ETA retains texture preparation time instead of using a short encoder-only window', () => {
+  const originalNow = Date.now;
+  let now = 3_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 120, sourceFps: 60 });
+    progress.estimateFromWholeJob = true;
+    // Eight seconds of pre-rendering, then four seconds of media: total job
+    // speed is 0.5x, even if the just-started GPU chunk is much faster.
+    now += 8_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=0');
+    now += 4_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=4000000');
+    assert.equal(progress.realtimeFactor, 4 / 12);
+    assert.equal(Math.round(progress.estimatedRemainingSec), 348);
+    assert.equal(setFfmpegJobStageFps(progress, { total: 480 }), true);
+    assert.equal(progress.realtimeFactor, 4 / 12);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('chunked native progress never lets a late PTS report rewind the displayed media clock', () => {
+  const originalNow = Date.now;
+  let now = 4_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 60, sourceFps: 60 });
+    progress.estimateFromWholeJob = true;
+    now += 4_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=40000000');
+    const lateReport = 39.98;
+    const monotonic = Math.max(progress.currentTimeSec, lateReport);
+    now += 1_000;
+    updateFfmpegJobProgress(progress, `out_time_us=${Math.round(monotonic * 1_000_000)}`);
+    assert.equal(progress.currentTimeSec, 40);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test('structured FFmpeg progress and merge resource waiting remain observable and cancellable', async () => {
   assert.equal(parseFfmpegProgressTime('frame=42\nout_time_us=31500000\nprogress=continue'), 31.5);
 

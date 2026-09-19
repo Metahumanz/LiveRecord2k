@@ -81,7 +81,10 @@ function createGpuSceneRenderRequest(scene, options = {}) {
       width,
       height,
       fps,
-      pixelFormat: 'nv12'
+      pixelFormat: 'nv12',
+      // Only the native NVMM path opts in. Its helper restores decoder PTS
+      // before matroskamux; the I420 bridge continues to emit bare H.26x.
+      container: options.container === 'mkv' ? 'mkv' : ''
     },
     scene: plan,
     // A source with audio before its first decodable video frame gets an

@@ -198,13 +198,16 @@ export function DanmakuStylePreview({
   layout,
   overlayMode,
   videoInfo,
-  onLayoutChange
+  onLayoutChange,
+  layoutGuideOnly = false
 }: {
   preset: DanmakuStylePreset;
   layout: DanmakuStyleLayout;
   overlayMode: AppSettings['burnOverlayMode'];
   videoInfo?: { width?: number; height?: number } | null;
   onLayoutChange: (nextLayout: DanmakuStyleLayout) => void;
+  /** Keep the real Scene Graph visible while retaining an always-available, draggable placement rail. */
+  layoutGuideOnly?: boolean;
 }) {
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -435,7 +438,7 @@ export function DanmakuStylePreview({
         ref={canvasRef}
         style={canvasStyle}
       >
-        {!sideStream ? (
+        {!layoutGuideOnly && !sideStream ? (
           <>
             <span
               className="preview-rolling-danmaku first"
@@ -474,6 +477,7 @@ export function DanmakuStylePreview({
               onPointerDown={(event) => beginInteraction(event, 'move')}
               title="拖动调整侧栏位置"
             >
+              {layoutGuideOnly ? <div className="preview-layout-guide-label">互动队列从这里向上</div> : <>
               <SideChatPreviewRow badge="LV.18" text="这是一条示例互动" tone="blue" />
               <SideChatPreviewRow badge="LV.25" text="点赞了直播间" tone="cyan" />
               {showCards ? (
@@ -487,6 +491,7 @@ export function DanmakuStylePreview({
               ) : null}
               <SideChatPreviewRow badge="LV.12" text="感谢你的支持～" tone="mint" />
               {showCards ? <SideEventPreview user="观众 E" text="加入了粉丝团" price="CNY 0.1" kind="superchat" /> : null}
+              </>}
             </div>
             <button
               className="preview-card-resize"
@@ -498,7 +503,7 @@ export function DanmakuStylePreview({
               <Maximize2 size={32} />
             </button>
           </div>
-        ) : showCards ? (
+        ) : showCards && !layoutGuideOnly ? (
           <div
             ref={stackRef}
             className={`preview-message-stack ${interaction ? 'is-adjusting' : ''}`}
@@ -542,7 +547,7 @@ export function DanmakuStylePreview({
 
       <div className="danmaku-preview-toolbar">
         <span>
-          {sideStream ? '侧栏' : '卡片'} x{Math.round(effective.panelLeft)} · y{Math.round(effective.superChatBottom)} · 宽
+          {layoutGuideOnly ? '实时 Scene Graph；拖动虚线基准调整互动队列' : (sideStream ? '侧栏' : '卡片')} x{Math.round(effective.panelLeft)} · y{Math.round(effective.superChatBottom)} · 宽
           {Math.round(effective.superChatWidth)} · {previewCanvas.portrait ? '竖屏' : '横屏'} {previewCanvas.width}×{previewCanvas.height}
         </span>
         <button type="button" onClick={() => void toggleFullscreen()} title="全屏查看画面和弹幕">

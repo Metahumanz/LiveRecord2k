@@ -621,6 +621,20 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   const decoderArgs = muxArgs.reduce((values, value, index) => value === '-c:v' ? [...values, muxArgs[index + 1]] : values, []);
   assert.deepEqual(decoderArgs.slice(0, 2), ['h264', 'hevc']);
 
+  const timestampedMuxArgs = createBurnEncodedVideoMuxArgs({
+    encodedVideoPath: '/recordings/native-chunk.mkv',
+    cleanPath: '/recordings/source.mkv',
+    outputPath: '/recordings/final.mkv',
+    codec: 'hevc_nvv4l2',
+    sourceCodec: 'hevc',
+    fps: 59.483,
+    duration: 20,
+    container: 'mkv',
+    includeAudio: false,
+    preserveVideoTimestamps: true
+  });
+  assert.equal(timestampedMuxArgs.includes('-r'), false, '已恢复 PTS 的原生分段不得被近似 fps 重定时');
+
   const jetsonDecodeArgs = createNormalizeRawVideoArgs({
     inputPath: '/recordings/source.mkv',
     durationSec: 12,

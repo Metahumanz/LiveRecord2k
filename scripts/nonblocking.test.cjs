@@ -228,6 +228,19 @@ test('captured child processes do not block the Node event loop', async () => {
   assert.equal(heartbeat, true);
 });
 
+test('captured child processes stream stdout progress before exit', async () => {
+  const chunks = [];
+  const result = await runCapturedProcess(
+    process.execPath,
+    ['-e', 'process.stdout.write("first\\n"); setTimeout(() => process.stdout.write("second\\n"), 40); setTimeout(() => process.exit(0), 80)'],
+    { timeoutMs: 2000, onStdout: (chunk) => chunks.push(chunk) }
+  );
+
+  assert.equal(result.status, 0);
+  assert.equal(chunks.join(''), 'first\nsecond\n');
+  assert.equal(result.stdout, 'first\nsecond\n');
+});
+
 test('captured child processes are terminated after their timeout', async () => {
   const startedAt = Date.now();
   const result = await runCapturedProcess(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], {

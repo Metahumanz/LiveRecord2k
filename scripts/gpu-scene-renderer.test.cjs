@@ -1,6 +1,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 const { buildSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
 const {
@@ -43,6 +45,28 @@ test('GPU Scene aligns a fractional lead-in to the next I420 frame boundary', ()
     inputPath: '/recording/clean.mp4', outputPath: '/tmp/out.h265', duration: 3, fps: 60, timelineOffsetSec: 1.019
   });
   assert.equal(request.timelineOffsetSec, 62 / 60);
+});
+
+test('native NVMM can opt into a timestamped MKV while the I420 bridge stays elementary', () => {
+  const nativeRequest = createGpuSceneRenderRequest(sampleGraph(), {
+    inputPath: '/recording/clean.mp4', outputPath: '/tmp/native.mkv', duration: 20, fps: 59.483, container: 'mkv'
+  });
+  const bridgeRequest = createGpuSceneRenderRequest(sampleGraph(), {
+    inputPath: '/recording/clean.mp4', outputPath: '/tmp/bridge.h265', duration: 20, fps: 59.483
+  });
+  assert.equal(nativeRequest.output.container, 'mkv');
+  assert.equal(bridgeRequest.output.container, '');
+});
+
+test('native NVMM lead keeps the source timestamp basis and stops on the requested frame budget', () => {
+  const helper = fs.readFileSync(
+    path.join(__dirname, '..', 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py'),
+    'utf8'
+  );
+  assert.match(helper, /concat name=timeline_lead adjust-base=false/);
+  assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\)\)/);
+  assert.match(helper, /reached_frame_budget = counters\['scene'\] >= requested_frame_count/);
+  assert.match(helper, /leading_video_frames or measured_media_seconds <= 0/);
 });
 
 test('GPU Scene helper is rejected unless it declares every Scene Graph primitive', () => {

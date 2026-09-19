@@ -426,6 +426,25 @@
   cursor: grab;
 }
 
+.preview-layout-guide-label {
+  box-sizing: border-box;
+  min-width: 220px;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border: 2px dashed rgba(141, 229, 222, 0.96);
+  border-bottom-width: 5px;
+  border-radius: 10px 10px 4px 4px;
+  color: #e4fffc;
+  background: rgba(10, 36, 40, 0.62);
+  font-size: max(13px, calc(var(--preview-font-size, 18px) * 0.72));
+  font-weight: 900;
+  text-align: center;
+  text-shadow: 0 1px 2px #000;
+}
+
 .preview-side-chat-row {
   --side-avatar: clamp(22px, 18%, 42px);
   display: grid;
