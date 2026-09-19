@@ -881,7 +881,12 @@ def render_native_nvmm(request):
         decoded_timing = deque()
         decoded_clock = {'first': None, 'last': None, 'frames': 0, 'restored': 0, 'unmatched': 0}
         lead_scene_frames = {'remaining': leading_video_frames}
-        requested_frame_count = max(1, int(math.ceil(duration * fps)))
+        # The finite interval is inclusive of its first frame.  A duration of
+        # two seconds at 59.48fps therefore needs 120 frames (PTS 0 through
+        # the frame at roughly 2.0s), not only ceil(2*59.48)=119. Dropping at
+        # the latter count shortens every chunk by one frame interval and
+        # makes the final audio/video timeline drift progressively.
+        requested_frame_count = max(1, int(math.ceil(duration * fps)) + 1)
         wall_started = GLib.get_monotonic_time()
         progress_report = {'last_wall_us': wall_started, 'last_media': -1.0}
         def emit_progress(buffer):
@@ -953,6 +958,15 @@ def render_native_nvmm(request):
                 if decoded_clock['first'] is None:
                     decoded_clock['first'] = buffer.pts
                 decoded_clock['last'] = buffer.pts
+            if key == 'scene' and buffer.pts == Gst.CLOCK_TIME_NONE and counters['scene'] >= requested_frame_count:
+                # A timestamp-less buffer is not expected from NVDEC, but do
+                # not leave an abnormal pipeline running forever.  This is
+                # only a fallback; normal output always uses the PTS branch.
+                if not eos_at_target['sent']:
+                    eos_at_target['sent'] = True
+                    native_nvmm_trace('send EOS at frame fallback=' + str(counters['scene']))
+                    pipeline.send_event(Gst.Event.new_eos())
+                return Gst.PadProbeReturn.DROP
             # EOS is sent from the streaming thread when the scene output
             # reaches the requested media PTS. It is deliberately not a
             # GLib timeout: a 4x realtime pipeline still emits exactly the
@@ -976,9 +990,14 @@ def render_native_nvmm(request):
                     scene_first_pts['value'] = buffer.pts
                 emit_progress(buffer)
                 target_pts = scene_first_pts['value'] + int(duration * Gst.SECOND)
-                reached_frame_budget = counters['scene'] >= requested_frame_count
+                # NVDEC can negotiate a stream rate that differs slightly
+                # from the container average (for example a 60/1 PTS clock
+                # with a 59.483fps average).  Once a real Scene PTS exists,
+                # that timestamp is authoritative; a frame-count cutoff here
+                # would terminate a 20s chunk around 19.88s.  Keep the count
+                # only as a defensive fallback for buffers without PTS.
                 reached_pts_budget = leading_video_frames <= 0 and buffer.pts >= target_pts
-                if reached_frame_budget or reached_pts_budget:
+                if reached_pts_budget:
                     if not eos_at_target['sent']:
                         eos_at_target['sent'] = True
                         native_nvmm_trace('send EOS at scene pts=' + str(buffer.pts))
