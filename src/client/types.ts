@@ -413,6 +413,13 @@ export type FfmpegJobProgress = {
   startedAt: number;
   workStartedAt?: number;
   updatedAt: number;
+  phase?: 'prepare' | 'render' | 'mux' | 'verify';
+  phaseStartedAt?: number;
+  phaseCurrentTimeSec?: number | null;
+  phaseDurationSec?: number | null;
+  phasePercent?: number | null;
+  phaseEstimatedRemainingSec?: number | null;
+  etaState?: 'estimating' | 'ready' | 'unavailable';
   currentTimeSec?: number;
   durationSec?: number;
   estimatedRemainingSec?: number | null;

@@ -15,7 +15,9 @@ const {
   probeMediaTimelineInfo,
   runFfmpegJob,
   runCapturedProcess,
+  setFfmpegJobPhase,
   setFfmpegJobStageFps,
+  updateFfmpegJobPrepareProgress,
   updateFfmpegJobProgress
 } = require('../src/server/shared/helpers.cjs');
 
@@ -123,7 +125,7 @@ test('merge progress keeps the current segment stage after FFmpeg begins reporti
   assert.match(progress.message, /\d+秒/);
 });
 
-test('FFmpeg progress reports recent rendering speed and uses it for a smoothed ETA', () => {
+test('render ETA uses media-time samples at a constant 2x speed', () => {
   const originalNow = Date.now;
   let now = 1_000_000;
   Date.now = () => now;
@@ -134,22 +136,93 @@ test('FFmpeg progress reports recent rendering speed and uses it for a smoothed 
       durationSec: 120,
       sourceFps: 60
     });
-    now += 4_000;
-    assert.equal(updateFfmpegJobProgress(progress, 'out_time_us=2000000'), true);
-    assert.equal(progress.realtimeFactor, 0.5);
-    assert.equal(progress.renderFps, 30);
-    assert.equal(Math.round(progress.estimatedRemainingSec), 236);
-
-    now += 4_000;
-    assert.equal(updateFfmpegJobProgress(progress, 'out_time_us=4000000'), true);
-    assert.equal(progress.realtimeFactor, 0.5);
-    assert.equal(Math.round(progress.estimatedRemainingSec), 232);
+    setFfmpegJobPhase(progress, 'render', { now });
+    for (const mediaTime of [0, 2, 4, 6]) {
+      now += 1_000;
+      updateFfmpegJobProgress(progress, `out_time_us=${mediaTime * 1_000_000}`);
+    }
+    assert.equal(progress.etaState, 'ready');
+    assert.equal(progress.realtimeFactor, 2);
+    assert.equal(progress.renderFps, 120);
+    assert.equal(Math.round(progress.phaseEstimatedRemainingSec), 57);
   } finally {
     Date.now = originalNow;
   }
 });
 
-test('native NVMM stage metrics provide realtime speed and ETA without FFmpeg progress lines', () => {
+test('render EWMA smooths a 1x to 3x speed change instead of jumping', () => {
+  const originalNow = Date.now;
+  let now = 2_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 120 });
+    setFfmpegJobPhase(progress, 'render', { now });
+    for (const mediaTime of [0, 1, 2, 3]) {
+      now += 1_000;
+      updateFfmpegJobProgress(progress, `out_time_us=${mediaTime * 1_000_000}`);
+    }
+    assert.equal(progress.realtimeFactor, 1);
+    for (const mediaTime of [6, 9, 12, 15]) {
+      now += 1_000;
+      updateFfmpegJobProgress(progress, `out_time_us=${mediaTime * 1_000_000}`);
+    }
+    assert.ok(progress.realtimeFactor > 1 && progress.realtimeFactor < 3);
+    for (const mediaTime of [18, 21, 24, 27, 30, 33]) {
+      now += 1_000;
+      updateFfmpegJobProgress(progress, `out_time_us=${mediaTime * 1_000_000}`);
+    }
+    assert.ok(progress.realtimeFactor > 2 && progress.realtimeFactor < 3);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('prepare ETA is object-count based and does not contaminate render samples', () => {
+  const originalNow = Date.now;
+  let now = 3_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 120 });
+    for (const prepared of [0, 100, 200, 300]) {
+      now += 1_000;
+      updateFfmpegJobPrepareProgress(progress, prepared, 600, now);
+    }
+    assert.equal(progress.phase, 'prepare');
+    assert.equal(progress.etaState, 'ready');
+    assert.equal(Math.round(progress.phaseEstimatedRemainingSec), 3);
+    setFfmpegJobPhase(progress, 'render', { now });
+    now += 1_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=1000000');
+    assert.equal(progress.etaState, 'estimating');
+    assert.equal(progress.phaseEstimatedRemainingSec, null);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('fallback resets render ETA samples', () => {
+  const originalNow = Date.now;
+  let now = 4_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 60 });
+    setFfmpegJobPhase(progress, 'render', { now });
+    for (const mediaTime of [0, 2, 4, 6]) {
+      now += 1_000;
+      updateFfmpegJobProgress(progress, `out_time_us=${mediaTime * 1_000_000}`);
+    }
+    assert.equal(progress.etaState, 'ready');
+    setFfmpegJobPhase(progress, 'render', { now, force: true });
+    now += 1_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=1000000');
+    assert.equal(progress.etaState, 'estimating');
+    assert.equal(progress.phaseEstimatedRemainingSec, null);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('stage FPS is diagnostics only and never creates an ETA', () => {
   const progress = createFfmpegJobProgress({
     kind: 'export',
     label: 'cuda',
@@ -157,79 +230,59 @@ test('native NVMM stage metrics provide realtime speed and ETA without FFmpeg pr
     durationSec: 3600,
     sourceFps: 60
   });
-  progress.currentTimeSec = 120;
   assert.equal(setFfmpegJobStageFps(progress, { decode: 132, scene: 120, encode: 120, total: 120 }), true);
-  assert.equal(progress.renderFps, 120);
-  assert.equal(progress.realtimeFactor, 2);
-  assert.equal(progress.estimatedRemainingSec, 1740);
-
-  // A chunk boundary can advance the media timestamp before the FFmpeg
-  // wall-clock sampler has enough samples. Keep the native CUDA measurement
-  // instead of clearing the ETA while the next chunk starts.
-  assert.equal(updateFfmpegJobProgress(progress, 'time=00:02:10.000'), true);
-  assert.equal(progress.renderFps, 120);
-  assert.equal(progress.realtimeFactor, 2);
-  assert.equal(progress.estimatedRemainingSec, 1735);
+  assert.equal(progress.renderFps, null);
+  assert.equal(progress.realtimeFactor, null);
+  assert.equal(progress.estimatedRemainingSec, null);
+  assert.equal(progress.stageFps.total, 120);
 });
 
-test('observed media progress wins over instantaneous NVMM chunk FPS when estimating ETA', () => {
+test('mux out_time starts at zero without rewinding completed render progress', () => {
   const originalNow = Date.now;
-  let now = 2_000_000;
+  let now = 5_000_000;
   Date.now = () => now;
   try {
-    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 120, sourceFps: 60 });
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 60 });
+    setFfmpegJobPhase(progress, 'render', { now });
     now += 4_000;
-    updateFfmpegJobProgress(progress, 'out_time_us=2000000');
-    assert.equal(progress.realtimeFactor, 0.5);
-    // A late first-chunk rate deliberately does not pretend that setup time
-    // did not happen. It remains visible in stageFps, but cannot overwrite
-    // the whole-job wall-clock ETA.
-    assert.equal(setFfmpegJobStageFps(progress, { decode: 500, scene: 500, encode: 500, total: 500 }), true);
-    assert.equal(progress.stageFps.total, 500);
-    assert.equal(progress.realtimeFactor, 0.5);
-    assert.equal(progress.renderFps, 30);
-    assert.equal(Math.round(progress.estimatedRemainingSec), 236);
-  } finally {
-    Date.now = originalNow;
-  }
-});
-
-test('native NVMM ETA retains texture preparation time instead of using a short encoder-only window', () => {
-  const originalNow = Date.now;
-  let now = 3_000_000;
-  Date.now = () => now;
-  try {
-    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 120, sourceFps: 60 });
-    progress.estimateFromWholeJob = true;
-    // Eight seconds of pre-rendering, then four seconds of media: total job
-    // speed is 0.5x, even if the just-started GPU chunk is much faster.
-    now += 8_000;
-    updateFfmpegJobProgress(progress, 'out_time_us=0');
-    now += 4_000;
-    updateFfmpegJobProgress(progress, 'out_time_us=4000000');
-    assert.equal(progress.realtimeFactor, 4 / 12);
-    assert.equal(Math.round(progress.estimatedRemainingSec), 348);
-    assert.equal(setFfmpegJobStageFps(progress, { total: 480 }), true);
-    assert.equal(progress.realtimeFactor, 4 / 12);
-  } finally {
-    Date.now = originalNow;
-  }
-});
-
-test('chunked native progress never lets a late PTS report rewind the displayed media clock', () => {
-  const originalNow = Date.now;
-  let now = 4_000_000;
-  Date.now = () => now;
-  try {
-    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 60, sourceFps: 60 });
-    progress.estimateFromWholeJob = true;
-    now += 4_000;
-    updateFfmpegJobProgress(progress, 'out_time_us=40000000');
-    const lateReport = 39.98;
-    const monotonic = Math.max(progress.currentTimeSec, lateReport);
+    updateFfmpegJobProgress(progress, 'out_time_us=60000000');
+    assert.equal(progress.currentTimeSec, 60);
+    setFfmpegJobPhase(progress, 'mux', { now });
     now += 1_000;
-    updateFfmpegJobProgress(progress, `out_time_us=${Math.round(monotonic * 1_000_000)}`);
-    assert.equal(progress.currentTimeSec, 40);
+    updateFfmpegJobProgress(progress, 'out_time_us=0');
+    assert.equal(progress.currentTimeSec, 60);
+    assert.equal(progress.percent, 100);
+    assert.equal(progress.phaseCurrentTimeSec, 0);
+    assert.equal(progress.phasePercent, 0);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test('render reaching 100% while mux runs is still not completed', () => {
+  const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 60 });
+  setFfmpegJobPhase(progress, 'render', { now: Date.now() });
+  updateFfmpegJobProgress(progress, 'out_time_us=60000000');
+  setFfmpegJobPhase(progress, 'mux', { now: Date.now() });
+  assert.equal(progress.status, 'running');
+  assert.equal(progress.percent, 100);
+  assert.equal(progress.phase, 'mux');
+  assert.notEqual(progress.status, 'completed');
+});
+
+test('insufficient render samples stay in estimating state', () => {
+  const originalNow = Date.now;
+  let now = 6_000_000;
+  Date.now = () => now;
+  try {
+    const progress = createFfmpegJobProgress({ kind: 'export', label: 'cuda', durationSec: 60 });
+    setFfmpegJobPhase(progress, 'render', { now });
+    now += 1_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=1000000');
+    now += 1_000;
+    updateFfmpegJobProgress(progress, 'out_time_us=2000000');
+    assert.equal(progress.etaState, 'estimating');
+    assert.equal(progress.phaseEstimatedRemainingSec, null);
   } finally {
     Date.now = originalNow;
   }

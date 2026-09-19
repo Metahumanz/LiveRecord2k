@@ -146,6 +146,8 @@ const {
   runFfmpegJob,
   createFfmpegJobProgress,
   resetFfmpegJobProgressRate,
+  setFfmpegJobPhase,
+  updateFfmpegJobPrepareProgress,
   updateFfmpegJobProgress,
   setFfmpegJobStageFps,
   finishFfmpegJobProgress,
@@ -1621,11 +1623,13 @@ class LiveRecordService {
     progress.fallbackReason = String(reason || '').trim() || undefined;
     if (options.avatarCompositeBackend) progress.avatarCompositeBackend = options.avatarCompositeBackend;
     if (options.reset) {
-      progress.workStartedAt = Date.now();
+      const now = Date.now();
+      progress.workStartedAt = now;
+      setFfmpegJobPhase(progress, 'render', { now });
       progress.currentTimeSec = 0;
       progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
       progress.estimatedRemainingSec = null;
-      resetFfmpegJobProgressRate(progress);
+      resetFfmpegJobProgressRate(progress, 'render');
     }
     if (options.message) progress.message = options.message;
     progress.updatedAt = Date.now();
@@ -9643,6 +9647,7 @@ try {
     onPipeline,
     onStageMetrics,
     onProgress,
+    onPhase,
     beforeRetry,
     onFallback,
     label = 'Jetson 媒体处理',
@@ -9676,6 +9681,7 @@ try {
     );
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     const run = async (nextDecoder) => {
+      onPhase?.('render');
       await fsp.rm(outputPath, { force: true }).catch(() => {});
       const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.filterScriptPath;
       const activeDecoder = nextDecoder === 'gstreamer-nvv4l2' && !useNativeDecode ? 'software' : nextDecoder;
@@ -9723,6 +9729,7 @@ try {
           onChild
         });
       }
+      onPhase?.('mux');
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
     };
 
@@ -9745,6 +9752,7 @@ try {
       );
       await beforeRetry?.();
       onFallback?.();
+      onPhase?.('render', { force: true });
       await run('software');
       return 'software';
     } finally {
@@ -11312,7 +11320,7 @@ try {
     graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
     leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
-    onStderr, onChild, onProgress, onStage, isCancelled, label
+    onStderr, onChild, onProgress, onPreparing, onPhase, onStage, isCancelled, label
   }) {
     const chunkPaths = [];
     const chunkDurations = [];
@@ -11335,9 +11343,6 @@ try {
     // timestamped NVDEC stream would make every concat boundary a new clock.
     const chunkSeconds = nativeTimestampedAdmission ? Math.max(0.001, Number(duration) || 0.001) : 20;
     let nativeTimestampedPass = nativeTimestampedAdmission;
-    if (useCudaSceneRenderer && decoder?.value === 'gstreamer-nvv4l2' && nativeDecoderPath && this.exportProgress?.status === 'running') {
-      this.exportProgress.estimateFromWholeJob = true;
-    }
     let completed = 0;
     try {
       while (completed < duration - 0.001) {
@@ -11436,13 +11441,11 @@ try {
             const total = Math.max(0, Number(metrics?.objectCount) || 0);
             const rows = Math.max(0, Number(metrics?.timelineRows) || 0);
             onStage?.(`正在预渲染 CUDA Scene 纹理：${prepared}/${total} 个对象${rows ? `（${rows} 个动画片段）` : ''}`);
-            // No media time advances during texture preparation, but feeding
-            // the unchanged PTS through the whole-job rate makes ETA reflect
-            // the real time spent waiting instead of freezing optimistically.
-            onProgress?.(completed);
+            onPreparing?.(metrics);
           },
           onChild,
           onPipeline: (pipeline) => this.setProgressPipeline(this.exportProgress, pipeline),
+          onPhase,
           onStageMetrics: (metrics) => {
             if (this.exportProgress?.status !== 'running') return;
             if (setFfmpegJobStageFps(this.exportProgress, metrics)) this.emitState('mediaJob');
@@ -11461,9 +11464,11 @@ try {
           leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
         });
         if (!useCudaSceneRenderer) {
-          await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+            onPhase?.('render');
+            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
         } else {
           try {
+            onPhase?.('render');
             const cudaResult = await this.runJetsonCudaSceneGraphTranscode({
               ...common,
               graph: chunkGraph,
@@ -11495,6 +11500,7 @@ try {
             // the entire remaining pass to that same timestamped contract.
             nativeTimestampedChunk = false;
             nativeTimestampedPass = false;
+            onPhase?.('render', { force: true });
             await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
           }
         }
@@ -11535,6 +11541,7 @@ try {
         onProgress?.(completed);
       }
       await writeConcatFile(concatPath, chunkPaths, { durations: chunkDurations });
+      onPhase?.('mux');
       onStage?.('正在无重编码拼接 Scene Graph 分段并封装源音频');
       await runFfmpegJob(this.ffmpegPath, createBurnAudioMuxArgs({
         concatPath, cleanPath, outputPath, codec, sourceCodec, startTime, duration, container: outputContainer,
@@ -11571,6 +11578,7 @@ try {
     onStageMetrics,
     onProgress,
     onPreparing,
+    onPhase,
     beforeRetry,
     onFallback,
     label = 'Jetson CUDA Scene Graph 烧录'
@@ -11608,6 +11616,7 @@ try {
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     let completedNativeMetrics = null;
     const run = async (nextDecoder) => {
+      onPhase?.('render');
       await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
       const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.decoderPath;
       onPipeline?.({
@@ -11720,6 +11729,7 @@ try {
           onChild
         });
       }
+      onPhase?.('mux');
       await runFfmpegJob(
         this.ffmpegPath,
         createMuxArgs({ preserveVideoTimestamps: Boolean(nativeTimestampedOutput && useNativeDecode && renderer.nativeNvmmScene) }),
@@ -11735,6 +11745,7 @@ try {
       this.log('warn', `${label} 的 ${decoder?.label || preferredDecoder} 不可用，改用 CPU 解码并保留 CUDA Scene 合成：${compactLogLine(error.message)}`);
       await beforeRetry?.();
       onFallback?.();
+      onPhase?.('render', { force: true });
       await run('software');
       return { decoder: 'software', nativeMetrics: null };
     } finally {
@@ -11770,6 +11781,7 @@ try {
     decoderInfo,
     progress,
     setExportStage,
+    setExportPhase,
     throwIfExportCancelled
   }) {
     let sceneDirectory = '';
@@ -11784,6 +11796,7 @@ try {
       await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
       throwIfExportCancelled();
       sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-scene-'));
+      setExportPhase?.('prepare', { stageLabel: '正在准备 Scene Graph' });
       setExportStage('正在从 Scene Graph 直接合成');
       const sceneResult = await this.buildSceneGraphForRecording(recording, {
         overlayMode,
@@ -11927,6 +11940,27 @@ try {
       const onChild = (child) => {
         this.exportProcess = child;
       };
+      const onScenePhase = (phase, options = {}) => {
+        if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
+        const labels = {
+          prepare: '正在准备 Scene Graph',
+          render: '正在渲染 Scene Graph',
+          mux: '正在封装输出',
+          verify: '正在验证输出'
+        };
+        setExportPhase?.(phase, { ...options, stageLabel: labels[phase] || progress.stageLabel });
+      };
+      const onScenePreparing = (metrics) => {
+        if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
+        const prepared = Math.max(0, Number(metrics?.objectsPrepared) || 0);
+        const total = Math.max(0, Number(metrics?.objectCount) || 0);
+        const rows = Math.max(0, Number(metrics?.timelineRows) || 0);
+        updateFfmpegJobPrepareProgress(progress, prepared, total);
+        progress.stageLabel = `正在预渲染 CUDA Scene 纹理：${prepared}/${total} 个对象${rows ? `（${rows} 个动画片段）` : ''}`;
+        progress.message = progress.stageLabel;
+        progress.updatedAt = Date.now();
+        this.emitState('mediaJob');
+      };
       const onDecoderFallback = () => {
         this.setProgressDecoder(
           progress,
@@ -11950,12 +11984,15 @@ try {
             legacySceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
             onProgress: (value) => {
               if (this.exportProgress?.id !== progress.id) return;
+              if (Number(value) > 0.001) onScenePhase('render');
               // A late native helper report can arrive at a chunk boundary
               // after the completed-chunk marker. Never let it move the
               // displayed media clock backward or reset the whole-job ETA.
               const monotonicValue = Math.max(Number(this.exportProgress.currentTimeSec || 0), Number(value) || 0);
               if (updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(monotonicValue * 1_000_000)}`)) this.emitState('mediaJob');
             },
+            onPreparing: onScenePreparing,
+            onPhase: onScenePhase,
             onStage: setExportStage, isCancelled: () => this.exportCancelRequested, label: 'Jetson Scene Graph 烧录'
           });
         } else {
@@ -11998,10 +12035,13 @@ try {
             onChild,
             onPipeline: (pipeline) => this.setProgressPipeline(progress, pipeline),
             onProgress: (value) => {
+              if (Number(value) > 0.001) onScenePhase('render');
               if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
                 this.emitState('mediaJob');
               }
             },
+            onPreparing: onScenePreparing,
+            onPhase: onScenePhase,
             onStageMetrics: (metrics) => {
               if (this.exportProgress?.id === progress.id && setFfmpegJobStageFps(progress, metrics)) this.emitState('mediaJob');
             },
@@ -12058,6 +12098,7 @@ try {
               if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
               this.log('warn', 'CUDA Scene Graph 失败，回退到兼容 Scene filter：' + compactLogLine(error.message));
               progress.avatarCompositeBackend = 'Scene Graph 直接合成（CPU 回退）';
+              setExportPhase?.('render', { force: true, stageLabel: '正在使用兼容 Scene filter 重新渲染' });
               await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
             }
           }
@@ -12093,6 +12134,7 @@ try {
         }
       }
       throwIfExportCancelled();
+      setExportPhase?.('verify', { stageLabel: '正在验证输出' });
       setExportStage('正在验证并完成 Scene Graph 导出');
       const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
@@ -12248,6 +12290,20 @@ try {
       progress.updatedAt = Date.now();
       this.emitState('mediaJob');
     };
+    const setExportPhase = (phase, options = {}) => {
+      if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return false;
+      const now = Number(options.now) || Date.now();
+      const stageLabel = options.stageLabel === undefined ? progress.stageLabel : options.stageLabel;
+      const changed = setFfmpegJobPhase(progress, phase, {
+        ...options,
+        now,
+        stageLabel
+      });
+      if (!changed) return false;
+      progress.updatedAt = now;
+      this.emitState('mediaJob');
+      return true;
+    };
     const throwIfExportCancelled = () => {
       if (!this.exportCancelRequested) return;
       const error = new Error('导出已取消。');
@@ -12281,9 +12337,11 @@ try {
         decoderInfo,
         progress,
         setExportStage,
+        setExportPhase,
         throwIfExportCancelled
       });
     }
+    setExportPhase('prepare', { stageLabel: mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段' });
     setExportStage(mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段');
 
     let cssPath = recording.cssPath;
@@ -12398,6 +12456,7 @@ try {
         );
       }
     }
+    setExportPhase('render', { stageLabel: mode === 'burn' ? '正在烧录片段' : '正在导出纯净片段' });
     setExportStage(mode === 'burn' ? '正在烧录片段' : '正在导出纯净片段');
     this.log(
       'info',
@@ -12560,6 +12619,7 @@ try {
         await runFfmpegJob(this.ffmpegPath, args, handleExportStderr, { onChild });
       }
       throwIfExportCancelled();
+      setExportPhase('verify', { stageLabel: '正在验证输出' });
       setExportStage('正在验证并完成导出');
       const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {

@@ -1605,55 +1605,133 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   });
 }
 
-const ffmpegJobProgressSamples = new WeakMap();
+const ffmpegJobProgressState = new WeakMap();
 const FFMPEG_PROGRESS_SAMPLE_WINDOW_MS = 90_000;
-const FFMPEG_PROGRESS_SAMPLE_LIMIT = 24;
+const FFMPEG_PROGRESS_SAMPLE_LIMIT = 48;
+const FFMPEG_PROGRESS_MIN_SAMPLES = 3;
+const FFMPEG_PROGRESS_MIN_ELAPSED_MS = 3_000;
+const FFMPEG_PROGRESS_EWMA_ALPHA = 0.2;
+const FFMPEG_PROGRESS_PHASES = new Set(['prepare', 'render', 'mux', 'verify']);
 
-function resetFfmpegJobProgressRate(progress) {
-  if (!progress || typeof progress !== 'object') return;
-  ffmpegJobProgressSamples.set(progress, [{ at: Date.now(), timeSec: Math.max(0, Number(progress.currentTimeSec) || 0) }]);
-  progress.renderFps = null;
-  progress.realtimeFactor = null;
+function progressPhaseState(progress, phase = progress?.phase || 'render') {
+  let state = ffmpegJobProgressState.get(progress);
+  if (!state) {
+    state = {};
+    ffmpegJobProgressState.set(progress, state);
+  }
+  if (!state[phase]) state[phase] = { samples: [], smoothedRate: null };
+  return state[phase];
 }
 
-function updateFfmpegJobProgressRate(progress, currentTimeSec, now) {
-  // Native NVMM Scene exports spend meaningful time preparing texture assets
-  // before each finite chunk can produce a media PTS. A short sliding window
-  // drops that cost after a few seconds and reports the encoder's burst rate
-  // as if it were the whole-job rate. Keep their ETA honest by measuring from
-  // the actual export start through every preparation and mux stage.
-  if (progress?.estimateFromWholeJob === true) {
-    const startedAt = Number(progress.workStartedAt || progress.startedAt || now);
-    const elapsedSec = Math.max(0, (now - startedAt) / 1000);
-    const mediaSec = Math.max(0, Number(currentTimeSec) || 0);
-    if (elapsedSec < 3 || mediaSec < 0.25) return null;
-    const realtimeFactor = mediaSec / elapsedSec;
-    return Number.isFinite(realtimeFactor) && realtimeFactor > 0 ? realtimeFactor : null;
+function resetFfmpegJobProgressRate(progress, phase = progress?.phase || 'render') {
+  if (!progress || typeof progress !== 'object') return;
+  const state = progressPhaseState(progress, phase);
+  state.samples = [];
+  state.smoothedRate = null;
+  if (phase === 'render') {
+    progress.renderFps = null;
+    progress.realtimeFactor = null;
   }
-  let samples = ffmpegJobProgressSamples.get(progress);
-  if (!samples) {
-    samples = [{ at: Number(progress.workStartedAt || progress.startedAt || now), timeSec: Math.max(0, Number(progress.currentTimeSec) || 0) }];
+  if (progress.phase === phase) {
+    progress.phaseEstimatedRemainingSec = null;
+    progress.estimatedRemainingSec = null;
+    progress.etaState = 'estimating';
   }
-  const lastSample = samples[samples.length - 1];
-  // A retry starts a new FFmpeg process at zero. Do not blend it with the
-  // failed attempt, otherwise its ETA is absurdly optimistic for minutes.
-  if (lastSample && currentTimeSec + 0.05 < lastSample.timeSec) {
-    samples = [{ at: now, timeSec: Math.max(0, currentTimeSec) }];
-  } else if (!lastSample || currentTimeSec > lastSample.timeSec + 0.02 || now - lastSample.at >= 1000) {
-    samples.push({ at: now, timeSec: Math.max(0, currentTimeSec) });
+}
+
+function setFfmpegJobPhase(progress, phase, options = {}) {
+  if (!progress || typeof progress !== 'object' || !FFMPEG_PROGRESS_PHASES.has(phase)) return false;
+  const now = Number(options.now) || Date.now();
+  const previousPhase = progress.phase;
+  const samePhase = previousPhase === phase && options.force !== true;
+  if (samePhase) {
+    if (options.stageLabel !== undefined) progress.stageLabel = String(options.stageLabel || '');
+    progress.updatedAt = now;
+    return true;
+  }
+  if (previousPhase === 'render' && (phase === 'mux' || phase === 'verify') && Number(progress.durationSec || 0) > 0) {
+    // Compatibility fields remain at the end of media forever. Mux/verify
+    // progress lives exclusively in phaseCurrentTimeSec/phasePercent.
+    progress.currentTimeSec = Number(progress.durationSec || 0);
+    progress.percent = 100;
+  }
+  progress.phase = phase;
+  progress.phaseStartedAt = now;
+  progress.phaseCurrentTimeSec = 0;
+  progress.phasePercent = phase === 'verify' ? null : 0;
+  progress.phaseEstimatedRemainingSec = null;
+  progress.estimatedRemainingSec = null;
+  progress.etaState = phase === 'verify' ? 'unavailable' : 'estimating';
+  progress.phaseDurationSec = Number.isFinite(Number(options.phaseDurationSec))
+    ? Math.max(0, Number(options.phaseDurationSec))
+    : phase === 'mux'
+      ? Math.max(0, Number(progress.durationSec || 0))
+      : phase === 'render'
+        ? Math.max(0, Number(progress.durationSec || 0))
+        : 0;
+  if (options.stageLabel !== undefined) progress.stageLabel = String(options.stageLabel || '');
+  progress.updatedAt = now;
+  resetFfmpegJobProgressRate(progress, phase);
+  return true;
+}
+
+function recordFfmpegJobProgressRate(progress, phase, value, now) {
+  const numericValue = Math.max(0, Number(value) || 0);
+  const phaseState = progressPhaseState(progress, phase);
+  let samples = phaseState.samples;
+  const last = samples[samples.length - 1];
+  // A retry/fallback or a new child process starts its media clock over.
+  if (last && numericValue + 0.05 < last.value) {
+    samples = [];
+    phaseState.smoothedRate = null;
+  }
+  if (!samples.length || numericValue > samples[samples.length - 1].value + 0.02 || now - samples[samples.length - 1].wallTime >= 1_000) {
+    samples.push({ wallTime: now, value: numericValue });
   }
   const cutoff = now - FFMPEG_PROGRESS_SAMPLE_WINDOW_MS;
-  samples = samples.filter((sample) => sample.at >= cutoff).slice(-FFMPEG_PROGRESS_SAMPLE_LIMIT);
-  ffmpegJobProgressSamples.set(progress, samples);
-  if (samples.length < 2) return null;
+  phaseState.samples = samples.filter((sample) => sample.wallTime >= cutoff).slice(-FFMPEG_PROGRESS_SAMPLE_LIMIT);
+  samples = phaseState.samples;
+  if (samples.length < FFMPEG_PROGRESS_MIN_SAMPLES) return null;
   const first = samples[0];
-  const last = samples[samples.length - 1];
-  const elapsedSec = Math.max(0, (last.at - first.at) / 1000);
-  const mediaSec = Math.max(0, last.timeSec - first.timeSec);
-  if (elapsedSec < 3 || mediaSec < 0.25) return null;
-  const realtimeFactor = mediaSec / elapsedSec;
-  if (!Number.isFinite(realtimeFactor) || realtimeFactor <= 0) return null;
-  return realtimeFactor;
+  const latest = samples[samples.length - 1];
+  const elapsedMs = Math.max(0, latest.wallTime - first.wallTime);
+  const deltaValue = latest.value - first.value;
+  if (elapsedMs < FFMPEG_PROGRESS_MIN_ELAPSED_MS || deltaValue <= 0) return null;
+  const instantRate = deltaValue / (elapsedMs / 1000);
+  if (!Number.isFinite(instantRate) || instantRate <= 0) return null;
+  phaseState.smoothedRate = phaseState.smoothedRate === null
+    ? instantRate
+    : phaseState.smoothedRate * (1 - FFMPEG_PROGRESS_EWMA_ALPHA) + instantRate * FFMPEG_PROGRESS_EWMA_ALPHA;
+  return phaseState.smoothedRate;
+}
+
+function updateFfmpegJobPhaseEta(progress, phase, value, now) {
+  const rate = recordFfmpegJobProgressRate(progress, phase, value, now);
+  if (rate === null) {
+    progress.etaState = 'estimating';
+    progress.phaseEstimatedRemainingSec = null;
+    progress.estimatedRemainingSec = null;
+    return null;
+  }
+  const remaining = Math.max(0, Number(progress.phaseDurationSec || 0) - Math.max(0, Number(value) || 0));
+  const eta = Number.isFinite(remaining / rate) ? remaining / rate : null;
+  progress.etaState = eta === null ? 'estimating' : 'ready';
+  progress.phaseEstimatedRemainingSec = eta;
+  progress.estimatedRemainingSec = eta;
+  return rate;
+}
+
+function updateFfmpegJobPrepareProgress(progress, objectsPrepared, objectCount, now = Date.now()) {
+  if (!progress || progress.status !== 'running') return false;
+  if (progress.phase !== 'prepare') setFfmpegJobPhase(progress, 'prepare', { now });
+  const prepared = Math.max(0, Number(objectsPrepared) || 0);
+  const total = Math.max(0, Number(objectCount) || 0);
+  progress.phaseCurrentTimeSec = prepared;
+  progress.phasePercent = total > 0 ? clamp((prepared / total) * 100, 0, 100) : null;
+  progress.phaseDurationSec = total;
+  updateFfmpegJobPhaseEta(progress, 'prepare', prepared, now);
+  progress.updatedAt = now;
+  return true;
 }
 
 function createFfmpegJobProgress({
@@ -1695,6 +1773,15 @@ function createFfmpegJobProgress({
     fallbackReason: undefined,
     startedAt: now,
     updatedAt: now,
+    phase: 'prepare',
+    phaseStartedAt: now,
+    phaseCurrentTimeSec: 0,
+    phasePercent: 0,
+    phaseEstimatedRemainingSec: null,
+    // Prepare is object-count based. It must not inherit media duration
+    // before nativeNvmmPreparing supplies objectCount.
+    phaseDurationSec: 0,
+    etaState: 'estimating',
     currentTimeSec: 0,
     durationSec: Number.isFinite(duration) && duration > 0 ? duration : 0,
     estimatedRemainingSec: null,
@@ -1716,32 +1803,8 @@ function setFfmpegJobStageFps(progress, stageFps) {
   }
   if (!Object.keys(normalized).length) return false;
   progress.stageFps = normalized;
-  // Native NVMM reports structured stage rates instead of FFmpeg's textual
-  // progress lines.  Surface that same measurement as render speed and ETA
-  // so the UI remains meaningful while a CUDA-only chunk is in flight.
-  const totalFps = Number(normalized.total);
-  const sourceFps = Number(progress.sourceFps || 0);
-  // Stage rates describe the most recent chunk. They intentionally exclude
-  // graph preparation, concat and remux time, so they are useful diagnostic
-  // data but optimistic as an ETA source. Prefer the PTS/wall-clock samples
-  // recorded by updateFfmpegJobProgress whenever they exist.
-  const hasObservedProgressRate = Number.isFinite(Number(progress.realtimeFactor)) && Number(progress.realtimeFactor) > 0;
-  if (!hasObservedProgressRate && Number.isFinite(totalFps) && totalFps > 0 && Number.isFinite(sourceFps) && sourceFps > 0) {
-    const realtimeFactor = totalFps / sourceFps;
-    const remainingSec = Math.max(0, Number(progress.durationSec || 0) - Math.max(0, Number(progress.currentTimeSec || 0)));
-    progress.renderFps = totalFps;
-    progress.realtimeFactor = realtimeFactor;
-    progress.estimatedRemainingSec = Number(progress.durationSec || 0) > 0 ? remainingSec / realtimeFactor : null;
-  }
   progress.updatedAt = Date.now();
   return true;
-}
-
-function getFfmpegJobStructuredRealtimeFactor(progress) {
-  const totalFps = Number(progress?.stageFps?.total);
-  const sourceFps = Number(progress?.sourceFps || 0);
-  if (!Number.isFinite(totalFps) || totalFps <= 0 || !Number.isFinite(sourceFps) || sourceFps <= 0) return null;
-  return totalFps / sourceFps;
 }
 
 function updateFfmpegJobProgress(progress, text) {
@@ -1754,10 +1817,14 @@ function updateFfmpegJobProgress(progress, text) {
   }
   const now = Date.now();
   const duration = Number(progress.durationSec || 0);
-  const percent = duration > 0 ? clamp((currentTimeSec / duration) * 100, 0, 99.5) : null;
-  const previousPercent = Number(progress.percent ?? 0);
-  const previousTime = Number(progress.currentTimeSec || 0);
-  const percentChanged = percent === null ? Math.abs(currentTimeSec - previousTime) >= 1 : Math.abs(percent - previousPercent) >= 0.4;
+  const phase = progress.phase || 'render';
+  const phaseDuration = Number(progress.phaseDurationSec || (phase === 'render' ? duration : 0));
+  const phasePercent = phaseDuration > 0
+    ? clamp((currentTimeSec / phaseDuration) * 100, 0, phase === 'render' ? 100 : 99.5)
+    : null;
+  const previousPercent = Number(progress.phasePercent ?? progress.percent ?? 0);
+  const previousTime = Number(progress.phaseCurrentTimeSec || progress.currentTimeSec || 0);
+  const percentChanged = phasePercent === null ? Math.abs(currentTimeSec - previousTime) >= 1 : Math.abs(phasePercent - previousPercent) >= 0.4;
   // Native NVMM emits PTS telemetry every 250 ms. Keep that cadence through
   // to SSE so long recordings do not appear frozen between rounded percent
   // changes, while still bounding UI/state churn.
@@ -1765,23 +1832,36 @@ function updateFfmpegJobProgress(progress, text) {
     return false;
   }
   const processedSec = Math.max(0, currentTimeSec);
-  const remainingSec = duration > 0 ? Math.max(0, duration - processedSec) : 0;
-  // A native NVMM chunk publishes its structured stage FPS only when that
-  // chunk exits. The following concat/mux progress line often arrives before
-  // there are enough FFmpeg samples for a wall-clock rate. Do not erase the
-  // already-real CUDA rate (and its ETA) in that gap.
-  const sampledRealtimeFactor = updateFfmpegJobProgressRate(progress, processedSec, now);
-  const realtimeFactor = sampledRealtimeFactor || getFfmpegJobStructuredRealtimeFactor(progress);
-  progress.currentTimeSec = Math.max(0, currentTimeSec);
-  progress.percent = percent;
-  progress.realtimeFactor = realtimeFactor;
-  progress.renderFps = realtimeFactor && Number(progress.sourceFps || 0) > 0 ? realtimeFactor * Number(progress.sourceFps) : null;
-  progress.estimatedRemainingSec = duration > 0 && realtimeFactor ? remainingSec / realtimeFactor : null;
+  progress.phaseCurrentTimeSec = phase === 'render'
+    ? Math.min(duration || processedSec, processedSec)
+    : processedSec;
+  progress.phasePercent = phasePercent;
+  if (phase === 'render') {
+    progress.currentTimeSec = Math.min(duration || processedSec, processedSec);
+    progress.percent = duration > 0 ? clamp((progress.currentTimeSec / duration) * 100, 0, 100) : null;
+    const realtimeFactor = updateFfmpegJobPhaseEta(progress, 'render', progress.currentTimeSec, now);
+    progress.realtimeFactor = realtimeFactor;
+    progress.renderFps = realtimeFactor && Number(progress.sourceFps || 0) > 0
+      ? realtimeFactor * Number(progress.sourceFps)
+      : null;
+  } else if (phase === 'mux') {
+    updateFfmpegJobPhaseEta(progress, 'mux', progress.phaseCurrentTimeSec, now);
+    // currentTimeSec/percent remain at the render boundary while mux owns its
+    // independent phase clock and percentage.
+    progress.currentTimeSec = duration > 0 ? duration : progress.currentTimeSec;
+    progress.percent = duration > 0 ? 100 : progress.percent;
+  } else {
+    progress.etaState = 'unavailable';
+    progress.phaseEstimatedRemainingSec = null;
+    progress.estimatedRemainingSec = null;
+  }
   progress.updatedAt = now;
   const progressText =
-    duration > 0
-      ? `${formatDurationSeconds(currentTimeSec)} / ${formatDurationSeconds(duration)}`
-      : `已处理 ${formatDurationSeconds(currentTimeSec)}`;
+    phase === 'mux'
+      ? `封装 ${phasePercent === null ? '' : `${Math.round(phasePercent)}%`}`
+      : duration > 0
+        ? `${formatDurationSeconds(progress.phaseCurrentTimeSec)} / ${formatDurationSeconds(duration)}`
+        : `已处理 ${formatDurationSeconds(progress.phaseCurrentTimeSec)}`;
   const stageLabel = String(progress.stageLabel || '').trim();
   progress.message = stageLabel ? `${stageLabel} · ${progressText}` : progressText;
   return true;
@@ -1795,6 +1875,12 @@ function finishFfmpegJobProgress(progress, status, message) {
   progress.updatedAt = Date.now();
   progress.message = message;
   if (status === 'completed') {
+    progress.phaseStartedAt = progress.updatedAt;
+    progress.phase = 'verify';
+    progress.phasePercent = 100;
+    progress.phaseCurrentTimeSec = Number(progress.phaseDurationSec || 0);
+    progress.etaState = 'unavailable';
+    progress.phaseEstimatedRemainingSec = null;
     progress.percent = 100;
     progress.estimatedRemainingSec = 0;
     if (Number(progress.durationSec || 0) > 0) {
@@ -4087,6 +4173,8 @@ module.exports = {
   runFfmpegJob,
   createFfmpegJobProgress,
   resetFfmpegJobProgressRate,
+  setFfmpegJobPhase,
+  updateFfmpegJobPrepareProgress,
   updateFfmpegJobProgress,
   setFfmpegJobStageFps,
   finishFfmpegJobProgress,
