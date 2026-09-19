@@ -595,6 +595,11 @@ export function ExportPage({
                   videoInfo={previewVideoInfo}
                   onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
                   layoutGuideOnly={Boolean(sceneGraph)}
+                  resolvedBounds={
+                    sceneGraph?.metadata?.layoutBounds && typeof sceneGraph.metadata.layoutBounds === 'object'
+                      ? (sceneGraph.metadata.layoutBounds as { top?: number; bottom?: number })
+                      : null
+                  }
                 />
                 {sceneGraph ? <SceneGraphOverlay scene={sceneGraph} time={playbackTime} /> : null}
                 {activePreviewProgress ? (

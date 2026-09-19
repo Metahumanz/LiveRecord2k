@@ -606,6 +606,18 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   assert.ok(newerStackGstreamerArgs.includes('nvvideoconvert'));
   assert.ok(newerStackGstreamerArgs.includes('nvv4l2h265enc'));
 
+  const timestampedGstreamerArgs = createJetsonGstreamerEncodeArgs({
+    codec: 'hevc_nvv4l2',
+    width: 1920,
+    height: 1080,
+    fps: 59.94,
+    quality: 24,
+    outputPath: '/recordings/temporary.mkv',
+    container: 'mkv'
+  });
+  assert.ok(timestampedGstreamerArgs.includes('matroskamux'));
+  assert.ok(timestampedGstreamerArgs.includes('streamable=true'));
+
   const muxArgs = createBurnEncodedVideoMuxArgs({
     encodedVideoPath: '/recordings/temporary.h264',
     cleanPath: '/recordings/source.mkv',

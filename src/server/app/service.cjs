@@ -152,6 +152,7 @@ const {
   parseFfmpegProgressTime,
   parseFfmpegTime,
   probeMediaFileInfo,
+  probeMediaClipTimelineInfo,
   probeMediaTimelineInfo,
   probeMediaTimelineHealth,
   resolveReliableDurationSec,
@@ -842,12 +843,21 @@ function deriveTimelineBoundaryDelta(timeline, boundary) {
 // first decodable video keyframe is later.  A burn filter resets video PTS so
 // it can render ASS, therefore it must explicitly restore that leading gap or
 // the video content is pulled forward against the audio (and repeated at the
-// first chunk boundary).  The persisted timeline audit supplies these values
-// without adding another full-file scan at export time.
-function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
+// first chunk boundary).  Export callers pass an actual clean-file clip probe;
+// persisted recording metadata is only a compatibility fallback for older
+// background-burn callers that do not have a fresh probe yet.
+function getBurnTimelineAlignment(recording, startTime = 0, duration = 0, actualTimeline = null) {
   const clipStart = Math.max(0, Number(startTime) || 0);
   const clipDuration = Math.max(0, Number(duration) || 0);
-  const candidates = [recording?.timelineHealth, recording?.timingInfo, recording?.streamMetadata].filter(
+  // Once an export has attempted the authoritative clean-file clip probe,
+  // its result is the complete source of truth.  In particular, a failed or
+  // incomplete probe must not fall back to stale sidecar PTS and synthesize a
+  // black/silence lead that the current clip never had.
+  const hasAuthoritativeClipProbe = actualTimeline?.actualClipProbe === true;
+  const candidates = (hasAuthoritativeClipProbe
+    ? [actualTimeline]
+    : [actualTimeline, recording?.timelineHealth, recording?.timingInfo, recording?.streamMetadata]
+  ).filter(
     (value) => value && typeof value === 'object'
   );
   const firstFinite = (field) => {
@@ -869,15 +879,20 @@ function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
   // with black video or silence so reconnect boundaries stay in sync.
   const relativeVideoStart = firstVideoPts !== null ? Math.max(0, Number(firstVideoPts) - clipStart) : null;
   const relativeAudioStart = firstAudioPts !== null ? Math.max(0, Number(firstAudioPts) - clipStart) : null;
-  const sharedStart =
-    relativeVideoStart !== null && relativeAudioStart !== null
-      ? Math.min(relativeVideoStart, relativeAudioStart)
-      : 0;
-  const videoPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null
-    ? capPadding(relativeVideoStart - sharedStart)
+  const measuredDelta = actualTimeline && Number.isFinite(Number(actualTimeline.avStartDeltaSec))
+    ? Number(actualTimeline.avStartDeltaSec)
+    : relativeAudioStart !== null && relativeVideoStart !== null
+      ? relativeAudioStart - relativeVideoStart
+      : null;
+  const tolerance = Math.max(0.04, Number(actualTimeline?.avBoundaryToleranceSec || 0));
+  const confirmedDelta = actualTimeline?.actualClipProbe === true
+    ? (measuredDelta !== null && Math.abs(measuredDelta) > tolerance ? measuredDelta : 0)
+    : measuredDelta;
+  const videoPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null && confirmedDelta !== 0
+    ? capPadding(confirmedDelta < 0 ? -confirmedDelta : 0)
     : 0;
-  const audioPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null
-    ? capPadding(relativeAudioStart - sharedStart)
+  const audioPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null && confirmedDelta !== 0
+    ? capPadding(confirmedDelta > 0 ? confirmedDelta : 0)
     : 0;
   return {
     videoPaddingSec,
@@ -7890,7 +7905,7 @@ try {
             if (isJetsonGstreamerCodec(videoCodec)) {
               const encodedVideoPath = path.join(
                 normalizeTempDir,
-                `${String(index + 1).padStart(3, '0')}.normalized.${isHevcCodec(videoCodec) ? 'h265' : 'h264'}`
+                `${String(index + 1).padStart(3, '0')}.normalized.mkv`
               );
               await runMergeFfmpeg(null, {
                 ...normalizeOptions,
@@ -9634,11 +9649,9 @@ try {
   }
 
   // L4T R35 exposes the Jetson hardware encoder through GStreamer rather
-  // than the stock FFmpeg binary.  Keep FFmpeg for decoding, ASS/avatar
-  // rendering and final muxing, then bridge its raw I420 output directly to
-  // nvv4l2{h264,h265}enc.  The elementary stream is deliberately temporary:
-  // unlike raw frames it remains small enough for an ordinary recording
-  // volume, including an SMB mount.
+  // than the stock FFmpeg binary. Keep FFmpeg for decoding/Scene rendering,
+  // bridge raw I420 to nvv4l2{h264,h265}enc, and immediately matroska-mux the
+  // video-only intermediate so its PTS survives the final audio mux.
   async runJetsonGstreamerTranscode({
     codec,
     quality,
@@ -9677,7 +9690,10 @@ try {
       quality,
       outputPath,
       preview,
-      converter: codecInfo.converter
+      converter: codecInfo.converter,
+      // Keep the temporary Jetson video timestamped.  A raw .h264/.h265
+      // elementary stream loses the decoder/renderer clock at every chunk.
+      container: 'mkv'
     });
     this.log(
       'info',
@@ -9848,9 +9864,7 @@ try {
         const chunkInputTrimEndSec = chunkSeekPrerollSec + chunkLength;
         const scriptPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.ffscript`);
         const chunkPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.mkv`);
-        const encodedChunkPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
-          isHevcCodec(codec) ? 'h265' : 'h264'
-        }`;
+        const encodedChunkPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
         const useGpuForChunk = Boolean(
           activeEntries.length > 0 &&
             canUseAvatarComposite &&
@@ -10129,6 +10143,7 @@ try {
     const stylePreset = source.stylePreset;
     const styleLayout = source.styleLayout;
     const mediaInfo = source.mediaInfo || {};
+    const actualTimeline = source.actualTimeline || null;
     const durationSec = Math.max(0, Number(source.durationSec || recording.durationSec || 0));
     const codecInfo = this.getBurnCodecInfo(burnCodec);
     const decoderInfo = this.getHardwareDecoder(recording.videoInfo || mediaInfo.videoInfo, burnCodec);
@@ -10149,7 +10164,7 @@ try {
     const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
     const burnedTmpPath = replaceExtension(burnedPath, '.tmp.' + getContainerFromPath(burnedPath));
     const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
-    const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
+    const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec, actualTimeline);
     const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
     let sceneDirectory = '';
     try {
@@ -10303,8 +10318,7 @@ try {
               sourceCodec: decoderInfo.codec
             });
           if (isJetsonGstreamerCodec(burnCodec)) {
-            const encodedVideoPath = burnedTmpPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
-              (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+            const encodedVideoPath = burnedTmpPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.mkv';
             await this.runJetsonGstreamerTranscode({
               codec: burnCodec,
               quality: burnCrf,
@@ -10410,6 +10424,17 @@ try {
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
       }
+      const actualTimeline = await probeMediaClipTimelineInfo(
+        this.ffmpegPath,
+        recording.cleanPath,
+        0,
+        durationSec,
+        mediaInfo,
+        { timeoutMs: 30_000, packetSampleDurationSec: Math.min(2, durationSec || 2) }
+      ).catch((error) => {
+        this.log('warn', `自动烧录实际 PTS 探测失败，按无起始 A/V 偏移继续：${compactLogLine(error.message)}`);
+        return { actualClipProbe: true, firstVideoPts: null, firstAudioPts: null, avStartDeltaSec: null, avBoundaryToleranceSec: 0.08 };
+      });
       if (SCENE_STYLE_PRESETS.includes(stylePreset)) {
         return this.startSceneGraphBurnRecording(room, recording, options, {
           burnCodec,
@@ -10419,10 +10444,11 @@ try {
           stylePreset,
           styleLayout,
           mediaInfo,
+          actualTimeline,
           durationSec
         });
       }
-      const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
+      const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec, actualTimeline);
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
       const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout, avatarMode });
       if (options.prepareOnly) {
@@ -10686,9 +10712,7 @@ try {
               this.markRoomDirty(room.id);
             };
             if (isJetsonGstreamerCodec(burnCodec)) {
-              const encodedVideoPath = `${burnedTmpPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
-                isHevcCodec(burnCodec) ? 'h265' : 'h264'
-              }`;
+              const encodedVideoPath = `${burnedTmpPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
               await this.runJetsonGstreamerWithCudaAvatarCompositeFallback({
                 avatarLayer,
                 createTranscode: (nextAvatarLayer) =>
@@ -11325,11 +11349,11 @@ try {
       this.ffmpegCapabilities?.sceneGpuVisualConformance
     ).ok;
     const nativeDecoderPath = resolveGpuSceneRenderer();
-    // A concat pass has one timestamp contract.  Native NVMM chunks are
-    // Matroska streams whose PTS come from the decoder; compatibility chunks
-    // are CFR elementary streams rebuilt by FFmpeg.  Never alternate those
-    // contracts within one output, or later chunks will steadily pull audio
-    // ahead of video.
+    // A concat pass has one timestamp contract.  Native NVMM and I420
+    // compatibility chunks are both Matroska streams now; each keeps the
+    // renderer's frame clock instead of reconstructing it from a rounded fps.
+    // Never alternate a timestamped pass with an elementary fallback within
+    // one output, or later chunks will steadily pull audio ahead of video.
     const nativeTimestampedAdmission = useCudaSceneRenderer && decoder?.value === 'gstreamer-nvv4l2' &&
       Boolean(this.ffmpegCapabilities?.sceneGpuRenderer?.nativeNvmmScene);
     let nativeTimestampedPass = nativeTimestampedAdmission;
@@ -11357,7 +11381,11 @@ try {
         // this pass rather than mixing an elementary fallback chunk into the
         // timestamped concat timeline.
         let nativeTimestampedChunk = nativeTimestampedPass;
-        const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${nativeTimestampedChunk ? 'mkv' : (isHevcCodec(codec) ? 'h265' : 'h264')}`;
+        // Every Jetson chunk now has a PTS-bearing container.  The native
+        // NVMM path writes Matroska directly; the I420 compatibility path
+        // uses the same matroskamux contract so concat never reconstructs a
+        // clock from a rounded fps or a bare elementary stream.
+        const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
         const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
           path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.legacy.ass`),
           legacyEvents,
@@ -11479,10 +11507,10 @@ try {
               restartError.code = 'BR2K_NATIVE_PTS_RESTART_REQUIRED';
               throw restartError;
             }
-            // The fallback produces an elementary H.26x stream and is muxed
-            // with the established CFR bridge. It must not be judged by the
-            // native-MKV PTS coverage gate below.  This is the first chunk,
-            // so commit the entire remaining pass to that same contract.
+            // The fallback still uses the CPU/I420 renderer, but its GStreamer
+            // output is also Matroska. It must not be judged by the native
+            // NVMM PTS coverage gate below. This is the first chunk, so commit
+            // the entire remaining pass to that same timestamped contract.
             nativeTimestampedChunk = false;
             nativeTimestampedPass = false;
             await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
@@ -11573,7 +11601,9 @@ try {
       duration,
       timelineOffsetSec,
       decoder: String(decoder?.value || decoder || 'software'),
-      container: nativeTimestampedOutput && nativeDecode?.decoderPath ? 'mkv' : ''
+      container: /\.mkv$/i.test(String(encodedVideoPath || '')) || (nativeTimestampedOutput && nativeDecode?.decoderPath)
+        ? 'mkv'
+        : ''
     });
     if (nativeDecode) {
       request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
@@ -11732,6 +11762,7 @@ try {
     temporaryOutputPath,
     outputContainer,
     mediaInfo,
+    actualTimeline,
     codecInfo,
     decoderInfo,
     progress,
@@ -11761,7 +11792,7 @@ try {
       });
       const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
       const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
-      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration, actualTimeline);
       const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
         path.join(sceneDirectory, 'scene.legacy.ass'),
         sceneResult.events,
@@ -11925,8 +11956,9 @@ try {
             onStage: setExportStage, isCancelled: () => this.exportCancelRequested, label: 'Jetson Scene Graph 烧录'
           });
         } else {
-          const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
-            (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+          // Jetson encoders always write a PTS-bearing video-only MKV here;
+          // do not hand a bare H.26x elementary stream to the final mux.
+          const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.mkv';
           const common = {
             codec: burnCodec,
             quality: burnCrf,
@@ -12153,6 +12185,33 @@ try {
       throw new Error('结束时间必须大于开始时间。');
     }
     const duration = endTime - startTime;
+    // Re-read the packet boundary for this exact clip.  Recording sidecars
+    // describe the original file and are not authoritative after a seek,
+    // trim, merge, or replacement of the clean media.
+    const actualTimeline = await probeMediaClipTimelineInfo(
+      this.ffmpegPath,
+      recording.cleanPath,
+      startTime,
+      duration,
+      mediaInfo,
+      { timeoutMs: 30_000, packetSampleDurationSec: Math.min(2, duration) }
+    ).catch((error) => {
+      this.log('warn', `导出片段实际 PTS 探测失败，按无起始 A/V 偏移继续：${compactLogLine(error.message)}`);
+      return {
+        clipStartSec: startTime,
+        clipDurationSec: duration,
+        actualClipProbe: true,
+        firstVideoPts: null,
+        firstAudioPts: null,
+        avStartDeltaSec: null,
+        avBoundaryToleranceSec: 0.08,
+        hasConfirmedStartDelta: false
+      };
+    });
+    this.log(
+      'info',
+      `导出片段实际 PTS：视频 ${Number.isFinite(actualTimeline.firstVideoPts) ? actualTimeline.firstVideoPts.toFixed(3) : '-'}s，音频 ${Number.isFinite(actualTimeline.firstAudioPts) ? actualTimeline.firstAudioPts.toFixed(3) : '-'}s，A/V 起点差 ${Number.isFinite(actualTimeline.avStartDeltaSec) ? actualTimeline.avStartDeltaSec.toFixed(3) : '-'}s。`
+    );
     const outputDir = String(options.outputDir || path.dirname(recording.cleanPath));
     await this.ensureDirectoryReady(outputDir, { label: '剪辑输出目录' });
     const outputPath =
@@ -12214,6 +12273,7 @@ try {
         temporaryOutputPath,
         outputContainer,
         mediaInfo,
+        actualTimeline,
         codecInfo,
         decoderInfo,
         progress,
@@ -12278,7 +12338,7 @@ try {
       const gpuAvatarComposite = Boolean(avatarComposite);
       const gpuAvatarOutputToCpu =
         requestedAvatarComposite?.value !== 'cuda' || !String(burnCodec || '').includes('nvenc');
-      burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      burnTimeline = getBurnTimelineAlignment(recording, startTime, duration, actualTimeline);
       copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       setExportStage('正在准备真实头像');
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
@@ -12427,9 +12487,7 @@ try {
           this.emitState('mediaJob');
         };
         if (isJetsonGstreamerCodec(burnCodec)) {
-          const encodedVideoPath = `${temporaryOutputPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
-            isHevcCodec(burnCodec) ? 'h265' : 'h264'
-          }`;
+          const encodedVideoPath = `${temporaryOutputPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
           await this.runJetsonGstreamerWithCudaAvatarCompositeFallback({
             avatarLayer,
             createTranscode: (nextAvatarLayer) =>

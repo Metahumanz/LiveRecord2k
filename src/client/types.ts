@@ -109,6 +109,9 @@ export type DanmakuStyleLayout = {
   superChatWidth?: number;
   boxFontSize?: number;
   danmakuTop?: number;
+  /** Absolute top/bottom bounds of the danmaku display region on the 1920x1080 reference canvas. */
+  danmakuAreaTop?: number;
+  danmakuAreaBottom?: number;
   danmakuFontSize?: number;
   danmakuLineHeight?: number;
   /** The time, in seconds, a normal rolling danmaku crosses the canvas. */

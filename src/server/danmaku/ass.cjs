@@ -254,6 +254,10 @@ const DANMAKU_STYLE_LAYOUT_LIMITS = {
   superChatWidth: [220, 1200],
   boxFontSize: [12, 80],
   danmakuTop: [0, 2000],
+  // Optional absolute layout bounds for the rolling/side danmaku region.
+  // When omitted, the named quarter/half/three-quarter preset is used.
+  danmakuAreaTop: [0, 4000],
+  danmakuAreaBottom: [1, 4000],
   danmakuFontSize: [12, 96],
   danmakuLineHeight: [16, 180],
   danmakuDuration: [2, 20]
@@ -469,6 +473,12 @@ function normalizeDanmakuStyle(values = {}) {
     }
     return clamp(numeric, min, max);
   };
+  const pickOptionalNumber = (key, min, max) => {
+    const raw = styleValue(values, key);
+    if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? clamp(numeric, min, max) : null;
+  };
   const fontFamily = String(styleValue(values, 'font-family') || DEFAULT_DANMAKU_STYLE.fontFamily)
     .replace(/["']/g, '')
     .trim();
@@ -481,6 +491,8 @@ function normalizeDanmakuStyle(values = {}) {
     danmakuLanes: Math.round(pickNumber('danmaku-lanes', DEFAULT_DANMAKU_STYLE.danmakuLanes, 1, 24)),
     danmakuDuration: pickNumber('danmaku-duration', DEFAULT_DANMAKU_STYLE.danmakuDuration, 2, 20),
     danmakuTop: pickNumber('danmaku-top', DEFAULT_DANMAKU_STYLE.danmakuTop, 0, 2000),
+    danmakuAreaTop: pickOptionalNumber('danmaku-area-top', 0, 4000),
+    danmakuAreaBottom: pickOptionalNumber('danmaku-area-bottom', 1, 4000),
     danmakuLineHeight: pickNumber('danmaku-line-height', DEFAULT_DANMAKU_STYLE.danmakuLineHeight, 16, 180),
     boxFontSize: pickNumber('box-font-size', DEFAULT_DANMAKU_STYLE.boxFontSize, 12, 80, {
       upgradeLegacyDefault: LEGACY_DEFAULT_DANMAKU_STYLE.boxFontSize
@@ -561,6 +573,9 @@ function adaptDanmakuStyleToVideo(styleValue = {}, videoInfo) {
   const anchorFromBottom = (value) =>
     clamp(canvas.height - (baseHeight - (Number(value) || 0)) * scale, 0, canvas.height);
   const giftWidth = clamp(scaleDanmakuMetric(style.giftWidth, scale), 1, maximumPanelWidth);
+  const scaleOptional = (value) => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value))
+    ? scaleDanmakuMetric(value, scale)
+    : null;
 
   return {
     ...style,
@@ -569,6 +584,8 @@ function adaptDanmakuStyleToVideo(styleValue = {}, videoInfo) {
     danmakuFontSize: scaleDanmakuMetric(style.danmakuFontSize, scale),
     danmakuOutline: scaleDanmakuMetric(style.danmakuOutline, scale),
     danmakuTop: scaleDanmakuMetric(style.danmakuTop, scale),
+    danmakuAreaTop: scaleOptional(style.danmakuAreaTop),
+    danmakuAreaBottom: scaleOptional(style.danmakuAreaBottom),
     danmakuLineHeight: Math.max(1, scaleDanmakuMetric(style.danmakuLineHeight, scale)),
     boxFontSize: scaleDanmakuMetric(style.boxFontSize, scale),
     panelLeft,
@@ -1009,9 +1026,12 @@ function getMessageItemMetrics(event, style, options = {}) {
 }
 
 function createMessageTimeline(events, styleValues = {}, options = {}) {
-  const style = Object.prototype.hasOwnProperty.call(styleValues, 'playWidth')
+  const baseStyle = Object.prototype.hasOwnProperty.call(styleValues, 'playWidth')
     ? { ...DEFAULT_DANMAKU_STYLE, ...styleValues }
     : normalizeDanmakuStyle(styleValues);
+  const style = baseStyle.danmakuAreaBottom !== null && baseStyle.danmakuAreaBottom !== undefined && Number.isFinite(Number(baseStyle.danmakuAreaBottom))
+    ? { ...baseStyle, superChatBottom: Number(baseStyle.danmakuAreaBottom) }
+    : baseStyle;
   const items = createMessageItems(events, style, options);
   if (options.sideStream === true) {
     return createPersistentSideStreamTimeline(items, style, options);
@@ -1260,9 +1280,9 @@ function renderMessageStack(events, style, options = {}) {
   const sideStream = options.sideStream === true;
   const clip = {
     x1: style.panelLeft,
-    y1: 0,
+    y1: style.danmakuAreaTop !== null && style.danmakuAreaTop !== undefined && Number.isFinite(Number(style.danmakuAreaTop)) ? Number(style.danmakuAreaTop) : 0,
     x2: style.panelLeft + style.superChatWidth,
-    y2: style.superChatBottom
+    y2: style.danmakuAreaBottom !== null && style.danmakuAreaBottom !== undefined && Number.isFinite(Number(style.danmakuAreaBottom)) ? Number(style.danmakuAreaBottom) : style.superChatBottom
   };
   const lines = [];
   for (const item of timeline.items) {
@@ -2173,10 +2193,16 @@ function roundedRectPath(width, height, radius, corners = {}) {
 
 function getDanmakuLayoutMetrics(style, areaValue) {
   const area = DANMAKU_DISPLAY_AREAS[normalizeDanmakuDisplayArea(areaValue)];
-  const top = Number(style.danmakuTop) || 0;
+  const hasTop = style.danmakuAreaTop !== null && style.danmakuAreaTop !== undefined && String(style.danmakuAreaTop).trim() !== '';
+  const hasBottom = style.danmakuAreaBottom !== null && style.danmakuAreaBottom !== undefined && String(style.danmakuAreaBottom).trim() !== '';
+  const configuredTop = Number(style.danmakuAreaTop);
+  const configuredBottom = Number(style.danmakuAreaBottom);
+  const top = hasTop && Number.isFinite(configuredTop) ? configuredTop : Number(style.danmakuTop) || 0;
   const lineHeight = Math.max(1, Number(style.danmakuLineHeight) || DEFAULT_DANMAKU_STYLE.danmakuLineHeight);
   const playHeight = Math.max(lineHeight, Number(style.playHeight) || DEFAULT_DANMAKU_STYLE.playHeight);
-  const bottom = clamp(playHeight * area.ratio, top + lineHeight, playHeight);
+  const bottom = hasBottom && Number.isFinite(configuredBottom)
+    ? clamp(configuredBottom, top + lineHeight, playHeight)
+    : clamp(playHeight * area.ratio, top + lineHeight, playHeight);
   const lanes = Math.max(1, Math.floor((bottom - top) / lineHeight));
   return {
     top,

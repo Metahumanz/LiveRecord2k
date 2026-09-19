@@ -11,7 +11,8 @@ const {
   createMessageTimeline: createLegacyMessageTimeline,
   getMessageItemMetrics: getLegacyMessageItemMetrics,
   resolveDanmakuStyle: resolveLegacyDanmakuStyle,
-  adaptDanmakuStyleToVideo: adaptLegacyDanmakuStyleToVideo
+  adaptDanmakuStyleToVideo: adaptLegacyDanmakuStyleToVideo,
+  getDanmakuLayoutMetrics
 } = require('./ass.cjs');
 
 const DEFAULT_STYLE = {
@@ -23,6 +24,8 @@ const DEFAULT_STYLE = {
   danmakuLanes: 8,
   danmakuDuration: 8,
   danmakuTop: 36,
+  danmakuAreaTop: null,
+  danmakuAreaBottom: null,
   danmakuLineHeight: 46,
   boxFontSize: 29,
   panelLeft: 5,
@@ -96,6 +99,12 @@ function resolveStyle(styleValues, presetValue, layoutValues) {
     danmakuLanes: toFinite(merged.danmakuLanes, DEFAULT_STYLE.danmakuLanes, 1, 48, true),
     danmakuDuration: toFinite(merged.danmakuDuration, DEFAULT_STYLE.danmakuDuration, 2, 30),
     danmakuTop: toFinite(merged.danmakuTop, DEFAULT_STYLE.danmakuTop, 0, 4000),
+    danmakuAreaTop: merged.danmakuAreaTop !== null && merged.danmakuAreaTop !== undefined && Number.isFinite(Number(merged.danmakuAreaTop))
+      ? toFinite(merged.danmakuAreaTop, 0, 0, 8000)
+      : null,
+    danmakuAreaBottom: merged.danmakuAreaBottom !== null && merged.danmakuAreaBottom !== undefined && Number.isFinite(Number(merged.danmakuAreaBottom))
+      ? toFinite(merged.danmakuAreaBottom, DEFAULT_STYLE.playHeight, 1, 8000)
+      : null,
     danmakuLineHeight: toFinite(merged.danmakuLineHeight, DEFAULT_STYLE.danmakuLineHeight, 16, 240),
     boxFontSize: toFinite(merged.boxFontSize, DEFAULT_STYLE.boxFontSize, 12, 128),
     panelLeft: toFinite(merged.panelLeft, DEFAULT_STYLE.panelLeft, 0, 4000),
@@ -145,6 +154,8 @@ function adaptStyleToCanvas(styleValues, videoInfo) {
     danmakuFontSize: metric(style.danmakuFontSize),
     danmakuOutline: metric(style.danmakuOutline),
     danmakuTop: metric(style.danmakuTop),
+    danmakuAreaTop: style.danmakuAreaTop === null ? null : metric(style.danmakuAreaTop),
+    danmakuAreaBottom: style.danmakuAreaBottom === null ? null : metric(style.danmakuAreaBottom),
     danmakuLineHeight: Math.max(1, metric(style.danmakuLineHeight)),
     boxFontSize: metric(style.boxFontSize),
     panelLeft,
@@ -260,19 +271,13 @@ function rollingDuration(event, style) {
 }
 
 function displayAreaMetrics(style, area) {
-  const ratios = {
-    quarter: 0.25,
-    half: 0.5,
-    'three-quarter': 0.75,
-    'no-overlap': 1,
-    unlimited: 1
-  };
   const normalized = normalizeDisplayArea(area);
-  const usableHeight = Math.max(style.danmakuLineHeight, style.playHeight * ratios[normalized] - style.danmakuTop);
+  const legacy = getDanmakuLayoutMetrics(style, normalized);
   return {
-    top: style.danmakuTop,
-    lanes: Math.max(1, Math.min(style.danmakuLanes, Math.floor(usableHeight / Math.max(1, style.danmakuLineHeight)) || 1)),
-    avoidOverlap: normalized === 'no-overlap'
+    top: legacy.top,
+    bottom: legacy.bottom,
+    lanes: Math.max(1, Math.min(style.danmakuLanes, legacy.lanes)),
+    avoidOverlap: legacy.avoidOverlap
   };
 }
 
@@ -601,15 +606,18 @@ class LayoutEngine {
       resolveLegacyDanmakuStyle(this.sourceStyle, this.sourceStyle.visualPreset),
       this.videoInfo || { width: this.style.playWidth, height: this.style.playHeight }
     );
+    const boundedLegacyStyle = legacyStyle.danmakuAreaBottom !== null && legacyStyle.danmakuAreaBottom !== undefined && Number.isFinite(Number(legacyStyle.danmakuAreaBottom))
+      ? { ...legacyStyle, superChatBottom: Number(legacyStyle.danmakuAreaBottom) }
+      : legacyStyle;
     const entries = sideStream
-      ? createLegacyMessageTimeline(sorted, legacyStyle, { includeDanmaku: true, sideStream: true }).items.map((item) => Object.assign(item, {
+      ? createLegacyMessageTimeline(sorted, boundedLegacyStyle, { includeDanmaku: true, sideStream: true }).items.map((item) => Object.assign(item, {
           kind: 'legacy-side',
-          metrics: getLegacyMessageItemMetrics(item.event, legacyStyle, { sideStream: true })
+          metrics: getLegacyMessageItemMetrics(item.event, boundedLegacyStyle, { sideStream: true })
         }))
       : layoutRolling(sorted, this.style, this.displayArea).concat(layoutMessages(sorted.filter((event) => event.type !== 'danmaku'), this.style, false));
     return {
       canvas: { width: this.style.playWidth, height: this.style.playHeight },
-      style: sideStream ? legacyStyle : this.style,
+      style: sideStream ? boundedLegacyStyle : this.style,
       overlayMode: this.overlayMode,
       displayArea: this.displayArea,
       sideStream,

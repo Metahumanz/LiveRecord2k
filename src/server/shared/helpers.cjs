@@ -1936,11 +1936,68 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
     error.code = 'MEDIA_PROBE_TIMEOUT';
     throw error;
   }
+  const videoInfo = parseFfmpegVideoInfo(probe.output);
+  const audioInfo = parseFfmpegAudioInfo(probe.output);
+  const exactStreams = await probeExactStreamTiming(ffmpegPath, filePath, options).catch(() => null);
+  const exactVideo = exactStreams?.find((stream) => stream.codec_type === 'video');
+  const exactAudio = exactStreams?.find((stream) => stream.codec_type === 'audio');
   return {
     durationSec: parseFfmpegDuration(probe.output),
-    videoInfo: parseFfmpegVideoInfo(probe.output),
-    audioInfo: parseFfmpegAudioInfo(probe.output)
+    videoInfo: videoInfo
+      ? {
+          ...videoInfo,
+          avgFrameRate: String(exactVideo?.avg_frame_rate || ''),
+          rFrameRate: String(exactVideo?.r_frame_rate || ''),
+          timeBase: String(exactVideo?.time_base || ''),
+          startTime: Number.isFinite(Number(exactVideo?.start_time)) ? Number(exactVideo.start_time) : undefined,
+          fps: parseFrameRate(exactVideo?.avg_frame_rate) || parseFrameRate(exactVideo?.r_frame_rate) || videoInfo.fps
+        }
+      : null,
+    audioInfo: audioInfo
+      ? {
+          ...audioInfo,
+          timeBase: String(exactAudio?.time_base || ''),
+          startTime: Number.isFinite(Number(exactAudio?.start_time)) ? Number(exactAudio.start_time) : undefined
+        }
+      : null
   };
+}
+
+function parseFrameRate(value) {
+  const text = String(value || '').trim();
+  if (!text) return 0;
+  if (text.includes('/')) {
+    const [numerator, denominator] = text.split('/').map(Number);
+    return Number.isFinite(numerator) && Number.isFinite(denominator) && denominator > 0 ? numerator / denominator : 0;
+  }
+  const number = Number(text);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
+  const ffmpeg = String(ffmpegPath || '');
+  const directory = path.dirname(ffmpeg);
+  const candidates = [
+    process.env.BR2K_FFPROBE,
+    path.join(directory, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe'),
+    path.join(directory, process.platform === 'win32' ? 'ffprobe-full.exe' : 'ffprobe-full')
+  ].filter(Boolean);
+  let ffprobe = '';
+  for (const candidate of [...new Set(candidates)]) {
+    if (await fsp.stat(candidate).then((stat) => stat.isFile()).catch(() => false)) {
+      ffprobe = candidate;
+      break;
+    }
+  }
+  if (!ffprobe) return null;
+  const result = await runCapturedProcess(
+    ffprobe,
+    ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time', '-of', 'json', filePath],
+    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024 }
+  );
+  if (result.status !== 0 || result.timedOut || result.error) return null;
+  const parsed = JSON.parse(String(result.stdout || '{}'));
+  return Array.isArray(parsed.streams) ? parsed.streams : [];
 }
 
 async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
@@ -2056,6 +2113,15 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
       const pts = parseDebugTimestamp(text, 'pkt_pts');
       const dts = parseDebugTimestamp(text, 'pkt_dts');
       if (!Number.isFinite(pts) && !Number.isFinite(dts)) return;
+      const clipStart = Number(options.startTimeSec);
+      // Input seeking may land on the preceding keyframe.  Ignore those
+      // packets and keep the first packet actually inside the requested clip;
+      // otherwise a long-GOP file would report the keyframe PTS as the clip's
+      // first PTS and fabricate a false A/V offset.
+      if (Number.isFinite(clipStart) && clipStart > 0) {
+        const comparable = Number.isFinite(pts) ? pts : dts;
+        if (comparable + 0.0005 < clipStart) return;
+      }
       result.packetCount += 1;
       if (Number.isFinite(pts)) {
         if (result.firstPts === null) result.firstPts = pts;
@@ -2087,7 +2153,9 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
           '-debug_ts',
           ...(options.packetSampleFromEnd
             ? ['-sseof', `-${Math.max(1, sampleDurationSec || 3)}`, '-i', filePath]
-            : ['-i', filePath]),
+            : Number.isFinite(Number(options.startTimeSec)) && Number(options.startTimeSec) > 0
+              ? ['-ss', formatFfmpegSeconds(options.startTimeSec), '-copyts', '-i', filePath]
+              : ['-i', filePath]),
           ...(sampleDurationSec && !options.packetSampleFromEnd ? ['-t', String(sampleDurationSec)] : []),
           '-map',
           selector,
@@ -2127,6 +2195,57 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
     }, timeoutMs);
     timer.unref?.();
   });
+}
+
+/**
+ * Probe the first packets that belong to the requested clean-file clip.
+ * Export code must use this result instead of persisted recording metadata:
+ * sidecars describe the recording as a whole and cannot prove that the
+ * current clip still has an A/V boundary offset after a seek.
+ */
+async function probeMediaClipTimelineInfo(ffmpegPath, filePath, startTimeSec, durationSec, mediaInfo = {}, options = {}) {
+  const start = Math.max(0, Number(startTimeSec) || 0);
+  const duration = Math.max(0.05, Number(durationSec) || 0.05);
+  const sampleDurationSec = Math.min(duration, Math.max(0.5, Number(options.packetSampleDurationSec || 2)));
+  const [video, audio] = await Promise.all([
+    scanMediaPacketTimeline(ffmpegPath, filePath, '0:v:0', {
+      ...options,
+      startTimeSec: start,
+      packetSampleDurationSec: sampleDurationSec
+    }),
+    mediaInfo.audioInfo
+      ? scanMediaPacketTimeline(ffmpegPath, filePath, '0:a:0', {
+          ...options,
+          startTimeSec: start,
+          packetSampleDurationSec: sampleDurationSec
+        })
+      : Promise.resolve(null)
+  ]);
+  const firstVideoPts = Number.isFinite(video?.firstPts) ? video.firstPts : null;
+  const firstAudioPts = Number.isFinite(audio?.firstPts) ? audio.firstPts : null;
+  const avStartDeltaSec = firstVideoPts !== null && firstAudioPts !== null
+    ? firstAudioPts - firstVideoPts
+    : null;
+  const fps = Number(mediaInfo.videoInfo?.fps || 0);
+  const avBoundaryToleranceSec = Math.max(0.04, fps > 0 ? Math.min(0.12, 2 / fps) : 0.08);
+  return {
+    clipStartSec: start,
+    clipDurationSec: duration,
+    firstVideoPts,
+    firstVideoDts: Number.isFinite(video?.firstDts) ? video.firstDts : null,
+    firstAudioPts,
+    firstAudioDts: Number.isFinite(audio?.firstDts) ? audio.firstDts : null,
+    avStartDeltaSec,
+    avBoundaryToleranceSec,
+    actualClipProbe: true,
+    hasConfirmedStartDelta: avStartDeltaSec !== null && Math.abs(avStartDeltaSec) > avBoundaryToleranceSec,
+    videoTimeBase: mediaInfo.videoInfo?.timeBase || '',
+    videoAvgFrameRate: mediaInfo.videoInfo?.avgFrameRate || '',
+    videoRFrameRate: mediaInfo.videoInfo?.rFrameRate || '',
+    videoFps: fps,
+    videoPacketCount: Number(video?.packetCount || 0),
+    audioPacketCount: Number(audio?.packetCount || 0)
+  };
 }
 
 async function scanMediaCopyWarnings(ffmpegPath, filePath, options = {}) {
@@ -3979,6 +4098,7 @@ module.exports = {
   estimateRecordingDurationFromStats,
   readDanmakuDurationSec,
   probeMediaFileInfo,
+  probeMediaClipTimelineInfo,
   probeMediaTimelineInfo,
   probeMediaTimelineHealth,
   isHevcCodec,

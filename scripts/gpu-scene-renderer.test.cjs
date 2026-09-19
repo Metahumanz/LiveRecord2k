@@ -47,15 +47,15 @@ test('GPU Scene aligns a fractional lead-in to the next I420 frame boundary', ()
   assert.equal(request.timelineOffsetSec, 62 / 60);
 });
 
-test('native NVMM can opt into a timestamped MKV while the I420 bridge stays elementary', () => {
+test('native NVMM and the I420 bridge can use a timestamped MKV contract', () => {
   const nativeRequest = createGpuSceneRenderRequest(sampleGraph(), {
     inputPath: '/recording/clean.mp4', outputPath: '/tmp/native.mkv', duration: 20, fps: 59.483, container: 'mkv'
   });
   const bridgeRequest = createGpuSceneRenderRequest(sampleGraph(), {
-    inputPath: '/recording/clean.mp4', outputPath: '/tmp/bridge.h265', duration: 20, fps: 59.483
+    inputPath: '/recording/clean.mp4', outputPath: '/tmp/bridge.mkv', duration: 20, fps: 59.483, container: 'mkv'
   });
   assert.equal(nativeRequest.output.container, 'mkv');
-  assert.equal(bridgeRequest.output.container, '');
+  assert.equal(bridgeRequest.output.container, 'mkv');
 });
 
 test('native NVMM lead keeps the source timestamp basis and stops on the requested frame budget', () => {
