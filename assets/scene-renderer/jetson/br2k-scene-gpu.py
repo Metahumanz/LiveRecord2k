@@ -1106,7 +1106,13 @@ def main():
         reports, failures = {}, {}
         for source_codec, source_name in [('h264', 'h264-sample.mp4'), ('hevc', 'hevc-sample.mp4')]:
             source = '/usr/lib/bili-record-2k/assets/jetson-self-test/' + source_name
-            target = '/tmp/br2k-native-nvmm-self-test-' + source_codec + '.h265'
+            # Never reuse a predictable /tmp filename: the service runs as
+            # bili-record-2k while a manual probe may have left a why-owned
+            # file behind, and /tmp's sticky bit correctly prevents us from
+            # overwriting it.  A unique path also keeps concurrent probes
+            # independent; remove the placeholder before GStreamer opens it.
+            target_fd, target = tempfile.mkstemp(prefix='br2k-native-nvmm-self-test-', suffix='-' + source_codec + '.h265')
+            os.close(target_fd)
             try: os.unlink(target)
             except FileNotFoundError: pass
             request = {
@@ -1131,12 +1137,16 @@ def main():
                 # the second result merely because the first decoder path
                 # failed; production still requires both to succeed.
                 failures[source_codec] = str(error)
+            finally:
+                try: os.unlink(target)
+                except FileNotFoundError: pass
         payload = {'ok': not failures, 'nativeNvmmMetrics': reports}
         if failures: payload['nativeNvmmFailures'] = failures
         print(json.dumps(payload, ensure_ascii=False))
         return 0 if not failures else 3
     if args.self_test:
-        target = '/tmp/br2k-gpu-scene-self-test.h264'
+        target_fd, target = tempfile.mkstemp(prefix='br2k-gpu-scene-self-test-', suffix='.h264')
+        os.close(target_fd)
         try: os.unlink(target)
         except FileNotFoundError: pass
         request = {
@@ -1149,10 +1159,14 @@ def main():
                 'animations': [{'type': 'Move', 'start': 0, 'end': 1, 'from': {'x': 18, 'y': 18}, 'to': {'x': 100, 'y': 18}}]
             }]}
         }
-        render(request, io.BytesIO(bytes(320 * 180 * 3 // 2 * 60)))
-        if not os.path.isfile(target) or os.path.getsize(target) < 1024: fail('GPU Scene 自检没有生成有效 H.264。')
-        print(json.dumps({'ok': True, 'output': target}, ensure_ascii=False))
-        return 0
+        try:
+            render(request, io.BytesIO(bytes(320 * 180 * 3 // 2 * 60)))
+            if not os.path.isfile(target) or os.path.getsize(target) < 1024: fail('GPU Scene 自检没有生成有效 H.264。')
+            print(json.dumps({'ok': True, 'output': target}, ensure_ascii=False))
+            return 0
+        finally:
+            try: os.unlink(target)
+            except FileNotFoundError: pass
     if not args.request: fail('需要 --request <scene-request.json>。')
     with open(args.request, 'r', encoding='utf-8') as handle: render(json.load(handle))
     return 0
