@@ -58,14 +58,15 @@ test('native NVMM and the I420 bridge can use a timestamped MKV contract', () =>
   assert.equal(bridgeRequest.output.container, 'mkv');
 });
 
-test('native NVMM lead keeps the source timestamp basis and stops on the requested frame budget', () => {
+test('native NVMM lead keeps the source timestamp basis and stops on the requested PTS budget', () => {
   const helper = fs.readFileSync(
     path.join(__dirname, '..', 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py'),
     'utf8'
   );
   assert.match(helper, /concat name=timeline_lead adjust-base=false/);
-  assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\)\)/);
-  assert.match(helper, /reached_frame_budget = counters\['scene'\] >= requested_frame_count/);
+  assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\) \+ 1\)/);
+  assert.match(helper, /reached_pts_budget = leading_video_frames <= 0 and buffer\.pts >= target_pts/);
+  assert.match(helper, /scene_encode_pending = deque\(\)/);
   assert.match(helper, /leading_video_frames or measured_media_seconds <= 0/);
 });
 

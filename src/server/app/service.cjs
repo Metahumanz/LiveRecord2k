@@ -11642,7 +11642,7 @@ try {
               const metrics = parsed.nativeNvmmProgress;
               onProgress?.(Math.max(0, Math.min(Number(nativeDecode?.duration || duration) || duration, Number(metrics.mediaSeconds) || 0)));
               onStageMetrics?.({
-                decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total),
+                decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total), pipelineFps: Number(metrics.pipelineFps),
                 frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds)
               });
             } else if (parsed?.nativeNvmmPreparing && typeof parsed.nativeNvmmPreparing === 'object') {
@@ -11699,7 +11699,7 @@ try {
           }
           completedNativeMetrics = metrics;
           onStageMetrics?.({
-            decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total),
+            decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total), pipelineFps: Number(metrics.pipelineFps),
             frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds), final: true
           });
         } else await runJetsonNativeDecodeCudaSceneJob({

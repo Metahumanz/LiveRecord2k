@@ -879,15 +879,20 @@ def render_native_nvmm(request):
         # clocks. Therefore this bridge validates frame coverage but leaves
         # the authoritative decoder PTS intact for the encoder and muxer.
         decoded_timing = deque()
-        source_scene_pts_values = []
-        scene_pts_values = []
-        encode_pts_values = []
+        # Pair Scene and encoder buffers in streaming order.  Keeping the
+        # pending queue bounded avoids retaining/sorting several hundred
+        # thousand PTS values for a long recording.
+        scene_encode_pending = deque()
+        pts_pending_peak = 0
+        encode_unmatched = 0
         decoded_clock = {'first': None, 'last': None, 'frames': 0, 'restored': 0, 'unmatched': 0}
         pts_tolerance_ns = max(2_000_000, int(Gst.SECOND / max(1.0, fps) * 0.25))
         pts_audit = {
             'sourceToSceneFrames': 0, 'sourceToSceneMismatches': 0, 'sourceToSceneMaxDeltaNs': 0,
             'sceneToEncodeFrames': 0, 'sceneToEncodeMismatches': 0, 'sceneToEncodeMaxDeltaNs': 0
         }
+        source_encode_stats = {'frames': 0, 'mismatches': 0, 'maxDeltaNs': 0}
+        source_encode_samples = []
         trace_pts = os.environ.get('BR2K_NATIVE_NVMM_TRACE_PTS') == '1'
         trace_encode_pairs = []
         lead_scene_frames = {'remaining': leading_video_frames}
@@ -922,13 +927,15 @@ def render_native_nvmm(request):
                     'decode': counters['decode'] / elapsed,
                     'scene': counters['scene'] / elapsed,
                     'encode': counters['encode'] / elapsed,
-                    'total': counters['encode'] / elapsed
+                    'total': counters['encode'] / elapsed,
+                    'pipelineFps': counters['encode'] / elapsed
                 }
             }
             print(json.dumps(payload, ensure_ascii=False), flush=True)
             progress_report['last_wall_us'] = wall_now
             progress_report['last_media'] = media_seconds
         def count_buffer(_pad, info, key):
+            nonlocal pts_pending_peak, encode_unmatched
             buffer = info.get_buffer()
             if not buffer:
                 return Gst.PadProbeReturn.OK
@@ -1015,21 +1022,46 @@ def render_native_nvmm(request):
                         native_nvmm_trace('send EOS at scene pts=' + str(buffer.pts))
                         pipeline.send_event(Gst.Event.new_eos())
                     return Gst.PadProbeReturn.DROP
-                scene_pts_values.append(int(buffer.pts))
                 if source_pts_for_scene is not None:
-                    source_scene_pts_values.append(source_pts_for_scene)
                     decoded_clock['restored'] += 1
                     delta = abs(int(buffer.pts) - source_pts_for_scene)
                     pts_audit['sourceToSceneFrames'] += 1
                     pts_audit['sourceToSceneMaxDeltaNs'] = max(pts_audit['sourceToSceneMaxDeltaNs'], delta)
                     if delta > pts_tolerance_ns:
                         pts_audit['sourceToSceneMismatches'] += 1
+                scene_encode_pending.append((source_pts_for_scene, int(buffer.pts)))
+                pts_pending_peak = max(pts_pending_peak, len(scene_encode_pending))
             counters[key] += 1
             if key == 'encode' and buffer.pts != Gst.CLOCK_TIME_NONE:
-                # NVENC may emit B-frame access units in decode order. Do
-                # not pair the encoder pad's arrival order with Scene order;
-                # compare the sorted presentation timestamps after EOS.
-                encode_pts_values.append(int(buffer.pts))
+                if scene_encode_pending:
+                    source_pts, scene_pts = scene_encode_pending.popleft()
+                    encode_pts = int(buffer.pts)
+                    delta = abs(encode_pts - scene_pts)
+                    pts_audit['sceneToEncodeFrames'] += 1
+                    pts_audit['sceneToEncodeMaxDeltaNs'] = max(
+                        pts_audit['sceneToEncodeMaxDeltaNs'], delta)
+                    if delta > pts_tolerance_ns:
+                        pts_audit['sceneToEncodeMismatches'] += 1
+                        if trace_pts and len(trace_encode_pairs) < 8:
+                            trace_encode_pairs.append({
+                                'scenePts': scene_pts, 'encodePts': encode_pts,
+                                'deltaNs': delta
+                            })
+                    if source_pts is not None:
+                        source_delta = abs(encode_pts - source_pts)
+                        source_encode_stats['frames'] += 1
+                        source_encode_stats['maxDeltaNs'] = max(
+                            source_encode_stats['maxDeltaNs'], source_delta)
+                        if source_delta > pts_tolerance_ns:
+                            source_encode_stats['mismatches'] += 1
+                            if trace_pts and len(source_encode_samples) < 8:
+                                source_encode_samples.append({
+                                    'sourcePts': source_pts,
+                                    'encodePts': encode_pts,
+                                    'deltaNs': source_delta
+                                })
+                else:
+                    encode_unmatched += 1
                 if encoded_pts['first'] is None:
                     encoded_pts['first'] = buffer.pts
                 end = buffer.pts
@@ -1059,38 +1091,16 @@ def render_native_nvmm(request):
             pipeline.set_state(Gst.State.NULL)
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
-        sorted_scene_pts = sorted(scene_pts_values)
-        sorted_encode_pts = sorted(encode_pts_values)
-        sorted_source_pts = sorted(source_scene_pts_values)
-        pair_count = min(len(sorted_scene_pts), len(sorted_encode_pts))
-        for index in range(pair_count):
-            scene_pts = sorted_scene_pts[index]
-            encode_pts = sorted_encode_pts[index]
-            delta = abs(encode_pts - scene_pts)
-            pts_audit['sceneToEncodeFrames'] += 1
-            pts_audit['sceneToEncodeMaxDeltaNs'] = max(pts_audit['sceneToEncodeMaxDeltaNs'], delta)
-            if delta > pts_tolerance_ns:
-                pts_audit['sceneToEncodeMismatches'] += 1
-                if trace_pts and len(trace_encode_pairs) < 8:
-                    trace_encode_pairs.append({'scenePts': scene_pts, 'encodePts': encode_pts, 'deltaNs': delta})
-        if len(sorted_scene_pts) != len(sorted_encode_pts):
-            pts_audit['sceneToEncodeMismatches'] += abs(len(sorted_scene_pts) - len(sorted_encode_pts))
-        source_encode_frames = 0
-        source_encode_mismatches = 0
-        source_encode_max_delta_ns = 0
-        source_encode_samples = []
-        source_encode_pair_count = min(len(sorted_source_pts), len(sorted_encode_pts))
-        for index in range(source_encode_pair_count):
-            source_pts = sorted_source_pts[index]
-            encode_pts = sorted_encode_pts[index]
-            delta = abs(encode_pts - source_pts)
-            source_encode_frames += 1
-            source_encode_max_delta_ns = max(source_encode_max_delta_ns, delta)
-            if delta > pts_tolerance_ns:
-                source_encode_mismatches += 1
-                if trace_pts and len(source_encode_samples) < 8:
-                    source_encode_samples.append({'sourcePts': source_pts, 'encodePts': encode_pts, 'deltaNs': delta})
-        source_encode_mismatches += abs(len(sorted_source_pts) - len(sorted_encode_pts))
+        pending_remaining = len(scene_encode_pending)
+        pending_source_remaining = sum(1 for source_pts, _scene_pts in scene_encode_pending if source_pts is not None)
+        # Any Scene frame still waiting at EOS or encoder frame without a
+        # Scene counterpart is a concrete coverage failure, not a reason to
+        # retain the whole PTS history.
+        pts_audit['sceneToEncodeMismatches'] += pending_remaining + encode_unmatched
+        source_encode_stats['mismatches'] += pending_source_remaining + encode_unmatched
+        source_encode_frames = source_encode_stats['frames']
+        source_encode_mismatches = source_encode_stats['mismatches']
+        source_encode_max_delta_ns = source_encode_stats['maxDeltaNs']
         if encoded_pts['first'] is not None and encoded_pts['end'] is not None:
             measured_media_seconds = max(0.0, (encoded_pts['end'] - encoded_pts['first']) / Gst.SECOND)
         # Some JetPack parser/encoder combinations do not retain a duration on
@@ -1117,12 +1127,13 @@ def render_native_nvmm(request):
         )
         source_encode_ok = (
             source_encode_mismatches == 0 and
-            source_encode_frames >= max(0, counters['scene'] - 2)
+            source_encode_frames >= max(0, expected_restored - 2)
         )
         timing_ok = (
             decoded_clock['unmatched'] == 0 and
             decoded_clock['restored'] >= max(0, expected_restored - 2) and
-            full_duration_frames and source_scene_ok and scene_encode_ok and source_encode_ok
+            full_duration_frames and source_scene_ok and scene_encode_ok and source_encode_ok and
+            pending_remaining == 0 and encode_unmatched == 0
         )
         if output_container == 'mkv' and not timing_ok:
             if trace_pts and trace_encode_pairs:
@@ -1132,12 +1143,12 @@ def render_native_nvmm(request):
             fail('NVMM CUDA Scene PTS 映射未覆盖完整媒体时间：解码=%d，source→Scene=%d/%d（偏差=%d），Scene→编码=%d/%d（偏差=%d），source→编码=%d/%d（偏差=%d），未匹配=%d，编码=%d/%d。' % (
                 decoded_clock['frames'], pts_audit['sourceToSceneFrames'], expected_restored,
                 pts_audit['sourceToSceneMismatches'], pts_audit['sceneToEncodeFrames'], counters['scene'],
-                pts_audit['sceneToEncodeMismatches'], source_encode_frames, len(sorted_encode_pts),
+                pts_audit['sceneToEncodeMismatches'], source_encode_frames, counters['encode'],
                 source_encode_mismatches, decoded_clock['unmatched'], counters['encode'], minimum_frames))
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'wallSeconds': wall_seconds,
             'decode': counters['decode'] / wall_seconds, 'scene': counters['scene'] / wall_seconds,
-            'encode': total, 'total': total,
+            'encode': total, 'total': total, 'pipelineFps': total,
             'ptsBridge': {
                 'ok': timing_ok, 'decodedFrames': decoded_clock['frames'], 'restoredFrames': decoded_clock['restored'],
                 'unmatchedSceneFrames': decoded_clock['unmatched'], 'leadingFrames': leading_video_frames,
@@ -1151,7 +1162,10 @@ def render_native_nvmm(request):
                 'sceneToEncodeMaxDeltaSec': pts_audit['sceneToEncodeMaxDeltaNs'] / Gst.SECOND,
                 'sourceToEncodeFrames': source_encode_frames,
                 'sourceToEncodeMismatches': source_encode_mismatches,
-                'sourceToEncodeMaxDeltaSec': source_encode_max_delta_ns / Gst.SECOND
+                'sourceToEncodeMaxDeltaSec': source_encode_max_delta_ns / Gst.SECOND,
+                'pendingPeak': pts_pending_peak,
+                'pendingRemaining': pending_remaining,
+                'unmatchedEncodeFrames': encode_unmatched
             }
         }
     finally:

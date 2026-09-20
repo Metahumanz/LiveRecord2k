@@ -1797,7 +1797,7 @@ function createFfmpegJobProgress({
 function setFfmpegJobStageFps(progress, stageFps) {
   if (!progress || progress.status !== 'running' || !stageFps || typeof stageFps !== 'object') return false;
   const normalized = {};
-  for (const key of ['decode', 'scene', 'encode', 'total']) {
+  for (const key of ['decode', 'scene', 'encode', 'total', 'pipelineFps']) {
     const value = Number(stageFps[key]);
     if (Number.isFinite(value) && value >= 0) normalized[key] = value;
   }

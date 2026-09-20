@@ -80,6 +80,9 @@ test('native NVMM CUDA Scene materializes a black lead and keeps muxed A/V at PT
     const metricsLine = helperResult.stdout.split(/\r?\n/).find((line) => line.includes('"nativeNvmmMetrics"'));
     assert.ok(metricsLine, `helper 未输出 nativeNvmmMetrics：${helperResult.stdout.slice(-1000)}`);
     const metrics = JSON.parse(metricsLine).nativeNvmmMetrics;
+    assert.equal(metrics.pipelineFps, metrics.total, 'native metrics 必须提供 pipelineFps 别名');
+    assert.equal(metrics.ptsBridge?.pendingRemaining, 0, 'PTS pending 队列必须在 EOS 清空');
+    assert.equal(metrics.ptsBridge?.unmatchedEncodeFrames, 0, '编码帧不能缺少 Scene 配对');
     assert.ok(metrics.frames >= Math.floor(2.4 * FPS), '有限 NVMM 输出必须覆盖请求的媒体时长');
     await fs.stat(elementary);
 

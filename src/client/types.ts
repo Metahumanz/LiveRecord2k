@@ -407,6 +407,7 @@ export type FfmpegJobProgress = {
     scene?: number;
     encode?: number;
     total?: number;
+    pipelineFps?: number;
   };
   avatarDiagnostics?: AvatarPreparationDiagnostics;
   fallbackReason?: string;
