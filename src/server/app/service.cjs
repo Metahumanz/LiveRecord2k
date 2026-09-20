@@ -15,7 +15,8 @@ const {
 } = require('../danmaku/gpu-scene-renderer.cjs');
 const {
   createCudaSceneConformanceUnavailable,
-  canUseCudaSceneProduction
+  canUseCudaSceneProduction,
+  canUseDesktopCudaSceneProduction
 } = require('../danmaku/gpu-scene-conformance.cjs');
 const {
   DanmakuClient,
@@ -145,12 +146,15 @@ const {
   runFfmpegJob,
   createFfmpegJobProgress,
   resetFfmpegJobProgressRate,
+  setFfmpegJobPhase,
+  updateFfmpegJobPrepareProgress,
   updateFfmpegJobProgress,
   setFfmpegJobStageFps,
   finishFfmpegJobProgress,
   parseFfmpegProgressTime,
   parseFfmpegTime,
   probeMediaFileInfo,
+  probeMediaClipTimelineInfo,
   probeMediaTimelineInfo,
   probeMediaTimelineHealth,
   resolveReliableDurationSec,
@@ -837,16 +841,23 @@ function deriveTimelineBoundaryDelta(timeline, boundary) {
   return audio !== null && video !== null ? audio - video : null;
 }
 
-// A live fMP4/HLS segment can legitimately carry audio from t=0 while its
-// first decodable video keyframe is later.  A burn filter resets video PTS so
-// it can render ASS, therefore it must explicitly restore that leading gap or
-// the video content is pulled forward against the audio (and repeated at the
-// first chunk boundary).  The persisted timeline audit supplies these values
-// without adding another full-file scan at export time.
-function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
+// A clean recording already has one media clock.  The first decodable video
+// packet may start after the first audio packet because of keyframe/reorder
+// metadata; that difference is not proof that playback is out of sync.  Keep
+// the probe values for diagnostics, but never synthesize black/silence from
+// firstVideoPts-firstAudioPts.  Clip callers reset both tracks from the same
+// source origin (clipStart), so the renderer receives a zero-based clock.
+function getBurnTimelineAlignment(recording, startTime = 0, duration = 0, actualTimeline = null) {
   const clipStart = Math.max(0, Number(startTime) || 0);
-  const clipDuration = Math.max(0, Number(duration) || 0);
-  const candidates = [recording?.timelineHealth, recording?.timingInfo, recording?.streamMetadata].filter(
+  // Once an export has attempted the authoritative clean-file clip probe,
+  // its result is the complete source of truth.  In particular, a failed or
+  // incomplete probe must not fall back to stale sidecar PTS and synthesize a
+  // black/silence lead that the current clip never had.
+  const hasAuthoritativeClipProbe = actualTimeline?.actualClipProbe === true;
+  const candidates = (hasAuthoritativeClipProbe
+    ? [actualTimeline]
+    : [actualTimeline, recording?.timelineHealth, recording?.timingInfo, recording?.streamMetadata]
+  ).filter(
     (value) => value && typeof value === 'object'
   );
   const firstFinite = (field) => {
@@ -858,30 +869,12 @@ function getBurnTimelineAlignment(recording, startTime = 0, duration = 0) {
   };
   const firstVideoPts = firstFinite('firstVideoPts');
   const firstAudioPts = firstFinite('firstAudioPts');
-  const capPadding = (value) => {
-    if (!Number.isFinite(value) || value <= 0) return 0;
-    return clipDuration > 0 ? Math.min(value, clipDuration) : value;
-  };
-  // Do not use absolute packet PTS as padding: some HLS/fMP4 inputs start at
-  // a non-zero timestamp.  Only the *relative* audio/video start offset is
-  // meaningful after filters reset each track to zero.  Preserve that offset
-  // with black video or silence so reconnect boundaries stay in sync.
-  const relativeVideoStart = firstVideoPts !== null ? Math.max(0, Number(firstVideoPts) - clipStart) : null;
-  const relativeAudioStart = firstAudioPts !== null ? Math.max(0, Number(firstAudioPts) - clipStart) : null;
-  const sharedStart =
-    relativeVideoStart !== null && relativeAudioStart !== null
-      ? Math.min(relativeVideoStart, relativeAudioStart)
-      : 0;
-  const videoPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null
-    ? capPadding(relativeVideoStart - sharedStart)
-    : 0;
-  const audioPaddingSec = relativeVideoStart !== null && relativeAudioStart !== null
-    ? capPadding(relativeAudioStart - sharedStart)
-    : 0;
   return {
-    videoPaddingSec,
-    audioPaddingSec,
-    videoClockStartSec: clipStart + videoPaddingSec,
+    videoPaddingSec: 0,
+    audioPaddingSec: 0,
+    sourceClockOriginSec: clipStart,
+    videoClockStartSec: 0,
+    audioClockStartSec: 0,
     firstVideoPts,
     firstAudioPts
   };
@@ -1219,11 +1212,16 @@ class LiveRecordService {
     });
     this.log('success', `WebUI 后端已启动，ffmpeg: ${this.ffmpegPath}`);
     this.log('info', '正在后台探测 ffmpeg、显卡能力和录像库。');
-    this.startRuntimeCapabilitiesProbe();
-    setImmediate(() => {
-      this.initializeRecordingLibrary().catch((error) => {
-        this.log('warn', `后台扫描录像库失败：${error.message}`);
-        this.emitState();
+    // 启动时的录像库扫描会读取大量 JSONL 和媒体元数据。它与 Jetson
+    // GStreamer 实机自检并行时会抢占事件循环，导致刚加入的导出请求在
+    // 浏览器超时后才真正进入内存队列。先完成能力探测；已落盘录像列表
+    // 仍可立刻展示，随后再在空闲时刷新整个库。
+    this.startRuntimeCapabilitiesProbe().finally(() => {
+      setImmediate(() => {
+        this.initializeRecordingLibrary().catch((error) => {
+          this.log('warn', `后台扫描录像库失败：${error.message}`);
+          this.emitState();
+        });
       });
     });
     setImmediate(() => {
@@ -1276,6 +1274,14 @@ class LiveRecordService {
     this.ffmpegCapabilities.sceneGpuRenderer = await this.probeGpuSceneRenderer();
     this.ffmpegCapabilities.sceneGpuVisualConformance = this.ffmpegCapabilities.sceneGpuRenderer.visualConformance ||
       createCudaSceneConformanceUnavailable();
+    const desktopCudaConformance = await this.readCudaSceneConformanceReport();
+    if (this.ffmpegCapabilities.desktopCuda) {
+      this.ffmpegCapabilities.desktopCuda.visualConformance = desktopCudaConformance;
+      this.ffmpegCapabilities.desktopCuda.fullSceneProduction = canUseDesktopCudaSceneProduction(
+        this.ffmpegCapabilities.desktopCuda,
+        desktopCudaConformance
+      ).ok;
+    }
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1332,9 +1338,10 @@ class LiveRecordService {
     );
     const desktopCuda = this.ffmpegCapabilities.desktopCuda;
     if (desktopCuda?.available) {
+      const desktopCudaSceneProduction = canUseDesktopCudaSceneProduction(desktopCuda, desktopCuda.visualConformance);
       this.log(
         'success',
-        `桌面 NVIDIA CUDA 已通过真实自检：${desktopCuda.decoder ? 'CUDA 硬解、' : ''}${desktopCuda.compositor || 'overlay_cuda'} 合成、${desktopCuda.encoder}。当前用于 NVENC 与真实头像/非文字图元合成；旧样式完整文字仍保持 ASS 金标准。`
+        `桌面 NVIDIA CUDA 已通过真实自检：${desktopCuda.decoder ? 'CUDA 硬解、' : ''}${desktopCuda.compositor || 'overlay_cuda'} 合成、${desktopCuda.encoder}。${desktopCudaSceneProduction.ok ? 'ASS 金标准视觉门禁通过，三套旧样式将使用完整 CUDA Scene。' : `完整 CUDA Scene 尚未准入：${desktopCudaSceneProduction.reason}`}`
       );
     } else if (process.platform !== 'linux' || process.arch !== 'arm64') {
       this.log('info', `桌面 NVIDIA CUDA 合成链未启用：${desktopCuda?.reason || '尚未完成自检。'}`);
@@ -1616,11 +1623,13 @@ class LiveRecordService {
     progress.fallbackReason = String(reason || '').trim() || undefined;
     if (options.avatarCompositeBackend) progress.avatarCompositeBackend = options.avatarCompositeBackend;
     if (options.reset) {
-      progress.workStartedAt = Date.now();
+      const now = Date.now();
+      progress.workStartedAt = now;
+      setFfmpegJobPhase(progress, 'render', { now });
       progress.currentTimeSec = 0;
       progress.percent = Number(progress.durationSec || 0) > 0 ? 0 : null;
       progress.estimatedRemainingSec = null;
-      resetFfmpegJobProgressRate(progress);
+      resetFfmpegJobProgressRate(progress, 'render');
     }
     if (options.message) progress.message = options.message;
     progress.updatedAt = Date.now();
@@ -1990,6 +1999,41 @@ class LiveRecordService {
       timelineHealthStatus: recording.timelineHealthStatus || saved.timelineHealthStatus || '',
       streamMetadata: recording.streamMetadata || saved.streamMetadata || null
     };
+  }
+
+  // A clip can be opened directly from disk instead of from the in-memory
+  // recording library.  Its sidecar is still the authoritative record of an
+  // HLS reconnect boundary (notably audio at 0 with video beginning at
+  // 1.019s).  Without it a burn loses the physical black lead-in and audio
+  // gets progressively early after chunk concatenation.
+  async hydrateRecordingTimingFromSidecar(recording) {
+    const cleanPath = String(recording?.cleanPath || '').trim();
+    if (!cleanPath) return recording;
+    const initialPts = (field) => {
+      for (const candidate of [recording?.timelineHealth, recording?.timingInfo, recording?.streamMetadata]) {
+        const value = finiteTimelineValue(candidate?.[field]);
+        if (value !== null) return value;
+      }
+      return null;
+    };
+    const needsTimeline = initialPts('firstVideoPts') === null || initialPts('firstAudioPts') === null;
+    if (!needsTimeline) return recording;
+    try {
+      const raw = await fsp.readFile(`${cleanPath}.metadata.json`, 'utf8');
+      const metadata = JSON.parse(raw);
+      if (!metadata || typeof metadata !== 'object') return recording;
+      return {
+        ...recording,
+        // Sidecar data belongs to this exact media file, so its packet-boundary
+        // fields take precedence over an older in-memory library entry.
+        timingInfo: { ...(recording.timingInfo || {}), ...(metadata.timingInfo || {}) },
+        timelineHealth: metadata.timelineHealth || metadata.timelineDetails || recording.timelineHealth || null,
+        timelineHealthStatus: metadata.timelineHealthStatus || recording.timelineHealthStatus || '',
+        streamMetadata: { ...(recording.streamMetadata || {}), ...(metadata.streamMetadata || {}) }
+      };
+    } catch {
+      return recording;
+    }
   }
 
   getSegmentDurationSec(minutes = this.settings.segmentMinutes) {
@@ -7840,7 +7884,7 @@ try {
             if (isJetsonGstreamerCodec(videoCodec)) {
               const encodedVideoPath = path.join(
                 normalizeTempDir,
-                `${String(index + 1).padStart(3, '0')}.normalized.${isHevcCodec(videoCodec) ? 'h265' : 'h264'}`
+                `${String(index + 1).padStart(3, '0')}.normalized.mkv`
               );
               await runMergeFfmpeg(null, {
                 ...normalizeOptions,
@@ -9584,11 +9628,9 @@ try {
   }
 
   // L4T R35 exposes the Jetson hardware encoder through GStreamer rather
-  // than the stock FFmpeg binary.  Keep FFmpeg for decoding, ASS/avatar
-  // rendering and final muxing, then bridge its raw I420 output directly to
-  // nvv4l2{h264,h265}enc.  The elementary stream is deliberately temporary:
-  // unlike raw frames it remains small enough for an ordinary recording
-  // volume, including an SMB mount.
+  // than the stock FFmpeg binary. Keep FFmpeg for decoding/Scene rendering,
+  // bridge raw I420 to nvv4l2{h264,h265}enc, and immediately matroska-mux the
+  // video-only intermediate so its PTS survives the final audio mux.
   async runJetsonGstreamerTranscode({
     codec,
     quality,
@@ -9604,6 +9646,8 @@ try {
     onChild,
     onPipeline,
     onStageMetrics,
+    onProgress,
+    onPhase,
     beforeRetry,
     onFallback,
     label = 'Jetson 媒体处理',
@@ -9626,7 +9670,10 @@ try {
       quality,
       outputPath,
       preview,
-      converter: codecInfo.converter
+      converter: codecInfo.converter,
+      // Keep the temporary Jetson video timestamped.  A raw .h264/.h265
+      // elementary stream loses the decoder/renderer clock at every chunk.
+      container: 'mkv'
     });
     this.log(
       'info',
@@ -9634,6 +9681,7 @@ try {
     );
     const preferredDecoder = String(decoder?.value || decoder || 'software');
     const run = async (nextDecoder) => {
+      onPhase?.('render');
       await fsp.rm(outputPath, { force: true }).catch(() => {});
       const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.filterScriptPath;
       const activeDecoder = nextDecoder === 'gstreamer-nvv4l2' && !useNativeDecode ? 'software' : nextDecoder;
@@ -9681,6 +9729,7 @@ try {
           onChild
         });
       }
+      onPhase?.('mux');
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
     };
 
@@ -9703,6 +9752,7 @@ try {
       );
       await beforeRetry?.();
       onFallback?.();
+      onPhase?.('render', { force: true });
       await run('software');
       return 'software';
     } finally {
@@ -9797,9 +9847,7 @@ try {
         const chunkInputTrimEndSec = chunkSeekPrerollSec + chunkLength;
         const scriptPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.ffscript`);
         const chunkPath = path.join(temporaryDir, `avatar-chunk-${String(chunkIndex).padStart(5, '0')}.mkv`);
-        const encodedChunkPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
-          isHevcCodec(codec) ? 'h265' : 'h264'
-        }`;
+        const encodedChunkPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
         const useGpuForChunk = Boolean(
           activeEntries.length > 0 &&
             canUseAvatarComposite &&
@@ -10078,6 +10126,7 @@ try {
     const stylePreset = source.stylePreset;
     const styleLayout = source.styleLayout;
     const mediaInfo = source.mediaInfo || {};
+    const actualTimeline = source.actualTimeline || null;
     const durationSec = Math.max(0, Number(source.durationSec || recording.durationSec || 0));
     const codecInfo = this.getBurnCodecInfo(burnCodec);
     const decoderInfo = this.getHardwareDecoder(recording.videoInfo || mediaInfo.videoInfo, burnCodec);
@@ -10098,7 +10147,7 @@ try {
     const burnedPath = options.outputPath || deriveBurnedPath(recording.cleanPath, overlayMode);
     const burnedTmpPath = replaceExtension(burnedPath, '.tmp.' + getContainerFromPath(burnedPath));
     const burnFps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
-    const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
+    const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec, actualTimeline);
     const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
     let sceneDirectory = '';
     try {
@@ -10252,8 +10301,7 @@ try {
               sourceCodec: decoderInfo.codec
             });
           if (isJetsonGstreamerCodec(burnCodec)) {
-            const encodedVideoPath = burnedTmpPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
-              (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+            const encodedVideoPath = burnedTmpPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.mkv';
             await this.runJetsonGstreamerTranscode({
               codec: burnCodec,
               quality: burnCrf,
@@ -10359,6 +10407,17 @@ try {
       if (mediaInfo.videoInfo) {
         recording.videoInfo = mediaInfo.videoInfo;
       }
+      const actualTimeline = await probeMediaClipTimelineInfo(
+        this.ffmpegPath,
+        recording.cleanPath,
+        0,
+        durationSec,
+        mediaInfo,
+        { timeoutMs: 30_000, packetSampleDurationSec: Math.min(2, durationSec || 2) }
+      ).catch((error) => {
+        this.log('warn', `自动烧录实际 PTS 探测失败，按无起始 A/V 偏移继续：${compactLogLine(error.message)}`);
+        return { actualClipProbe: true, firstVideoPts: null, firstAudioPts: null, avStartDeltaSec: null, avBoundaryToleranceSec: 0.08 };
+      });
       if (SCENE_STYLE_PRESETS.includes(stylePreset)) {
         return this.startSceneGraphBurnRecording(room, recording, options, {
           burnCodec,
@@ -10368,10 +10427,11 @@ try {
           stylePreset,
           styleLayout,
           mediaInfo,
+          actualTimeline,
           durationSec
         });
       }
-      const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec);
+      const burnTimeline = getBurnTimelineAlignment(recording, 0, durationSec, actualTimeline);
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, 0, durationSec, burnTimeline);
       const assets = await this.generateSubtitleAssets(recording, { overlayMode, danmakuArea, stylePreset, styleLayout, avatarMode });
       if (options.prepareOnly) {
@@ -10635,9 +10695,7 @@ try {
               this.markRoomDirty(room.id);
             };
             if (isJetsonGstreamerCodec(burnCodec)) {
-              const encodedVideoPath = `${burnedTmpPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
-                isHevcCodec(burnCodec) ? 'h265' : 'h264'
-              }`;
+              const encodedVideoPath = `${burnedTmpPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
               await this.runJetsonGstreamerWithCudaAvatarCompositeFallback({
                 avatarLayer,
                 createTranscode: (nextAvatarLayer) =>
@@ -11075,6 +11133,7 @@ try {
       throw new Error('请选择录像文件。');
     }
     recording = this.hydrateRecordingFromLibrary(recording);
+    recording = await this.hydrateRecordingTimingFromSidecar(recording);
     if (recording.valid === false) {
       throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
@@ -11178,9 +11237,23 @@ try {
     }
     this.exportQueueRunning = true;
     this.activeExportQueueItem = item;
+    const queuedStartTime = parseTimeInput(item.startTime);
+    const queuedEndTime = parseTimeInput(item.endTime);
+    const capabilityProgress = createFfmpegJobProgress({
+      kind: 'export',
+      label: item.label,
+      outputPath: item.outputPath,
+      durationSec: Number.isFinite(queuedStartTime) && Number.isFinite(queuedEndTime)
+        ? Math.max(0, queuedEndTime - queuedStartTime)
+        : 0
+    });
+    capabilityProgress.stageLabel = '正在完成启动硬件探测';
+    capabilityProgress.message = '正在完成启动硬件探测，导出将在探测完成后自动开始';
+    this.exportProgress = capabilityProgress;
     this.emitState();
     setImmediate(async () => {
       let lease = null;
+      let exportStarted = false;
       const removeWaitingItem = () => {
         const index = this.exportQueue.findIndex((candidate) => candidate.id === item.id);
         if (index >= 0) {
@@ -11190,10 +11263,16 @@ try {
       };
       try {
         if (this.cancelledExportQueueIds.has(item.id)) {
+          if (this.exportProgress?.id === capabilityProgress.id) {
+            finishFfmpegJobProgress(this.exportProgress, 'cancelled', '已取消等待硬件探测的导出');
+          }
           return;
         }
         await this.waitForRuntimeCapabilities();
         if (this.cancelledExportQueueIds.has(item.id)) {
+          if (this.exportProgress?.id === capabilityProgress.id) {
+            finishFfmpegJobProgress(this.exportProgress, 'cancelled', '已取消等待硬件探测的导出');
+          }
           return;
         }
         const codec = this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
@@ -11211,9 +11290,13 @@ try {
           lease = null;
           return;
         }
+        exportStarted = true;
         await this.runExportClipNow({ ...item.request, codec, onProgressCreated: removeWaitingItem });
       } catch (error) {
         this.log('error', `导出队列任务失败：${item.label}，${error.message || String(error)}`);
+        if (this.exportProgress?.id === capabilityProgress.id) {
+          finishFfmpegJobProgress(this.exportProgress, 'error', `导出启动失败：${error.message || String(error)}`);
+        }
       } finally {
         removeWaitingItem();
         lease?.release();
@@ -11222,6 +11305,9 @@ try {
           this.activeExportQueueItem = null;
         }
         this.exportQueueRunning = false;
+        if (!exportStarted && this.exportCancelRequested) {
+          this.exportCancelRequested = false;
+        }
         this.emitState();
         if (this.exportQueue.length > 0) {
           this.pumpExportQueue();
@@ -11234,9 +11320,8 @@ try {
     graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
     leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
-    onStderr, onChild, onProgress, onStage, isCancelled, label
+    onStderr, onChild, onProgress, onPreparing, onPhase, onStage, isCancelled, label
   }) {
-    const chunkSeconds = 20;
     const chunkPaths = [];
     const chunkDurations = [];
     const scriptPaths = [];
@@ -11246,6 +11331,18 @@ try {
       this.ffmpegCapabilities?.sceneGpuVisualConformance
     ).ok;
     const nativeDecoderPath = resolveGpuSceneRenderer();
+    // A concat pass has one timestamp contract.  Native NVMM and I420
+    // compatibility chunks are both Matroska streams now; each keeps the
+    // renderer's frame clock instead of reconstructing it from a rounded fps.
+    // Never alternate a timestamped pass with an elementary fallback within
+    // one output, or later chunks will steadily pull audio ahead of video.
+    const nativeTimestampedAdmission = useCudaSceneRenderer && decoder?.value === 'gstreamer-nvv4l2' &&
+      Boolean(this.ffmpegCapabilities?.sceneGpuRenderer?.nativeNvmmScene);
+    // Native NVMM keeps one media clock for the entire export. The historical
+    // 20s loop remains only for the CPU/I420 compatibility path; splitting a
+    // timestamped NVDEC stream would make every concat boundary a new clock.
+    const chunkSeconds = nativeTimestampedAdmission ? Math.max(0.001, Number(duration) || 0.001) : 20;
+    let nativeTimestampedPass = nativeTimestampedAdmission;
     let completed = 0;
     try {
       while (completed < duration - 0.001) {
@@ -11262,7 +11359,16 @@ try {
         const chunkGraph = clipSceneGraph(graph, graphChunkStart, graphChunkStart + chunkDuration, { shiftTime: true });
         const scriptPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.filter`);
         const chunkPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
-        const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${isHevcCodec(codec) ? 'h265' : 'h264'}`;
+        // Native PTS chunks are admitted only when the CUDA/NVMM runtime
+        // probe passed. A later per-chunk bridge or coverage failure aborts
+        // this pass rather than mixing an elementary fallback chunk into the
+        // timestamped concat timeline.
+        let nativeTimestampedChunk = nativeTimestampedPass;
+        // Every Jetson chunk now has a PTS-bearing container.  The native
+        // NVMM path writes Matroska directly; the I420 compatibility path
+        // uses the same matroskamux contract so concat never reconstructs a
+        // clock from a rounded fps or a bare elementary stream.
+        const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
         const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
           path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.legacy.ass`),
           legacyEvents,
@@ -11273,7 +11379,9 @@ try {
             shiftTime: true
           }
         );
-        onStage?.(`正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+        onStage?.(nativeTimestampedAdmission
+          ? `正在连续合成 CUDA Scene Graph（${chunkGraph.objects.length} 个对象）`
+          : `正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
         const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
           duration: chunkDuration,
           outputDuration: chunkDuration,
@@ -11285,6 +11393,8 @@ try {
         scriptPaths.push(scriptPath);
         if (legacyAssPath) scriptPaths.push(legacyAssPath);
         await fsp.rm(chunkPath, { force: true }).catch(() => {});
+        let nativeRenderingReported = false;
+        let nativeMetrics = null;
         const common = {
           codec,
           quality: crf,
@@ -11292,9 +11402,10 @@ try {
           height,
           fps,
           encodedVideoPath,
-          createMuxArgs: () => createBurnEncodedVideoMuxArgs({
+          createMuxArgs: (options = {}) => createBurnEncodedVideoMuxArgs({
             encodedVideoPath, cleanPath, outputPath: chunkPath, codec, sourceCodec, fps, startTime: chunkStart,
-            duration: chunkDuration, container: 'mkv', includeAudio: false
+            duration: chunkDuration, container: 'mkv', includeAudio: false,
+            preserveVideoTimestamps: Boolean(options.preserveVideoTimestamps)
           }),
           decoder,
           nativeDecode: decoder?.value === 'gstreamer-nvv4l2' && nativeDecoderPath
@@ -11312,8 +11423,29 @@ try {
             const local = parseFfmpegProgressTime(line);
             if (Number.isFinite(local)) onProgress?.(Math.min(duration, completed + Math.max(0, local)));
           },
+          // The native NVMM helper has no FFmpeg stderr progress stream. Its
+          // PTS-derived callback is therefore the only authoritative live
+          // position for a running chunk; without forwarding it here the UI
+          // remains at the previous chunk boundary until concat begins.
+          onProgress: (localSeconds) => {
+            if (!nativeRenderingReported && Number(localSeconds) > 0.001) {
+              nativeRenderingReported = true;
+              onStage?.(nativeTimestampedAdmission
+                ? `正在连续合成 CUDA Scene Graph（${chunkGraph.objects.length} 个对象）`
+                : `正在直接合成 CUDA Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+            }
+            onProgress?.(Math.min(duration, completed + Math.max(0, Number(localSeconds) || 0)));
+          },
+          onPreparing: (metrics) => {
+            const prepared = Math.max(0, Number(metrics?.objectsPrepared) || 0);
+            const total = Math.max(0, Number(metrics?.objectCount) || 0);
+            const rows = Math.max(0, Number(metrics?.timelineRows) || 0);
+            onStage?.(`正在预渲染 CUDA Scene 纹理：${prepared}/${total} 个对象${rows ? `（${rows} 个动画片段）` : ''}`);
+            onPreparing?.(metrics);
+          },
           onChild,
           onPipeline: (pipeline) => this.setProgressPipeline(this.exportProgress, pipeline),
+          onPhase,
           onStageMetrics: (metrics) => {
             if (this.exportProgress?.status !== 'running') return;
             if (setFfmpegJobStageFps(this.exportProgress, metrics)) this.emitState('mediaJob');
@@ -11332,34 +11464,84 @@ try {
           leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
         });
         if (!useCudaSceneRenderer) {
-          await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+            onPhase?.('render');
+            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
         } else {
           try {
-            await this.runJetsonCudaSceneGraphTranscode({
+            onPhase?.('render');
+            const cudaResult = await this.runJetsonCudaSceneGraphTranscode({
               ...common,
               graph: chunkGraph,
               cleanPath,
               duration: chunkDuration,
               timelineOffsetSec: chunkLeadingVideoPaddingSec,
+              nativeTimestampedOutput: nativeTimestampedChunk,
               createRawArgs: (nextDecoder) => createBurnRawVideoArgs({
                 cleanPath, assPath: '', fps, startTime: chunkStart, duration: chunkDuration, inputSeek: true,
                 timelineOffset: 0, leadingVideoPaddingSec: chunkLeadingVideoPaddingSec, decoder: nextDecoder,
                 sourceCodec, videoWidth: width, videoHeight: height, directRaw: true
               })
             });
+            if (nativeTimestampedChunk && !cudaResult?.nativeMetrics?.ptsBridge?.ok) {
+              throw new Error('原生 NVMM PTS bridge 未通过逐帧覆盖校验。');
+            }
+            nativeMetrics = cudaResult?.nativeMetrics || null;
           } catch (error) {
             if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
             onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
+            if (nativeTimestampedChunk && chunkPaths.length > 0) {
+              const restartError = new Error(`原生 NVMM PTS 分段 ${index + 1} 失败；已拒绝与前序时间戳分段混拼，请从头走兼容链重试。`);
+              restartError.code = 'BR2K_NATIVE_PTS_RESTART_REQUIRED';
+              throw restartError;
+            }
+            // The fallback still uses the CPU/I420 renderer, but its GStreamer
+            // output is also Matroska. It must not be judged by the native
+            // NVMM PTS coverage gate below. This is the first chunk, so commit
+            // the entire remaining pass to that same timestamped contract.
+            nativeTimestampedChunk = false;
+            nativeTimestampedPass = false;
+            onPhase?.('render', { force: true });
             await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
           }
         }
         if ((await getFileSize(chunkPath)) < 1024) throw new Error(`Scene Graph 分段 ${index + 1} 未产生有效视频。`);
+        if (nativeTimestampedChunk) {
+          const bridge = nativeMetrics?.ptsBridge || {};
+          const encodedFrames = Number(bridge.encodedFrames ?? nativeMetrics?.frames);
+          const minimumFrames = Number(bridge.minimumFrames);
+          const sourceToSceneFrames = Number(bridge.sourceToSceneFrames);
+          const sceneToEncodeFrames = Number(bridge.sceneToEncodeFrames);
+          const sourceToEncodeFrames = Number(bridge.sourceToEncodeFrames);
+          const sourceToSceneMismatches = Number(bridge.sourceToSceneMismatches || 0);
+          const sceneToEncodeMismatches = Number(bridge.sceneToEncodeMismatches || 0);
+          const sourceToEncodeMismatches = Number(bridge.sourceToEncodeMismatches || 0);
+          if (!Number.isFinite(encodedFrames) || !Number.isFinite(minimumFrames) || encodedFrames < minimumFrames) {
+            throw new Error(`原生 NVMM 分段 ${index + 1} 帧预算不足：${Number.isFinite(encodedFrames) ? encodedFrames : '?'} / ${Number.isFinite(minimumFrames) ? minimumFrames : '?'}。`);
+          }
+          if (!Number.isFinite(sourceToSceneFrames) || !Number.isFinite(sceneToEncodeFrames) || !Number.isFinite(sourceToEncodeFrames) ||
+              sourceToSceneFrames <= 0 || sceneToEncodeFrames <= 0 || sourceToEncodeFrames <= 0 ||
+              sourceToSceneMismatches > 0 || sceneToEncodeMismatches > 0 || sourceToEncodeMismatches > 0) {
+            throw new Error(`原生 NVMM 分段 ${index + 1} PTS 映射不足：source→Scene ${Number.isFinite(sourceToSceneFrames) ? sourceToSceneFrames : '?'} 帧/${sourceToSceneMismatches} 个偏差，Scene→编码 ${Number.isFinite(sceneToEncodeFrames) ? sceneToEncodeFrames : '?'} 帧/${sceneToEncodeMismatches} 个偏差，source→编码 ${Number.isFinite(sourceToEncodeFrames) ? sourceToEncodeFrames : '?'} 帧/${sourceToEncodeMismatches} 个偏差。`);
+          }
+          // JetPack NVENC can omit packet duration metadata on the final
+          // access units. Its FFprobe presentation duration is therefore a
+          // useful diagnostic only; treating it as an admission gate falsely
+          // rejects an already validated fixed-frame media interval.
+          const chunkInfo = await probeMediaFileInfo(this.ffmpegPath, chunkPath, { timeoutMs: 30_000 });
+          const timeline = await probeMediaTimelineInfo(this.ffmpegPath, chunkPath, chunkInfo, { timeoutMs: 30_000 });
+          const coverage = Number(timeline.videoPresentationDurationSec || timeline.videoDurationSec || 0);
+          this.log(
+            'info',
+            `${label} ${nativeTimestampedAdmission ? '连续链路' : `分段 ${index + 1}`} PTS 映射：source→Scene ${sourceToSceneFrames} 帧（最大 ${(Number(bridge.sourceToSceneMaxDeltaSec || 0) * 1000).toFixed(3)}ms），Scene→编码 ${sceneToEncodeFrames} 帧（最大 ${(Number(bridge.sceneToEncodeMaxDeltaSec || 0) * 1000).toFixed(3)}ms），source→编码 ${sourceToEncodeFrames} 帧（最大 ${(Number(bridge.sourceToEncodeMaxDeltaSec || 0) * 1000).toFixed(3)}ms）；封装诊断 ${coverage.toFixed(3)}s / ${chunkDuration.toFixed(3)}s。`
+          );
+        }
         chunkPaths.push(chunkPath);
         chunkDurations.push(chunkDuration);
         completed += chunkDuration;
         onProgress?.(completed);
       }
       await writeConcatFile(concatPath, chunkPaths, { durations: chunkDurations });
+      onPhase?.('mux');
       onStage?.('正在无重编码拼接 Scene Graph 分段并封装源音频');
       await runFfmpegJob(this.ffmpegPath, createBurnAudioMuxArgs({
         concatPath, cleanPath, outputPath, codec, sourceCodec, startTime, duration, container: outputContainer,
@@ -11383,6 +11565,7 @@ try {
     fps,
     duration,
     timelineOffsetSec = 0,
+    nativeTimestampedOutput = false,
     cleanPath,
     encodedVideoPath,
     createRawArgs,
@@ -11393,6 +11576,9 @@ try {
     onChild,
     onPipeline,
     onStageMetrics,
+    onProgress,
+    onPreparing,
+    onPhase,
     beforeRetry,
     onFallback,
     label = 'Jetson CUDA Scene Graph 烧录'
@@ -11405,6 +11591,7 @@ try {
       throw new Error('Jetson CUDA Scene Graph 编码缺少有效参数。');
     }
     const requestPath = `${encodedVideoPath}.scene-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`;
+    const keepSceneRequestForDiagnostics = process.env.BR2K_KEEP_SCENE_REQUEST === '1';
     const request = createGpuSceneRenderRequest(graph, {
       backend: 'cuda-gstreamer',
       inputPath: cleanPath,
@@ -11415,7 +11602,10 @@ try {
       fps,
       duration,
       timelineOffsetSec,
-      decoder: String(decoder?.value || decoder || 'software')
+      decoder: String(decoder?.value || decoder || 'software'),
+      container: /\.mkv$/i.test(String(encodedVideoPath || '')) || (nativeTimestampedOutput && nativeDecode?.decoderPath)
+        ? 'mkv'
+        : ''
     });
     if (nativeDecode) {
       request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
@@ -11424,7 +11614,9 @@ try {
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
     this.log('info', `${label}：将在子进程实际启动后报告 CUDA Scene 运行链路。`);
     const preferredDecoder = String(decoder?.value || decoder || 'software');
+    let completedNativeMetrics = null;
     const run = async (nextDecoder) => {
+      onPhase?.('render');
       await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
       const useNativeDecode = nextDecoder === 'gstreamer-nvv4l2' && nativeDecode?.decoderPath;
       onPipeline?.({
@@ -11438,11 +11630,55 @@ try {
       });
       if (useNativeDecode) {
         if (renderer.nativeNvmmScene) {
-          const nativeResult = await runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
-            timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024
+          let nativeStdoutRemainder = '';
+          const consumeNativeReportLine = (line) => {
+            let parsed;
+            try {
+              parsed = JSON.parse(line);
+            } catch {
+              return;
+            }
+            if (parsed?.nativeNvmmProgress && typeof parsed.nativeNvmmProgress === 'object') {
+              const metrics = parsed.nativeNvmmProgress;
+              onProgress?.(Math.max(0, Math.min(Number(nativeDecode?.duration || duration) || duration, Number(metrics.mediaSeconds) || 0)));
+              onStageMetrics?.({
+                decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total),
+                frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds)
+              });
+            } else if (parsed?.nativeNvmmPreparing && typeof parsed.nativeNvmmPreparing === 'object') {
+              onPreparing?.(parsed.nativeNvmmPreparing);
+            }
+          };
+          const runNativeHelper = () => runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
+            timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024,
+            onStdout: (chunk) => {
+              nativeStdoutRemainder += chunk;
+              const lines = nativeStdoutRemainder.split(/\r?\n/);
+              nativeStdoutRemainder = lines.pop() || '';
+              for (const line of lines) consumeNativeReportLine(line);
+            }
           });
+          let nativeResult = await runNativeHelper();
+          const nativeFailureText = String(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '');
+          // JetPack occasionally refuses a fresh nvivafilter/NVENC context
+          // after many short helper processes with an Argus connection error.
+          // Retry the same timestamped chunk once; it is safe because no
+          // concat state has been committed yet.  Do not downgrade this chunk
+          // to a different timestamp contract after earlier native chunks.
+          if ((nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) &&
+              /(?:\bArgus\b|NvBuf|resource busy|connecting to.*daemon)/i.test(nativeFailureText)) {
+            this.log('warn', `${label} 的原生 NVMM 上下文启动异常，正在原链路重试一次。`);
+            nativeStdoutRemainder = '';
+            await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
+            await new Promise((resolve) => setTimeout(resolve, 750));
+            nativeResult = await runNativeHelper();
+          }
+          if (nativeStdoutRemainder) consumeNativeReportLine(nativeStdoutRemainder);
           if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) {
-            throw new Error(compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。'));
+            const nativeDiagnostic = compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。');
+            onStderr?.(`原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
+            this.log('warn', `${label}：原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
+            throw new Error(nativeDiagnostic);
           }
           let metrics = null;
           for (const line of String(nativeResult.stdout || '').trim().split(/\r?\n/).reverse()) {
@@ -11457,6 +11693,11 @@ try {
             }
           }
           if (!metrics) throw new Error('原生 NVMM CUDA Scene 未返回真实性能统计。');
+          if (!metrics?.ptsBridge?.ok) throw new Error('原生 NVMM CUDA Scene PTS bridge 未通过逐帧覆盖校验。');
+          if (Number(metrics?.ptsBridge?.leadingFrames) > 0) {
+            this.log('info', `${label}：原生 NVMM 已生成 ${metrics.ptsBridge.leadingFrames} 帧黑帧前导。`);
+          }
+          completedNativeMetrics = metrics;
           onStageMetrics?.({
             decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total),
             frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds), final: true
@@ -11488,20 +11729,33 @@ try {
           onChild
         });
       }
-      await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
+      onPhase?.('mux');
+      await runFfmpegJob(
+        this.ffmpegPath,
+        createMuxArgs({ preserveVideoTimestamps: Boolean(nativeTimestampedOutput && useNativeDecode && renderer.nativeNvmmScene) }),
+        onStderr,
+        { onChild }
+      );
     };
     try {
       await run(preferredDecoder);
-      return preferredDecoder;
+      return { decoder: preferredDecoder, nativeMetrics: completedNativeMetrics };
     } catch (error) {
       if (preferredDecoder === 'software' || error?.code === 'BR2K_MEDIA_CANCELLED' || !isFfmpegHardwareDecodeError(error)) throw error;
       this.log('warn', `${label} 的 ${decoder?.label || preferredDecoder} 不可用，改用 CPU 解码并保留 CUDA Scene 合成：${compactLogLine(error.message)}`);
       await beforeRetry?.();
       onFallback?.();
+      onPhase?.('render', { force: true });
       await run('software');
-      return 'software';
+      return { decoder: 'software', nativeMetrics: null };
     } finally {
-      await fsp.rm(requestPath, { force: true }).catch(() => {});
+      if (keepSceneRequestForDiagnostics) {
+        const preservedRequestPath = path.join('/tmp', `br2k-scene-request-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`);
+        await fsp.copyFile(requestPath, preservedRequestPath).catch(() => {});
+        this.log('warn', `${label}：保留原生 Scene 请求用于诊断：${preservedRequestPath}`);
+      } else {
+        await fsp.rm(requestPath, { force: true }).catch(() => {});
+      }
       await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
     }
   }
@@ -11522,10 +11776,12 @@ try {
     temporaryOutputPath,
     outputContainer,
     mediaInfo,
+    actualTimeline,
     codecInfo,
     decoderInfo,
     progress,
     setExportStage,
+    setExportPhase,
     throwIfExportCancelled
   }) {
     let sceneDirectory = '';
@@ -11540,6 +11796,7 @@ try {
       await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
       throwIfExportCancelled();
       sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-scene-'));
+      setExportPhase?.('prepare', { stageLabel: '正在准备 Scene Graph' });
       setExportStage('正在从 Scene Graph 直接合成');
       const sceneResult = await this.buildSceneGraphForRecording(recording, {
         overlayMode,
@@ -11551,7 +11808,7 @@ try {
       });
       const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
       const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
-      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration, actualTimeline);
       const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
         path.join(sceneDirectory, 'scene.legacy.ass'),
         sceneResult.events,
@@ -11576,6 +11833,12 @@ try {
       // Graph composition bounded; every source frame is still composed and
       // hardware-encoded exactly once, then the encoded chunks are copied.
       const useChunkedJetsonScene = isJetsonGstreamerCodec(burnCodec) && graph.objects.length > 1200;
+      const desktopCudaSceneProduction = canUseDesktopCudaSceneProduction(
+        this.ffmpegCapabilities?.desktopCuda,
+        this.ffmpegCapabilities?.desktopCuda?.visualConformance
+      );
+      const useDesktopCudaSceneRenderer = !useChunkedJetsonScene &&
+        /^(?:h264|hevc)_nvenc$/i.test(String(burnCodec || '')) && desktopCudaSceneProduction.ok;
       const sceneLayer = useChunkedJetsonScene
         ? null
         : await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
@@ -11586,6 +11849,31 @@ try {
             target,
             legacyAssPath
           });
+      // Do not put legacy ASS in this production graph. It remains the frozen
+      // reference layer above, while the independently gated CUDA graph
+      // rasterizes canonical Scene objects and uploads every layer once.
+      const desktopCudaSceneLayer = useDesktopCudaSceneRenderer
+        ? await writeSceneFilterScript(path.join(sceneDirectory, 'scene.desktop-cuda.filter'), graph, {
+            duration,
+            outputDuration: duration,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+            fps,
+            target: 'cuda',
+            cudaInput: decoderInfo.value === 'cuda',
+            legacyAssPath
+          })
+        : null;
+      const desktopCudaCpuFallbackSceneLayer = useDesktopCudaSceneRenderer && decoderInfo.value === 'cuda'
+        ? await writeSceneFilterScript(path.join(sceneDirectory, 'scene.desktop-cuda-cpu-source.filter'), graph, {
+            duration,
+            outputDuration: duration,
+            leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
+            fps,
+            target: 'cuda',
+            cudaInput: false,
+            legacyAssPath
+          })
+        : desktopCudaSceneLayer;
       // CUDA Scene now receives an explicit black lead-in and shifts its
       // timeline by the same amount, so both ordinary and leading-keyframe
       // exports retain the established audio/video alignment.
@@ -11619,6 +11907,30 @@ try {
           decoder,
           sourceCodec: decoderInfo.codec
         });
+      const createDesktopCudaArgs = (decoder) => {
+        const usesCudaDecode = String(decoder?.value || decoder || '').toLowerCase() === 'cuda';
+        const layer = usesCudaDecode ? desktopCudaSceneLayer : desktopCudaCpuFallbackSceneLayer;
+        return createBurnArgs({
+          cleanPath: recording.cleanPath,
+          assPath: '',
+          burnedPath: temporaryOutputPath,
+          codec: burnCodec,
+          crf: burnCrf,
+          container: outputContainer,
+          startTime,
+          duration,
+          fps,
+          avatarOverlay: { filterScriptPath: layer.filterScriptPath },
+          inputSeek: true,
+          timelineOffset: 0,
+          leadingVideoPaddingSec: 0,
+          leadingAudioPaddingSec: 0,
+          copyAudio: copySourceAudio,
+          decoder,
+          sourceCodec: decoderInfo.codec,
+          sceneCuda: true
+        });
+      };
       const onStderr = (line) => {
         if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
           this.emitState('mediaJob');
@@ -11627,6 +11939,27 @@ try {
       };
       const onChild = (child) => {
         this.exportProcess = child;
+      };
+      const onScenePhase = (phase, options = {}) => {
+        if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
+        const labels = {
+          prepare: '正在准备 Scene Graph',
+          render: '正在渲染 Scene Graph',
+          mux: '正在封装输出',
+          verify: '正在验证输出'
+        };
+        setExportPhase?.(phase, { ...options, stageLabel: labels[phase] || progress.stageLabel });
+      };
+      const onScenePreparing = (metrics) => {
+        if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
+        const prepared = Math.max(0, Number(metrics?.objectsPrepared) || 0);
+        const total = Math.max(0, Number(metrics?.objectCount) || 0);
+        const rows = Math.max(0, Number(metrics?.timelineRows) || 0);
+        updateFfmpegJobPrepareProgress(progress, prepared, total);
+        progress.stageLabel = `正在预渲染 CUDA Scene 纹理：${prepared}/${total} 个对象${rows ? `（${rows} 个动画片段）` : ''}`;
+        progress.message = progress.stageLabel;
+        progress.updatedAt = Date.now();
+        this.emitState('mediaJob');
       };
       const onDecoderFallback = () => {
         this.setProgressDecoder(
@@ -11650,13 +11983,22 @@ try {
             legacyEvents: sceneResult.events,
             legacySceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
             onProgress: (value) => {
-              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) this.emitState('mediaJob');
+              if (this.exportProgress?.id !== progress.id) return;
+              if (Number(value) > 0.001) onScenePhase('render');
+              // A late native helper report can arrive at a chunk boundary
+              // after the completed-chunk marker. Never let it move the
+              // displayed media clock backward or reset the whole-job ETA.
+              const monotonicValue = Math.max(Number(this.exportProgress.currentTimeSec || 0), Number(value) || 0);
+              if (updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(monotonicValue * 1_000_000)}`)) this.emitState('mediaJob');
             },
+            onPreparing: onScenePreparing,
+            onPhase: onScenePhase,
             onStage: setExportStage, isCancelled: () => this.exportCancelRequested, label: 'Jetson Scene Graph 烧录'
           });
         } else {
-          const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.' +
-            (isHevcCodec(burnCodec) ? 'h265' : 'h264');
+          // Jetson encoders always write a PTS-bearing video-only MKV here;
+          // do not hand a bare H.26x elementary stream to the final mux.
+          const encodedVideoPath = temporaryOutputPath + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.mkv';
           const common = {
             codec: burnCodec,
             quality: burnCrf,
@@ -11692,6 +12034,14 @@ try {
             onStderr,
             onChild,
             onPipeline: (pipeline) => this.setProgressPipeline(progress, pipeline),
+            onProgress: (value) => {
+              if (Number(value) > 0.001) onScenePhase('render');
+              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
+                this.emitState('mediaJob');
+              }
+            },
+            onPreparing: onScenePreparing,
+            onPhase: onScenePhase,
             onStageMetrics: (metrics) => {
               if (this.exportProgress?.id === progress.id && setFfmpegJobStageFps(progress, metrics)) this.emitState('mediaJob');
             },
@@ -11748,22 +12098,43 @@ try {
               if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
               this.log('warn', 'CUDA Scene Graph 失败，回退到兼容 Scene filter：' + compactLogLine(error.message));
               progress.avatarCompositeBackend = 'Scene Graph 直接合成（CPU 回退）';
+              setExportPhase?.('render', { force: true, stageLabel: '正在使用兼容 Scene filter 重新渲染' });
               await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
             }
           }
         }
       } else {
-        await this.runFfmpegWithHardwareDecodeFallback({
-          decoder: decoderInfo,
-          createArgs,
-          onStderr,
-          onChild,
-          beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
-          onFallback: onDecoderFallback,
-          label: 'Scene Graph 烧录'
-        });
+        if (useDesktopCudaSceneRenderer) {
+          progress.avatarCompositeBackend = 'CUDA Scene（桌面 CUDA）';
+          setExportStage('正在 CUDA 合成完整 Scene Graph');
+          this.setProgressPipeline(progress, {
+            decoder: decoderInfo,
+            sceneRenderer: 'CUDA Scene（桌面 CUDA）',
+            encoder: `NVIDIA ${isHevcCodec(burnCodec) ? 'hevc_nvenc' : 'h264_nvenc'}`
+          });
+          await this.runFfmpegWithHardwareDecodeFallback({
+            decoder: decoderInfo,
+            createArgs: createDesktopCudaArgs,
+            onStderr,
+            onChild,
+            beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+            onFallback: onDecoderFallback,
+            label: '桌面 CUDA Scene Graph 烧录'
+          });
+        } else {
+          await this.runFfmpegWithHardwareDecodeFallback({
+            decoder: decoderInfo,
+            createArgs,
+            onStderr,
+            onChild,
+            beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+            onFallback: onDecoderFallback,
+            label: 'Scene Graph 烧录'
+          });
+        }
       }
       throwIfExportCancelled();
+      setExportPhase?.('verify', { stageLabel: '正在验证输出' });
       setExportStage('正在验证并完成 Scene Graph 导出');
       const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
@@ -11821,6 +12192,7 @@ try {
       throw new Error('请选择录像文件。');
     }
     recording = this.hydrateRecordingFromLibrary(recording);
+    recording = await this.hydrateRecordingTimingFromSidecar(recording);
     if (recording.valid === false) {
       throw new Error(`这个录像文件未通过完整性检查：${recording.validReason || '没有检测到可用视频流'}`);
     }
@@ -11858,6 +12230,33 @@ try {
       throw new Error('结束时间必须大于开始时间。');
     }
     const duration = endTime - startTime;
+    // Re-read the packet boundary for this exact clip.  Recording sidecars
+    // describe the original file and are not authoritative after a seek,
+    // trim, merge, or replacement of the clean media.
+    const actualTimeline = await probeMediaClipTimelineInfo(
+      this.ffmpegPath,
+      recording.cleanPath,
+      startTime,
+      duration,
+      mediaInfo,
+      { timeoutMs: 30_000, packetSampleDurationSec: Math.min(2, duration) }
+    ).catch((error) => {
+      this.log('warn', `导出片段实际 PTS 探测失败，按无起始 A/V 偏移继续：${compactLogLine(error.message)}`);
+      return {
+        clipStartSec: startTime,
+        clipDurationSec: duration,
+        actualClipProbe: true,
+        firstVideoPts: null,
+        firstAudioPts: null,
+        avStartDeltaSec: null,
+        avBoundaryToleranceSec: 0.08,
+        hasConfirmedStartDelta: false
+      };
+    });
+    this.log(
+      'info',
+      `导出片段实际 PTS：视频 ${Number.isFinite(actualTimeline.firstVideoPts) ? actualTimeline.firstVideoPts.toFixed(3) : '-'}s，音频 ${Number.isFinite(actualTimeline.firstAudioPts) ? actualTimeline.firstAudioPts.toFixed(3) : '-'}s，A/V 起点差 ${Number.isFinite(actualTimeline.avStartDeltaSec) ? actualTimeline.avStartDeltaSec.toFixed(3) : '-'}s。`
+    );
     const outputDir = String(options.outputDir || path.dirname(recording.cleanPath));
     await this.ensureDirectoryReady(outputDir, { label: '剪辑输出目录' });
     const outputPath =
@@ -11891,6 +12290,20 @@ try {
       progress.updatedAt = Date.now();
       this.emitState('mediaJob');
     };
+    const setExportPhase = (phase, options = {}) => {
+      if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return false;
+      const now = Number(options.now) || Date.now();
+      const stageLabel = options.stageLabel === undefined ? progress.stageLabel : options.stageLabel;
+      const changed = setFfmpegJobPhase(progress, phase, {
+        ...options,
+        now,
+        stageLabel
+      });
+      if (!changed) return false;
+      progress.updatedAt = now;
+      this.emitState('mediaJob');
+      return true;
+    };
     const throwIfExportCancelled = () => {
       if (!this.exportCancelRequested) return;
       const error = new Error('导出已取消。');
@@ -11919,13 +12332,16 @@ try {
         temporaryOutputPath,
         outputContainer,
         mediaInfo,
+        actualTimeline,
         codecInfo,
         decoderInfo,
         progress,
         setExportStage,
+        setExportPhase,
         throwIfExportCancelled
       });
     }
+    setExportPhase('prepare', { stageLabel: mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段' });
     setExportStage(mode === 'burn' ? '正在准备字幕和真实头像' : '正在准备纯净片段');
 
     let cssPath = recording.cssPath;
@@ -11967,10 +12383,10 @@ try {
         avatarMode,
         startTime,
         endTime,
-        // Keep ASS/avatar timings on the source recording clock. The burn
-        // command seeks at input time, then shifts the decoded chunk back to
-        // this clock before applying the overlays.
-        shiftTime: false,
+        // A clip has one source media origin.  Shift ASS/avatar events by the
+        // requested clip start so both the video filter and the audio muxer
+        // begin at zero; do not retain an absolute recording-clock offset.
+        shiftTime: true,
         cssPath: options.cssPath || recording.cssPath,
         assPath: temporaryAssPath
       });
@@ -11983,7 +12399,7 @@ try {
       const gpuAvatarComposite = Boolean(avatarComposite);
       const gpuAvatarOutputToCpu =
         requestedAvatarComposite?.value !== 'cuda' || !String(burnCodec || '').includes('nvenc');
-      burnTimeline = getBurnTimelineAlignment(recording, startTime, duration);
+      burnTimeline = getBurnTimelineAlignment(recording, startTime, duration, actualTimeline);
       copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       setExportStage('正在准备真实头像');
       avatarLayer = await this.prepareAvatarOverlayLayer(assets.avatarPlan, {
@@ -11991,7 +12407,7 @@ try {
         assPath,
         fps: exportFps,
         duration: startTime + duration,
-        timelineOffset: burnTimeline.videoClockStartSec,
+        timelineOffset: 0,
         leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
         outputDuration: duration,
         skipInitialKeyframeGuard: true,
@@ -12024,7 +12440,7 @@ try {
             fps: exportFps,
             avatarOverlay: nextAvatarLayer,
             inputSeek: true,
-            timelineOffset: burnTimeline.videoClockStartSec,
+            timelineOffset: 0,
             leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
             leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
             copyAudio: copySourceAudio,
@@ -12040,6 +12456,7 @@ try {
         );
       }
     }
+    setExportPhase('render', { stageLabel: mode === 'burn' ? '正在烧录片段' : '正在导出纯净片段' });
     setExportStage(mode === 'burn' ? '正在烧录片段' : '正在导出纯净片段');
     this.log(
       'info',
@@ -12132,9 +12549,7 @@ try {
           this.emitState('mediaJob');
         };
         if (isJetsonGstreamerCodec(burnCodec)) {
-          const encodedVideoPath = `${temporaryOutputPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${
-            isHevcCodec(burnCodec) ? 'h265' : 'h264'
-          }`;
+          const encodedVideoPath = `${temporaryOutputPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
           await this.runJetsonGstreamerWithCudaAvatarCompositeFallback({
             avatarLayer,
             createTranscode: (nextAvatarLayer) =>
@@ -12154,7 +12569,7 @@ try {
                     startTime,
                     duration,
                     inputSeek: true,
-                    timelineOffset: burnTimeline.videoClockStartSec,
+                    timelineOffset: 0,
                     leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
                     decoder,
                     sourceCodec: decoderInfo.codec,
@@ -12204,6 +12619,7 @@ try {
         await runFfmpegJob(this.ffmpegPath, args, handleExportStderr, { onChild });
       }
       throwIfExportCancelled();
+      setExportPhase('verify', { stageLabel: '正在验证输出' });
       setExportStage('正在验证并完成导出');
       const exportedMediaInfo = await probeMediaFileInfo(this.ffmpegPath, temporaryOutputPath, { timeoutMs: 15000 });
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
@@ -12921,6 +13337,7 @@ module.exports = {
   BusinessError,
   isBusinessError,
   isFfmpegMemoryPressureError,
+  getBurnTimelineAlignment,
   getMergeSegmentTimingAssessment,
   getMonitorPollDelayMs,
   createUiCapabilities,

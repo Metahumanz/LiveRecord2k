@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.8.2 - 2026-09-20
+
+- 重构导出进度与 ETA：准备、渲染、封装、验证分别维护阶段时钟，渲染 ETA 仅使用媒体时间采样与 EWMA，不再用总任务耗时或阶段 FPS 反推剩余时间。
+- 修复原生 NVMM 导出在渲染完成进入封装时的进度回退，封装 `out_time` 不再覆盖已经完成的媒体进度；前端分别显示纹理准备、渲染、封装和验证状态，并独立展示阶段 FPS。
+- 增加 prepare/render/mux/fallback ETA 回归测试，并在 AGX Orin 实测 30 分钟 HEVC 片段验证 `Jetson nvv4l2decoder → CUDA Scene（NVMM）→ Jetson nvv4l2h265enc` 链路与输出音视频时长。
+
 ## 0.8.1 - 2026-09-18
 
 - 修复 Jetson 原生 NVMM CUDA Scene 在源录像有 0 秒或 1.019 秒视频前导时，仅平移图元却未生成真实黑帧的问题。现由同一条 `NVDEC → CUDA Scene（NVMM）→ NVENC` 管线生成有限黑场并与解码视频连续拼接，最终回封后音频、视频均从 PTS 0 开始，不再把视频内容提前到原始音频之前。

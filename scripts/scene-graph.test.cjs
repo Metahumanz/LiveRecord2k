@@ -19,8 +19,8 @@ const {
 const { compileSceneToAss, createSceneAssTracks } = require('../src/server/danmaku/scene-ass.cjs');
 const { createSceneFilterScript, createSceneRenderPlan, evaluateRenderPlan, writeSceneFilterScript } = require('../src/server/danmaku/scene-renderer.cjs');
 const { createBurnArgs, createSceneAssRemuxArgs } = require('../src/server/recording/ffmpeg.cjs');
-const { LiveRecordService } = require('../src/server/app/service.cjs');
-const { probeMediaFileInfo } = require('../src/server/shared/helpers.cjs');
+const { LiveRecordService, getBurnTimelineAlignment } = require('../src/server/app/service.cjs');
+const { probeMediaFileInfo, probeMediaClipTimelineInfo } = require('../src/server/shared/helpers.cjs');
 
 let sceneGraphFfmpegPathPromise;
 
@@ -183,6 +183,112 @@ test('Scene Graph is the canonical layout for Web, ASS, CUDA and Jetson targets'
     assert.equal(compacted.eventCount, events.length);
     assert.ok(compacted.graph.timeline.end <= 8);
     assert.equal(JSON.parse(await fs.readFile(scenePath, 'utf8')).schema, 'bili-record2k.scene/v1');
+  } finally {
+    await fs.rm(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test('Scene Graph publishes resolved display bounds for preview/export parity', () => {
+  for (const stylePreset of ['h5-card', 'bubble', 'minimal']) {
+    const graph = buildSceneGraph(
+      [{ type: 'danmaku', time: 1, uid: 7, user: '区域用户', text: '预览和烧录必须同一位置' }],
+      {
+        stylePreset,
+        styleLayout: { danmakuAreaTop: 180, danmakuAreaBottom: 700 },
+        videoInfo: { width: 1920, height: 1080, fps: 60 }
+      }
+    );
+    assert.deepEqual(graph.metadata.layoutBounds, { top: 180, bottom: 700 }, stylePreset);
+    const text = graph.objects.find((object) => object.type === 'Text');
+    assert.ok(text, `${stylePreset}: expected a text node`);
+    const clipped = graph.objects.filter((object) => object.style?.clip);
+    assert.ok(clipped.length > 0, `${stylePreset}: expected a shared display clip`);
+    assert.ok(clipped.every((object) => object.style.clip.y === 180 && object.style.clip.height === 520), `${stylePreset}: display clip mismatch`);
+  }
+  const rolling = buildSceneGraph(
+    [{ type: 'danmaku', time: 1, text: '滚动区域' }],
+    { stylePreset: 'current', danmakuArea: 'half', videoInfo: { width: 1920, height: 1080, fps: 60 } }
+  );
+  assert.deepEqual(rolling.metadata.layoutBounds, { top: 36, bottom: 540 });
+});
+
+test('all Scene styles resolve display areas to one shared top/bottom contract', () => {
+  for (const stylePreset of ['current', 'h5-card', 'bubble', 'minimal']) {
+    const bounds = {};
+    for (const danmakuArea of ['quarter', 'half', 'three-quarter']) {
+      const graph = buildSceneGraph(
+        [{ type: 'danmaku', time: 1, uid: 8, user: '区域测试', text: `${stylePreset}-${danmakuArea}` }],
+        { stylePreset, danmakuArea, videoInfo: { width: 1920, height: 1080, fps: 60 } }
+      );
+      bounds[danmakuArea] = graph.metadata.layoutBounds;
+      assert.ok(bounds[danmakuArea].bottom > bounds[danmakuArea].top, `${stylePreset}/${danmakuArea} must have positive bounds`);
+      const clipped = graph.objects.filter((object) => object.style?.clip);
+      if (stylePreset === 'current') {
+        const rolling = graph.objects.find((object) => object.type === 'Text');
+        assert.ok(rolling, `${stylePreset}/${danmakuArea}: expected a rolling text node`);
+        assert.ok(rolling.frame.y >= bounds[danmakuArea].top, `${stylePreset}/${danmakuArea}: rolling top mismatch`);
+      } else {
+        assert.ok(clipped.length > 0, `${stylePreset}/${danmakuArea}: expected a display clip`);
+        assert.ok(clipped.every((object) => object.style.clip.y === bounds[danmakuArea].top), `${stylePreset}/${danmakuArea}: clip top mismatch`);
+      }
+    }
+    assert.ok(bounds.quarter.bottom < bounds.half.bottom, `${stylePreset}: quarter must be above half`);
+    assert.ok(bounds.half.bottom < bounds['three-quarter'].bottom, `${stylePreset}: half must be above three-quarter`);
+
+    const dragged = buildSceneGraph(
+      [{ type: 'danmaku', time: 1, uid: 9, user: '拖动区域', text: 'explicit bounds win' }],
+      {
+        stylePreset,
+        danmakuArea: 'quarter',
+        styleLayout: { danmakuAreaTop: 310, danmakuAreaBottom: 760 },
+        videoInfo: { width: 1920, height: 1080, fps: 60 }
+      }
+    );
+    assert.deepEqual(dragged.metadata.layoutBounds, { top: 310, bottom: 760 }, `${stylePreset}: explicit bounds must override area`);
+  }
+});
+
+test('clip alignment uses one source media origin and never pads from first packet delta alone', () => {
+  const alignment = getBurnTimelineAlignment(
+    { timelineHealth: { firstVideoPts: 1.019, firstAudioPts: 0 } },
+    10,
+    20,
+    {
+      actualClipProbe: true,
+      firstVideoPts: 10.021,
+      firstAudioPts: 10,
+      avStartDeltaSec: -0.021,
+      avBoundaryToleranceSec: 0.04
+    }
+  );
+  assert.equal(alignment.videoPaddingSec, 0);
+  assert.equal(alignment.audioPaddingSec, 0);
+  assert.equal(alignment.sourceClockOriginSec, 10);
+  assert.equal(alignment.videoClockStartSec, 0);
+  assert.equal(alignment.audioClockStartSec, 0);
+});
+
+test('clip PTS probe ignores the preceding keyframe and measures the actual range', async () => {
+  const ffmpeg = await getSceneGraphFfmpegPath();
+  if (!ffmpeg) return;
+  const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-clip-pts-test-'));
+  const source = path.join(temporaryDirectory, 'source.mp4');
+  try {
+    await run(ffmpeg, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30000/1001:duration=3',
+      '-f', 'lavfi', '-i', 'sine=frequency=1000:duration=3',
+      '-c:v', 'mpeg4', '-c:a', 'aac', source
+    ]);
+    const mediaInfo = await probeMediaFileInfo(ffmpeg, source);
+    const timeline = await probeMediaClipTimelineInfo(ffmpeg, source, 1, 1, mediaInfo, {
+      timeoutMs: 30_000,
+      packetSampleDurationSec: 1
+    });
+    assert.ok(timeline.firstVideoPts >= 0.99, `video PTS ${timeline.firstVideoPts} came from before the clip`);
+    assert.ok(timeline.firstAudioPts >= 0.99, `audio PTS ${timeline.firstAudioPts} came from before the clip`);
+    assert.ok(Math.abs(timeline.avStartDeltaSec) < 0.08, `unexpected clip A/V delta ${timeline.avStartDeltaSec}`);
+    assert.equal(timeline.actualClipProbe, true);
   } finally {
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   }

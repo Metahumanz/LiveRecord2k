@@ -588,17 +588,20 @@ export function ExportPage({
                     void describePreviewError(event.currentTarget);
                   }}
                 />
-                {sceneGraph ? (
-                  <SceneGraphOverlay scene={sceneGraph} time={playbackTime} />
-                ) : (
-                  <DanmakuStylePreview
-                    preset={draft.stylePreset}
-                    layout={draft.styleLayout}
-                    overlayMode={draft.overlayMode}
-                    videoInfo={previewVideoInfo}
-                    onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
-                  />
-                )}
+                <DanmakuStylePreview
+                  preset={draft.stylePreset}
+                  layout={draft.styleLayout}
+                  overlayMode={draft.overlayMode}
+                  videoInfo={previewVideoInfo}
+                  onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
+                  layoutGuideOnly={Boolean(sceneGraph)}
+                  resolvedBounds={
+                    sceneGraph?.metadata?.layoutBounds && typeof sceneGraph.metadata.layoutBounds === 'object'
+                      ? (sceneGraph.metadata.layoutBounds as { top?: number; bottom?: number })
+                      : null
+                  }
+                />
+                {sceneGraph ? <SceneGraphOverlay scene={sceneGraph} time={playbackTime} /> : null}
                 {activePreviewProgress ? (
                   <div className="clip-preview-progress">
                     <JobProgress progress={activePreviewProgress} />

@@ -11,7 +11,8 @@ const {
   eventTime,
   resolvePalette,
   totalGiftPrice,
-  round
+  round,
+  displayAreaMetrics
 } = require('./layout-engine.cjs');
 const {
   getSideChatMetrics,
@@ -559,6 +560,7 @@ function addMessageNode(graph, entry, layout, avatarAssets) {
 function buildSceneGraph(events, options) {
   const source = options || {};
   const layout = new LayoutEngine(source).layout(events);
+  const resolvedArea = layout.layoutBounds || displayAreaMetrics(layout.style, layout.displayArea);
   const graph = {
     schema: SCENE_GRAPH_SCHEMA,
     version: SCENE_GRAPH_VERSION,
@@ -577,14 +579,23 @@ function buildSceneGraph(events, options) {
       generator: 'LayoutEngine',
       generatedAt: new Date().toISOString(),
       sourceEventCount: Array.isArray(events) ? events.length : 0,
-      layoutVersion: 1
+      layoutVersion: 2,
+      // Preview and every renderer can consume the same resolved bounds;
+      // they no longer need to infer a region from lane count alone.
+      layoutBounds: {
+        top: Number(resolvedArea.top) || 0,
+        bottom: Number(resolvedArea.bottom) || layout.canvas.height
+      }
     }
   };
   const legacySideClip = {
     x: Number(layout.style.panelLeft) || 0,
-    y: 0,
+    y: Number(resolvedArea.top) || 0,
     width: Math.max(1, Number(layout.style.superChatWidth) || layout.canvas.width),
-    height: Math.max(1, Number(layout.style.superChatBottom) || layout.canvas.height)
+    height: Math.max(
+      1,
+      Number(resolvedArea.bottom || layout.canvas.height) - Number(resolvedArea.top || 0)
+    )
   };
   for (const entry of layout.entries) {
     if (entry.kind === 'rolling') addRollingNode(graph, entry, layout.style);

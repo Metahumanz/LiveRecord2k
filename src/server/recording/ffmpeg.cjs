@@ -228,6 +228,12 @@ function appendHardwareDecodeInputArgs(args, decoder, options = {}) {
   args.push('-hwaccel', value);
   const device = String(options.device || '').trim();
   if (device) args.push('-hwaccel_device', device);
+  // A desktop CUDA Scene filter graph consumes CUDA frames directly. Keep
+  // this opt-in: ordinary CPU/ASS filters still need FFmpeg to download the
+  // decoder surface automatically.
+  if (value === 'cuda' && options.cudaOutput === true) {
+    args.push('-hwaccel_output_format', 'cuda');
+  }
 }
 
 function normalizeAvatarOverlayEntries(avatarOverlay) {
@@ -914,7 +920,8 @@ function createBurnArgs({
   includeAudio = true,
   copyAudio = false,
   decoder = 'software',
-  sourceCodec = ''
+  sourceCodec = '',
+  sceneCuda = false
 }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
@@ -932,14 +939,21 @@ function createBurnArgs({
     ? normalizeAvatarCompositeBackend(avatarOverlay?.gpuCompositeBackend) || 'cuda'
     : '';
   const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  const sceneCudaDevice = sceneCuda ? 'br2k_scene_cuda' : '';
+  if (sceneCuda) {
+    args.push('-init_hw_device', `cuda=${sceneCudaDevice}:0`, '-filter_hw_device', sceneCudaDevice);
+  }
   const avatarCompositeDevice = appendAvatarCompositeDeviceArgs(
     args,
     avatarCompositeBackend,
     avatarOverlay?.gpuCompositeDevice
   );
   appendHardwareDecodeInputArgs(args, decoder, {
-    device: avatarCompositeBackend === 'cuda' && decoder === 'cuda' ? avatarCompositeDevice : '',
-    sourceCodec
+    device: sceneCuda && String(decoder?.value || decoder || '').toLowerCase() === 'cuda'
+      ? sceneCudaDevice
+      : avatarCompositeBackend === 'cuda' && decoder === 'cuda' ? avatarCompositeDevice : '',
+    sourceCodec,
+    cudaOutput: sceneCuda && String(decoder?.value || decoder || '').toLowerCase() === 'cuda'
   });
   if (inputSeek && hasStart) {
     args.push('-ss', formatFfmpegSeconds(inputSeekStart));
@@ -1197,7 +1211,7 @@ function createBurnRawSceneFromPipeArgs({
   ];
 }
 
-function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false, converter = 'nvvidconv' }) {
+function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false, converter = 'nvvidconv', container = '' }) {
   const encoder = getJetsonGstreamerEncoder(codec);
   const outputWidth = makeEvenDimension(width);
   const outputHeight = makeEvenDimension(height);
@@ -1234,6 +1248,7 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
     '!',
     encodedCaps,
     '!',
+    ...(String(container).toLowerCase() === 'mkv' ? ['matroskamux', 'streamable=true', '!'] : []),
     'filesink',
     `location=${outputPath}`
   ];
@@ -1249,6 +1264,7 @@ function createBurnEncodedVideoMuxArgs({
   startTime,
   duration,
   container,
+  preserveVideoTimestamps = false,
   leadingAudioPaddingSec = 0,
   includeAudio = true,
   copyAudio = false
@@ -1261,14 +1277,14 @@ function createBurnEncodedVideoMuxArgs({
     '-fflags',
     '+genpts+discardcorrupt',
     '-err_detect',
-    'ignore_err',
-    '-r',
-    formatGstreamerFramerate(fps)
+    'ignore_err'
   ];
+  const keepVideoTimestamps = preserveVideoTimestamps || /\.mkv$/i.test(String(encodedVideoPath || ''));
+  if (!keepVideoTimestamps) args.push('-r', formatGstreamerFramerate(fps));
   // This stage stream-copies video, but FFmpeg may still initialize a decoder
   // while probing its inputs. Keep ARM64 builds from silently selecting a
   // CUDA wrapper when the Jetson pipeline deliberately uses CPU decoding.
-  const encodedDecoder = getNativeSoftwareDecoder(codec);
+  const encodedDecoder = keepVideoTimestamps ? '' : getNativeSoftwareDecoder(codec);
   if (encodedDecoder) args.push('-c:v', encodedDecoder);
   args.push('-i', encodedVideoPath);
   if (includeAudio) {
@@ -1282,9 +1298,9 @@ function createBurnEncodedVideoMuxArgs({
   if (includeAudio) {
     const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
     if (copyAudio && audioPaddingMs <= 0) {
-      // The elementary H26x stream from nvv4l2 has no container timestamps.
-      // `-shortest` can therefore stop before the first AAC packet even when
-      // both inputs are valid. The explicit output -t above is authoritative.
+      // Legacy elementary H26x callers have no container timestamps. MKV
+      // intermediates keep their own PTS, while the explicit output -t above
+      // remains authoritative for the final clip duration.
       args.push('-map', '1:a?', '-c:a', 'copy');
     } else {
       const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
@@ -2198,6 +2214,7 @@ function createNormalizeEncodedVideoMuxArgs({
   }
   const normalizedDuration = Math.max(0.001, Number(durationSec) || 0.001);
   const leadingAudioPaddingMs = Math.max(0, Math.round((Number(timelineAlignment?.audioPaddingSec) || 0) * 1000));
+  const keepVideoTimestamps = /\.mkv$/i.test(String(encodedVideoPath || ''));
   const args = [
     '-hide_banner',
     '-nostats',
@@ -2208,10 +2225,8 @@ function createNormalizeEncodedVideoMuxArgs({
     '+genpts+discardcorrupt',
     '-err_detect',
     'ignore_err',
-    '-r',
-    formatGstreamerFramerate(fps),
-    '-i',
-    encodedVideoPath
+    ...(keepVideoTimestamps ? [] : ['-r', formatGstreamerFramerate(fps)]),
+    '-i', encodedVideoPath
   ];
   if (hasAudio) {
     args.push('-i', inputPath);

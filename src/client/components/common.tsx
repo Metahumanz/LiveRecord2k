@@ -132,13 +132,23 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
 }
 
 export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
-  const hasPercent = typeof progress.percent === 'number' && Number.isFinite(progress.percent);
-  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent;
-  const percent = hasPercent ? clampNumber(progress.percent || 0, 0, 100) : 0;
+  const phase = progress.phase || (progress.status === 'completed' ? 'verify' : 'render');
+  const phasePercentValue = typeof progress.phasePercent === 'number' && Number.isFinite(progress.phasePercent)
+    ? progress.phasePercent
+    : progress.percent;
+  const hasPercent = typeof phasePercentValue === 'number' && Number.isFinite(phasePercentValue);
+  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent || (phase === 'verify' && progress.status === 'running');
+  const percent = hasPercent ? clampNumber(phasePercentValue || 0, 0, 100) : 0;
+  const phaseCurrentTime = Number(progress.phaseCurrentTimeSec ?? progress.currentTimeSec ?? 0);
+  const phaseDuration = Number(progress.phaseDurationSec ?? progress.durationSec ?? 0);
+  const etaSeconds = progress.phaseEstimatedRemainingSec ?? progress.estimatedRemainingSec;
   const hasEta =
     (progress.status === 'running' || progress.status === 'retrying') &&
-    typeof progress.estimatedRemainingSec === 'number' &&
-    Number.isFinite(progress.estimatedRemainingSec);
+    progress.etaState === 'ready' &&
+    typeof etaSeconds === 'number' &&
+    Number.isFinite(etaSeconds);
+  const isEstimating =
+    (progress.status === 'running' || progress.status === 'retrying') && progress.etaState === 'estimating';
   const codecLabel = progress.codec
     ? `${progress.codecKind === 'hardware' ? '硬件' : '软件'}编码 ${progress.codec}`
     : '';
@@ -152,6 +162,15 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const renderFpsLabel = Number.isFinite(renderFps) && renderFps > 0 ? `渲染 ${renderFps.toFixed(renderFps >= 10 ? 1 : 2)} fps` : '';
   const realtimeFactor = Number(progress.realtimeFactor);
   const realtimeLabel = Number.isFinite(realtimeFactor) && realtimeFactor > 0 ? `${realtimeFactor.toFixed(2)}×实时` : '';
+  const runningPhaseLabel = phase === 'prepare'
+    ? hasPercent ? `准备 ${Math.round(percent)}%` : '准备中'
+    : phase === 'mux'
+      ? hasPercent ? `封装 ${Math.round(percent)}%` : '正在封装'
+      : phase === 'verify'
+        ? '正在验证输出'
+        : hasPercent
+          ? `${Math.round(percent)}%`
+          : '处理中';
   const statusLabel =
     progress.status === 'completed'
       ? '完成'
@@ -163,11 +182,23 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
           ? '等待重试'
           : progress.status === 'queued'
             ? '等待资源'
-          : hasPercent
-          ? `${Math.round(percent)}%`
-          : '处理中';
+          : runningPhaseLabel;
   const primaryMessage = progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
-  const timingDetails = [hasEta ? `预计剩余 ${formatCompactDuration(progress.estimatedRemainingSec || 0)}` : ''].filter(Boolean);
+  const phaseTimingLabel = phase === 'prepare'
+    ? phaseDuration > 0
+      ? `正在预渲染纹理 ${Math.max(0, Math.floor(phaseCurrentTime))}/${Math.max(0, Math.floor(phaseDuration))}`
+      : '正在预渲染纹理'
+    : phase === 'render' && phaseDuration > 0
+      ? `正在渲染 ${formatCompactDuration(phaseCurrentTime)} / ${formatCompactDuration(phaseDuration)}`
+      : phase === 'mux'
+        ? `正在封装 ${hasPercent ? `${Math.round(percent)}%` : ''}`.trim()
+        : phase === 'verify'
+          ? '正在验证输出'
+          : '';
+  const timingDetails = [
+    phaseTimingLabel,
+    hasEta ? `预计剩余 ${formatCompactDuration(etaSeconds || 0)}` : isEstimating && phase !== 'verify' ? '正在估算' : ''
+  ].filter(Boolean);
   const stageFps = progress.stageFps;
   const stageFpsLabel = stageFps
     ? [

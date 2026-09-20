@@ -15,7 +15,8 @@ const {
   superChatPalette,
   guardCardPalette,
   giftCardPalette,
-  wrapTextToWidthLines
+  wrapTextToWidthLines,
+  getDanmakuLayoutMetrics
 } = require('../src/server/danmaku/ass.cjs');
 
 test('default message card style matches the compact lower-left reference scale', () => {
@@ -73,6 +74,18 @@ test('style presets keep the existing CSS untouched by default and apply preview
   assert.equal(legacyAss, currentAss);
   assert.match(styledAss, /\\clip\(90,0,590,1000\)/);
   assert.match(styledAss, /\\pos\(90,/);
+});
+
+test('explicit danmaku area bounds are shared by ASS layout and clipping', () => {
+  const layout = normalizeDanmakuStyleLayout({ danmakuAreaTop: 120, danmakuAreaBottom: 640 });
+  const style = resolveDanmakuStyle({}, 'h5-card', layout);
+  const metrics = getDanmakuLayoutMetrics(style, 'half');
+  assert.deepEqual({ top: metrics.top, bottom: metrics.bottom }, { top: 120, bottom: 640 });
+  const ass = createAss([{ type: 'danmaku', time: 1, user: '区域用户', text: '必须落在显式区域内' }], {
+    stylePreset: 'h5-card',
+    styleLayout: layout
+  });
+  assert.match(ass, /\\clip\(28,120,478,640\)/);
 });
 
 test('portrait source videos use their real ASS canvas and keep overlays inside it', () => {

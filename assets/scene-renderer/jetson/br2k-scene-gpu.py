@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from fractions import Fraction
 
 # Private GPU plugins are packaged outside the system GStreamer directory so
@@ -377,7 +378,26 @@ def prepare_cuda_timeline(request, work_dir):
     """
     rows = []
     timeline_offset = max(0, number(request.get('timelineOffsetSec'), 0))
-    for entry in sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex'))):
+    entries = sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex')))
+    report_preparation = request.get('reportPreparation') is True
+    preparation_started = GLib.get_monotonic_time() if report_preparation else 0
+    last_reported = preparation_started
+    def report_preparation_progress(prepared, force=False):
+        nonlocal last_reported
+        if not report_preparation:
+            return
+        now = GLib.get_monotonic_time()
+        if not force and now - last_reported < 250000:
+            return
+        print(json.dumps({'nativeNvmmPreparing': {
+            'objectsPrepared': prepared,
+            'objectCount': len(entries),
+            'timelineRows': len(rows),
+            'wallSeconds': max(0.0, (now - preparation_started) / GLib.USEC_PER_SEC)
+        }}, ensure_ascii=False), flush=True)
+        last_reported = now
+    report_preparation_progress(0, force=True)
+    for entry_index, entry in enumerate(entries, start=1):
         style = entry.get('style') or {}
         png, texture_width, texture_height = draw_texture(entry, work_dir)
         raw_path = os.path.splitext(png)[0] + '.rgba'
@@ -399,6 +419,7 @@ def prepare_cuda_timeline(request, work_dir):
             rows.append([left + timeline_offset, right + timeline_offset, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
                          final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height,
                          number(clip.get('x'), 0), number(clip.get('y'), 0), clip_width, clip_height])
+        report_preparation_progress(entry_index, force=entry_index == len(entries))
     manifest = os.path.join(work_dir, 'scene-cuda.timeline.tsv')
     with open(manifest, 'w', encoding='utf-8') as handle:
         for row in rows:
@@ -475,16 +496,16 @@ def create_pipeline(request, work_dir):
     base.set_property('format', Gst.Format.TIME)
     base.set_property('is-live', True)
     base.set_property('block', True)
-    base.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    base.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
     upload = make_element('glupload', 'base-upload')
     mixer = make_element('glvideomixer', 'scene-mixer')
     download = make_element('gldownload', 'scene-download')
     convert = make_element('videoconvert', 'scene-convert')
     raw_caps = make_element('capsfilter', 'scene-i420')
-    raw_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    raw_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
     nvvidconv = make_element('nvvidconv', 'scene-nvvidconv')
     nv_caps = make_element('capsfilter', 'scene-nvmm')
-    nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
     encode = make_element(encoder, 'scene-encode')
     encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
     parse = make_element(parser, 'scene-parse')
@@ -508,7 +529,7 @@ def create_pipeline(request, work_dir):
         freeze.set_property('num-buffers', overlay_frames)
         rate = make_element('videorate', 'overlay-rate-%d' % index)
         caps = make_element('capsfilter', 'overlay-caps-%d' % index)
-        caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=RGBA,framerate=%d/1' % round(fps)))
+        caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=RGBA,framerate=%s' % fps_caps(fps)))
         item_upload = make_element('glupload', 'overlay-upload-%d' % index)
         queue = make_element('queue', 'overlay-queue-%d' % index)
         for element in [source, png, freeze, rate, caps, item_upload, queue]: pipeline.add(element)
@@ -550,15 +571,15 @@ def create_cuda_nvmm_pipeline(request, work_dir):
     # The finite exporter controls completion with EOS. Never let a full
     # appsrc queue stall the Python producer before it can submit that EOS.
     base.set_property('block', False)
-    base.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    base.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
     convert = make_element('nvvidconv', 'scene-nvvidconv')
     nv_caps = make_element('capsfilter', 'scene-nvmm')
-    nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    nv_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
     composite = make_element('nvivafilter', 'scene-cuda-composite')
     composite.set_property('cuda-process', True)
     composite.set_property('customer-lib-name', CUDA_SCENE_CUSTOMER_LIBRARY)
     out_caps = make_element('capsfilter', 'scene-cuda-nvmm')
-    out_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%d/1' % (width, height, round(fps))))
+    out_caps.set_property('caps', Gst.Caps.from_string('video/x-raw(memory:NVMM),format=NV12,width=%d,height=%d,framerate=%s' % (width, height, fps_caps(fps))))
     encode = make_element(encoder, 'scene-encode')
     encode.set_property('bitrate', max(1000000, int(number(output.get('bitrate'), 15000000))))
     parse = make_element(parser, 'scene-parse')
@@ -737,6 +758,7 @@ def render_native_nvmm(request):
     try:
         timeline_request = dict(request)
         timeline_request['timelineOffsetSec'] = materialized_lead_sec
+        timeline_request['reportPreparation'] = True
         timeline = prepare_cuda_timeline(timeline_request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
         os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
@@ -753,11 +775,18 @@ def render_native_nvmm(request):
             'filesrc name=source location=%s ! qtdemux name=demux demux.video_0 ! %s name=parser ! '
             'nvv4l2decoder name=decoder ! nvvidconv name=nvmm-rewrap ! %s'
         ) % (launch_quote(input_path), parser_factory, caps)
+        output_container = str(output.get('container') or '').lower()
+        output_sink = 'filesink name=output async=false location=%s' % launch_quote(output['path'])
+        if output_container == 'mkv':
+            # nvivafilter currently assigns an incorrect synthetic clock to
+            # its output on some JetPack releases.  The pad probe below
+            # restores NVDEC's PTS before this muxer sees each frame.
+            output_sink = 'matroskamux name=output-mux ! ' + output_sink
         encoder_branch = (
             'nvivafilter name=cuda-scene cuda-process=true customer-lib-name=%s ! %s ! '
-            '%s name=encode bitrate=%d ! %s name=parse ! filesink name=output async=false location=%s'
+            '%s name=encode bitrate=%d ! %s name=parse ! %s'
         ) % (launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps, encoder,
-             max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, launch_quote(output['path']))
+             max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, output_sink)
         if leading_video_frames:
             # concat adjusts the source branch's segment base after the finite
             # black branch. Both inputs are NVMM/NV12 before nvivafilter, so
@@ -766,7 +795,11 @@ def render_native_nvmm(request):
             # black stream would discard its timestamp continuity at remux.
             native_nvmm_trace('insert NVMM black lead frames=%d seconds=%.6f' % (leading_video_frames, leading_video_sec))
             launch = (
-                'concat name=timeline_lead adjust-base=true ! queue ! %s '
+                # The decoded MP4 branch already carries the recording's
+                # media-origin PTS (for example its first picture is 1.019s).
+                # Re-basing it after the black source would add that gap a
+                # second time and final mux would trim the lead away.
+                'concat name=timeline_lead adjust-base=false ! queue ! %s '
                 'videotestsrc name=black-lead pattern=black num-buffers=%d ! '
                 'video/x-raw,format=I420,width=%d,height=%d,framerate=%s ! nvvidconv ! %s ! queue ! timeline_lead. '
                 '%s ! queue ! timeline_lead.'
@@ -791,7 +824,8 @@ def render_native_nvmm(request):
         startup_gate = {'reached': False}
         startup_pad = composite.get_static_pad('src')
         startup_probe = None
-        if start > 0.0001:
+        needs_segment_seek = start > 0.0001
+        if needs_segment_seek:
             def hold_first_scene_buffer(_pad, _info):
                 startup_gate['reached'] = True
                 native_nvmm_trace('startup scene buffer held for seek')
@@ -804,7 +838,7 @@ def render_native_nvmm(request):
         # nvivafilter does not accept a pipeline-wide stop segment on every
         # release, so seek the media start and use the CUDA Scene output PTS
         # to inject EOS at the requested end instead.
-        if start > 0.0001:
+        if needs_segment_seek:
             deadline = GLib.get_monotonic_time() + 5 * GLib.USEC_PER_SEC
             while not startup_gate['reached'] and GLib.get_monotonic_time() < deadline:
                 message = pipeline.get_bus().timed_pop_filtered(10 * Gst.MSECOND, Gst.MessageType.ERROR)
@@ -813,16 +847,87 @@ def render_native_nvmm(request):
                     fail('原生 NVMM 分段定位预热失败：' + str(error) + ('；' + str(debug) if debug else ''))
             if not startup_gate['reached']:
                 fail('原生 NVMM 分段定位预热超时。')
-            if not pipeline.seek_simple(
-                    Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
-                    int(start * Gst.SECOND)):
-                fail('原生 NVMM 无法定位到分段起点。')
+            # nvivafilter is a transform, not a seekable demuxer. Seeking the
+            # whole pipeline therefore returns false on JetPack even though
+            # qtdemux can seek the MP4 perfectly well. Target qtdemux itself
+            # and carry both segment bounds in the media clock; EOS below is
+            # only a defensive stop, never a wall-clock timer.
+            demux = pipeline.get_by_name('demux')
+            seek_target = demux if demux else pipeline
+            segment_stop = int((start + duration) * Gst.SECOND)
+            seek_ok = seek_target.seek(
+                1.0,
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
+                Gst.SeekType.SET,
+                int(start * Gst.SECOND),
+                Gst.SeekType.SET,
+                segment_stop
+            )
+            if not seek_ok:
+                fail('原生 NVMM qtdemux 无法定位到分段起点。')
             startup_pad.remove_probe(startup_probe)
         counters = {'decode': 0, 'scene': 0, 'encode': 0}
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
         scene_first_pts = {'value': None}
+        # Audit CUDA output against the ordered NVDEC frame sequence. JetPack
+        # keeps the actual timestamp in NVMM metadata through nvivafilter and
+        # NVENC; assigning a replacement Gst.Buffer.pts at the Scene pad does
+        # not update that metadata and would make the EOS comparison mix two
+        # clocks. Therefore this bridge validates frame coverage but leaves
+        # the authoritative decoder PTS intact for the encoder and muxer.
+        decoded_timing = deque()
+        source_scene_pts_values = []
+        scene_pts_values = []
+        encode_pts_values = []
+        decoded_clock = {'first': None, 'last': None, 'frames': 0, 'restored': 0, 'unmatched': 0}
+        pts_tolerance_ns = max(2_000_000, int(Gst.SECOND / max(1.0, fps) * 0.25))
+        pts_audit = {
+            'sourceToSceneFrames': 0, 'sourceToSceneMismatches': 0, 'sourceToSceneMaxDeltaNs': 0,
+            'sceneToEncodeFrames': 0, 'sceneToEncodeMismatches': 0, 'sceneToEncodeMaxDeltaNs': 0
+        }
+        trace_pts = os.environ.get('BR2K_NATIVE_NVMM_TRACE_PTS') == '1'
+        trace_encode_pairs = []
+        lead_scene_frames = {'remaining': leading_video_frames}
+        # The finite interval is inclusive of its first frame.  A duration of
+        # two seconds at 59.48fps therefore needs 120 frames (PTS 0 through
+        # the frame at roughly 2.0s), not only ceil(2*59.48)=119. Dropping at
+        # the latter count shortens every chunk by one frame interval and
+        # makes the final audio/video timeline drift progressively.
+        requested_frame_count = max(1, int(math.ceil(duration * fps)) + 1)
+        wall_started = GLib.get_monotonic_time()
+        progress_report = {'last_wall_us': wall_started, 'last_media': -1.0}
+        def emit_progress(buffer):
+            """Stream PTS-derived progress; wall time is only a report cadence."""
+            if buffer.pts == Gst.CLOCK_TIME_NONE or scene_first_pts['value'] is None:
+                return
+            wall_now = GLib.get_monotonic_time()
+            # NVMM concat keeps the original video PTS after a black lead.
+            # That clock contains the source's initial 1.019s gap, so it is
+            # unsuitable for finite-chunk progress. Scene frame count is the
+            # authoritative media clock for this fixed-rate renderer.
+            media_seconds = max(0.0, min(duration, counters['scene'] / max(1.0, fps)))
+            # A fast Orin can finish a 20-second chunk in a few seconds.  Keep
+            # the UI responsive without emitting one JSON line per frame.
+            if media_seconds <= progress_report['last_media'] + 0.01 or wall_now - progress_report['last_wall_us'] < 250000:
+                return
+            elapsed = max(0.001, (wall_now - wall_started) / GLib.USEC_PER_SEC)
+            payload = {
+                'nativeNvmmProgress': {
+                    'mediaSeconds': media_seconds,
+                    'frames': counters['encode'],
+                    'wallSeconds': elapsed,
+                    'decode': counters['decode'] / elapsed,
+                    'scene': counters['scene'] / elapsed,
+                    'encode': counters['encode'] / elapsed,
+                    'total': counters['encode'] / elapsed
+                }
+            }
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+            progress_report['last_wall_us'] = wall_now
+            progress_report['last_media'] = media_seconds
         def count_buffer(_pad, info, key):
             buffer = info.get_buffer()
             if not buffer:
@@ -836,9 +941,19 @@ def render_native_nvmm(request):
                 caps_text = caps.to_string() if caps else ''
                 match = __import__('re').search(r'framerate=\(fraction\)(\d+)/(\d+)', caps_text)
                 if match and int(match.group(2)) > 0:
-                    negotiated_fps['value'] = match.group(1) + '/' + match.group(2)
-                    os.environ['BR2K_CUDA_SCENE_FPS'] = negotiated_fps['value']
-                    native_nvmm_trace('negotiated source fps=' + negotiated_fps['value'])
+                    numerator, denominator = int(match.group(1)), int(match.group(2))
+                    negotiated_fps['value'] = str(numerator) + '/' + str(denominator)
+                    # nvivafilter's customer-library ABI exposes no buffer
+                    # PTS, so the CUDA renderer derives its media clock from
+                    # frame index / BR2K_CUDA_SCENE_FPS.  The customer library
+                    # consumes a numeric value (not a GStreamer fraction):
+                    # writing "60000/1001" previously made strtod() see
+                    # 60000 fps, freezing all normal-time overlays near t=0.
+                    # Preserve the source rational rate as a precise decimal
+                    # for the renderer, while retaining the rational form in
+                    # diagnostics.
+                    os.environ['BR2K_CUDA_SCENE_FPS'] = format(numerator / denominator, '.12g')
+                    native_nvmm_trace('negotiated source fps=' + negotiated_fps['value'] + ' (' + os.environ['BR2K_CUDA_SCENE_FPS'] + ')')
                 elif caps_text:
                     # Avoid re-querying once per decoded frame on unusual
                     # streams whose negotiated caps omit framerate.
@@ -846,26 +961,75 @@ def render_native_nvmm(request):
                     native_nvmm_trace('decoder caps omit framerate: ' + caps_text)
             if counters[key] == 0:
                 native_nvmm_trace('first ' + key + ' buffer pts=' + str(buffer.pts))
+            if key == 'decode' and buffer.pts != Gst.CLOCK_TIME_NONE:
+                source_duration = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE and buffer.duration > 0 else Gst.CLOCK_TIME_NONE
+                decoded_timing.append((buffer.pts, source_duration))
+                decoded_clock['frames'] += 1
+                if decoded_clock['first'] is None:
+                    decoded_clock['first'] = buffer.pts
+                decoded_clock['last'] = buffer.pts
+            if key == 'scene' and buffer.pts == Gst.CLOCK_TIME_NONE and counters['scene'] >= requested_frame_count:
+                # A timestamp-less buffer is not expected from NVDEC, but do
+                # not leave an abnormal pipeline running forever.  This is
+                # only a fallback; normal output always uses the PTS branch.
+                if not eos_at_target['sent']:
+                    eos_at_target['sent'] = True
+                    native_nvmm_trace('send EOS at frame fallback=' + str(counters['scene']))
+                    pipeline.send_event(Gst.Event.new_eos())
+                return Gst.PadProbeReturn.DROP
             # EOS is sent from the streaming thread when the scene output
             # reaches the requested media PTS. It is deliberately not a
             # GLib timeout: a 4x realtime pipeline still emits exactly the
             # same 20 seconds of media as a realtime one.
             if key == 'scene' and buffer.pts != Gst.CLOCK_TIME_NONE:
+                source_pts_for_scene = None
+                # `concat` emits physical black lead frames before it releases
+                # the decoded branch. Do not consume decoder timing for these
+                # frames even if NVDEC has already prefetched source surfaces.
+                if lead_scene_frames['remaining'] > 0:
+                    lead_scene_frames['remaining'] -= 1
+                elif decoded_timing:
+                    source_pts, source_duration = decoded_timing.popleft()
+                    source_pts_for_scene = int(source_pts)
+                    delta = abs(int(buffer.pts) - int(source_pts))
+                elif decoded_clock['frames'] > 0:
+                    decoded_clock['unmatched'] += 1
                 # Container tracks need not begin at PTS 0 (the HEVC fixture
                 # begins at 66.7ms). Anchor the finite chunk at the first
                 # output scene PTS, rather than an assumed absolute zero, so
                 # every chunk contains its requested media duration.
                 if scene_first_pts['value'] is None:
                     scene_first_pts['value'] = buffer.pts
+                emit_progress(buffer)
                 target_pts = scene_first_pts['value'] + int(duration * Gst.SECOND)
-                if buffer.pts >= target_pts:
+                # NVDEC can negotiate a stream rate that differs slightly
+                # from the container average (for example a 60/1 PTS clock
+                # with a 59.483fps average).  Once a real Scene PTS exists,
+                # that timestamp is authoritative; a frame-count cutoff here
+                # would terminate a 20s chunk around 19.88s.  Keep the count
+                # only as a defensive fallback for buffers without PTS.
+                reached_pts_budget = leading_video_frames <= 0 and buffer.pts >= target_pts
+                if reached_pts_budget:
                     if not eos_at_target['sent']:
                         eos_at_target['sent'] = True
                         native_nvmm_trace('send EOS at scene pts=' + str(buffer.pts))
                         pipeline.send_event(Gst.Event.new_eos())
                     return Gst.PadProbeReturn.DROP
+                scene_pts_values.append(int(buffer.pts))
+                if source_pts_for_scene is not None:
+                    source_scene_pts_values.append(source_pts_for_scene)
+                    decoded_clock['restored'] += 1
+                    delta = abs(int(buffer.pts) - source_pts_for_scene)
+                    pts_audit['sourceToSceneFrames'] += 1
+                    pts_audit['sourceToSceneMaxDeltaNs'] = max(pts_audit['sourceToSceneMaxDeltaNs'], delta)
+                    if delta > pts_tolerance_ns:
+                        pts_audit['sourceToSceneMismatches'] += 1
             counters[key] += 1
             if key == 'encode' and buffer.pts != Gst.CLOCK_TIME_NONE:
+                # NVENC may emit B-frame access units in decode order. Do
+                # not pair the encoder pad's arrival order with Scene order;
+                # compare the sorted presentation timestamps after EOS.
+                encode_pts_values.append(int(buffer.pts))
                 if encoded_pts['first'] is None:
                     encoded_pts['first'] = buffer.pts
                 end = buffer.pts
@@ -875,7 +1039,6 @@ def render_native_nvmm(request):
             return Gst.PadProbeReturn.OK
         for name, element in [('decode', decoder), ('scene', composite), ('encode', encode)]:
             element.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, count_buffer, name)
-        wall_started = GLib.get_monotonic_time()
         bus = pipeline.get_bus()
         try:
             if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -896,19 +1059,100 @@ def render_native_nvmm(request):
             pipeline.set_state(Gst.State.NULL)
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
+        sorted_scene_pts = sorted(scene_pts_values)
+        sorted_encode_pts = sorted(encode_pts_values)
+        sorted_source_pts = sorted(source_scene_pts_values)
+        pair_count = min(len(sorted_scene_pts), len(sorted_encode_pts))
+        for index in range(pair_count):
+            scene_pts = sorted_scene_pts[index]
+            encode_pts = sorted_encode_pts[index]
+            delta = abs(encode_pts - scene_pts)
+            pts_audit['sceneToEncodeFrames'] += 1
+            pts_audit['sceneToEncodeMaxDeltaNs'] = max(pts_audit['sceneToEncodeMaxDeltaNs'], delta)
+            if delta > pts_tolerance_ns:
+                pts_audit['sceneToEncodeMismatches'] += 1
+                if trace_pts and len(trace_encode_pairs) < 8:
+                    trace_encode_pairs.append({'scenePts': scene_pts, 'encodePts': encode_pts, 'deltaNs': delta})
+        if len(sorted_scene_pts) != len(sorted_encode_pts):
+            pts_audit['sceneToEncodeMismatches'] += abs(len(sorted_scene_pts) - len(sorted_encode_pts))
+        source_encode_frames = 0
+        source_encode_mismatches = 0
+        source_encode_max_delta_ns = 0
+        source_encode_samples = []
+        source_encode_pair_count = min(len(sorted_source_pts), len(sorted_encode_pts))
+        for index in range(source_encode_pair_count):
+            source_pts = sorted_source_pts[index]
+            encode_pts = sorted_encode_pts[index]
+            delta = abs(encode_pts - source_pts)
+            source_encode_frames += 1
+            source_encode_max_delta_ns = max(source_encode_max_delta_ns, delta)
+            if delta > pts_tolerance_ns:
+                source_encode_mismatches += 1
+                if trace_pts and len(source_encode_samples) < 8:
+                    source_encode_samples.append({'sourcePts': source_pts, 'encodePts': encode_pts, 'deltaNs': delta})
+        source_encode_mismatches += abs(len(sorted_source_pts) - len(sorted_encode_pts))
         if encoded_pts['first'] is not None and encoded_pts['end'] is not None:
             measured_media_seconds = max(0.0, (encoded_pts['end'] - encoded_pts['first']) / Gst.SECOND)
         # Some JetPack parser/encoder combinations do not retain a duration on
         # the final access unit.  Frame count at the negotiated rational fps
         # is still media time, never wall time.
-        if measured_media_seconds <= 0:
-            measured_media_seconds = counters['encode'] * Fraction(fps_caps(fps)) ** -1
-            measured_media_seconds = float(measured_media_seconds)
+        if leading_video_frames or measured_media_seconds <= 0:
+            measured_media_seconds = min(duration, counters['encode'] / max(1.0, fps))
         total = counters['encode'] / wall_seconds
+        expected_restored = max(0, min(decoded_clock['frames'], counters['scene'] - leading_video_frames))
+        # Packet-duration coverage alone can look valid when the source video
+        # starts after audio: 1.019 seconds of absent decoded frames still
+        # leaves a file that ends close to the requested stop time.  Require
+        # the finite media interval in frames too, otherwise the first chunk
+        # would silently omit its black lead and make audio lead video.
+        minimum_frames = max(1, int(math.ceil(duration * fps)) - 2)
+        full_duration_frames = counters['encode'] >= minimum_frames
+        source_scene_ok = (
+            pts_audit['sourceToSceneMismatches'] == 0 and
+            pts_audit['sourceToSceneFrames'] >= max(0, expected_restored - 2)
+        )
+        scene_encode_ok = (
+            pts_audit['sceneToEncodeMismatches'] == 0 and
+            pts_audit['sceneToEncodeFrames'] >= max(0, counters['scene'] - 2)
+        )
+        source_encode_ok = (
+            source_encode_mismatches == 0 and
+            source_encode_frames >= max(0, counters['scene'] - 2)
+        )
+        timing_ok = (
+            decoded_clock['unmatched'] == 0 and
+            decoded_clock['restored'] >= max(0, expected_restored - 2) and
+            full_duration_frames and source_scene_ok and scene_encode_ok and source_encode_ok
+        )
+        if output_container == 'mkv' and not timing_ok:
+            if trace_pts and trace_encode_pairs:
+                native_nvmm_trace('scene→encode samples=' + json.dumps(trace_encode_pairs, ensure_ascii=False))
+            if trace_pts and source_encode_samples:
+                native_nvmm_trace('source→encode samples=' + json.dumps(source_encode_samples, ensure_ascii=False))
+            fail('NVMM CUDA Scene PTS 映射未覆盖完整媒体时间：解码=%d，source→Scene=%d/%d（偏差=%d），Scene→编码=%d/%d（偏差=%d），source→编码=%d/%d（偏差=%d），未匹配=%d，编码=%d/%d。' % (
+                decoded_clock['frames'], pts_audit['sourceToSceneFrames'], expected_restored,
+                pts_audit['sourceToSceneMismatches'], pts_audit['sceneToEncodeFrames'], counters['scene'],
+                pts_audit['sceneToEncodeMismatches'], source_encode_frames, len(sorted_encode_pts),
+                source_encode_mismatches, decoded_clock['unmatched'], counters['encode'], minimum_frames))
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'wallSeconds': wall_seconds,
             'decode': counters['decode'] / wall_seconds, 'scene': counters['scene'] / wall_seconds,
-            'encode': total, 'total': total
+            'encode': total, 'total': total,
+            'ptsBridge': {
+                'ok': timing_ok, 'decodedFrames': decoded_clock['frames'], 'restoredFrames': decoded_clock['restored'],
+                'unmatchedSceneFrames': decoded_clock['unmatched'], 'leadingFrames': leading_video_frames,
+                'encodedFrames': counters['encode'], 'minimumFrames': minimum_frames,
+                'sourceFirstPts': decoded_clock['first'], 'sourceLastPts': decoded_clock['last'],
+                'sourceToSceneFrames': pts_audit['sourceToSceneFrames'],
+                'sourceToSceneMismatches': pts_audit['sourceToSceneMismatches'],
+                'sourceToSceneMaxDeltaSec': pts_audit['sourceToSceneMaxDeltaNs'] / Gst.SECOND,
+                'sceneToEncodeFrames': pts_audit['sceneToEncodeFrames'],
+                'sceneToEncodeMismatches': pts_audit['sceneToEncodeMismatches'],
+                'sceneToEncodeMaxDeltaSec': pts_audit['sceneToEncodeMaxDeltaNs'] / Gst.SECOND,
+                'sourceToEncodeFrames': source_encode_frames,
+                'sourceToEncodeMismatches': source_encode_mismatches,
+                'sourceToEncodeMaxDeltaSec': source_encode_max_delta_ns / Gst.SECOND
+            }
         }
     finally:
         if pipeline:
@@ -965,7 +1209,13 @@ def main():
         reports, failures = {}, {}
         for source_codec, source_name in [('h264', 'h264-sample.mp4'), ('hevc', 'hevc-sample.mp4')]:
             source = '/usr/lib/bili-record-2k/assets/jetson-self-test/' + source_name
-            target = '/tmp/br2k-native-nvmm-self-test-' + source_codec + '.h265'
+            # Never reuse a predictable /tmp filename: the service runs as
+            # bili-record-2k while a manual probe may have left a why-owned
+            # file behind, and /tmp's sticky bit correctly prevents us from
+            # overwriting it.  A unique path also keeps concurrent probes
+            # independent; remove the placeholder before GStreamer opens it.
+            target_fd, target = tempfile.mkstemp(prefix='br2k-native-nvmm-self-test-', suffix='-' + source_codec + '.h265')
+            os.close(target_fd)
             try: os.unlink(target)
             except FileNotFoundError: pass
             request = {
@@ -990,12 +1240,16 @@ def main():
                 # the second result merely because the first decoder path
                 # failed; production still requires both to succeed.
                 failures[source_codec] = str(error)
+            finally:
+                try: os.unlink(target)
+                except FileNotFoundError: pass
         payload = {'ok': not failures, 'nativeNvmmMetrics': reports}
         if failures: payload['nativeNvmmFailures'] = failures
         print(json.dumps(payload, ensure_ascii=False))
         return 0 if not failures else 3
     if args.self_test:
-        target = '/tmp/br2k-gpu-scene-self-test.h264'
+        target_fd, target = tempfile.mkstemp(prefix='br2k-gpu-scene-self-test-', suffix='.h264')
+        os.close(target_fd)
         try: os.unlink(target)
         except FileNotFoundError: pass
         request = {
@@ -1008,10 +1262,14 @@ def main():
                 'animations': [{'type': 'Move', 'start': 0, 'end': 1, 'from': {'x': 18, 'y': 18}, 'to': {'x': 100, 'y': 18}}]
             }]}
         }
-        render(request, io.BytesIO(bytes(320 * 180 * 3 // 2 * 60)))
-        if not os.path.isfile(target) or os.path.getsize(target) < 1024: fail('GPU Scene 自检没有生成有效 H.264。')
-        print(json.dumps({'ok': True, 'output': target}, ensure_ascii=False))
-        return 0
+        try:
+            render(request, io.BytesIO(bytes(320 * 180 * 3 // 2 * 60)))
+            if not os.path.isfile(target) or os.path.getsize(target) < 1024: fail('GPU Scene 自检没有生成有效 H.264。')
+            print(json.dumps({'ok': True, 'output': target}, ensure_ascii=False))
+            return 0
+        finally:
+            try: os.unlink(target)
+            except FileNotFoundError: pass
     if not args.request: fail('需要 --request <scene-request.json>。')
     with open(args.request, 'r', encoding='utf-8') as handle: render(json.load(handle))
     return 0
