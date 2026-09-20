@@ -1221,9 +1221,10 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
   }
   const hevc = isHevcCodec(codec);
   const parser = hevc ? 'h265parse' : 'h264parse';
+  const isMkv = String(container).toLowerCase() === 'mkv';
   const encodedCaps = hevc
-    ? 'video/x-h265,stream-format=byte-stream,alignment=au'
-    : 'video/x-h264,stream-format=byte-stream,alignment=au';
+    ? `video/x-h265,stream-format=${isMkv ? 'hvc1' : 'byte-stream'},alignment=au`
+    : `video/x-h264,stream-format=${isMkv ? 'avc' : 'byte-stream'},alignment=au`;
   return [
     '-q',
     '-e',
@@ -1248,7 +1249,7 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
     '!',
     encodedCaps,
     '!',
-    ...(String(container).toLowerCase() === 'mkv' ? ['matroskamux', 'streamable=true', '!'] : []),
+    ...(isMkv ? ['matroskamux', 'streamable=true', '!'] : []),
     'filesink',
     `location=${outputPath}`
   ];

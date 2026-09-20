@@ -593,6 +593,7 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   assert.ok(gstreamerArgs.includes('nvv4l2h264enc'));
   assert.ok(gstreamerArgs.includes('nvvidconv'));
   assert.ok(gstreamerArgs.includes('framerate=2997/100'));
+  assert.ok(gstreamerArgs.includes('video/x-h264,stream-format=byte-stream,alignment=au'));
 
   const newerStackGstreamerArgs = createJetsonGstreamerEncodeArgs({
     codec: 'hevc_nvv4l2',
@@ -605,6 +606,18 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   });
   assert.ok(newerStackGstreamerArgs.includes('nvvideoconvert'));
   assert.ok(newerStackGstreamerArgs.includes('nvv4l2h265enc'));
+  assert.ok(newerStackGstreamerArgs.includes('video/x-h265,stream-format=byte-stream,alignment=au'));
+
+  const h264MkvGstreamerArgs = createJetsonGstreamerEncodeArgs({
+    codec: 'h264_nvv4l2',
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    quality: 24,
+    outputPath: '/recordings/temporary-h264.mkv',
+    container: 'mkv'
+  });
+  assert.ok(h264MkvGstreamerArgs.includes('video/x-h264,stream-format=avc,alignment=au'));
 
   const timestampedGstreamerArgs = createJetsonGstreamerEncodeArgs({
     codec: 'hevc_nvv4l2',
@@ -617,6 +630,7 @@ test('Jetson GStreamer bridge uses rawvideoparse and keeps the final mux in FFmp
   });
   assert.ok(timestampedGstreamerArgs.includes('matroskamux'));
   assert.ok(timestampedGstreamerArgs.includes('streamable=true'));
+  assert.ok(timestampedGstreamerArgs.includes('video/x-h265,stream-format=hvc1,alignment=au'));
 
   const muxArgs = createBurnEncodedVideoMuxArgs({
     encodedVideoPath: '/recordings/temporary.h264',

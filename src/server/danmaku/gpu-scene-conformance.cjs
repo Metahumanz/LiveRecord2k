@@ -48,7 +48,18 @@ function validateCudaSceneConformance(report) {
     return { ok: false, reason: 'CUDA Scene 像素一致性报告版本无效。' };
   }
   if (report.passed !== true) {
-    return { ok: false, reason: String(report.reason || 'CUDA Scene 像素一致性自检未通过。') };
+    const failedPresets = [...new Set(
+      (Array.isArray(report.cases) ? report.cases : [])
+        .filter((entry) => entry?.passed !== true)
+        .map((entry) => entry?.preset)
+        .filter(Boolean)
+    )];
+    return {
+      ok: false,
+      reason: failedPresets.length
+        ? `visualConformance=${failedPresets.join(',')} failed`
+        : String(report.reason || 'CUDA Scene 像素一致性自检未通过。')
+    };
   }
   const cases = Array.isArray(report.cases) ? report.cases : [];
   for (const preset of CUDA_SCENE_CONFORMANCE_PRESETS) {

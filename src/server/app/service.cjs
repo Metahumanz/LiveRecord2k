@@ -11326,10 +11326,14 @@ try {
     const chunkDurations = [];
     const scriptPaths = [];
     const concatPath = path.join(temporaryDir, 'scene-chunks.ffconcat');
-    const useCudaSceneRenderer = canUseCudaSceneProduction(
+    const cudaSceneAdmission = canUseCudaSceneProduction(
       this.ffmpegCapabilities?.sceneGpuRenderer,
       this.ffmpegCapabilities?.sceneGpuVisualConformance
-    ).ok;
+    );
+    if (!cudaSceneAdmission.ok) {
+      this.log('warn', `CUDA Scene未获准生产使用：${cudaSceneAdmission.reason}`);
+    }
+    const useCudaSceneRenderer = cudaSceneAdmission.ok;
     const nativeDecoderPath = resolveGpuSceneRenderer();
     // A concat pass has one timestamp contract.  Native NVMM and I420
     // compatibility chunks are both Matroska streams now; each keeps the
@@ -11877,10 +11881,14 @@ try {
       // CUDA Scene now receives an explicit black lead-in and shifts its
       // timeline by the same amount, so both ordinary and leading-keyframe
       // exports retain the established audio/video alignment.
-      const useCudaSceneRenderer = !useChunkedJetsonScene && canUseCudaSceneProduction(
+      const cudaSceneAdmission = canUseCudaSceneProduction(
         this.ffmpegCapabilities?.sceneGpuRenderer,
         this.ffmpegCapabilities?.sceneGpuVisualConformance
-      ).ok;
+      );
+      if (!cudaSceneAdmission.ok) {
+        this.log('warn', `CUDA Scene未获准生产使用：${cudaSceneAdmission.reason}`);
+      }
+      const useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
