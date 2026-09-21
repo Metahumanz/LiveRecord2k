@@ -85,8 +85,20 @@ function validateCudaSceneConformance(report) {
 }
 
 function canUseCudaSceneProduction(renderer, conformance) {
-  if (!renderer?.available || renderer.backend !== 'cuda-gstreamer') {
-    return { ok: false, reason: 'CUDA Scene runtime probe 未通过。' };
+  if (!renderer) {
+    return { ok: false, reason: 'renderer不存在' };
+  }
+  if (renderer.available !== true) {
+    return {
+      ok: false,
+      reason: `renderer.available=false + ${String(renderer.reason || '未提供 runtime probe 原因。')}`
+    };
+  }
+  if (renderer.backend !== 'cuda-gstreamer') {
+    return {
+      ok: false,
+      reason: `backend不是cuda-gstreamer + 实际backend=${String(renderer.backend || '-')}`
+    };
   }
   return validateCudaSceneConformance(conformance || renderer.visualConformance);
 }

@@ -11927,7 +11927,14 @@ try {
         this.ffmpegCapabilities?.sceneGpuVisualConformance
       );
       const gpuSceneRenderer = this.ffmpegCapabilities?.sceneGpuRenderer;
-      this.logCudaSceneAdmission(cudaSceneAdmission, gpuSceneRenderer);
+      // Chunked Jetson exports perform the same admission check inside
+      // runChunkedJetsonSceneGraphExport(), where the actual chunk pipeline
+      // is selected. Keep one complete status line per export instead of
+      // logging the identical result once in the wrapper and once in the
+      // chunk runner.
+      if (!useChunkedJetsonScene) {
+        this.logCudaSceneAdmission(cudaSceneAdmission, gpuSceneRenderer);
+      }
       const useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
       const nativeDecoderPath = gpuSceneRenderer?.available && gpuSceneRenderer.helper
         ? gpuSceneRenderer.helper

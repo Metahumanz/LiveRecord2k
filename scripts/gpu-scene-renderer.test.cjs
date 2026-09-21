@@ -12,6 +12,7 @@ const {
   createGpuSceneProbeArgs,
   parseGpuSceneRendererProbe
 } = require('../src/server/danmaku/gpu-scene-renderer.cjs');
+const { canUseCudaSceneProduction } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
 
 function sampleGraph() {
   return buildSceneGraph(
@@ -83,4 +84,16 @@ test('GPU Scene helper is rejected unless it declares every Scene Graph primitiv
   }, 'cuda-gstreamer');
   assert.equal(full.ok, true);
   assert.equal(full.backend, 'cuda-gstreamer');
+});
+
+test('CUDA Scene admission exposes the actual renderer runtime failure', () => {
+  assert.equal(canUseCudaSceneProduction(null).reason, 'renderer不存在');
+  assert.match(
+    canUseCudaSceneProduction({ available: false, reason: 'GPU Scene helper缺少GStreamer元件：nvivafilter' }).reason,
+    /renderer\.available=false.*nvivafilter/
+  );
+  assert.match(
+    canUseCudaSceneProduction({ available: true, backend: 'gl-gstreamer' }).reason,
+    /backend不是cuda-gstreamer.*gl-gstreamer/
+  );
 });
