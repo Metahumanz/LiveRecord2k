@@ -39,6 +39,7 @@ const GROUPS = {
     'desktop-cuda-capability.test.cjs',
     'gpu-scene-conformance.test.cjs',
     'gpu-scene-renderer.test.cjs',
+    'jetson-native-bridge.test.cjs',
     'jetson-self-test.test.cjs',
     'keyframe-preview.test.cjs',
     'preview-editor-contract.test.cjs',

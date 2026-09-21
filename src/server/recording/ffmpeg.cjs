@@ -1760,11 +1760,13 @@ function runJetsonNativeDecodeSceneEncodeJob({
     const reportMetrics = (final = false) => {
       const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
       const bytesPerFrame = Math.max(1, Number(frameSize) || 1);
+      const decodedFrames = Math.floor(counters.decodedBytes / bytesPerFrame);
+      const sceneFrames = Math.floor(counters.sceneBytes / bytesPerFrame);
       const decode = counters.decodedBytes / bytesPerFrame / elapsed;
       const scene = counters.sceneBytes / bytesPerFrame / elapsed;
       // renderer stdout is back-pressured by encoder.stdin; this is the rate
       // at which raw frames are actually accepted by nvv4l2, not a probe.
-      onStageMetrics?.({ decode, scene, encode: scene, total: scene, elapsed, final });
+      onStageMetrics?.({ decode, scene, encode: scene, total: scene, elapsed, decodedFrames, sceneFrames, final });
     };
     const children = () => [decoder, renderer, encoder].filter(Boolean);
     const stopAll = () => children().forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
@@ -1775,6 +1777,26 @@ function runJetsonNativeDecodeSceneEncodeJob({
       if (metricsTimer) clearInterval(metricsTimer);
       reportMetrics(true);
       onChild?.(null);
+      const bytesPerFrame = Math.max(1, Number(frameSize) || 1);
+      const decodedFrames = Math.floor(counters.decodedBytes / bytesPerFrame);
+      const sceneFrames = Math.floor(counters.sceneBytes / bytesPerFrame);
+      if (decodedFrames === 0 || sceneFrames === 0) {
+        const error = new Error(
+          `Jetson原生硬解没有产生视频帧：decodedFrames=${decodedFrames} / sceneFrames=${sceneFrames}；` +
+          `decoder stderr=${String(results.decoder.stderr || '-').replace(/\s+/g, ' ').trim().slice(-2500)}；` +
+          `renderer stderr=${String(results.renderer.stderr || '-').replace(/\s+/g, ' ').trim().slice(-2500)}；` +
+          `encoder stderr=${String(results.encoder.stderr || '-').replace(/\s+/g, ' ').trim().slice(-2500)}`
+        );
+        error.code = 'BR2K_JETSON_NATIVE_DECODE_EMPTY';
+        error.primaryProcess = decodedFrames === 0 ? 'decoder' : 'renderer';
+        error.decodedFrames = decodedFrames;
+        error.sceneFrames = sceneFrames;
+        error.decoderStderr = results.decoder.stderr;
+        error.rendererStderr = results.renderer.stderr;
+        error.encoderStderr = results.encoder.stderr;
+        reject(error);
+        return;
+      }
       // Once ffmpeg-full has rendered its requested duration it closes the
       // raw stdin; fdsink then reports EPIPE while the decoder is being torn
       // down. Renderer + encoder are the authoritative finite stages.

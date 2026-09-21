@@ -1757,6 +1757,18 @@ class LiveRecordService {
     );
   }
 
+  logCudaSceneAdmission(admission, renderer) {
+    const runtime = renderer || null;
+    const status = [
+      `runtime available=${runtime?.available === true ? 'true' : 'false'}`,
+      `backend=${String(runtime?.backend || '-')}`,
+      `reason=${String(admission?.reason || runtime?.reason || '-')}`,
+      `nativeNvmmScene=${runtime?.nativeNvmmScene === true ? 'true' : 'false'}`,
+      `nativeNvmmReason=${String(runtime?.nativeNvmmReason || '-')}`
+    ].join(' ');
+    this.log(admission?.ok ? 'info' : 'warn', `CUDA Scene准入${admission?.ok ? '通过' : '失败'}：${status}`);
+  }
+
   async probeGpuSceneRenderer() {
     const visualConformance = await this.readCudaSceneConformanceReport();
     const helper = resolveGpuSceneRenderer();
@@ -9729,6 +9741,29 @@ try {
           onChild
         });
       }
+      const encodedSize = await getFileSize(outputPath);
+      if (encodedSize < 1024) {
+        const error = new Error(`Jetson 编码中间 MKV 无效：文件大小 ${encodedSize} 字节。`);
+        error.code = 'BR2K_JETSON_ENCODE_OUTPUT_INVALID';
+        error.encodedSize = encodedSize;
+        throw error;
+      }
+      let encodedInfo;
+      try {
+        encodedInfo = await probeMediaFileInfo(this.ffmpegPath, outputPath, { timeoutMs: 10_000 });
+      } catch (cause) {
+        const error = new Error(`Jetson 编码中间 MKV 无法读取：${compactLogLine(cause?.message || cause)}`);
+        error.code = 'BR2K_JETSON_ENCODE_OUTPUT_INVALID';
+        error.encodedSize = encodedSize;
+        error.cause = cause;
+        throw error;
+      }
+      if (!encodedInfo?.videoInfo) {
+        const error = new Error('Jetson 编码中间 MKV 没有可读取的视频流。');
+        error.code = 'BR2K_JETSON_ENCODE_OUTPUT_INVALID';
+        error.encodedSize = encodedSize;
+        throw error;
+      }
       onPhase?.('mux');
       await runFfmpegJob(this.ffmpegPath, createMuxArgs(), onStderr, { onChild });
     };
@@ -9740,16 +9775,21 @@ try {
       if (
         preferredDecoder === 'software' ||
         error?.code === 'BR2K_MEDIA_CANCELLED' ||
-        !isFfmpegHardwareDecodeError(error)
+        (error?.code !== 'BR2K_JETSON_NATIVE_DECODE_EMPTY' && !isFfmpegHardwareDecodeError(error))
       ) {
         throw error;
       }
-      this.log(
-        'warn',
-        `${label} 的 ${decoder?.label || preferredDecoder} 硬件解码不可用于当前视频，立即改用 CPU 解码重试：${compactLogLine(
-          error.message
-        )}`
-      );
+      if (error?.code === 'BR2K_JETSON_NATIVE_DECODE_EMPTY') {
+        this.log('warn', `${label} 的 Jetson nvv4l2decoder 未产生有效帧，已切换 CPU 解码重新执行当前分段。`);
+      } else {
+        this.log(
+          'warn',
+          `${label} 的 ${decoder?.label || preferredDecoder} 硬件解码不可用于当前视频，立即改用 CPU 解码重试：${compactLogLine(
+            error.message
+          )}`
+        );
+      }
+      await fsp.rm(outputPath, { force: true }).catch(() => {});
       await beforeRetry?.();
       onFallback?.();
       onPhase?.('render', { force: true });
@@ -11330,11 +11370,12 @@ try {
       this.ffmpegCapabilities?.sceneGpuRenderer,
       this.ffmpegCapabilities?.sceneGpuVisualConformance
     );
-    if (!cudaSceneAdmission.ok) {
-      this.log('warn', `CUDA Scene未获准生产使用：${cudaSceneAdmission.reason}`);
-    }
+    const gpuSceneRenderer = this.ffmpegCapabilities?.sceneGpuRenderer;
+    this.logCudaSceneAdmission(cudaSceneAdmission, gpuSceneRenderer);
     const useCudaSceneRenderer = cudaSceneAdmission.ok;
-    const nativeDecoderPath = resolveGpuSceneRenderer();
+    const nativeDecoderPath = gpuSceneRenderer?.available && gpuSceneRenderer.helper
+      ? gpuSceneRenderer.helper
+      : '';
     // A concat pass has one timestamp contract.  Native NVMM and I420
     // compatibility chunks are both Matroska streams now; each keeps the
     // renderer's frame clock instead of reconstructing it from a rounded fps.
@@ -11885,10 +11926,12 @@ try {
         this.ffmpegCapabilities?.sceneGpuRenderer,
         this.ffmpegCapabilities?.sceneGpuVisualConformance
       );
-      if (!cudaSceneAdmission.ok) {
-        this.log('warn', `CUDA Scene未获准生产使用：${cudaSceneAdmission.reason}`);
-      }
+      const gpuSceneRenderer = this.ffmpegCapabilities?.sceneGpuRenderer;
+      this.logCudaSceneAdmission(cudaSceneAdmission, gpuSceneRenderer);
       const useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
+      const nativeDecoderPath = gpuSceneRenderer?.available && gpuSceneRenderer.helper
+        ? gpuSceneRenderer.helper
+        : '';
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -12029,14 +12072,14 @@ try {
                 copyAudio: copySourceAudio
               }),
             decoder: decoderInfo,
-            nativeDecode: decoderInfo.value === 'gstreamer-nvv4l2' && resolveGpuSceneRenderer()
+            nativeDecode: decoderInfo.value === 'gstreamer-nvv4l2' && nativeDecoderPath
               ? {
                   cleanPath: recording.cleanPath,
                   sourceCodec: decoderInfo.codec,
                   filterScriptPath: sceneLayer.filterScriptPath,
                   startTime,
                   duration,
-                  decoderPath: resolveGpuSceneRenderer()
+                  decoderPath: nativeDecoderPath
                 }
               : null,
             onStderr,
