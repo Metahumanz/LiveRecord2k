@@ -90,8 +90,7 @@ function buildContainedPreviewFrame(hostWidth: number, hostHeight: number, canva
 function buildEffectiveLayout(
   preset: DanmakuStylePreset,
   layout: DanmakuStyleLayout,
-  canvas: PreviewCanvas,
-  resolvedBounds?: { top?: number; bottom?: number } | null
+  canvas: PreviewCanvas
 ): EffectiveLayout {
   const style = danmakuStylePresets[preset]?.style || {};
   const base = {
@@ -110,12 +109,12 @@ function buildEffectiveLayout(
     boxFontSize: clampNumber(numberValue(layout.boxFontSize ?? style.boxFontSize, DEFAULT_LAYOUT.boxFontSize), 12, 80),
     danmakuTop: clampNumber(numberValue(layout.danmakuTop ?? style.danmakuTop, DEFAULT_LAYOUT.danmakuTop), 0, 2000),
     danmakuAreaTop: clampNumber(
-      numberValue(resolvedBounds?.top ?? layout.danmakuAreaTop ?? style.danmakuAreaTop, numberValue(layout.danmakuTop ?? style.danmakuTop, DEFAULT_LAYOUT.danmakuTop)),
+      numberValue(layout.danmakuAreaTop ?? style.danmakuAreaTop, numberValue(layout.danmakuTop ?? style.danmakuTop, DEFAULT_LAYOUT.danmakuTop)),
       0,
       4000
     ),
     danmakuAreaBottom: clampNumber(
-      numberValue(resolvedBounds?.bottom ?? layout.danmakuAreaBottom ?? style.danmakuAreaBottom, numberValue(layout.superChatBottom ?? style.superChatBottom, DEFAULT_LAYOUT.superChatBottom)),
+      numberValue(layout.danmakuAreaBottom ?? style.danmakuAreaBottom, numberValue(layout.superChatBottom ?? style.superChatBottom, DEFAULT_LAYOUT.superChatBottom)),
       1,
       4000
     ),
@@ -217,19 +216,13 @@ export function DanmakuStylePreview({
   layout,
   overlayMode,
   videoInfo,
-  onLayoutChange,
-  layoutGuideOnly = false,
-  resolvedBounds = null
+  onLayoutChange
 }: {
   preset: DanmakuStylePreset;
   layout: DanmakuStyleLayout;
   overlayMode: AppSettings['burnOverlayMode'];
   videoInfo?: { width?: number; height?: number } | null;
   onLayoutChange: (nextLayout: DanmakuStyleLayout) => void;
-  /** Bounds resolved by the server LayoutEngine; used by the guide so preview and burn share coordinates. */
-  resolvedBounds?: { top?: number; bottom?: number } | null;
-  /** Keep the real Scene Graph visible while retaining an always-available, draggable placement rail. */
-  layoutGuideOnly?: boolean;
 }) {
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -247,8 +240,8 @@ export function DanmakuStylePreview({
     scale: 1
   }));
   const effective = useMemo(
-    () => buildEffectiveLayout(preset, layout, previewCanvas, resolvedBounds),
-    [layout, preset, previewCanvas, resolvedBounds]
+    () => buildEffectiveLayout(preset, layout, previewCanvas),
+    [layout, preset, previewCanvas]
   );
   const fontScale = effective.boxFontSize / DEFAULT_LAYOUT.boxFontSize;
   const showCards = overlayMode === 'danmaku-gift';
@@ -462,7 +455,7 @@ export function DanmakuStylePreview({
         ref={canvasRef}
         style={canvasStyle}
       >
-        {!layoutGuideOnly && !sideStream ? (
+        {!sideStream ? (
           <>
             <span
               className="preview-rolling-danmaku first"
@@ -501,7 +494,6 @@ export function DanmakuStylePreview({
               onPointerDown={(event) => beginInteraction(event, 'move')}
               title="拖动调整侧栏位置"
             >
-              {layoutGuideOnly ? <div className="preview-layout-guide-label">互动队列从这里向上</div> : <>
               <SideChatPreviewRow badge="LV.18" text="这是一条示例互动" tone="blue" />
               <SideChatPreviewRow badge="LV.25" text="点赞了直播间" tone="cyan" />
               {showCards ? (
@@ -515,7 +507,6 @@ export function DanmakuStylePreview({
               ) : null}
               <SideChatPreviewRow badge="LV.12" text="感谢你的支持～" tone="mint" />
               {showCards ? <SideEventPreview user="观众 E" text="加入了粉丝团" price="CNY 0.1" kind="superchat" /> : null}
-              </>}
             </div>
             <button
               className="preview-card-resize"
@@ -527,7 +518,7 @@ export function DanmakuStylePreview({
               <Maximize2 size={32} />
             </button>
           </div>
-        ) : showCards && !layoutGuideOnly ? (
+        ) : showCards ? (
           <div
             ref={stackRef}
             className={`preview-message-stack ${interaction ? 'is-adjusting' : ''}`}
@@ -571,7 +562,7 @@ export function DanmakuStylePreview({
 
       <div className="danmaku-preview-toolbar">
         <span>
-          {layoutGuideOnly ? '实时 Scene Graph；拖动虚线基准调整互动队列' : (sideStream ? '侧栏' : '卡片')} x{Math.round(effective.panelLeft)} · y{Math.round(effective.danmakuAreaBottom)} · 宽
+          {sideStream ? '侧栏' : '卡片'} x{Math.round(effective.panelLeft)} · y{Math.round(effective.danmakuAreaBottom)} · 宽
           {Math.round(effective.superChatWidth)} · {previewCanvas.portrait ? '竖屏' : '横屏'} {previewCanvas.width}×{previewCanvas.height}
         </span>
         <button type="button" onClick={() => void toggleFullscreen()} title="全屏查看画面和弹幕">

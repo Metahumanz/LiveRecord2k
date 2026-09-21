@@ -41,6 +41,7 @@ const GROUPS = {
     'gpu-scene-renderer.test.cjs',
     'jetson-self-test.test.cjs',
     'keyframe-preview.test.cjs',
+    'preview-editor-contract.test.cjs',
     'maintenance-confirmation.test.cjs',
     'maintenance-service.test.cjs',
     'release-notes.test.cjs',
