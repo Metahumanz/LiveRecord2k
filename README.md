@@ -227,17 +227,11 @@ NVIDIA Jetson：
 BiliRecord2K 不会安装或替换 JetPack/L4T、NVIDIA 驱动和 NVIDIA 专有 GStreamer 插件。
 这些组件必须由设备已有的、彼此匹配的 JetPack/L4T 环境提供。
 
-安装器会安装：
+使用一键安装脚本时，会安装 FFmpeg、字体以及 GStreamer tools/base/good 等通用依赖。
 
-- GStreamer tools/base/good
-- FFmpeg
-- 字体等通用依赖
+直接安装 `.deb` 时，由 Debian 包声明并安装其运行所需的基础依赖。
 
-不会主动 `apt install`：
-
-- `nvidia-l4t-*`
-- JetPack
-- NVIDIA 驱动
+JetPack/L4T、NVIDIA 驱动和 NVIDIA 专有 GStreamer 组件，在两种方式下都不会由 BiliRecord2K 替换或跨版本安装。
 
 正式发布会同时提供 Debian 安装包和通用 systemd 压缩包。两种包都自带 Node.js 运行时，服务器只需要能安装 `ffmpeg` 等系统依赖。
 
