@@ -237,6 +237,20 @@ const { createAss } = require('../danmaku/ass.cjs');
 const LEGACY_ASS_SCENE_PRESETS = new Set(['h5-card', 'bubble', 'minimal']);
 const NATIVE_EARLY_FALLBACK_SEC = 5;
 
+function shouldAbortCommittedJetsonNativeFallback({ committed, processedMediaSeconds }) {
+  return Boolean(committed) && Number(processedMediaSeconds) > NATIVE_EARLY_FALLBACK_SEC;
+}
+
+function createCommittedJetsonNativeRuntimeError(processedMediaSeconds, cause) {
+  const processed = Math.max(0, Number(processedMediaSeconds) || 0);
+  const runtimeError = new Error(
+    `CUDA/NVMM 已处理 ${processed.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${compactLogLine(cause?.message || String(cause || '未知错误'))}`
+  );
+  runtimeError.code = 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT';
+  runtimeError.processedMediaSeconds = processed;
+  return runtimeError;
+}
+
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
     super(message);
@@ -11698,11 +11712,11 @@ try {
             nativeMetrics = cudaResult?.nativeMetrics || null;
           } catch (error) {
             if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-            if (nativeTimestampedChunk && formalNativeMediaSeconds > NATIVE_EARLY_FALLBACK_SEC) {
-              const runtimeError = new Error(`CUDA/NVMM 已处理 ${formalNativeMediaSeconds.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${compactLogLine(error.message)}`);
-              runtimeError.code = 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT';
-              runtimeError.processedMediaSeconds = formalNativeMediaSeconds;
-              throw runtimeError;
+            if (shouldAbortCommittedJetsonNativeFallback({
+              committed: nativeTimestampedChunk,
+              processedMediaSeconds: formalNativeMediaSeconds
+            })) {
+              throw createCommittedJetsonNativeRuntimeError(formalNativeMediaSeconds, error);
             }
             onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
             // The fallback still uses the CPU/I420 renderer, but its GStreamer
@@ -12104,6 +12118,7 @@ try {
       let nativePreflight = null;
       let useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
       let nativeDecoderPath = '';
+      let nonChunkedFormalNativeMediaSeconds = 0;
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -12333,8 +12348,15 @@ try {
             onChild,
             onPipeline: (pipeline) => this.setProgressPipeline(progress, pipeline),
             onProgress: (value) => {
-              if (Number(value) > 0.001) onScenePhase('render');
-              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
+              const mediaSeconds = Math.max(0, Number(value) || 0);
+              if (nativePreflight?.ok === true && nativeDecoderPath) {
+                nonChunkedFormalNativeMediaSeconds = Math.max(
+                  nonChunkedFormalNativeMediaSeconds,
+                  mediaSeconds
+                );
+              }
+              if (mediaSeconds > 0.001) onScenePhase('render');
+              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(mediaSeconds * 1_000_000)}`)) {
                 this.emitState('mediaJob');
               }
             },
@@ -12394,7 +12416,17 @@ try {
               });
             } catch (error) {
               if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-              this.log('warn', 'CUDA Scene Graph 失败，回退到兼容 Scene filter：' + compactLogLine(error.message));
+              const committedNativeRun = nativePreflight?.ok === true && Boolean(nativeDecoderPath);
+              if (shouldAbortCommittedJetsonNativeFallback({
+                committed: committedNativeRun,
+                processedMediaSeconds: nonChunkedFormalNativeMediaSeconds
+              })) {
+                throw createCommittedJetsonNativeRuntimeError(nonChunkedFormalNativeMediaSeconds, error);
+              }
+              this.log(
+                'warn',
+                `CUDA Scene Graph 在正式处理 ${nonChunkedFormalNativeMediaSeconds.toFixed(1)}s 后失败，仍处于允许早期回退窗口，切换兼容 Scene filter：${compactLogLine(error.message)}`
+              );
               progress.avatarCompositeBackend = 'Scene Graph 直接合成（CPU 回退）';
               setExportPhase?.('render', { force: true, stageLabel: '正在使用兼容 Scene filter 重新渲染' });
               await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
@@ -13635,6 +13667,8 @@ module.exports = {
   LiveRecordService,
   BusinessError,
   isBusinessError,
+  shouldAbortCommittedJetsonNativeFallback,
+  createCommittedJetsonNativeRuntimeError,
   isFfmpegMemoryPressureError,
   getBurnTimelineAlignment,
   getMergeSegmentTimingAssessment,
