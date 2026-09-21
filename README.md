@@ -9,7 +9,8 @@
 - 想保存哔哩哔哩直播源流的用户。
 - 想同时保留无弹幕录像和弹幕记录的用户。
 - 想在录制后生成带弹幕视频或剪辑片段的用户。
-- 想在 Windows 本机用浏览器界面管理录制任务的用户。
+- 想在 Windows 桌面、Linux 服务器或 ARM64 设备上用浏览器界面管理录制任务的用户。
+- 想在 NVIDIA Jetson 上使用硬件解码、CUDA Scene 和硬件编码能力的用户。
 
 ## Windows 快速开始
 
@@ -108,10 +109,11 @@ https://live.bilibili.com/22625025
 
 - `.clean.mp4`：无弹幕原始录像，默认最终文件。
 - `.danmaku.jsonl`：弹幕和互动事件记录。
-- `.danmaku.avatars.json`：录制期间捕获到的头像清单；烧录优先从这里读取，不再等到烧录时才按 UID 查询。
+- `.danmaku.avatars.json`：录制期间捕获的头像清单；烧录优先从这里读取，不再等到烧录时才按 UID 查询。
 - `.danmaku.avatars/`：与清单配套的本地头像图片，文件名包含 UID 和内容摘要；清单和目录按同一录像分段生成，续录合并时会合并到最终录像旁边。
-- `.danmaku.ass`：根据弹幕记录生成的字幕文件。
-- `.danmaku.mp4`：烧录弹幕后生成的视频。
+- `clean 视频（通常为 .clean.mp4）`、`.danmaku.jsonl`、`avatars.json / avatars 目录`：重新生成弹幕成片所依赖的原始素材；它们共同构成弹幕 Scene 的输入，不是只有 ASS 才是真相。
+- `.danmaku.ass`：根据弹幕记录生成的派生字幕文件。
+- `.danmaku.mp4`：烧录弹幕后生成的派生成片。
 - `.recording.mkv`：MP4 模式录制中的临时文件，正常停止并封装成功后会自动删除。
 
 如果某个源流无法封装成 MP4，可以在 `录制配置` 里把最终输出容器切换为 MKV 后再试。
@@ -216,7 +218,26 @@ http://192.168.1.23:3263
 
 如果其它电脑无法打开，请检查 Windows 防火墙是否允许该端口入站访问。远端会先看到独立登录页；会话使用 HttpOnly Cookie，连续登录失败会被临时限速。只有直接连接 loopback、使用 loopback Host 且没有任何转发 Header 的请求才免认证，本机反向代理也不会继承本机豁免。公网使用时必须在前面配置 HTTPS 反向代理，不建议直接暴露明文 HTTP 端口。
 
-## Linux 云服务器安装
+## Linux / ARM64 / Jetson 安装
+
+普通 x64/ARM64 Linux：
+程序会安装 FFmpeg、字体和通用 GStreamer 依赖。
+
+NVIDIA Jetson：
+BiliRecord2K 不会安装或替换 JetPack/L4T、NVIDIA 驱动和 NVIDIA 专有 GStreamer 插件。
+这些组件必须由设备已有的、彼此匹配的 JetPack/L4T 环境提供。
+
+安装器会安装：
+
+- GStreamer tools/base/good
+- FFmpeg
+- 字体等通用依赖
+
+不会主动 `apt install`：
+
+- `nvidia-l4t-*`
+- JetPack
+- NVIDIA 驱动
 
 正式发布会同时提供 Debian 安装包和通用 systemd 压缩包。两种包都自带 Node.js 运行时，服务器只需要能安装 `ffmpeg` 等系统依赖。
 
@@ -302,7 +323,11 @@ sudo journalctl -u bili-record-2k -f
 
 ### Jetson 硬件编码
 
-在 Jetson AGX Orin 的 Ubuntu 20.04 / L4T R35 系列上，安装器会保留服务用户的 `video`、`render` 组成员资格。运行时会先实际试编码 FFmpeg 的 `h264_v4l2m2m` / `hevc_v4l2m2m`；若系统 FFmpeg 没有可用硬编，则检测 `gst-inspect-1.0` 和两帧 `nvv4l2h264enc` / `nvv4l2h265enc` 管线。检测通过后，弹幕烧录、片段导出及头像分段烧录会将 FFmpeg 的渲染后 I420 帧流式传给 Jetson GStreamer V4L2 编码器，再由 FFmpeg 封装音视频；检测或试编码失败时才保留软件编码回退。
+Jetson 导出有三个能力层级：兼容路径是 `CPU decode / FFmpeg Scene → I420 → nvvidconv → nvv4l2 encoder`；硬件解码/编码路径使用 `nvv4l2decoder`、`nvv4l2h264enc` 或 `nvv4l2h265enc`；完整 CUDA Scene 生产路径是 `NVDEC → NVMM → CUDA Scene → NVENC`。当前真实生产日志中的完整链路为 `Jetson nvv4l2decoder → CUDA Scene（NVMM）→ Jetson nvv4l2h265enc`。
+
+启动时会依次进行能力探测、CUDA Scene runtime probe、视觉一致性门禁和当前真实录像约 5 秒的 preflight，通过后才正式使用连续 NVMM 链。preflight 失败时，正式任务从 0 开始直接走兼容链；正式 NVMM 已经运行较长时间后失败时，会停止任务并保留明确错误，不会偷偷把整部长录像从 0 重新 CPU 渲染。
+
+Jetson 的依赖边界、诊断命令、服务用户检查和日志判断方式见 [docs/jetson.md](docs/jetson.md)。
 
 ### systemd 与自动更新
 
@@ -338,7 +363,9 @@ MP4 模式下，为了降低异常中断造成损坏文件的风险，录制时�
 
 ### 弹幕视频为什么生成比较慢？
 
-带弹幕视频需要重新编码画面，耗时取决于视频长度、CPU/GPU 性能和选择的编码器。
+弹幕视频必须重新编码。
+
+Jetson 上可以在任务进度中查看实际 pipeline。显示 `CUDA Scene（NVMM）` 时正在使用原生 NVMM 路径；显示 `BiliRecord2K ffmpeg-full Scene Graph` 时表示正在使用兼容渲染路径。
 
 ### 修改端口后为什么没生效？
 
@@ -357,6 +384,22 @@ npm run dev
 ```powershell
 npm run build
 ```
+
+测试分组：
+
+```bash
+npm test
+npm run test:integration
+npm run test:package
+npm run test:hardware
+npm run test:all
+```
+
+- `npm test`：快速逻辑/合同回归。
+- `test:integration`：录制、合并、队列、文件生命周期等较重测试。
+- `test:package`：Linux/MSIX 包与更新逻辑。
+- `test:hardware`：真实 GPU/Jetson 硬件专项；普通 CI 不要求真实硬件。
+- `test:all`：开发者主动执行的完整合集。
 
 Linux 构建必须在 Linux x64/arm64 构建机运行：
 
@@ -384,7 +427,11 @@ release/install-linux.sh
 release/update.json
 ```
 
-官方 Release 在发布前会依次通过单测、FFmpeg smoke、Windows x64 构建、Linux x64/ARM64 原生构建，并用仓库 Secret `UPDATE_SIGNING_PRIVATE_KEY_B64` 生成和复验签名清单；缺少任何架构产物或签名验证失败时不会发布。
+普通 CI：
+Linux/Windows quick、Linux integration，以及按路径触发的 Package checks。
+
+Release workflow：
+指定媒体回归、TypeScript/Vite 构建、FFmpeg smoke、Windows 包构建、Linux x64/ARM64 原生构建与包结构验证，以及 Ed25519 update manifest 生成和复验。Release workflow 不会再次运行全部 `npm test`。
 
 Windows MSIX 的单用户安装、签名和静默更新源配置见 [docs/windows-msix.md](docs/windows-msix.md)。
 

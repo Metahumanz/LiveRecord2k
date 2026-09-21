@@ -2,9 +2,14 @@
 
 ## 0.8.3 - 2026-09-21
 
-- 修复 Jetson `FFmpeg → GStreamer` bridge 的停滞检测：即使 FFmpeg 仍持续提供 raw 数据、编码器却不再增长输出文件，也会在完整超时周期后准确归因于 GStreamer，并清理两端子进程返回明确错误。
-- 修复 NVMM Scene→Encode 的重复 PTS 覆盖：相同时间戳现在按 FIFO 逐帧匹配，`pendingPeak` 与 `pendingRemaining` 按真实待匹配帧数统计，避免长任务 PTS 审计误判。
-- 收敛 package 测试入口与超时保护，stall 回归测试增加 5 秒级超时和子进程清理校验，降低发布检查被无限挂起的风险。
+- 长录像 Scene 调度从每帧扫描全部 timeline 改为只维护当前 active 对象，显著减少事件数量增长时 CUDA Scene 的调度开销。
+- Jetson 正式生产链改为真实源短预检后再选择 pipeline：通过后连续使用 `nvv4l2decoder → CUDA Scene（NVMM）→ nvv4l2h264/h265enc`；预检失败则从任务开始就使用兼容链，避免长时间运行后再从 0 重新渲染。
+- PTS 完整性改按真实媒体时钟覆盖校验，而不是 `duration × average fps`；Scene→Encode 支持编码器重排和重复 PTS，pending 按真实帧数统计。
+- 修复 Jetson Matroska H.264/H.265 parser 的 `stream-format` 协商，并阻止零帧硬解继续进入 mux，避免产生空 MKV 或 EOF 输出。
+- 导出进度对 NVMM 显示真实 pipeline FPS、媒体覆盖和阶段状态，重复的字体 fallback 日志会折叠。
+- 恢复剪辑导出页原来的可交互样式预览，拖动和缩放不再被 Scene Graph `resolvedBounds` 锁死。
+- FFmpeg→GStreamer 兼容 bridge 现在能检测“raw 仍持续输入、但编码文件停止增长”的 encoder stall，并正确清理子进程。
+- CI 拆分为 quick、integration、package、hardware 分组，普通回归和 package 检查从异常的长时间等待恢复为分钟级反馈。
 
 ## 0.8.2 - 2026-09-20
 

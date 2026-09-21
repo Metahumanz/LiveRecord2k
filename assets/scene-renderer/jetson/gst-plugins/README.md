@@ -12,3 +12,16 @@ primitive compositor. It intentionally does not depend on the unavailable
 library. It accepts the NVMM allocator emitted by `nvvidconv` through NVIDIA's
 official CUDA callback ABI, then draws the pre-rendered Scene texture timeline
 without mapping video frames to CPU memory.
+
+## 依赖边界
+
+这些 `.so` 是 BiliRecord2K 私有组件。它们不会替代 JetPack 提供的：
+
+- `libcuda`
+- `nvivafilter`
+- `nvvidconv`
+- `nvv4l2decoder`
+- `nvv4l2h264enc`
+- `nvv4l2h265enc`
+
+`GST_PLUGIN_PATH_1_0` 只用于暴露 BiliRecord2K 私有插件目录，不会修改系统 JetPack 插件目录。
