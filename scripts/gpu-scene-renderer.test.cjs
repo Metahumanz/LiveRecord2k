@@ -12,6 +12,7 @@ const {
   createGpuSceneProbeArgs,
   parseGpuSceneRendererProbe
 } = require('../src/server/danmaku/gpu-scene-renderer.cjs');
+const { canUseCudaSceneProduction } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
 
 function sampleGraph() {
   return buildSceneGraph(
@@ -58,15 +59,46 @@ test('native NVMM and the I420 bridge can use a timestamped MKV contract', () =>
   assert.equal(bridgeRequest.output.container, 'mkv');
 });
 
-test('native NVMM lead keeps the source timestamp basis and stops on the requested frame budget', () => {
+test('native NVMM lead keeps the source timestamp basis and stops on the requested PTS budget', () => {
   const helper = fs.readFileSync(
     path.join(__dirname, '..', 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py'),
     'utf8'
   );
   assert.match(helper, /concat name=timeline_lead adjust-base=false/);
-  assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\)\)/);
-  assert.match(helper, /reached_frame_budget = counters\['scene'\] >= requested_frame_count/);
+  assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\) \+ 1\)/);
+  assert.match(helper, /reached_pts_budget = leading_video_frames <= 0 and buffer\.pts >= target_pts/);
+  assert.match(helper, /scene_encode_pending = \{\}/);
+  assert.match(helper, /scene_encode_pending\.setdefault\(scene_pts, deque\(\)\)/);
+  assert.match(helper, /bucket\.append\(source_pts_for_scene\)/);
+  assert.match(helper, /source_pts = bucket\.popleft\(\)/);
+  assert.match(helper, /if not bucket:\s+del scene_encode_pending\[matched_scene_pts\]/);
+  assert.match(helper, /pending_remaining = scene_encode_pending_count/);
+  assert.match(helper, /nearest = min\(scene_encode_pending/);
+  assert.match(helper, /sceneCoverageSec/);
+  assert.match(helper, /encodeCoverageSec/);
+  assert.match(helper, /observedFrameDurationSec/);
+  assert.match(helper, /coverage_tolerance_ns = max\(observed_frame_ns \* 3, 50_000_000\)/);
+  assert.doesNotMatch(helper, /full_duration_frames and source_scene_ok/);
   assert.match(helper, /leading_video_frames or measured_media_seconds <= 0/);
+});
+
+test('duplicate Scene PTS values are preserved as separate pending frames', () => {
+  const pending = new Map();
+
+  const push = (pts, sourcePts) => {
+    const bucket = pending.get(pts) || [];
+    bucket.push(sourcePts);
+    pending.set(pts, bucket);
+  };
+
+  push(1000, 1000);
+  push(1000, 1000);
+
+  assert.equal(pending.get(1000).length, 2);
+  assert.equal(pending.get(1000).shift(), 1000);
+  assert.equal(pending.get(1000).length, 1);
+  assert.equal(pending.get(1000).shift(), 1000);
+  assert.equal(pending.get(1000).length, 0);
 });
 
 test('GPU Scene helper is rejected unless it declares every Scene Graph primitive', () => {
@@ -82,4 +114,16 @@ test('GPU Scene helper is rejected unless it declares every Scene Graph primitiv
   }, 'cuda-gstreamer');
   assert.equal(full.ok, true);
   assert.equal(full.backend, 'cuda-gstreamer');
+});
+
+test('CUDA Scene admission exposes the actual renderer runtime failure', () => {
+  assert.equal(canUseCudaSceneProduction(null).reason, 'renderer不存在');
+  assert.match(
+    canUseCudaSceneProduction({ available: false, reason: 'GPU Scene helper缺少GStreamer元件：nvivafilter' }).reason,
+    /renderer\.available=false.*nvivafilter/
+  );
+  assert.match(
+    canUseCudaSceneProduction({ available: true, backend: 'gl-gstreamer' }).reason,
+    /backend不是cuda-gstreamer.*gl-gstreamer/
+  );
 });

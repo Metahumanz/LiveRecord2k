@@ -16,8 +16,7 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
-import { SceneGraphOverlay } from '../components/SceneGraphOverlay';
-import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState, SceneGraph } from '../types';
+import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
 import {
   burnAvatarModeOptions,
   danmakuAreaOptions,
@@ -71,7 +70,6 @@ export function ExportPage({
   const [previewNeedsProxy, setPreviewNeedsProxy] = useState(false);
   const [previewDeclined, setPreviewDeclined] = useState(false);
   const [previewStarting, setPreviewStarting] = useState(false);
-  const [sceneGraph, setSceneGraph] = useState<SceneGraph | null>(null);
   const [sceneTracksMessage, setSceneTracksMessage] = useState('');
   const [pathPickerBusy, setPathPickerBusy] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
@@ -154,50 +152,12 @@ export function ExportPage({
     setMediaDuration(0);
     setPlaybackTime(0);
     setDecodedVideoSize(null);
-    setSceneGraph(null);
     setPreviewError('');
     setPreviewNeedsProxy(false);
     setPreviewDeclined(false);
     setSceneTracksMessage('');
     releasePreviewVideo();
   }, [draft.cleanPath]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!draft.cleanPath || draft.mode === 'clean') {
-      setSceneGraph(null);
-      return;
-    }
-    const sceneStylePreset =
-      draft.stylePreset === 'current' || draft.stylePreset === 'h5-card' || draft.stylePreset === 'bubble' || draft.stylePreset === 'minimal'
-        ? draft.stylePreset
-        : state.settings.sceneGraphDefaultStyle;
-    void recorder
-      .getSceneGraph({
-        cleanPath: draft.cleanPath,
-        stylePreset: sceneStylePreset,
-        overlayMode: draft.overlayMode,
-        danmakuArea: draft.danmakuArea,
-        styleLayout: draft.styleLayout
-      })
-      .then((nextScene) => {
-        if (!cancelled) setSceneGraph(nextScene);
-      })
-      .catch(() => {
-        if (!cancelled) setSceneGraph(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    draft.cleanPath,
-    draft.danmakuArea,
-    draft.mode,
-    draft.overlayMode,
-    draft.styleLayout,
-    draft.stylePreset,
-    state.settings.sceneGraphDefaultStyle
-  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -594,14 +554,7 @@ export function ExportPage({
                   overlayMode={draft.overlayMode}
                   videoInfo={previewVideoInfo}
                   onLayoutChange={(styleLayout) => setDraft({ ...draft, styleLayout })}
-                  layoutGuideOnly={Boolean(sceneGraph)}
-                  resolvedBounds={
-                    sceneGraph?.metadata?.layoutBounds && typeof sceneGraph.metadata.layoutBounds === 'object'
-                      ? (sceneGraph.metadata.layoutBounds as { top?: number; bottom?: number })
-                      : null
-                  }
                 />
-                {sceneGraph ? <SceneGraphOverlay scene={sceneGraph} time={playbackTime} /> : null}
                 {activePreviewProgress ? (
                   <div className="clip-preview-progress">
                     <JobProgress progress={activePreviewProgress} />

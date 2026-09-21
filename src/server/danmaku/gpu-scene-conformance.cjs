@@ -48,7 +48,18 @@ function validateCudaSceneConformance(report) {
     return { ok: false, reason: 'CUDA Scene 像素一致性报告版本无效。' };
   }
   if (report.passed !== true) {
-    return { ok: false, reason: String(report.reason || 'CUDA Scene 像素一致性自检未通过。') };
+    const failedPresets = [...new Set(
+      (Array.isArray(report.cases) ? report.cases : [])
+        .filter((entry) => entry?.passed !== true)
+        .map((entry) => entry?.preset)
+        .filter(Boolean)
+    )];
+    return {
+      ok: false,
+      reason: failedPresets.length
+        ? `visualConformance=${failedPresets.join(',')} failed`
+        : String(report.reason || 'CUDA Scene 像素一致性自检未通过。')
+    };
   }
   const cases = Array.isArray(report.cases) ? report.cases : [];
   for (const preset of CUDA_SCENE_CONFORMANCE_PRESETS) {
@@ -74,8 +85,20 @@ function validateCudaSceneConformance(report) {
 }
 
 function canUseCudaSceneProduction(renderer, conformance) {
-  if (!renderer?.available || renderer.backend !== 'cuda-gstreamer') {
-    return { ok: false, reason: 'CUDA Scene runtime probe 未通过。' };
+  if (!renderer) {
+    return { ok: false, reason: 'renderer不存在' };
+  }
+  if (renderer.available !== true) {
+    return {
+      ok: false,
+      reason: `renderer.available=false + ${String(renderer.reason || '未提供 runtime probe 原因。')}`
+    };
+  }
+  if (renderer.backend !== 'cuda-gstreamer') {
+    return {
+      ok: false,
+      reason: `backend不是cuda-gstreamer + 实际backend=${String(renderer.backend || '-')}`
+    };
   }
   return validateCudaSceneConformance(conformance || renderer.visualConformance);
 }

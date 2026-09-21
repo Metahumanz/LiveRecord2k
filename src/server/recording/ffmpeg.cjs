@@ -1221,9 +1221,10 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
   }
   const hevc = isHevcCodec(codec);
   const parser = hevc ? 'h265parse' : 'h264parse';
+  const isMkv = String(container).toLowerCase() === 'mkv';
   const encodedCaps = hevc
-    ? 'video/x-h265,stream-format=byte-stream,alignment=au'
-    : 'video/x-h264,stream-format=byte-stream,alignment=au';
+    ? `video/x-h265,stream-format=${isMkv ? 'hvc1' : 'byte-stream'},alignment=au`
+    : `video/x-h264,stream-format=${isMkv ? 'avc' : 'byte-stream'},alignment=au`;
   return [
     '-q',
     '-e',
@@ -1248,7 +1249,7 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
     '!',
     encodedCaps,
     '!',
-    ...(String(container).toLowerCase() === 'mkv' ? ['matroskamux', 'streamable=true', '!'] : []),
+    ...(isMkv ? ['matroskamux', 'streamable=true', '!'] : []),
     'filesink',
     `location=${outputPath}`
   ];
@@ -1488,6 +1489,11 @@ function runFfmpegToGstreamerJob({
     let gstreamerOutputBytes = 0;
     let lastFfmpegRawAt = Date.now();
     let lastGstreamerOutputAt = Date.now();
+    // Start the encoder-stall clock only when a new raw-data burst arrives
+    // after the last observed encoded-file growth. A broken encoder may keep
+    // draining raw input without producing encoded bytes, so FFmpeg
+    // back-pressure is not required to identify the GStreamer side as stuck.
+    let rawSinceLastGstreamerOutputAt = 0;
     const outputPath = String(gstreamerOutputPath || '').trim();
     const stopReasons = { ffmpeg: '', gstreamer: '' };
 
@@ -1623,6 +1629,9 @@ function runFfmpegToGstreamerJob({
         const now = Date.now();
         ffmpegRawBytes += Math.max(0, Number(chunk?.length) || 0);
         lastFfmpegRawAt = now;
+        if (!rawSinceLastGstreamerOutputAt) {
+          rawSinceLastGstreamerOutputAt = now;
+        }
         onBridgeProgress?.({ ffmpegRawBytes, gstreamerOutputBytes, lastFfmpegRawAt, lastGstreamerOutputAt });
       });
       gstreamer.stdin.on('error', () => {
@@ -1636,21 +1645,20 @@ function runFfmpegToGstreamerJob({
           if (outputBytes > gstreamerOutputBytes) {
             gstreamerOutputBytes = outputBytes;
             lastGstreamerOutputAt = now;
+            rawSinceLastGstreamerOutputAt = 0;
             onBridgeProgress?.({ ffmpegRawBytes, gstreamerOutputBytes, lastFfmpegRawAt, lastGstreamerOutputAt });
           }
           const ffmpegIdleMs = now - lastFfmpegRawAt;
           const gstreamerIdleMs = now - lastGstreamerOutputAt;
+          const rawWithoutEncodedProgressMs = rawSinceLastGstreamerOutputAt
+            ? now - rawSinceLastGstreamerOutputAt
+            : 0;
           let stalledProcess = '';
-          // Once FFmpeg has supplied any I420 bytes, a frozen GStreamer
-          // consumer can back-pressure its stdout and make FFmpeg appear
-          // idle. Prefer the missing encoded-file growth in that case so
-          // diagnostics point at the process that is actually blocking.
-          // An encoder is allowed to wait for its first keyframe while the
-          // Scene Graph renderer is still feeding sparse raw frames.  That is
-          // real end-to-end progress, not a GStreamer deadlock.  Once the
-          // consumer is actually frozen it back-pressures stdout, so FFmpeg
-          // becomes idle as well; require both signals before blaming GST.
-          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout && ffmpegIdleMs >= noProgressTimeout) {
+          // A broken encoder may continue draining raw input without
+          // producing encoded bytes, so FFmpeg back-pressure is not required.
+          // Start the output-stall clock when raw input first arrives after
+          // the last encoded-file growth.
+          if (outputPath && ffmpegRawBytes > 0 && rawWithoutEncodedProgressMs >= noProgressTimeout && gstreamerIdleMs >= noProgressTimeout) {
             stalledProcess = 'gstreamer';
           } else if (!ffmpegClosed && ffmpegIdleMs >= noProgressTimeout) {
             stalledProcess = 'ffmpeg';
@@ -1759,11 +1767,13 @@ function runJetsonNativeDecodeSceneEncodeJob({
     const reportMetrics = (final = false) => {
       const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
       const bytesPerFrame = Math.max(1, Number(frameSize) || 1);
+      const decodedFrames = Math.floor(counters.decodedBytes / bytesPerFrame);
+      const sceneFrames = Math.floor(counters.sceneBytes / bytesPerFrame);
       const decode = counters.decodedBytes / bytesPerFrame / elapsed;
       const scene = counters.sceneBytes / bytesPerFrame / elapsed;
       // renderer stdout is back-pressured by encoder.stdin; this is the rate
       // at which raw frames are actually accepted by nvv4l2, not a probe.
-      onStageMetrics?.({ decode, scene, encode: scene, total: scene, elapsed, final });
+      onStageMetrics?.({ decode, scene, encode: scene, total: scene, elapsed, decodedFrames, sceneFrames, final });
     };
     const children = () => [decoder, renderer, encoder].filter(Boolean);
     const stopAll = () => children().forEach((child) => { try { if (child.exitCode === null) child.kill('SIGKILL'); } catch {} });
@@ -1774,6 +1784,26 @@ function runJetsonNativeDecodeSceneEncodeJob({
       if (metricsTimer) clearInterval(metricsTimer);
       reportMetrics(true);
       onChild?.(null);
+      const bytesPerFrame = Math.max(1, Number(frameSize) || 1);
+      const decodedFrames = Math.floor(counters.decodedBytes / bytesPerFrame);
+      const sceneFrames = Math.floor(counters.sceneBytes / bytesPerFrame);
+      if (decodedFrames === 0 || sceneFrames === 0) {
+        const error = new Error(
+          `Jetson原生硬解没有产生视频帧：decodedFrames=${decodedFrames} / sceneFrames=${sceneFrames}；` +
+          `decoder stderr=${String(results.decoder.stderr || '-').replace(/\s+/g, ' ').trim().slice(-2500)}；` +
+          `renderer stderr=${String(results.renderer.stderr || '-').replace(/\s+/g, ' ').trim().slice(-2500)}；` +
+          `encoder stderr=${String(results.encoder.stderr || '-').replace(/\s+/g, ' ').trim().slice(-2500)}`
+        );
+        error.code = 'BR2K_JETSON_NATIVE_DECODE_EMPTY';
+        error.primaryProcess = decodedFrames === 0 ? 'decoder' : 'renderer';
+        error.decodedFrames = decodedFrames;
+        error.sceneFrames = sceneFrames;
+        error.decoderStderr = results.decoder.stderr;
+        error.rendererStderr = results.renderer.stderr;
+        error.encoderStderr = results.encoder.stderr;
+        reject(error);
+        return;
+      }
       // Once ffmpeg-full has rendered its requested duration it closes the
       // raw stdin; fdsink then reports EPIPE while the decoder is being torn
       // down. Renderer + encoder are the authoritative finite stages.

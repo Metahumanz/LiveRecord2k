@@ -57,6 +57,16 @@ test('CUDA Scene production gate rejects a report whose aggregate result hides a
   assert.match(result.reason, /像素差异超限/);
 });
 
+test('CUDA Scene production gate names failed visual-conformance presets', () => {
+  const report = passingReport();
+  report.passed = false;
+  report.cases.find((entry) => entry.preset === 'h5-card').passed = false;
+  report.cases.find((entry) => entry.preset === 'bubble').passed = false;
+  const result = validateCudaSceneConformance(report);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'visualConformance=h5-card,bubble failed');
+});
+
 test('服务仅加载已落盘的 CUDA 视觉通过报告', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-cuda-conformance-'));
   try {

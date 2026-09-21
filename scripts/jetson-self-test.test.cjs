@@ -61,6 +61,10 @@ test('Jetson end-to-end self-test always covers H.264/HEVC plans and both requir
   assert.match(serviceImplementation, /sourceToSceneFrames/);
   assert.match(serviceImplementation, /sceneToEncodeFrames/);
   assert.match(serviceImplementation, /sourceToEncodeFrames/);
+  const nativeHelper = fs.readFileSync(path.join(__dirname, '..', 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py'), 'utf8');
+  assert.match(nativeHelper, /scene_encode_pending = \{\}/);
+  assert.match(nativeHelper, /'pendingPeak': pts_pending_peak/);
+  assert.match(nativeHelper, /'pipelineFps': total/);
 });
 
 test('non-Jetson hosts never mark nvv4l2 as burn-ready', async () => {

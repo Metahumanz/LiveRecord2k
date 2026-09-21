@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +52,13 @@ struct TimelineEntry {
 
 struct SceneState {
   std::vector<TimelineEntry> entries;
+  std::vector<size_t> start_order;
+  std::vector<size_t> active_entries;
+  size_t next_start = 0;
+  double last_seconds = -1.0;
+  unsigned long long active_total = 0;
+  size_t active_peak = 0;
+  bool scheduler_trace = false;
   std::unordered_map<std::string, Texture> textures;
   double fps = 30.0;
   unsigned long long frame = 0;
@@ -232,14 +240,62 @@ static bool load_scene() {
       as_number(field[17]), as_number(field[18]), &existing->second};
     if (entry.end > entry.start) g_scene.entries.push_back(entry);
   }
+  g_scene.start_order.resize(g_scene.entries.size());
+  std::iota(g_scene.start_order.begin(), g_scene.start_order.end(), 0);
+  std::stable_sort(
+      g_scene.start_order.begin(),
+      g_scene.start_order.end(),
+      [](size_t a, size_t b) {
+        if (g_scene.entries[a].start != g_scene.entries[b].start)
+          return g_scene.entries[a].start < g_scene.entries[b].start;
+        return a < b;
+      });
+  g_scene.scheduler_trace = std::getenv("BR2K_CUDA_SCENE_SCHED_TRACE") &&
+      std::string(std::getenv("BR2K_CUDA_SCENE_SCHED_TRACE")) == "1";
   g_scene.ready = true;
   return true;
+}
+
+static void update_active_entries(double seconds) {
+  // A fresh pipeline normally advances monotonically.  Reset defensively if
+  // nvivafilter ever reuses this library after a seek or a segment restart.
+  if (g_scene.last_seconds >= 0.0 && seconds + 1e-9 < g_scene.last_seconds) {
+    g_scene.next_start = 0;
+    g_scene.active_entries.clear();
+  }
+  while (g_scene.next_start < g_scene.start_order.size()) {
+    const size_t index = g_scene.start_order[g_scene.next_start];
+    if (g_scene.entries[index].start > seconds) break;
+    auto pos = std::lower_bound(
+        g_scene.active_entries.begin(), g_scene.active_entries.end(), index);
+    g_scene.active_entries.insert(pos, index);
+    ++g_scene.next_start;
+  }
+  g_scene.active_entries.erase(
+      std::remove_if(
+          g_scene.active_entries.begin(), g_scene.active_entries.end(),
+          [seconds](size_t index) {
+            return g_scene.entries[index].end < seconds;
+          }),
+      g_scene.active_entries.end());
+  g_scene.active_total += g_scene.active_entries.size();
+  g_scene.active_peak = std::max(g_scene.active_peak, g_scene.active_entries.size());
+  g_scene.last_seconds = seconds;
+  if (g_scene.scheduler_trace && g_scene.frame % 600 == 0) {
+    std::fprintf(
+        stderr,
+        "br2k CUDA Scene scheduler: frame=%llu time=%.3f active=%zu peak=%zu next=%zu/%zu\n",
+        g_scene.frame, seconds, g_scene.active_entries.size(), g_scene.active_peak,
+        g_scene.next_start, g_scene.start_order.size());
+  }
 }
 
 static void gpu_process(EGLImageKHR image, void **) {
   std::lock_guard<std::mutex> guard(g_scene.lock);
   if (!g_scene.ready && !load_scene()) return;
-  const double seconds = (double)g_scene.frame++ / g_scene.fps;
+  const unsigned long long frame_index = g_scene.frame++;
+  const double seconds = (double)frame_index / g_scene.fps;
+  update_active_entries(seconds);
   // nvivafilter can invoke fGPUProcess from a worker thread different from
   // init(). Make the Runtime primary context current on this callback thread
   // before using the Driver API's EGL interop entry points. Without this,
@@ -283,8 +339,8 @@ static void gpu_process(EGLImageKHR image, void **) {
   }
   if (result == cudaSuccess) {
     const dim3 block(16, 16);
-    for (const TimelineEntry &entry : g_scene.entries) {
-      if (seconds < entry.start || seconds > entry.end) continue;
+    for (const size_t index : g_scene.active_entries) {
+      const TimelineEntry &entry = g_scene.entries[index];
       const double progress = std::min(1.0, std::max(0.0, (seconds - entry.start) / (entry.end - entry.start)));
       const int width = std::max(1, (int)std::lround(entry.width0 + (entry.width1 - entry.width0) * progress));
       const int height = std::max(1, (int)std::lround(entry.height0 + (entry.height1 - entry.height0) * progress));
@@ -319,9 +375,22 @@ static void gpu_process(EGLImageKHR image, void **) {
 extern "C" void init(CustomerFunction *functions) {
   cudaFree(0);
   g_scene.frame = 0;
+  g_scene.next_start = 0;
+  g_scene.active_entries.clear();
+  g_scene.last_seconds = -1.0;
+  g_scene.active_total = 0;
+  g_scene.active_peak = 0;
   functions->fGPUProcess = gpu_process;
   functions->fPreProcess = nullptr;
   functions->fPostProcess = nullptr;
 }
 
-extern "C" void deinit(void) {}
+extern "C" void deinit(void) {
+  std::lock_guard<std::mutex> guard(g_scene.lock);
+  if (!g_scene.scheduler_trace || !g_scene.frame) return;
+  const double average = (double)g_scene.active_total / (double)g_scene.frame;
+  std::fprintf(
+      stderr,
+      "br2k CUDA Scene scheduler: total entries=%zu peak active=%zu average active=%.3f frames=%llu\n",
+      g_scene.entries.size(), g_scene.active_peak, average, g_scene.frame);
+}

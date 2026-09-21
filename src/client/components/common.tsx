@@ -200,13 +200,23 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
     hasEta ? `预计剩余 ${formatCompactDuration(etaSeconds || 0)}` : isEstimating && phase !== 'verify' ? '正在估算' : ''
   ].filter(Boolean);
   const stageFps = progress.stageFps;
+  const isNativeNvmmPipeline = sceneRendererLabel.includes('CUDA Scene（NVMM）') || sceneRendererLabel.includes('CUDA Scene (NVMM)');
   const stageFpsLabel = stageFps
-    ? [
-        ['解码', stageFps.decode], ['Scene', stageFps.scene], ['编码', stageFps.encode], ['总计', stageFps.total]
-      ].filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
-        .map(([name, value]) => `${name} ${(value as number).toFixed((value as number) >= 10 ? 1 : 2)} fps`).join(' · ')
+    ? isNativeNvmmPipeline
+      ? [
+          ['NVMM管线', stageFps.pipelineFps ?? stageFps.total],
+          ['渲染', stageFps.scene]
+        ].filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+          .map(([name, value]) => `${name} ${(value as number).toFixed((value as number) >= 10 ? 1 : 2)} fps`).join(' · ')
+      : [
+          ['解码', stageFps.decode], ['Scene', stageFps.scene], ['编码', stageFps.encode], ['总计', stageFps.total]
+        ].filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+          .map(([name, value]) => `${name} ${(value as number).toFixed((value as number) >= 10 ? 1 : 2)} fps`).join(' · ')
     : '';
-  const rateDetails = [stageFpsLabel, renderFpsLabel, realtimeLabel].filter(Boolean);
+  const rateDetails = (isNativeNvmmPipeline
+    ? [stageFpsLabel, realtimeLabel]
+    : [stageFpsLabel, renderFpsLabel, realtimeLabel]
+  ).filter(Boolean);
   const avatarDiagnostics = progress.avatarDiagnostics;
   const avatarDiagnosticsLabel = avatarDiagnostics
     ? `头像 ${avatarDiagnostics.prepared}/${avatarDiagnostics.requested}，通用回退 ${avatarDiagnostics.fallback}（无源 ${
