@@ -882,10 +882,12 @@ def render_native_nvmm(request):
         decoded_timing = deque()
         decoded_pts_deltas = []
         last_decoded_pts = None
-        # Pair Scene and encoder buffers in streaming order.  Keeping the
-        # pending queue bounded avoids retaining/sorting several hundred
-        # thousand PTS values for a long recording.
+        # Pair Scene and encoder buffers in streaming order.  PTS keys can
+        # legally repeat, therefore every timestamp owns a FIFO bucket.
+        # Encoder matching consumes one Scene frame at a time while preserving
+        # streaming memory bounds.
         scene_encode_pending = {}
+        scene_encode_pending_count = 0
         pts_pending_peak = 0
         encode_unmatched = 0
         decoded_clock = {'first': None, 'last': None, 'frames': 0, 'restored': 0, 'unmatched': 0}
@@ -939,7 +941,7 @@ def render_native_nvmm(request):
             progress_report['last_wall_us'] = wall_now
             progress_report['last_media'] = media_seconds
         def count_buffer(_pad, info, key):
-            nonlocal pts_pending_peak, encode_unmatched, last_decoded_pts
+            nonlocal pts_pending_peak, encode_unmatched, last_decoded_pts, scene_encode_pending_count
             buffer = info.get_buffer()
             if not buffer:
                 return Gst.PadProbeReturn.OK
@@ -1041,21 +1043,30 @@ def render_native_nvmm(request):
                     pts_audit['sourceToSceneMaxDeltaNs'] = max(pts_audit['sourceToSceneMaxDeltaNs'], delta)
                     if delta > pts_tolerance_ns:
                         pts_audit['sourceToSceneMismatches'] += 1
-                scene_encode_pending[int(buffer.pts)] = source_pts_for_scene
-                pts_pending_peak = max(pts_pending_peak, len(scene_encode_pending))
+                scene_pts = int(buffer.pts)
+                bucket = scene_encode_pending.setdefault(scene_pts, deque())
+                bucket.append(source_pts_for_scene)
+                scene_encode_pending_count += 1
+                pts_pending_peak = max(pts_pending_peak, scene_encode_pending_count)
             counters[key] += 1
             if key == 'encode' and buffer.pts != Gst.CLOCK_TIME_NONE:
                 source_pts = None
                 scene_pts = None
                 encode_pts = int(buffer.pts)
+                matched_scene_pts = None
                 if encode_pts in scene_encode_pending:
-                    scene_pts = encode_pts
-                    source_pts = scene_encode_pending.pop(encode_pts)
+                    matched_scene_pts = encode_pts
                 elif scene_encode_pending:
                     nearest = min(scene_encode_pending, key=lambda value: abs(int(value) - encode_pts))
                     if abs(int(nearest) - encode_pts) <= pts_tolerance_ns:
-                        scene_pts = int(nearest)
-                        source_pts = scene_encode_pending.pop(nearest)
+                        matched_scene_pts = int(nearest)
+                if matched_scene_pts is not None:
+                    bucket = scene_encode_pending[matched_scene_pts]
+                    source_pts = bucket.popleft()
+                    scene_pts = matched_scene_pts
+                    scene_encode_pending_count -= 1
+                    if not bucket:
+                        del scene_encode_pending[matched_scene_pts]
                 if scene_pts is not None:
                     delta = abs(encode_pts - scene_pts)
                     pts_audit['sceneToEncodeFrames'] += 1
@@ -1112,8 +1123,13 @@ def render_native_nvmm(request):
             pipeline.set_state(Gst.State.NULL)
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
-        pending_remaining = len(scene_encode_pending)
-        pending_source_remaining = sum(1 for source_pts in scene_encode_pending.values() if source_pts is not None)
+        pending_remaining = scene_encode_pending_count
+        pending_source_remaining = sum(
+            1
+            for bucket in scene_encode_pending.values()
+            for source_pts in bucket
+            if source_pts is not None
+        )
         # Any Scene frame still waiting at EOS or encoder frame without a
         # Scene counterpart is a concrete coverage failure, not a reason to
         # retain the whole PTS history.

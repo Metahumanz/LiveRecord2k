@@ -68,6 +68,11 @@ test('native NVMM lead keeps the source timestamp basis and stops on the request
   assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\) \+ 1\)/);
   assert.match(helper, /reached_pts_budget = leading_video_frames <= 0 and buffer\.pts >= target_pts/);
   assert.match(helper, /scene_encode_pending = \{\}/);
+  assert.match(helper, /scene_encode_pending\.setdefault\(scene_pts, deque\(\)\)/);
+  assert.match(helper, /bucket\.append\(source_pts_for_scene\)/);
+  assert.match(helper, /source_pts = bucket\.popleft\(\)/);
+  assert.match(helper, /if not bucket:\s+del scene_encode_pending\[matched_scene_pts\]/);
+  assert.match(helper, /pending_remaining = scene_encode_pending_count/);
   assert.match(helper, /nearest = min\(scene_encode_pending/);
   assert.match(helper, /sceneCoverageSec/);
   assert.match(helper, /encodeCoverageSec/);
@@ -75,6 +80,25 @@ test('native NVMM lead keeps the source timestamp basis and stops on the request
   assert.match(helper, /coverage_tolerance_ns = max\(observed_frame_ns \* 3, 50_000_000\)/);
   assert.doesNotMatch(helper, /full_duration_frames and source_scene_ok/);
   assert.match(helper, /leading_video_frames or measured_media_seconds <= 0/);
+});
+
+test('duplicate Scene PTS values are preserved as separate pending frames', () => {
+  const pending = new Map();
+
+  const push = (pts, sourcePts) => {
+    const bucket = pending.get(pts) || [];
+    bucket.push(sourcePts);
+    pending.set(pts, bucket);
+  };
+
+  push(1000, 1000);
+  push(1000, 1000);
+
+  assert.equal(pending.get(1000).length, 2);
+  assert.equal(pending.get(1000).shift(), 1000);
+  assert.equal(pending.get(1000).length, 1);
+  assert.equal(pending.get(1000).shift(), 1000);
+  assert.equal(pending.get(1000).length, 0);
 });
 
 test('GPU Scene helper is rejected unless it declares every Scene Graph primitive', () => {
