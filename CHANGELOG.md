@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.8.3 - 2026-09-21
+
+- 修复 Jetson `FFmpeg → GStreamer` bridge 的停滞检测：即使 FFmpeg 仍持续提供 raw 数据、编码器却不再增长输出文件，也会在完整超时周期后准确归因于 GStreamer，并清理两端子进程返回明确错误。
+- 修复 NVMM Scene→Encode 的重复 PTS 覆盖：相同时间戳现在按 FIFO 逐帧匹配，`pendingPeak` 与 `pendingRemaining` 按真实待匹配帧数统计，避免长任务 PTS 审计误判。
+- 收敛 package 测试入口与超时保护，stall 回归测试增加 5 秒级超时和子进程清理校验，降低发布检查被无限挂起的风险。
+
 ## 0.8.2 - 2026-09-20
 
 - 重构导出进度与 ETA：准备、渲染、封装、验证分别维护阶段时钟，渲染 ETA 仅使用媒体时间采样与 EWMA，不再用总任务耗时或阶段 FPS 反推剩余时间。
