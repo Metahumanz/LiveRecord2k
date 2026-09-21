@@ -63,7 +63,7 @@ const GROUPS = {
 const GROUP_OPTIONS = {
   quick: { concurrency: 4, timeoutMs: 60_000 },
   integration: { concurrency: 2, timeoutMs: 120_000 },
-  package: { concurrency: 1, timeoutMs: 120_000 },
+  package: { concurrency: 1, timeoutMs: 60_000 },
   hardware: { concurrency: 1, timeoutMs: 120_000 }
 };
 

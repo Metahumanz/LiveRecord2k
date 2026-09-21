@@ -1489,6 +1489,11 @@ function runFfmpegToGstreamerJob({
     let gstreamerOutputBytes = 0;
     let lastFfmpegRawAt = Date.now();
     let lastGstreamerOutputAt = Date.now();
+    // Start the encoder-stall clock only when a new raw-data burst arrives
+    // after the last observed encoded-file growth. A broken encoder may keep
+    // draining raw input without producing encoded bytes, so FFmpeg
+    // back-pressure is not required to identify the GStreamer side as stuck.
+    let rawSinceLastGstreamerOutputAt = 0;
     const outputPath = String(gstreamerOutputPath || '').trim();
     const stopReasons = { ffmpeg: '', gstreamer: '' };
 
@@ -1624,6 +1629,9 @@ function runFfmpegToGstreamerJob({
         const now = Date.now();
         ffmpegRawBytes += Math.max(0, Number(chunk?.length) || 0);
         lastFfmpegRawAt = now;
+        if (!rawSinceLastGstreamerOutputAt) {
+          rawSinceLastGstreamerOutputAt = now;
+        }
         onBridgeProgress?.({ ffmpegRawBytes, gstreamerOutputBytes, lastFfmpegRawAt, lastGstreamerOutputAt });
       });
       gstreamer.stdin.on('error', () => {
@@ -1637,21 +1645,20 @@ function runFfmpegToGstreamerJob({
           if (outputBytes > gstreamerOutputBytes) {
             gstreamerOutputBytes = outputBytes;
             lastGstreamerOutputAt = now;
+            rawSinceLastGstreamerOutputAt = 0;
             onBridgeProgress?.({ ffmpegRawBytes, gstreamerOutputBytes, lastFfmpegRawAt, lastGstreamerOutputAt });
           }
           const ffmpegIdleMs = now - lastFfmpegRawAt;
           const gstreamerIdleMs = now - lastGstreamerOutputAt;
+          const rawWithoutEncodedProgressMs = rawSinceLastGstreamerOutputAt
+            ? now - rawSinceLastGstreamerOutputAt
+            : 0;
           let stalledProcess = '';
-          // Once FFmpeg has supplied any I420 bytes, a frozen GStreamer
-          // consumer can back-pressure its stdout and make FFmpeg appear
-          // idle. Prefer the missing encoded-file growth in that case so
-          // diagnostics point at the process that is actually blocking.
-          // An encoder is allowed to wait for its first keyframe while the
-          // Scene Graph renderer is still feeding sparse raw frames.  That is
-          // real end-to-end progress, not a GStreamer deadlock.  Once the
-          // consumer is actually frozen it back-pressures stdout, so FFmpeg
-          // becomes idle as well; require both signals before blaming GST.
-          if (outputPath && (ffmpegRawBytes > 0 || ffmpegClosed) && gstreamerIdleMs >= noProgressTimeout && ffmpegIdleMs >= noProgressTimeout) {
+          // A broken encoder may continue draining raw input without
+          // producing encoded bytes, so FFmpeg back-pressure is not required.
+          // Start the output-stall clock when raw input first arrives after
+          // the last encoded-file growth.
+          if (outputPath && ffmpegRawBytes > 0 && rawWithoutEncodedProgressMs >= noProgressTimeout && gstreamerIdleMs >= noProgressTimeout) {
             stalledProcess = 'gstreamer';
           } else if (!ffmpegClosed && ffmpegIdleMs >= noProgressTimeout) {
             stalledProcess = 'ffmpeg';

@@ -1030,15 +1030,17 @@ test('FFmpeg-to-GStreamer bridge never presents an Argus-only GStreamer message 
   assert.doesNotMatch(captured?.message || '', /GStreamer：[^；]*nvargus-daemon/);
 });
 
-test('FFmpeg-to-GStreamer bridge aborts an FFmpeg that produces no I420 data', async () => {
+test('FFmpeg-to-GStreamer bridge aborts an FFmpeg that produces no I420 data', { timeout: 5_000 }, async () => {
   let captured = null;
+  const children = [];
   try {
     await runFfmpegToGstreamerJob({
       ffmpegPath: process.execPath,
       ffmpegArgs: ['-e', "setInterval(() => {}, 1000);"],
       gstreamerPath: process.execPath,
       gstreamerArgs: ['-e', "process.stdin.resume(); setInterval(() => {}, 1000);"],
-      noProgressTimeoutMs: 300
+      noProgressTimeoutMs: 300,
+      onChild: (child) => children.push(child)
     });
     assert.fail('预期没有 I420 数据会触发 FFmpeg 卡死保护。');
   } catch (error) {
@@ -1047,11 +1049,13 @@ test('FFmpeg-to-GStreamer bridge aborts an FFmpeg that produces no I420 data', a
   assert.equal(captured?.code, 'BR2K_JETSON_FFMPEG_STALL');
   assert.equal(captured?.primaryProcess, 'ffmpeg');
   assert.match(captured?.message || '', /FFmpeg 未输出 I420 视频数据/);
+  assert.equal(children.at(-1), null);
 });
 
-test('FFmpeg-to-GStreamer bridge points to GStreamer when raw data flows but encoded output stops growing', async () => {
+test('FFmpeg-to-GStreamer bridge points to GStreamer when raw data flows but encoded output stops growing', { timeout: 5_000 }, async () => {
   const outputPath = path.join(os.tmpdir(), `br2k-bridge-stall-${process.pid}-${Date.now()}.h264`);
   let captured = null;
+  const children = [];
   try {
     await runFfmpegToGstreamerJob({
       ffmpegPath: process.execPath,
@@ -1059,7 +1063,8 @@ test('FFmpeg-to-GStreamer bridge points to GStreamer when raw data flows but enc
       gstreamerPath: process.execPath,
       gstreamerArgs: ['-e', "process.stdin.resume(); setInterval(() => {}, 1000);"],
       gstreamerOutputPath: outputPath,
-      noProgressTimeoutMs: 300
+      noProgressTimeoutMs: 300,
+      onChild: (child) => children.push(child)
     });
     assert.fail('预期没有编码输出会触发 GStreamer 卡死保护。');
   } catch (error) {
@@ -1070,6 +1075,7 @@ test('FFmpeg-to-GStreamer bridge points to GStreamer when raw data flows but enc
   assert.equal(captured?.code, 'BR2K_JETSON_GSTREAMER_STALL');
   assert.equal(captured?.primaryProcess, 'gstreamer');
   assert.match(captured?.message || '', /GStreamer 未生成编码视频数据/);
+  assert.equal(children.at(-1), null);
 });
 
 test('root updater refuses to append through a symbolic-link log target', { skip: process.platform !== 'linux' }, async () => {
