@@ -11,7 +11,9 @@ Debian/Ubuntu x64 或 ARM64：下载架构匹配的 \`.deb\` 后运行 \`sudo ap
 
 Linux 包会安装 systemd 主服务和独立的受控更新服务。官方自动更新必须通过 Ed25519 签名验证；自定义更新源不会交给 root 自动安装。
 
-Linux 一键安装：\`curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh\``;
+Linux 一键安装：\`curl -fsSL https://raw.githubusercontent.com/Metahumanz/LiveRecord2k/main/scripts/install-linux.sh | sudo sh\`
+
+Jetson：ARM64 安装包不会安装或替换 JetPack/L4T；CUDA Scene 和 nvv4l2 加速仅在设备现有 NVIDIA 运行环境通过能力测试后启用。`;
 
 function normalizeVersionFromTag(tag) {
   const version = String(tag || '').trim().replace(/^v/, '');

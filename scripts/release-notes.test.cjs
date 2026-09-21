@@ -22,6 +22,8 @@ test('release notes include only the matching changelog entry and installation n
   assert.doesNotMatch(notes, /旧版本内容/);
   assert.match(notes, /^## 安装说明/m);
   assert.match(notes, /bili-record-2k-setup\.exe/);
+  assert.match(notes, /Jetson：ARM64 安装包不会安装或替换 JetPack\/L4T/);
+  assert.match(notes, /现有 NVIDIA 运行环境通过能力测试后启用/);
 });
 
 test('release notes reject a missing or invalid version', () => {

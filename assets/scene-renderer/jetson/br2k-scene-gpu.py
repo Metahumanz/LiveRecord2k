@@ -1,11 +1,11 @@
 #!/usr/bin/python3
 """BiliRecord2K GPU Scene Graph renderer for Jetson.
 
-The helper reads I420 frames from stdin, composes cached Scene Graph textures
-with GStreamer's GL mixer, then hands I420 to nvvidconv/nvv4l2 for hardware
-encoding.  It intentionally accepts a JSON request file rather than command
-fragments.  The Node service stays responsible for downloading avatars and
-for final audio muxing.
+The helper supports both the compatible I420/GStreamer Scene path and the
+production qtdemux -> nvv4l2decoder -> NVMM -> nvivafilter CUDA Scene ->
+nvv4l2 encoder path.  It intentionally accepts a JSON request file rather
+than command fragments.  The Node service stays responsible for Scene
+requests, avatar/texture resources, and final audio muxing.
 """
 
 import argparse
@@ -644,8 +644,8 @@ def decode_native(args):
     """Seek and decode one finite source range through Jetson NVDEC.
 
     gst-launch has no command-line equivalent for GstElement.seek_simple().
-    Keeping this tiny helper beside the Scene renderer lets every 20-second
-    export chunk begin at its real timeline position while retaining
+    Keeping this tiny helper beside the Scene renderer lets every finite
+    source range begin at its real timeline position while retaining
     qtdemux -> parser -> nvv4l2decoder -> nvvidconv as the decoder path.
     Raw frames leave only via the inherited fd requested by Node; no raw file
     is ever materialised on disk.
@@ -920,7 +920,7 @@ def render_native_nvmm(request):
             # unsuitable for finite-chunk progress. Scene frame count is the
             # authoritative media clock for this fixed-rate renderer.
             media_seconds = max(0.0, min(duration, counters['scene'] / max(1.0, fps)))
-            # A fast Orin can finish a 20-second chunk in a few seconds.  Keep
+            # A fast Orin can finish a finite source range in a few seconds. Keep
             # the UI responsive without emitting one JSON line per frame.
             if media_seconds <= progress_report['last_media'] + 0.01 or wall_now - progress_report['last_wall_us'] < 250000:
                 return
