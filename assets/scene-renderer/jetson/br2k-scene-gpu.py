@@ -15,6 +15,7 @@ import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -879,13 +880,16 @@ def render_native_nvmm(request):
         # clocks. Therefore this bridge validates frame coverage but leaves
         # the authoritative decoder PTS intact for the encoder and muxer.
         decoded_timing = deque()
+        decoded_pts_deltas = []
+        last_decoded_pts = None
         # Pair Scene and encoder buffers in streaming order.  Keeping the
         # pending queue bounded avoids retaining/sorting several hundred
         # thousand PTS values for a long recording.
-        scene_encode_pending = deque()
+        scene_encode_pending = {}
         pts_pending_peak = 0
         encode_unmatched = 0
         decoded_clock = {'first': None, 'last': None, 'frames': 0, 'restored': 0, 'unmatched': 0}
+        scene_clock = {'first': None, 'last': None, 'last_duration': None}
         pts_tolerance_ns = max(2_000_000, int(Gst.SECOND / max(1.0, fps) * 0.25))
         pts_audit = {
             'sourceToSceneFrames': 0, 'sourceToSceneMismatches': 0, 'sourceToSceneMaxDeltaNs': 0,
@@ -935,7 +939,7 @@ def render_native_nvmm(request):
             progress_report['last_wall_us'] = wall_now
             progress_report['last_media'] = media_seconds
         def count_buffer(_pad, info, key):
-            nonlocal pts_pending_peak, encode_unmatched
+            nonlocal pts_pending_peak, encode_unmatched, last_decoded_pts
             buffer = info.get_buffer()
             if not buffer:
                 return Gst.PadProbeReturn.OK
@@ -975,6 +979,11 @@ def render_native_nvmm(request):
                 if decoded_clock['first'] is None:
                     decoded_clock['first'] = buffer.pts
                 decoded_clock['last'] = buffer.pts
+                if last_decoded_pts is not None and len(decoded_pts_deltas) < 64:
+                    delta = int(buffer.pts) - int(last_decoded_pts)
+                    if delta > 0:
+                        decoded_pts_deltas.append(delta)
+                last_decoded_pts = buffer.pts
             if key == 'scene' and buffer.pts == Gst.CLOCK_TIME_NONE and counters['scene'] >= requested_frame_count:
                 # A timestamp-less buffer is not expected from NVDEC, but do
                 # not leave an abnormal pipeline running forever.  This is
@@ -1007,6 +1016,9 @@ def render_native_nvmm(request):
                 # every chunk contains its requested media duration.
                 if scene_first_pts['value'] is None:
                     scene_first_pts['value'] = buffer.pts
+                scene_clock['first'] = scene_clock['first'] if scene_clock['first'] is not None else buffer.pts
+                scene_clock['last'] = buffer.pts
+                scene_clock['last_duration'] = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE and buffer.duration > 0 else None
                 emit_progress(buffer)
                 target_pts = scene_first_pts['value'] + int(duration * Gst.SECOND)
                 # NVDEC can negotiate a stream rate that differs slightly
@@ -1029,13 +1041,22 @@ def render_native_nvmm(request):
                     pts_audit['sourceToSceneMaxDeltaNs'] = max(pts_audit['sourceToSceneMaxDeltaNs'], delta)
                     if delta > pts_tolerance_ns:
                         pts_audit['sourceToSceneMismatches'] += 1
-                scene_encode_pending.append((source_pts_for_scene, int(buffer.pts)))
+                scene_encode_pending[int(buffer.pts)] = source_pts_for_scene
                 pts_pending_peak = max(pts_pending_peak, len(scene_encode_pending))
             counters[key] += 1
             if key == 'encode' and buffer.pts != Gst.CLOCK_TIME_NONE:
-                if scene_encode_pending:
-                    source_pts, scene_pts = scene_encode_pending.popleft()
-                    encode_pts = int(buffer.pts)
+                source_pts = None
+                scene_pts = None
+                encode_pts = int(buffer.pts)
+                if encode_pts in scene_encode_pending:
+                    scene_pts = encode_pts
+                    source_pts = scene_encode_pending.pop(encode_pts)
+                elif scene_encode_pending:
+                    nearest = min(scene_encode_pending, key=lambda value: abs(int(value) - encode_pts))
+                    if abs(int(nearest) - encode_pts) <= pts_tolerance_ns:
+                        scene_pts = int(nearest)
+                        source_pts = scene_encode_pending.pop(nearest)
+                if scene_pts is not None:
                     delta = abs(encode_pts - scene_pts)
                     pts_audit['sceneToEncodeFrames'] += 1
                     pts_audit['sceneToEncodeMaxDeltaNs'] = max(
@@ -1092,7 +1113,7 @@ def render_native_nvmm(request):
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
         pending_remaining = len(scene_encode_pending)
-        pending_source_remaining = sum(1 for source_pts, _scene_pts in scene_encode_pending if source_pts is not None)
+        pending_source_remaining = sum(1 for source_pts in scene_encode_pending.values() if source_pts is not None)
         # Any Scene frame still waiting at EOS or encoder frame without a
         # Scene counterpart is a concrete coverage failure, not a reason to
         # retain the whole PTS history.
@@ -1116,7 +1137,17 @@ def render_native_nvmm(request):
         # the finite media interval in frames too, otherwise the first chunk
         # would silently omit its black lead and make audio lead video.
         minimum_frames = max(1, int(math.ceil(duration * fps)) - 2)
-        full_duration_frames = counters['encode'] >= minimum_frames
+        observed_frame_ns = int(statistics.median(decoded_pts_deltas)) if decoded_pts_deltas else max(1, int(Gst.SECOND / max(1.0, fps)))
+        coverage_tolerance_ns = max(observed_frame_ns * 3, 50_000_000)
+        requested_duration_ns = int(max(0.0, duration) * Gst.SECOND)
+        scene_end = None
+        if scene_clock['last'] is not None:
+            scene_end = int(scene_clock['last']) + int(scene_clock['last_duration'] or observed_frame_ns)
+        encode_end = int(encoded_pts['end']) if encoded_pts['end'] is not None else None
+        scene_coverage_ns = max(0, int(scene_end - scene_clock['first'])) if scene_end is not None and scene_clock['first'] is not None else 0
+        encode_coverage_ns = max(0, int(encode_end - encoded_pts['first'])) if encode_end is not None and encoded_pts['first'] is not None else 0
+        scene_coverage_ok = scene_coverage_ns + coverage_tolerance_ns >= requested_duration_ns
+        encode_coverage_ok = encode_coverage_ns + coverage_tolerance_ns >= requested_duration_ns
         source_scene_ok = (
             pts_audit['sourceToSceneMismatches'] == 0 and
             pts_audit['sourceToSceneFrames'] >= max(0, expected_restored - 2)
@@ -1132,7 +1163,7 @@ def render_native_nvmm(request):
         timing_ok = (
             decoded_clock['unmatched'] == 0 and
             decoded_clock['restored'] >= max(0, expected_restored - 2) and
-            full_duration_frames and source_scene_ok and scene_encode_ok and source_encode_ok and
+            scene_coverage_ok and encode_coverage_ok and source_scene_ok and scene_encode_ok and source_encode_ok and
             pending_remaining == 0 and encode_unmatched == 0
         )
         if output_container == 'mkv' and not timing_ok:
@@ -1165,7 +1196,13 @@ def render_native_nvmm(request):
                 'sourceToEncodeMaxDeltaSec': source_encode_max_delta_ns / Gst.SECOND,
                 'pendingPeak': pts_pending_peak,
                 'pendingRemaining': pending_remaining,
-                'unmatchedEncodeFrames': encode_unmatched
+                'unmatchedEncodeFrames': encode_unmatched,
+                'sceneCoverageSec': scene_coverage_ns / Gst.SECOND,
+                'encodeCoverageSec': encode_coverage_ns / Gst.SECOND,
+                'requestedDurationSec': requested_duration_ns / Gst.SECOND,
+                'coverageToleranceSec': coverage_tolerance_ns / Gst.SECOND,
+                'observedFrameDurationSec': observed_frame_ns / Gst.SECOND,
+                'diagnosticMinimumFrames': minimum_frames
             }
         }
     finally:

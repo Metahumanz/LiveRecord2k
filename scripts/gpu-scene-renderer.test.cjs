@@ -67,7 +67,13 @@ test('native NVMM lead keeps the source timestamp basis and stops on the request
   assert.match(helper, /concat name=timeline_lead adjust-base=false/);
   assert.match(helper, /requested_frame_count = max\(1, int\(math\.ceil\(duration \* fps\)\) \+ 1\)/);
   assert.match(helper, /reached_pts_budget = leading_video_frames <= 0 and buffer\.pts >= target_pts/);
-  assert.match(helper, /scene_encode_pending = deque\(\)/);
+  assert.match(helper, /scene_encode_pending = \{\}/);
+  assert.match(helper, /nearest = min\(scene_encode_pending/);
+  assert.match(helper, /sceneCoverageSec/);
+  assert.match(helper, /encodeCoverageSec/);
+  assert.match(helper, /observedFrameDurationSec/);
+  assert.match(helper, /coverage_tolerance_ns = max\(observed_frame_ns \* 3, 50_000_000\)/);
+  assert.doesNotMatch(helper, /full_duration_frames and source_scene_ok/);
   assert.match(helper, /leading_video_frames or measured_media_seconds <= 0/);
 });
 
