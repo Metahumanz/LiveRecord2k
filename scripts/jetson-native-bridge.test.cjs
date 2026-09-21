@@ -57,3 +57,23 @@ test('Jetson export contract validates the intermediate MKV and retries empty na
   assert.match(serviceSource, /gpuSceneRenderer\?\.available && gpuSceneRenderer\.helper/);
   assert.match(serviceSource, /Jetson nvv4l2decoder 未产生有效帧，已切换 CPU 解码/);
 });
+
+test('Jetson native admission preflights a real source and never restarts a committed long run', () => {
+  const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'app', 'service.cjs'), 'utf8');
+  assert.match(serviceSource, /probeJetsonNativeSceneForSource/);
+  assert.match(serviceSource, /native-preflight\.json/);
+  assert.match(serviceSource, /native-preflight\.mkv/);
+  assert.match(serviceSource, /BR2K_FORCE_NATIVE_PREFLIGHT_FAIL/);
+  assert.match(serviceSource, /BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT/);
+  assert.match(serviceSource, /NATIVE_EARLY_FALLBACK_SEC = 5/);
+  assert.match(serviceSource, /正式导出使用连续NVMM链路/);
+  assert.match(serviceSource, /本次导出从开始即使用兼容链/);
+});
+
+test('Scene Graph stderr folds repeated font fallback warnings without hiding fatal errors', () => {
+  const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'app', 'service.cjs'), 'utf8');
+  assert.match(serviceSource, /sceneFontFallbackWarnings/);
+  assert.match(serviceSource, /缺少字体fallback/);
+  assert.match(serviceSource, /已折叠/);
+  assert.match(serviceSource, /if \(\/error\|failed\|invalid\/i\.test\(line\)\)/);
+});

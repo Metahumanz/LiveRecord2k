@@ -235,6 +235,7 @@ const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('..
 const { createAss } = require('../danmaku/ass.cjs');
 
 const LEGACY_ASS_SCENE_PRESETS = new Set(['h5-card', 'bubble', 'minimal']);
+const NATIVE_EARLY_FALLBACK_SEC = 5;
 
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -11356,11 +11357,142 @@ try {
     });
   }
 
+  async probeJetsonNativeSceneForSource({
+    graph,
+    cleanPath,
+    codec,
+    sourceCodec,
+    crf,
+    fps,
+    width,
+    height,
+    startTime,
+    duration,
+    temporaryDir,
+    decoder,
+    label = 'Jetson CUDA Scene',
+    onPreparing,
+    onStage
+  } = {}) {
+    const probeDuration = Math.min(5, Math.max(0.001, Number(duration) || 0.001));
+    const probeStart = Math.max(0, Number(startTime) || 0);
+    const requestPath = path.join(temporaryDir, 'native-preflight.json');
+    const outputPath = path.join(temporaryDir, 'native-preflight.mkv');
+    let metrics = null;
+    try {
+      if (process.env.BR2K_FORCE_NATIVE_PREFLIGHT_FAIL === '1' && process.env.NODE_ENV === 'test') {
+        return { ok: false, reason: 'BR2K_FORCE_NATIVE_PREFLIGHT_FAIL=1', metrics: null, durationSec: probeDuration };
+      }
+      const renderer = this.ffmpegCapabilities?.sceneGpuRenderer;
+      if (!renderer?.available || renderer.backend !== 'cuda-gstreamer' || !renderer.helper) {
+        return { ok: false, reason: 'GPU Scene helper 未通过 runtime probe。', metrics: null, durationSec: probeDuration };
+      }
+      if (!cleanPath || !isJetsonGstreamerCodec(codec)) {
+        return { ok: false, reason: '缺少真实 clean 源或 Jetson 硬编参数。', metrics: null, durationSec: probeDuration };
+      }
+      const probeGraph = clipSceneGraph(graph, 0, probeDuration, { shiftTime: true });
+      const request = createGpuSceneRenderRequest(probeGraph, {
+        backend: 'cuda-gstreamer',
+        inputPath: cleanPath,
+        outputPath,
+        codec,
+        width,
+        height,
+        fps,
+        duration: probeDuration,
+        timelineOffsetSec: 0,
+        decoder: String(decoder?.value || decoder || 'gstreamer-nvv4l2'),
+        container: 'mkv'
+      });
+      request.input.startTime = probeStart;
+      request.input.codec = String(sourceCodec || '').toLowerCase();
+      await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
+      onStage?.('正在验证 Jetson CUDA Scene（5秒真实样本）');
+      let stdoutRemainder = '';
+      const consumeLine = (line) => {
+        let parsed;
+        try { parsed = JSON.parse(line); } catch { return; }
+        if (parsed?.nativeNvmmPreparing && typeof parsed.nativeNvmmPreparing === 'object') {
+          onPreparing?.(parsed.nativeNvmmPreparing);
+        }
+        if (parsed?.nativeNvmmProgress && typeof parsed.nativeNvmmProgress === 'object') {
+          onStage?.('正在验证 Jetson CUDA Scene（5秒真实样本）');
+        }
+      };
+      const result = await runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
+        timeoutMs: Math.max(30_000, Math.ceil(probeDuration * 10_000)),
+        maxOutputBytes: 256 * 1024,
+        onStdout: (chunk) => {
+          stdoutRemainder += chunk;
+          const lines = stdoutRemainder.split(/\r?\n/);
+          stdoutRemainder = lines.pop() || '';
+          for (const line of lines) consumeLine(line);
+        }
+      });
+      if (stdoutRemainder) consumeLine(stdoutRemainder);
+      for (const line of String(result.stdout || '').trim().split(/\r?\n/).reverse()) {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.nativeNvmmMetrics && typeof parsed.nativeNvmmMetrics === 'object') {
+            metrics = parsed.nativeNvmmMetrics;
+            break;
+          }
+        } catch {
+          // Helper diagnostics are intentionally ignored until the structured
+          // metrics line is available.
+        }
+      }
+      if (result.status !== 0 || result.error || result.timedOut) {
+        return {
+          ok: false,
+          reason: compactLogLine(result.stderr || result.stdout || result.error?.message || '真实源 CUDA Scene helper 失败。'),
+          metrics,
+          durationSec: probeDuration
+        };
+      }
+      const bridge = metrics?.ptsBridge || {};
+      const mismatches = [
+        ['source→Scene', bridge.sourceToSceneMismatches],
+        ['Scene→编码', bridge.sceneToEncodeMismatches],
+        ['source→编码', bridge.sourceToEncodeMismatches]
+      ].filter(([, value]) => Number(value || 0) > 0);
+      if (!metrics || !Number.isFinite(Number(metrics.pipelineFps)) || Number(metrics.pipelineFps) <= 0) {
+        return { ok: false, reason: '真实源预检没有返回有效 pipelineFps。', metrics, durationSec: probeDuration };
+      }
+      if (bridge.ok !== true || Number(bridge.pendingRemaining || 0) !== 0 || Number(bridge.unmatchedEncodeFrames || 0) !== 0 || mismatches.length) {
+        return {
+          ok: false,
+          reason: `真实源 PTS bridge 未通过：${mismatches.map(([name, value]) => `${name} ${value} 个偏差`).join('；') || `bridge=${bridge.ok ? '通过' : '失败'}，pending=${bridge.pendingRemaining || 0}，unmatched=${bridge.unmatchedEncodeFrames || 0}`}`,
+          metrics,
+          durationSec: probeDuration
+        };
+      }
+      const encodedSize = await getFileSize(outputPath);
+      if (encodedSize < 1024) {
+        return { ok: false, reason: `真实源预检 MKV 无效：文件仅 ${encodedSize} 字节。`, metrics, durationSec: probeDuration };
+      }
+      const encodedInfo = await probeMediaFileInfo(this.ffmpegPath, outputPath, { timeoutMs: 10_000 });
+      if (!encodedInfo?.videoInfo) {
+        return { ok: false, reason: '真实源预检 MKV 没有可读取的视频流。', metrics, durationSec: probeDuration };
+      }
+      return { ok: true, metrics, durationSec: probeDuration };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: compactLogLine(error?.message || String(error) || '真实源 CUDA Scene 预检失败。'),
+        metrics,
+        durationSec: probeDuration
+      };
+    } finally {
+      await Promise.all([requestPath, outputPath].map((file) => fsp.rm(file, { force: true }).catch(() => {})));
+    }
+  }
+
   async runChunkedJetsonSceneGraphExport({
     graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
     leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
-    onStderr, onChild, onProgress, onPreparing, onPhase, onStage, isCancelled, label
+    onStderr, onChild, onProgress, onPreparing, onPhase, onStage, onNativePreflight, isCancelled, label
   }) {
     const chunkPaths = [];
     const chunkDurations = [];
@@ -11372,8 +11504,39 @@ try {
     );
     const gpuSceneRenderer = this.ffmpegCapabilities?.sceneGpuRenderer;
     this.logCudaSceneAdmission(cudaSceneAdmission, gpuSceneRenderer);
-    const useCudaSceneRenderer = cudaSceneAdmission.ok;
-    const nativeDecoderPath = gpuSceneRenderer?.available && gpuSceneRenderer.helper
+    const nativeCandidate = cudaSceneAdmission.ok && decoder?.value === 'gstreamer-nvv4l2' &&
+      Boolean(gpuSceneRenderer?.nativeNvmmScene);
+    let nativePreflight = null;
+    if (nativeCandidate) {
+      onPhase?.('prepare', { force: true });
+      nativePreflight = await this.probeJetsonNativeSceneForSource({
+        graph,
+        cleanPath,
+        codec,
+        sourceCodec,
+        crf,
+        fps,
+        width,
+        height,
+        startTime,
+        duration,
+        temporaryDir,
+        decoder,
+        label,
+        onPreparing,
+        onStage
+      });
+      onNativePreflight?.(nativePreflight);
+      if (nativePreflight.ok) {
+        this.log('info', `${label}真实源预检通过：${nativePreflight.durationSec.toFixed(2)}s，${Number(nativePreflight.metrics?.pipelineFps || 0).toFixed(1)}fps，PTS bridge通过；正式导出使用连续NVMM链路。`);
+      } else {
+        this.log('warn', `${label}真实源预检失败：${nativePreflight.reason}；本次导出从开始即使用兼容链。`);
+      }
+      onPhase?.('render', { force: true });
+    }
+    const nativeTimestampedAdmission = nativePreflight?.ok === true;
+    const useCudaSceneRenderer = cudaSceneAdmission.ok && (!nativeCandidate || nativeTimestampedAdmission);
+    const nativeDecoderPath = nativeTimestampedAdmission && gpuSceneRenderer?.available && gpuSceneRenderer.helper
       ? gpuSceneRenderer.helper
       : '';
     // A concat pass has one timestamp contract.  Native NVMM and I420
@@ -11381,8 +11544,6 @@ try {
     // renderer's frame clock instead of reconstructing it from a rounded fps.
     // Never alternate a timestamped pass with an elementary fallback within
     // one output, or later chunks will steadily pull audio ahead of video.
-    const nativeTimestampedAdmission = useCudaSceneRenderer && decoder?.value === 'gstreamer-nvv4l2' &&
-      Boolean(this.ffmpegCapabilities?.sceneGpuRenderer?.nativeNvmmScene);
     // Native NVMM keeps one media clock for the entire export. The historical
     // 20s loop remains only for the CPU/I420 compatibility path; splitting a
     // timestamped NVDEC stream would make every concat boundary a new clock.
@@ -11440,6 +11601,7 @@ try {
         await fsp.rm(chunkPath, { force: true }).catch(() => {});
         let nativeRenderingReported = false;
         let nativeMetrics = null;
+        let formalNativeMediaSeconds = 0;
         const common = {
           codec,
           quality: crf,
@@ -11473,6 +11635,9 @@ try {
           // position for a running chunk; without forwarding it here the UI
           // remains at the previous chunk boundary until concat begins.
           onProgress: (localSeconds) => {
+            if (nativeTimestampedChunk) {
+              formalNativeMediaSeconds = Math.max(formalNativeMediaSeconds, Number(localSeconds) || 0);
+            }
             if (!nativeRenderingReported && Number(localSeconds) > 0.001) {
               nativeRenderingReported = true;
               onStage?.(nativeTimestampedAdmission
@@ -11533,16 +11698,17 @@ try {
             nativeMetrics = cudaResult?.nativeMetrics || null;
           } catch (error) {
             if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-            onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
-            if (nativeTimestampedChunk && chunkPaths.length > 0) {
-              const restartError = new Error(`原生 NVMM PTS 分段 ${index + 1} 失败；已拒绝与前序时间戳分段混拼，请从头走兼容链重试。`);
-              restartError.code = 'BR2K_NATIVE_PTS_RESTART_REQUIRED';
-              throw restartError;
+            if (nativeTimestampedChunk && formalNativeMediaSeconds > NATIVE_EARLY_FALLBACK_SEC) {
+              const runtimeError = new Error(`CUDA/NVMM 已处理 ${formalNativeMediaSeconds.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${compactLogLine(error.message)}`);
+              runtimeError.code = 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT';
+              runtimeError.processedMediaSeconds = formalNativeMediaSeconds;
+              throw runtimeError;
             }
+            onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
             // The fallback still uses the CPU/I420 renderer, but its GStreamer
             // output is also Matroska. It must not be judged by the native
-            // NVMM PTS coverage gate below. This is the first chunk, so commit
-            // the entire remaining pass to that same timestamped contract.
+            // NVMM PTS coverage gate below. This is only allowed during the
+            // first five seconds of a preflight-committed native run.
             nativeTimestampedChunk = false;
             nativeTimestampedPass = false;
             onPhase?.('render', { force: true });
@@ -11552,17 +11718,12 @@ try {
         if ((await getFileSize(chunkPath)) < 1024) throw new Error(`Scene Graph 分段 ${index + 1} 未产生有效视频。`);
         if (nativeTimestampedChunk) {
           const bridge = nativeMetrics?.ptsBridge || {};
-          const encodedFrames = Number(bridge.encodedFrames ?? nativeMetrics?.frames);
-          const minimumFrames = Number(bridge.minimumFrames);
           const sourceToSceneFrames = Number(bridge.sourceToSceneFrames);
           const sceneToEncodeFrames = Number(bridge.sceneToEncodeFrames);
           const sourceToEncodeFrames = Number(bridge.sourceToEncodeFrames);
           const sourceToSceneMismatches = Number(bridge.sourceToSceneMismatches || 0);
           const sceneToEncodeMismatches = Number(bridge.sceneToEncodeMismatches || 0);
           const sourceToEncodeMismatches = Number(bridge.sourceToEncodeMismatches || 0);
-          if (!Number.isFinite(encodedFrames) || !Number.isFinite(minimumFrames) || encodedFrames < minimumFrames) {
-            throw new Error(`原生 NVMM 分段 ${index + 1} 帧预算不足：${Number.isFinite(encodedFrames) ? encodedFrames : '?'} / ${Number.isFinite(minimumFrames) ? minimumFrames : '?'}。`);
-          }
           if (!Number.isFinite(sourceToSceneFrames) || !Number.isFinite(sceneToEncodeFrames) || !Number.isFinite(sourceToEncodeFrames) ||
               sourceToSceneFrames <= 0 || sceneToEncodeFrames <= 0 || sourceToEncodeFrames <= 0 ||
               sourceToSceneMismatches > 0 || sceneToEncodeMismatches > 0 || sourceToEncodeMismatches > 0) {
@@ -11830,6 +11991,8 @@ try {
     throwIfExportCancelled
   }) {
     let sceneDirectory = '';
+    const sceneFontFallbackWarnings = new Map();
+    let flushSceneFontFallbackWarnings = () => {};
     let cancelled = false;
     try {
       const estimatedExportBytes = Math.ceil(
@@ -11935,10 +12098,12 @@ try {
       if (!useChunkedJetsonScene) {
         this.logCudaSceneAdmission(cudaSceneAdmission, gpuSceneRenderer);
       }
-      const useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
-      const nativeDecoderPath = gpuSceneRenderer?.available && gpuSceneRenderer.helper
-        ? gpuSceneRenderer.helper
-        : '';
+      const nativeCandidate = isJetsonGstreamerCodec(burnCodec) && !useChunkedJetsonScene &&
+        cudaSceneAdmission.ok && decoderInfo.value === 'gstreamer-nvv4l2' &&
+        Boolean(gpuSceneRenderer?.nativeNvmmScene);
+      let nativePreflight = null;
+      let useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
+      let nativeDecoderPath = '';
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -11989,10 +12154,39 @@ try {
           sceneCuda: true
         });
       };
+      let sceneFontFallbackLastSummaryAt = 0;
+      flushSceneFontFallbackWarnings = (force = false) => {
+        const entries = [...sceneFontFallbackWarnings.entries()].filter(([, count]) => count > 1);
+        if (!entries.length) return;
+        const now = Date.now();
+        if (!force && now - sceneFontFallbackLastSummaryAt < 30_000) return;
+        sceneFontFallbackLastSummaryAt = now;
+        const summary = entries.map(([key, count]) => {
+          const [glyph, font] = key.split('|');
+          return `${glyph}${font ? `(${font})` : ''}字体fallback警告重复${count}次`;
+        }).join('；');
+        this.log('warn', `Scene Graph 导出：${summary}，已折叠。`);
+      };
+      const foldSceneFontFallbackWarning = (line) => {
+        const normalized = String(line || '').replace(/\[[^\]]+@\s*0x[0-9a-f]+\]/ig, '');
+        if (!/(?:glyph\s+0x[0-9a-f]+|fontselect:\s*failed to find any fallback with glyph)/i.test(normalized)) return false;
+        const glyphMatch = normalized.match(/(?:glyph\s+|U\+)(0x[0-9a-f]+|[0-9a-f]+)/i);
+        if (!glyphMatch) return false;
+        const glyph = `U+${glyphMatch[1].replace(/^0x/i, '').toUpperCase()}`;
+        const fontMatch = normalized.match(/for\s+font\s+['"]?([^'"\s,;]+)/i) || normalized.match(/fontselect:\s*\(([^)]+)\)/i);
+        const font = fontMatch ? String(fontMatch[1]).trim() : '';
+        const key = `${glyph}|${font}`;
+        const count = (sceneFontFallbackWarnings.get(key) || 0) + 1;
+        sceneFontFallbackWarnings.set(key, count);
+        if (count === 1) this.log('warn', `Scene Graph 导出：缺少字体fallback：${glyph}${font ? `（${font}）` : ''}`);
+        flushSceneFontFallbackWarnings(false);
+        return true;
+      };
       const onStderr = (line) => {
         if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
           this.emitState('mediaJob');
         }
+        if (foldSceneFontFallbackWarning(line)) return;
         if (/error|failed|invalid/i.test(line)) this.log('warn', 'Scene Graph 导出：' + compactLogLine(line));
       };
       const onChild = (child) => {
@@ -12028,6 +12222,49 @@ try {
         this.setProgressFallback(progress, '硬件解码不兼容，已回退到 CPU 解码；Scene Graph 几何未改变。');
         this.emitState('mediaJob');
       };
+      const recordNativePreflight = (result) => {
+        nativePreflight = result || null;
+        progress.nativePreflight = nativePreflight
+          ? {
+              status: nativePreflight.ok ? 'passed' : 'failed',
+              durationSec: nativePreflight.durationSec,
+              pipelineFps: Number(nativePreflight.metrics?.pipelineFps || 0),
+              ptsBridge: nativePreflight.metrics?.ptsBridge?.ok === true,
+              reason: nativePreflight.reason || ''
+            }
+          : null;
+        progress.updatedAt = Date.now();
+        this.emitState('mediaJob');
+      };
+      if (nativeCandidate) {
+        onScenePhase('prepare', { force: true });
+        setExportStage('正在验证 Jetson CUDA Scene（5秒真实样本）');
+        recordNativePreflight(await this.probeJetsonNativeSceneForSource({
+          graph,
+          cleanPath: recording.cleanPath,
+          codec: burnCodec,
+          sourceCodec: decoderInfo.codec,
+          crf: burnCrf,
+          fps,
+          width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
+          height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
+          startTime,
+          duration,
+          temporaryDir: sceneDirectory,
+          decoder: decoderInfo,
+          label: 'Jetson CUDA Scene',
+          onPreparing: onScenePreparing,
+          onStage: setExportStage
+        }));
+        if (nativePreflight.ok) {
+          this.log('info', `Jetson CUDA Scene真实源预检通过：${nativePreflight.durationSec.toFixed(2)}s，${Number(nativePreflight.metrics?.pipelineFps || 0).toFixed(1)}fps，PTS bridge通过；正式导出使用连续NVMM链路。`);
+          nativeDecoderPath = gpuSceneRenderer.helper;
+        } else {
+          this.log('warn', `Jetson CUDA Scene真实源预检失败：${nativePreflight.reason}；本次导出从开始即使用兼容链。`);
+          useCudaSceneRenderer = false;
+        }
+        onScenePhase('render', { force: true });
+      }
       throwIfExportCancelled();
       if (isJetsonGstreamerCodec(burnCodec)) {
         if (useChunkedJetsonScene) {
@@ -12051,7 +12288,10 @@ try {
             },
             onPreparing: onScenePreparing,
             onPhase: onScenePhase,
-            onStage: setExportStage, isCancelled: () => this.exportCancelRequested, label: 'Jetson Scene Graph 烧录'
+            onStage: setExportStage,
+            onNativePreflight: recordNativePreflight,
+            isCancelled: () => this.exportCancelRequested,
+            label: 'Jetson Scene Graph 烧录'
           });
         } else {
           // Jetson encoders always write a PTS-bearing video-only MKV here;
@@ -12226,6 +12466,7 @@ try {
       if (!cancelled) throw error;
       return { ok: false, mode: 'burn', cleanPath: recording.cleanPath };
     } finally {
+      flushSceneFontFallbackWarnings?.(true);
       await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
       if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
       if (this.exportProgress?.id === progress.id) {
