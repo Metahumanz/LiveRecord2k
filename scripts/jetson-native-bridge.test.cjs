@@ -5,7 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const { runJetsonNativeDecodeSceneEncodeJob } = require('../src/server/recording/ffmpeg.cjs');
-const { shouldAbortCommittedJetsonNativeFallback } = require('../src/server/app/service.cjs');
+const {
+  NATIVE_EARLY_FALLBACK_SEC,
+  shouldAbortCommittedJetsonNativeFallback,
+  decideJetsonNativeFailure
+} = require('../src/server/recording/jetson-policy.cjs');
 
 const node = process.execPath;
 const rendererArgs = ['-e', "process.stdin.on('data', (chunk) => process.stdout.write(chunk)); process.stdin.on('end', () => process.exit(0));"];
@@ -66,11 +70,12 @@ test('Jetson native admission preflights a real source and never restarts a comm
   assert.match(serviceSource, /native-preflight\.mkv/);
   assert.match(serviceSource, /BR2K_FORCE_NATIVE_PREFLIGHT_FAIL/);
   assert.match(serviceSource, /BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT/);
-  assert.match(serviceSource, /NATIVE_EARLY_FALLBACK_SEC = 5/);
+  const policySource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'recording', 'jetson-policy.cjs'), 'utf8');
+  assert.equal(NATIVE_EARLY_FALLBACK_SEC, 5);
+  assert.match(policySource, /> NATIVE_EARLY_FALLBACK_SEC/);
   assert.match(serviceSource, /nonChunkedFormalNativeMediaSeconds/);
   assert.match(serviceSource, /nativePreflight\?\.ok/);
   assert.match(serviceSource, /nativeDecoderPath/);
-  assert.match(serviceSource, /> NATIVE_EARLY_FALLBACK_SEC/);
   assert.match(serviceSource, /processedMediaSeconds/);
   const nonChunkedRegionStart = serviceSource.indexOf('let nonChunkedFormalNativeMediaSeconds');
   assert.notEqual(nonChunkedRegionStart, -1);
@@ -109,6 +114,13 @@ test('committed Jetson native fallback stops only after more than five media sec
       `${committed}/${processedMediaSeconds}s`
     );
   }
+});
+
+test('chunked and nonchunked Jetson native failures share cancellation and fallback decisions', () => {
+  assert.equal(decideJetsonNativeFailure({ committed: false, processedMediaSeconds: 100, cancelled: false }), 'fallback');
+  assert.equal(decideJetsonNativeFailure({ committed: true, processedMediaSeconds: 5, cancelled: false }), 'fallback');
+  assert.equal(decideJetsonNativeFailure({ committed: true, processedMediaSeconds: 5.01, cancelled: false }), 'abort');
+  assert.equal(decideJetsonNativeFailure({ committed: true, processedMediaSeconds: 180, cancelled: true }), 'cancel');
 });
 
 test('Scene Graph stderr folds repeated font fallback warnings without hiding fatal errors', () => {

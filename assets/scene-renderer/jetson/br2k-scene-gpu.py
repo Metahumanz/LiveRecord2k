@@ -892,6 +892,8 @@ def render_native_nvmm(request):
         encode_unmatched = 0
         decoded_clock = {'first': None, 'last': None, 'frames': 0, 'restored': 0, 'unmatched': 0}
         scene_clock = {'first': None, 'last': None, 'last_duration': None}
+        scene_media_first_pts = {'value': None}
+        scene_previous_pts = {'value': None}
         pts_tolerance_ns = max(2_000_000, int(Gst.SECOND / max(1.0, fps) * 0.25))
         pts_audit = {
             'sourceToSceneFrames': 0, 'sourceToSceneMismatches': 0, 'sourceToSceneMaxDeltaNs': 0,
@@ -912,14 +914,17 @@ def render_native_nvmm(request):
         progress_report = {'last_wall_us': wall_started, 'last_media': -1.0}
         def emit_progress(buffer):
             """Stream PTS-derived progress; wall time is only a report cadence."""
-            if buffer.pts == Gst.CLOCK_TIME_NONE or scene_first_pts['value'] is None:
+            if buffer.pts == Gst.CLOCK_TIME_NONE or scene_media_first_pts['value'] is None:
                 return
             wall_now = GLib.get_monotonic_time()
-            # NVMM concat keeps the original video PTS after a black lead.
-            # That clock contains the source's initial 1.019s gap, so it is
-            # unsuitable for finite-chunk progress. Scene frame count is the
-            # authoritative media clock for this fixed-rate renderer.
-            media_seconds = max(0.0, min(duration, counters['scene'] / max(1.0, fps)))
+            buffer_duration = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE and buffer.duration > 0 else None
+            if buffer_duration is None and scene_previous_pts['value'] is not None:
+                delta = int(buffer.pts) - int(scene_previous_pts['value'])
+                buffer_duration = delta if delta > 0 else None
+            if buffer_duration is None:
+                buffer_duration = max(1, int(Gst.SECOND / max(1.0, fps)))
+            media_end_pts = int(buffer.pts) + int(buffer_duration)
+            media_seconds = max(0.0, min(duration, (media_end_pts - scene_media_first_pts['value']) / Gst.SECOND))
             # A fast Orin can finish a finite source range in a few seconds. Keep
             # the UI responsive without emitting one JSON line per frame.
             if media_seconds <= progress_report['last_media'] + 0.01 or wall_now - progress_report['last_wall_us'] < 250000:
@@ -998,13 +1003,14 @@ def render_native_nvmm(request):
             # EOS is sent from the streaming thread when the scene output
             # reaches the requested media PTS. It is deliberately not a
             # GLib timeout: a 4x realtime pipeline still emits exactly the
-            # same 20 seconds of media as a realtime one.
+            # finite source range as a realtime one.
             if key == 'scene' and buffer.pts != Gst.CLOCK_TIME_NONE:
                 source_pts_for_scene = None
                 # `concat` emits physical black lead frames before it releases
                 # the decoded branch. Do not consume decoder timing for these
                 # frames even if NVDEC has already prefetched source surfaces.
-                if lead_scene_frames['remaining'] > 0:
+                is_lead_scene_frame = lead_scene_frames['remaining'] > 0
+                if is_lead_scene_frame:
                     lead_scene_frames['remaining'] -= 1
                 elif decoded_timing:
                     source_pts, source_duration = decoded_timing.popleft()
@@ -1018,16 +1024,19 @@ def render_native_nvmm(request):
                 # every chunk contains its requested media duration.
                 if scene_first_pts['value'] is None:
                     scene_first_pts['value'] = buffer.pts
+                if not is_lead_scene_frame and scene_media_first_pts['value'] is None:
+                    scene_media_first_pts['value'] = buffer.pts
                 scene_clock['first'] = scene_clock['first'] if scene_clock['first'] is not None else buffer.pts
                 scene_clock['last'] = buffer.pts
                 scene_clock['last_duration'] = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE and buffer.duration > 0 else None
                 emit_progress(buffer)
+                scene_previous_pts['value'] = buffer.pts
                 target_pts = scene_first_pts['value'] + int(duration * Gst.SECOND)
                 # NVDEC can negotiate a stream rate that differs slightly
                 # from the container average (for example a 60/1 PTS clock
                 # with a 59.483fps average).  Once a real Scene PTS exists,
                 # that timestamp is authoritative; a frame-count cutoff here
-                # would terminate a 20s chunk around 19.88s.  Keep the count
+                # would terminate a finite range early. Keep the count
                 # only as a defensive fallback for buffers without PTS.
                 reached_pts_budget = leading_video_frames <= 0 and buffer.pts >= target_pts
                 if reached_pts_budget:
@@ -1123,6 +1132,7 @@ def render_native_nvmm(request):
             pipeline.set_state(Gst.State.NULL)
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
+        media_clock = 'frame-fallback'
         pending_remaining = scene_encode_pending_count
         pending_source_remaining = sum(
             1
@@ -1138,13 +1148,21 @@ def render_native_nvmm(request):
         source_encode_frames = source_encode_stats['frames']
         source_encode_mismatches = source_encode_stats['mismatches']
         source_encode_max_delta_ns = source_encode_stats['maxDeltaNs']
+        observed_frame_ns = int(statistics.median(decoded_pts_deltas)) if decoded_pts_deltas else max(1, int(Gst.SECOND / max(1.0, fps)))
         if encoded_pts['first'] is not None and encoded_pts['end'] is not None:
             measured_media_seconds = max(0.0, (encoded_pts['end'] - encoded_pts['first']) / Gst.SECOND)
+            media_clock = 'encode-pts'
         # Some JetPack parser/encoder combinations do not retain a duration on
         # the final access unit.  Frame count at the negotiated rational fps
         # is still media time, never wall time.
         if leading_video_frames or measured_media_seconds <= 0:
-            measured_media_seconds = min(duration, counters['encode'] / max(1.0, fps))
+            if scene_clock['first'] is not None and scene_clock['last'] is not None:
+                scene_end_pts = int(scene_clock['last']) + int(scene_clock['last_duration'] or observed_frame_ns)
+                measured_media_seconds = max(0.0, (scene_end_pts - int(scene_clock['first'])) / Gst.SECOND)
+                media_clock = 'scene-pts'
+            else:
+                measured_media_seconds = min(duration, counters['encode'] / max(1.0, fps))
+                media_clock = 'frame-fallback'
         total = counters['encode'] / wall_seconds
         expected_restored = max(0, min(decoded_clock['frames'], counters['scene'] - leading_video_frames))
         # Packet-duration coverage alone can look valid when the source video
@@ -1153,7 +1171,6 @@ def render_native_nvmm(request):
         # the finite media interval in frames too, otherwise the first chunk
         # would silently omit its black lead and make audio lead video.
         minimum_frames = max(1, int(math.ceil(duration * fps)) - 2)
-        observed_frame_ns = int(statistics.median(decoded_pts_deltas)) if decoded_pts_deltas else max(1, int(Gst.SECOND / max(1.0, fps)))
         coverage_tolerance_ns = max(observed_frame_ns * 3, 50_000_000)
         requested_duration_ns = int(max(0.0, duration) * Gst.SECOND)
         scene_end = None
@@ -1193,7 +1210,7 @@ def render_native_nvmm(request):
                 pts_audit['sceneToEncodeMismatches'], source_encode_frames, counters['encode'],
                 source_encode_mismatches, decoded_clock['unmatched'], counters['encode'], minimum_frames))
         return {
-            'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'wallSeconds': wall_seconds,
+            'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'mediaClock': media_clock, 'wallSeconds': wall_seconds,
             'decode': counters['decode'] / wall_seconds, 'scene': counters['scene'] / wall_seconds,
             'encode': total, 'total': total, 'pipelineFps': total,
             'ptsBridge': {

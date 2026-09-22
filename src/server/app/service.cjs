@@ -243,24 +243,14 @@ const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safet
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
 const { createAss } = require('../danmaku/ass.cjs');
+const {
+  NATIVE_EARLY_FALLBACK_SEC,
+  shouldAbortCommittedJetsonNativeFallback,
+  createCommittedJetsonNativeRuntimeError,
+  decideJetsonNativeFailure
+} = require('../recording/jetson-policy.cjs');
 
 const LEGACY_ASS_SCENE_PRESETS = new Set(['h5-card', 'bubble', 'minimal']);
-const NATIVE_EARLY_FALLBACK_SEC = 5;
-
-function shouldAbortCommittedJetsonNativeFallback({ committed, processedMediaSeconds }) {
-  return Boolean(committed) && Number(processedMediaSeconds) > NATIVE_EARLY_FALLBACK_SEC;
-}
-
-function createCommittedJetsonNativeRuntimeError(processedMediaSeconds, cause) {
-  const processed = Math.max(0, Number(processedMediaSeconds) || 0);
-  const runtimeError = new Error(
-    `CUDA/NVMM 已处理 ${processed.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${compactLogLine(cause?.message || String(cause || '未知错误'))}`
-  );
-  runtimeError.code = 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT';
-  runtimeError.processedMediaSeconds = processed;
-  return runtimeError;
-}
-
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
     super(message);
@@ -11867,11 +11857,13 @@ try {
             }
             nativeMetrics = cudaResult?.nativeMetrics || null;
           } catch (error) {
-            if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-            if (shouldAbortCommittedJetsonNativeFallback({
+            const decision = decideJetsonNativeFailure({
               committed: nativeTimestampedChunk,
-              processedMediaSeconds: formalNativeMediaSeconds
-            })) {
+              processedMediaSeconds: formalNativeMediaSeconds,
+              cancelled: error?.code === 'BR2K_MEDIA_CANCELLED'
+            });
+            if (decision === 'cancel') throw error;
+            if (decision === 'abort') {
               throw createCommittedJetsonNativeRuntimeError(formalNativeMediaSeconds, error);
             }
             onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
@@ -12590,12 +12582,14 @@ try {
                   })
               });
             } catch (error) {
-              if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
               const committedNativeRun = nativePreflight?.ok === true && Boolean(nativeDecoderPath);
-              if (shouldAbortCommittedJetsonNativeFallback({
+              const decision = decideJetsonNativeFailure({
                 committed: committedNativeRun,
-                processedMediaSeconds: nonChunkedFormalNativeMediaSeconds
-              })) {
+                processedMediaSeconds: nonChunkedFormalNativeMediaSeconds,
+                cancelled: error?.code === 'BR2K_MEDIA_CANCELLED'
+              });
+              if (decision === 'cancel') throw error;
+              if (decision === 'abort') {
                 throw createCommittedJetsonNativeRuntimeError(nonChunkedFormalNativeMediaSeconds, error);
               }
               this.log(
