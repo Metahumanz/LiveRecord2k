@@ -11834,6 +11834,7 @@ try {
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
     this.log('info', `${label}：将在子进程实际启动后报告 CUDA Scene 运行链路。`);
     const preferredDecoder = String(decoder?.value || decoder || 'software');
+    const committedNativeNvmmRun = Boolean(nativeDecode?.decoderPath);
     let completedNativeMetrics = null;
     const run = async (nextDecoder) => {
       onPhase?.('render');
@@ -11961,6 +11962,10 @@ try {
       await run(preferredDecoder);
       return { decoder: preferredDecoder, nativeMetrics: completedNativeMetrics };
     } catch (error) {
+      // A real-source-preflighted NVMM run must return to the caller here.
+      // The caller owns the single five-second early-fallback window and the
+      // post-commit stop policy; this helper must never start a full CPU rerun.
+      if (committedNativeNvmmRun) throw error;
       if (preferredDecoder === 'software' || error?.code === 'BR2K_MEDIA_CANCELLED' || !isFfmpegHardwareDecodeError(error)) throw error;
       this.log('warn', `${label} 的 ${decoder?.label || preferredDecoder} 不可用，改用 CPU 解码并保留 CUDA Scene 合成：${compactLogLine(error.message)}`);
       await beforeRetry?.();

@@ -80,6 +80,15 @@ test('Jetson native admission preflights a real source and never restarts a comm
   assert.match(nonChunkedRegion, /nativePreflight\?\.ok/);
   assert.match(nonChunkedRegion, /nativeDecoderPath/);
   assert.match(nonChunkedRegion, /createCommittedJetsonNativeRuntimeError/);
+  const cudaTranscodeStart = serviceSource.indexOf('async runJetsonCudaSceneGraphTranscode');
+  assert.notEqual(cudaTranscodeStart, -1);
+  const nativeFallbackGuardStart = serviceSource.indexOf('const committedNativeNvmmRun = Boolean(nativeDecode?.decoderPath)', cudaTranscodeStart);
+  assert.ok(nativeFallbackGuardStart > cudaTranscodeStart);
+  const nativeFallbackCpuRunStart = serviceSource.indexOf("await run('software')", nativeFallbackGuardStart);
+  assert.ok(nativeFallbackCpuRunStart > nativeFallbackGuardStart);
+  const nativeFallbackGuardRegion = serviceSource.slice(nativeFallbackGuardStart, nativeFallbackCpuRunStart + 30);
+  assert.match(nativeFallbackGuardRegion, /if \(committedNativeNvmmRun\) throw error/);
+  assert.ok(nativeFallbackGuardRegion.indexOf('if (committedNativeNvmmRun) throw error') < nativeFallbackGuardRegion.indexOf("await run('software')"));
   assert.match(serviceSource, /正式导出使用连续NVMM链路/);
   assert.match(serviceSource, /本次导出从开始即使用兼容链/);
 });
