@@ -20,6 +20,7 @@ const GROUPS = {
     'preview-queue.test.cjs'
   ],
   package: [
+    'install-linux.test.cjs',
     'linux-package.test.cjs',
     'msix-package.test.cjs'
   ],

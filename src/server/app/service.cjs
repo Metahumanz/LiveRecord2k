@@ -2346,6 +2346,7 @@ class LiveRecordService {
       platform: UI_PLATFORM,
       uiCapabilities: createUiCapabilities(UI_PLATFORM, process.env, options),
       diagnostics: this.diagnostics,
+      accelerationDiagnostics: this.diagnostics.acceleration,
       storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT

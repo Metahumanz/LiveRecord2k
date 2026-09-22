@@ -575,6 +575,7 @@ export type AppState = {
     acceleration?: AccelerationDiagnostics | null;
     lastExportFailure?: ExportDiagnosticReport | null;
   };
+  accelerationDiagnostics?: AccelerationDiagnostics | null;
   hardwareSelfTest?: HardwareSelfTest;
   exportProgress?: FfmpegJobProgress | null;
   exportQueue?: ExportQueueItem[];
