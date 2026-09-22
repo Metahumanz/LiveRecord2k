@@ -68,6 +68,7 @@ export function MaintenancePage({
     changes: ReturnType<typeof getSettingsImportChanges>;
   } | null>(null);
   const [cleanupScan, setCleanupScan] = useState<CleanupScanResult | null>(null);
+  const [diagnosticCopied, setDiagnosticCopied] = useState(false);
   const isLinux = state.platform === 'linux';
   const canOpenServerPath = state.uiCapabilities?.openServerPath ?? !isLinux;
   const canShutdownService = state.uiCapabilities?.serviceShutdown ?? !isLinux;
@@ -79,6 +80,29 @@ export function MaintenancePage({
     .join('；');
   const jetsonBurnTests = Object.values(state.ffmpegCapabilities?.jetsonBurnTests || {});
   const desktopCuda = state.ffmpegCapabilities?.desktopCuda;
+  const accelerationDiagnostics = state.diagnostics?.acceleration;
+
+  async function copyDiagnostics() {
+    const text = JSON.stringify(state.diagnostics || {}, null, 2);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+      }
+      setDiagnosticCopied(true);
+      window.setTimeout(() => setDiagnosticCopied(false), 1800);
+    } catch {
+      window.alert('复制诊断信息失败，请手动打开状态信息。');
+    }
+  }
 
   function updateSetting(nextSettings: Partial<AppSettings>, saveMode: 'immediate' | 'debounced' | 'commit' = 'immediate') {
     updateSettingsDraft(nextSettings, { saveMode });
@@ -460,6 +484,31 @@ export function MaintenancePage({
             value={`${currentCodec?.kind === 'hardware' ? '硬件' : '软件'} ${state.settings.burnCodec}`}
           />
           <PathLine label="不可用硬编" value={unavailableCodecText || '无'} />
+          <div className="capability-panel maintenance-section">
+            <div className="capability-panel-header">
+              <div>
+                <h3>硬件加速能力</h3>
+                <p className="field-help">这里显示当前设备实际通过的能力，不根据型号或驱动版本猜测。</p>
+              </div>
+              <button className="wide-button fill" type="button" onClick={() => void copyDiagnostics()}>
+                {diagnosticCopied ? '已复制' : '复制诊断信息'}
+              </button>
+            </div>
+            {accelerationDiagnostics ? (
+              <div className="capability-grid">
+                {Object.values(accelerationDiagnostics.checks).map((item) => (
+                  <div key={item.id} className={`capability-row ${item.ok ? 'ok' : 'error'}`}>
+                    <span className="capability-label">{item.label}</span>
+                    <strong>{item.ok ? '可用' : '不可用'}</strong>
+                    {item.reason ? <span className="capability-detail">{item.reason}</span> : null}
+                  </div>
+                ))}
+              </div>
+            ) : <p className="field-help">能力汇总尚未完成。</p>}
+            {state.diagnostics?.lastExportFailure ? (
+              <p className="field-help">已保留最近一次导出失败诊断；报告已脱敏，不包含 Cookie、密码或完整直播地址。</p>
+            ) : null}
+          </div>
           {desktopCuda ? (
             <div className={`maintenance-section ${desktopCuda.available ? '' : 'error'}`}>
               <h3>通用 NVIDIA CUDA 自检</h3>

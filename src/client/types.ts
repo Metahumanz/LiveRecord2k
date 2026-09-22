@@ -361,11 +361,41 @@ export type FfmpegCapabilities = {
     decoder?: string;
     compositor?: string;
     fullSceneProduction?: boolean;
+    conformanceStatus?: 'pending' | 'running' | 'passed' | 'failed' | 'stale';
+    conformanceReason?: string;
+    conformanceCached?: boolean;
+    environmentFingerprint?: string;
+    environment?: {
+      platform: string;
+      arch: string;
+      appVersion?: string;
+      ffmpegVersion?: string;
+      gpu?: Array<{ name: string; driver: string; pciBusId: string }> | null;
+      videoAdapters?: Array<{ name: string; vendor: string }>;
+    };
     reason?: string;
   };
   probedAt: number;
   probeError?: string;
 };
+
+export type AccelerationDiagnostics = {
+  version: number;
+  generatedAt: number;
+  platform: string;
+  arch: string;
+  appVersion: string;
+  checks: Record<string, {
+    id: string;
+    label: string;
+    ok: boolean;
+    reason: string;
+    details?: Record<string, unknown>;
+  }>;
+  finalCapability: Record<string, unknown>;
+};
+
+export type ExportDiagnosticReport = Record<string, unknown>;
 
 export type AvatarPreparationDiagnostics = {
   requested: number;
@@ -541,6 +571,11 @@ export type AppState = {
   update: UpdateState;
   ffmpegPath?: string;
   ffmpegCapabilities?: FfmpegCapabilities;
+  diagnostics?: {
+    acceleration?: AccelerationDiagnostics | null;
+    lastExportFailure?: ExportDiagnosticReport | null;
+  };
+  accelerationDiagnostics?: AccelerationDiagnostics | null;
   hardwareSelfTest?: HardwareSelfTest;
   exportProgress?: FfmpegJobProgress | null;
   exportQueue?: ExportQueueItem[];

@@ -20,6 +20,7 @@ const GROUPS = {
     'preview-queue.test.cjs'
   ],
   package: [
+    'install-linux.test.cjs',
     'linux-package.test.cjs',
     'msix-package.test.cjs'
   ],
@@ -37,6 +38,7 @@ const GROUPS = {
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
     'desktop-cuda-capability.test.cjs',
+    'diagnostics.test.cjs',
     'gpu-scene-conformance.test.cjs',
     'gpu-scene-renderer.test.cjs',
     'jetson-native-bridge.test.cjs',

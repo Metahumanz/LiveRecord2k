@@ -566,6 +566,21 @@ if [ "$SERVICE_READY" -ne 1 ]; then
   fail '服务安装完成但健康检查失败，请查看：journalctl -u bili-record-2k -n 100'
 fi
 
+STATE_JSON=$TEMP_ROOT/state.json
+if curl --fail --silent --max-time 5 "$CHECK_URL" -o "$STATE_JSON" && jq -e 'type == "object"' "$STATE_JSON" >/dev/null 2>&1; then
+  printf '硬件能力摘要：\n'
+  jq -r '
+    (.accelerationDiagnostics // .diagnostics.acceleration // {}) as $diag |
+    ($diag.finalCapability // {}) |
+    to_entries |
+    map("\(.key)=\(.value)") |
+    join("；")
+  ' "$STATE_JSON" | sed 's/^/  /'
+  printf '详细能力和最近失败诊断可在 WebUI 的“软件维护”中查看。\n'
+else
+  printf '硬件能力摘要暂时不可用；请安装完成后打开 WebUI 的“软件维护”查看。\n'
+fi
+
 PUBLIC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 printf '\n============================================================\n'
 printf '%s %s 安装成功\n' "$APP_NAME" "$LATEST_VERSION"

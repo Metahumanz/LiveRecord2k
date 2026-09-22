@@ -1,5 +1,15 @@
 # 更新日志
 
+## 0.8.4 - 2026-09-22
+
+- 桌面 NVIDIA CUDA 视觉一致性门禁抽为服务端 runner，并按当前 GPU、驱动、FFmpeg 和门禁版本指纹缓存；环境变化后自动标记 stale 并在空闲时后台重跑，未通过门禁的机器不会进入完整 CUDA Scene 生产链。
+- 新增统一硬件能力诊断：分别汇总桌面 CUDA/NVDEC/NVENC、Jetson JetPack/L4T、nvv4l2、NVMM 和 BiliRecord2K 私有 Scene 插件的真实探测结果，并在维护页提供状态面板和脱敏诊断复制。
+- 导出失败会原子保存最近一次脱敏诊断报告，记录实际 decoder、Scene、encoder、preflight、PTS bridge、fallback 或停止决策；不写入 Cookie、密码、访问令牌或完整直播地址。
+- NVMM 进度和提交判断改用真实编码/Scene PTS 媒体时钟，兼容 59.94 等非整数帧率、初始时间偏移和编码器重排；缺失 PTS 时才使用帧率作为防御性回退。
+- chunked 与 non-chunked Jetson 导出统一使用 5 秒早期回退策略：真实源 preflight 未通过或正式 NVMM 前 5 秒失败时从兼容链继续；超过 5 秒后停止并返回 `BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT`，不从 0 重跑 CPU 整片。
+- 正式 NVMM helper 在真实源 preflight 已通过后只负责执行和报告错误，不再在内部自行启动 CPU 重跑；Jetson 依赖仍由设备现有且匹配的 JetPack/L4T 提供，BiliRecord2K 安装包不会替换它们。
+- Linux 安装完成后会从服务端 `/api/state` 输出硬件能力摘要；普通 CI、集成、package 和真实硬件专项测试分组继续独立运行，便于快速定位发布回归。
+
 ## 0.8.3 - 2026-09-21
 
 - 长录像 Scene 调度从每帧扫描全部 timeline 改为只维护当前 active 对象，显著减少事件数量增长时 CUDA Scene 的调度开销。

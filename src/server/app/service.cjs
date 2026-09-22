@@ -19,6 +19,15 @@ const {
   canUseDesktopCudaSceneProduction
 } = require('../danmaku/gpu-scene-conformance.cjs');
 const {
+  collectDesktopCudaEnvironment,
+  runDesktopCudaSceneConformance
+} = require('../danmaku/desktop-cuda-conformance.cjs');
+const {
+  buildAccelerationDiagnostics,
+  buildExportDiagnosticReport,
+  sanitizeDiagnosticReport
+} = require('./diagnostics.cjs');
+const {
   DanmakuClient,
   requestBiliJsonWithCookies,
   fetchWithTimeout,
@@ -118,6 +127,7 @@ const {
   parseFfmpegHwaccels,
   detectVideoAdapters,
   detectVideoAdapterVendor,
+  detectJetsonRuntimeIdentity,
   hasVideoAdapterVendor,
   testFfmpegEncoder,
   testFfmpegAvatarCompositeBackend,
@@ -233,10 +243,14 @@ const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safet
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
 const { createAss } = require('../danmaku/ass.cjs');
+const {
+  NATIVE_EARLY_FALLBACK_SEC,
+  shouldAbortCommittedJetsonNativeFallback,
+  createCommittedJetsonNativeRuntimeError,
+  decideJetsonNativeFailure
+} = require('../recording/jetson-policy.cjs');
 
 const LEGACY_ASS_SCENE_PRESETS = new Set(['h5-card', 'bubble', 'minimal']);
-const NATIVE_EARLY_FALLBACK_SEC = 5;
-
 class BusinessError extends Error {
   constructor(code, message, statusCode = 400) {
     super(message);
@@ -1013,6 +1027,8 @@ class LiveRecordService {
     // Runtime probing alone never grants CUDA production eligibility.
     this.cudaSceneConformanceReportPath = String(process.env.BILI_RECORD_CUDA_SCENE_CONFORMANCE_REPORT || '').trim() ||
       path.join(appData, 'BiliRecord2K', 'cuda-scene-conformance.json');
+    this.lastExportDiagnosticPath = String(process.env.BILI_RECORD_LAST_EXPORT_DIAGNOSTIC || '').trim() ||
+      path.join(appData, 'BiliRecord2K', 'last-export-diagnostic.json');
     this.stateStore = new AtomicJsonStore(this.storePath);
     this.storeExists = false;
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
@@ -1108,6 +1124,7 @@ class LiveRecordService {
     this.recordings = [];
     this.recordingScanPromise = null;
     this.notifications = [];
+    this.diagnostics = { acceleration: null, lastExportFailure: null };
     this.notificationSeq = 0;
     this.webhookQueue = [];
     this.webhookQueueRunning = false;
@@ -1167,11 +1184,17 @@ class LiveRecordService {
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
       cudaAvatarCompositeReason: '',
-      desktopCuda: { available: false, reason: '尚未执行桌面 CUDA 合成/NVENC 自检。' },
+      desktopCuda: {
+        available: false,
+        conformanceStatus: 'pending',
+        conformanceCached: false,
+        reason: '尚未执行桌面 CUDA 合成/NVENC 自检。'
+      },
       probedAt: 0,
       probeError: ''
     };
     this.runtimeCapabilitiesPromise = null;
+    this.desktopCudaConformancePromise = null;
     this.settings = this.normalizeSettings(this.settings);
     this.statePublisher = new StatePublisher({
       getFullState: (options) => this.getState(options),
@@ -1189,6 +1212,7 @@ class LiveRecordService {
 
   async init() {
     await this.loadStore();
+    await this.loadLastExportDiagnostic();
     await this.bootstrapPersistentConfiguration();
     await this.loadLastUpdateStatus();
     try {
@@ -1275,14 +1299,8 @@ class LiveRecordService {
     this.ffmpegCapabilities.sceneGpuRenderer = await this.probeGpuSceneRenderer();
     this.ffmpegCapabilities.sceneGpuVisualConformance = this.ffmpegCapabilities.sceneGpuRenderer.visualConformance ||
       createCudaSceneConformanceUnavailable();
-    const desktopCudaConformance = await this.readCudaSceneConformanceReport();
-    if (this.ffmpegCapabilities.desktopCuda) {
-      this.ffmpegCapabilities.desktopCuda.visualConformance = desktopCudaConformance;
-      this.ffmpegCapabilities.desktopCuda.fullSceneProduction = canUseDesktopCudaSceneProduction(
-        this.ffmpegCapabilities.desktopCuda,
-        desktopCudaConformance
-      ).ok;
-    }
+    await this.initializeDesktopCudaConformance();
+    await this.refreshAccelerationDiagnostics();
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1339,7 +1357,11 @@ class LiveRecordService {
     );
     const desktopCuda = this.ffmpegCapabilities.desktopCuda;
     if (desktopCuda?.available) {
-      const desktopCudaSceneProduction = canUseDesktopCudaSceneProduction(desktopCuda, desktopCuda.visualConformance);
+      const desktopCudaSceneProduction = canUseDesktopCudaSceneProduction(
+        desktopCuda,
+        desktopCuda.visualConformance,
+        { environmentFingerprint: desktopCuda.environmentFingerprint }
+      );
       this.log(
         'success',
         `桌面 NVIDIA CUDA 已通过真实自检：${desktopCuda.decoder ? 'CUDA 硬解、' : ''}${desktopCuda.compositor || 'overlay_cuda'} 合成、${desktopCuda.encoder}。${desktopCudaSceneProduction.ok ? 'ASS 金标准视觉门禁通过，三套旧样式将使用完整 CUDA Scene。' : `完整 CUDA Scene 尚未准入：${desktopCudaSceneProduction.reason}`}`
@@ -1348,6 +1370,143 @@ class LiveRecordService {
       this.log('info', `桌面 NVIDIA CUDA 合成链未启用：${desktopCuda?.reason || '尚未完成自检。'}`);
     }
     this.emitState();
+  }
+
+  async initializeDesktopCudaConformance() {
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda?.available) return;
+    let environment;
+    try {
+      environment = await collectDesktopCudaEnvironment({
+        ffmpegPath: this.ffmpegPath,
+        appVersion: APP_VERSION,
+        videoAdapters: this.ffmpegCapabilities.videoAdapters
+      });
+    } catch (error) {
+      desktopCuda.conformanceStatus = 'failed';
+      desktopCuda.conformanceReason = `无法读取桌面 CUDA 自检环境：${compactLogLine(error.message || error)}`;
+      desktopCuda.reason = desktopCuda.conformanceReason;
+      return;
+    }
+    desktopCuda.environment = environment;
+    desktopCuda.environmentFingerprint = environment.fingerprint;
+    const report = await this.readCudaSceneConformanceReport();
+    this.applyDesktopCudaConformanceReport(report, { cached: false });
+    const admission = canUseDesktopCudaSceneProduction(
+      desktopCuda,
+      report,
+      { environmentFingerprint: environment.fingerprint }
+    );
+    if (admission.ok) {
+      this.applyDesktopCudaConformanceReport(report, { cached: true });
+      return;
+    }
+    this.ensureDesktopCudaConformance().catch((error) => {
+      this.log('warn', `桌面 CUDA Scene 视觉门禁失败：${error.message}`);
+    });
+  }
+
+  applyDesktopCudaConformanceReport(report, options = {}) {
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda) return { ok: false, reason: '桌面 CUDA runtime 不可用。' };
+    desktopCuda.visualConformance = report;
+    const admission = canUseDesktopCudaSceneProduction(
+      desktopCuda,
+      report,
+      { environmentFingerprint: desktopCuda.environmentFingerprint }
+    );
+    desktopCuda.fullSceneProduction = admission.ok;
+    desktopCuda.conformanceCached = Boolean(options.cached && admission.ok);
+    desktopCuda.conformanceReason = admission.reason || '';
+    if (admission.ok) desktopCuda.conformanceStatus = 'passed';
+    else if (!report?.executedAt) desktopCuda.conformanceStatus = 'pending';
+    else if (report?.passed !== true) desktopCuda.conformanceStatus = 'failed';
+    else desktopCuda.conformanceStatus = 'stale';
+    return admission;
+  }
+
+  ensureDesktopCudaConformance() {
+    if (this.desktopCudaConformancePromise) return this.desktopCudaConformancePromise;
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda?.available || desktopCuda.fullSceneProduction) return Promise.resolve(null);
+    this.desktopCudaConformancePromise = this.startDesktopCudaConformance()
+      .finally(() => { this.desktopCudaConformancePromise = null; });
+    return this.desktopCudaConformancePromise;
+  }
+
+  async startDesktopCudaConformance() {
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda?.available) return null;
+    if (this.exportProgress || this.burnQueue.some((item) => ['queued', 'running'].includes(item.status))) {
+      desktopCuda.conformanceStatus = 'pending';
+      desktopCuda.conformanceReason = '当前有媒体任务，桌面 CUDA 视觉门禁将在空闲时执行。';
+      return null;
+    }
+    desktopCuda.conformanceStatus = 'running';
+    desktopCuda.conformanceCached = false;
+    this.emitState();
+    const report = await runDesktopCudaSceneConformance({
+      ffmpegPath: this.ffmpegPath,
+      environment: desktopCuda.environment,
+      environmentFingerprint: desktopCuda.environmentFingerprint
+    });
+    await fsp.mkdir(path.dirname(this.cudaSceneConformanceReportPath), { recursive: true });
+    const temporaryPath = `${this.cudaSceneConformanceReportPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(temporaryPath, JSON.stringify(report, null, 2), 'utf8');
+    await fsp.rename(temporaryPath, this.cudaSceneConformanceReportPath);
+    this.applyDesktopCudaConformanceReport(report, { cached: false });
+    this.emitState();
+    return report;
+  }
+
+  async refreshAccelerationDiagnostics() {
+    const isJetson = process.platform === 'linux' && process.arch === 'arm64';
+    const renderer = this.ffmpegCapabilities?.sceneGpuRenderer || {};
+    const availableElements = new Set(renderer.gstreamerElements || []);
+    const jetsonRuntime = isJetson
+      ? await detectJetsonRuntimeIdentity({
+          elements: {
+            nvv4l2decoder: availableElements.has('nvv4l2decoder'),
+            nvv4l2h264enc: availableElements.has('nvv4l2h264enc'),
+            nvv4l2h265enc: availableElements.has('nvv4l2h265enc'),
+            nvvidconv: availableElements.has('nvvidconv') || availableElements.has('nvvideoconvert'),
+            nvivafilter: availableElements.has('nvivafilter')
+          }
+        })
+      : {};
+    this.diagnostics.acceleration = buildAccelerationDiagnostics({
+      appVersion: APP_VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      ffmpegCapabilities: this.ffmpegCapabilities,
+      jetsonRuntime
+    });
+    return this.diagnostics.acceleration;
+  }
+
+  async loadLastExportDiagnostic() {
+    try {
+      this.diagnostics.lastExportFailure = sanitizeDiagnosticReport(
+        JSON.parse(await fsp.readFile(this.lastExportDiagnosticPath, 'utf8'))
+      );
+    } catch {
+      this.diagnostics.lastExportFailure = null;
+    }
+  }
+
+  async persistExportDiagnosticFailure(context, error) {
+    const report = buildExportDiagnosticReport({
+      appVersion: APP_VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      ...context
+    }, error);
+    await fsp.mkdir(path.dirname(this.lastExportDiagnosticPath), { recursive: true });
+    const temporaryPath = `${this.lastExportDiagnosticPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(temporaryPath, JSON.stringify(report, null, 2), 'utf8');
+    await fsp.rename(temporaryPath, this.lastExportDiagnosticPath);
+    this.diagnostics.lastExportFailure = report;
+    return report;
   }
 
   startRuntimeCapabilitiesProbe() {
@@ -2186,6 +2345,8 @@ class LiveRecordService {
       currentHost: this.currentHost || DEFAULT_HOST,
       platform: UI_PLATFORM,
       uiCapabilities: createUiCapabilities(UI_PLATFORM, process.env, options),
+      diagnostics: this.diagnostics,
+      accelerationDiagnostics: this.diagnostics.acceleration,
       storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT
@@ -11697,12 +11858,14 @@ try {
             }
             nativeMetrics = cudaResult?.nativeMetrics || null;
           } catch (error) {
-            if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-            if (nativeTimestampedChunk && formalNativeMediaSeconds > NATIVE_EARLY_FALLBACK_SEC) {
-              const runtimeError = new Error(`CUDA/NVMM 已处理 ${formalNativeMediaSeconds.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${compactLogLine(error.message)}`);
-              runtimeError.code = 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT';
-              runtimeError.processedMediaSeconds = formalNativeMediaSeconds;
-              throw runtimeError;
+            const decision = decideJetsonNativeFailure({
+              committed: nativeTimestampedChunk,
+              processedMediaSeconds: formalNativeMediaSeconds,
+              cancelled: error?.code === 'BR2K_MEDIA_CANCELLED'
+            });
+            if (decision === 'cancel') throw error;
+            if (decision === 'abort') {
+              throw createCommittedJetsonNativeRuntimeError(formalNativeMediaSeconds, error);
             }
             onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
             // The fallback still uses the CPU/I420 renderer, but its GStreamer
@@ -11820,6 +11983,7 @@ try {
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
     this.log('info', `${label}：将在子进程实际启动后报告 CUDA Scene 运行链路。`);
     const preferredDecoder = String(decoder?.value || decoder || 'software');
+    const committedNativeNvmmRun = Boolean(nativeDecode?.decoderPath);
     let completedNativeMetrics = null;
     const run = async (nextDecoder) => {
       onPhase?.('render');
@@ -11947,6 +12111,10 @@ try {
       await run(preferredDecoder);
       return { decoder: preferredDecoder, nativeMetrics: completedNativeMetrics };
     } catch (error) {
+      // A real-source-preflighted NVMM run must return to the caller here.
+      // The caller owns the single five-second early-fallback window and the
+      // post-commit stop policy; this helper must never start a full CPU rerun.
+      if (committedNativeNvmmRun) throw error;
       if (preferredDecoder === 'software' || error?.code === 'BR2K_MEDIA_CANCELLED' || !isFfmpegHardwareDecodeError(error)) throw error;
       this.log('warn', `${label} 的 ${decoder?.label || preferredDecoder} 不可用，改用 CPU 解码并保留 CUDA Scene 合成：${compactLogLine(error.message)}`);
       await beforeRetry?.();
@@ -11993,6 +12161,15 @@ try {
     let sceneDirectory = '';
     const sceneFontFallbackWarnings = new Map();
     let flushSceneFontFallbackWarnings = () => {};
+    const diagnosticContext = {
+      decoder: decoderInfo,
+      encoder: burnCodec,
+      scene: { stylePreset, overlayMode, startTime, duration },
+      pipeline: null,
+      preflight: null,
+      ptsBridge: null,
+      fallback: null
+    };
     let cancelled = false;
     try {
       const estimatedExportBytes = Math.ceil(
@@ -12104,6 +12281,7 @@ try {
       let nativePreflight = null;
       let useCudaSceneRenderer = !useChunkedJetsonScene && cudaSceneAdmission.ok;
       let nativeDecoderPath = '';
+      let nonChunkedFormalNativeMediaSeconds = 0;
       const copySourceAudio = canCopyWholeSourceAudio(mediaInfo, startTime, duration, burnTimeline);
       progress.avatarCompositeBackend = 'Scene Graph 直接合成';
       progress.stageLabel = '正在一次合成 Scene Graph';
@@ -12224,6 +12402,7 @@ try {
       };
       const recordNativePreflight = (result) => {
         nativePreflight = result || null;
+        diagnosticContext.preflight = nativePreflight;
         progress.nativePreflight = nativePreflight
           ? {
               status: nativePreflight.ok ? 'passed' : 'failed',
@@ -12331,16 +12510,27 @@ try {
               : null,
             onStderr,
             onChild,
-            onPipeline: (pipeline) => this.setProgressPipeline(progress, pipeline),
+            onPipeline: (pipeline) => {
+              diagnosticContext.pipeline = pipeline;
+              this.setProgressPipeline(progress, pipeline);
+            },
             onProgress: (value) => {
-              if (Number(value) > 0.001) onScenePhase('render');
-              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(value * 1_000_000)}`)) {
+              const mediaSeconds = Math.max(0, Number(value) || 0);
+              if (nativePreflight?.ok === true && nativeDecoderPath) {
+                nonChunkedFormalNativeMediaSeconds = Math.max(
+                  nonChunkedFormalNativeMediaSeconds,
+                  mediaSeconds
+                );
+              }
+              if (mediaSeconds > 0.001) onScenePhase('render');
+              if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(mediaSeconds * 1_000_000)}`)) {
                 this.emitState('mediaJob');
               }
             },
             onPreparing: onScenePreparing,
             onPhase: onScenePhase,
             onStageMetrics: (metrics) => {
+              diagnosticContext.ptsBridge = metrics?.ptsBridge || diagnosticContext.ptsBridge;
               if (this.exportProgress?.id === progress.id && setFfmpegJobStageFps(progress, metrics)) this.emitState('mediaJob');
             },
             beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
@@ -12393,8 +12583,20 @@ try {
                   })
               });
             } catch (error) {
-              if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
-              this.log('warn', 'CUDA Scene Graph 失败，回退到兼容 Scene filter：' + compactLogLine(error.message));
+              const committedNativeRun = nativePreflight?.ok === true && Boolean(nativeDecoderPath);
+              const decision = decideJetsonNativeFailure({
+                committed: committedNativeRun,
+                processedMediaSeconds: nonChunkedFormalNativeMediaSeconds,
+                cancelled: error?.code === 'BR2K_MEDIA_CANCELLED'
+              });
+              if (decision === 'cancel') throw error;
+              if (decision === 'abort') {
+                throw createCommittedJetsonNativeRuntimeError(nonChunkedFormalNativeMediaSeconds, error);
+              }
+              this.log(
+                'warn',
+                `CUDA Scene Graph 在正式处理 ${nonChunkedFormalNativeMediaSeconds.toFixed(1)}s 后失败，仍处于允许早期回退窗口，切换兼容 Scene filter：${compactLogLine(error.message)}`
+              );
               progress.avatarCompositeBackend = 'Scene Graph 直接合成（CPU 回退）';
               setExportPhase?.('render', { force: true, stageLabel: '正在使用兼容 Scene filter 重新渲染' });
               await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
@@ -12462,6 +12664,17 @@ try {
       } else if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'error', 'Scene Graph 导出失败：' + error.message);
         this.emitState('mediaJob');
+        await this.persistExportDiagnosticFailure({
+          ...diagnosticContext,
+          pipeline: diagnosticContext.pipeline || progress.activePipeline,
+          fallback: diagnosticContext.fallback || {
+            decision: error.code === 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT'
+              ? 'abort-after-commit'
+              : 'native-failure'
+          }
+        }).catch((diagnosticError) => {
+          this.log('warn', `保存导出失败诊断报告失败：${diagnosticError.message}`);
+        });
       }
       if (!cancelled) throw error;
       return { ok: false, mode: 'burn', cleanPath: recording.cleanPath };
@@ -13635,6 +13848,8 @@ module.exports = {
   LiveRecordService,
   BusinessError,
   isBusinessError,
+  shouldAbortCommittedJetsonNativeFallback,
+  createCommittedJetsonNativeRuntimeError,
   isFfmpegMemoryPressureError,
   getBurnTimelineAlignment,
   getMergeSegmentTimingAssessment,

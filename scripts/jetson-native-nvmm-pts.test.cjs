@@ -12,6 +12,15 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const test = require('node:test');
 
+test('native NVMM progress is driven by media PTS rather than wall clock or frame count', async () => {
+  const source = await fs.readFile(path.join(__dirname, '..', 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py'), 'utf8');
+  assert.match(source, /media_end_pts\s*=\s*int\(buffer\.pts\)/);
+  assert.match(source, /scene_media_first_pts/);
+  assert.match(source, /mediaClock/);
+  assert.doesNotMatch(source, /media_seconds\s*=\s*max\(0\.0, min\(duration, counters\['scene'\] \/ max\(1\.0, fps\)\)\)/);
+  assert.doesNotMatch(source, /media_seconds\s*=\s*.*wall_seconds/);
+});
+
 const FPS = 30;
 const LEAD_SECONDS = 1.019;
 const WIDTH = 320;

@@ -238,6 +238,11 @@ BiliRecord2K 不会安装或替换 JetPack/L4T、NVIDIA 驱动和 NVIDIA 专有 
 - `nvidia-l4t-*`
 - JetPack
 - NVIDIA 驱动
+使用一键安装脚本时，会安装 FFmpeg、字体以及 GStreamer tools/base/good 等通用依赖。
+
+直接安装 `.deb` 时，由 Debian 包声明并安装其运行所需的基础依赖。
+
+JetPack/L4T、NVIDIA 驱动和 NVIDIA 专有 GStreamer 组件，在两种方式下都不会由 BiliRecord2K 替换或跨版本安装。
 
 正式发布会同时提供 Debian 安装包和通用 systemd 压缩包。两种包都自带 Node.js 运行时，服务器只需要能安装 `ffmpeg` 等系统依赖。
 
@@ -328,6 +333,10 @@ Jetson 导出有三个能力层级：兼容路径是 `CPU decode / FFmpeg Scene 
 启动时会依次进行能力探测、CUDA Scene runtime probe、视觉一致性门禁和当前真实录像约 5 秒的 preflight，通过后才正式使用连续 NVMM 链。preflight 失败时，正式任务从 0 开始直接走兼容链；正式 NVMM 已经运行较长时间后失败时，会停止任务并保留明确错误，不会偷偷把整部长录像从 0 重新 CPU 渲染。
 
 Jetson 的依赖边界、诊断命令、服务用户检查和日志判断方式见 [docs/jetson.md](docs/jetson.md)。
+
+正式 NVMM 在前 5 秒内失败时仍允许兼容链回退一次；超过 5 秒后失败会停止任务，并在“软件维护”中保留脱敏的导出失败诊断报告。
+
+桌面 NVIDIA CUDA 视觉门禁、缓存失效条件、硬件能力面板和导出诊断说明也会在“软件维护”中显示；桌面 CUDA 只有在当前机器的真实视觉门禁通过后才会进入完整 Scene 生产路径。
 
 ### systemd 与自动更新
 
