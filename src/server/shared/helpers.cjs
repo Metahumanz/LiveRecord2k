@@ -669,6 +669,27 @@ async function detectDesktopCudaCapability(ffmpegPath, options = {}) {
   };
 }
 
+async function detectJetsonRuntimeIdentity(options = {}) {
+  const fileSystem = options.fileSystem || fs;
+  const readFile = options.readFile || ((filePath) => fileSystem.promises.readFile(filePath, 'utf8'));
+  const runProcess = options.runCapturedProcess || runCapturedProcess;
+  const release = await readFile('/etc/nv_tegra_release').catch(() => '');
+  const packageProbe = await runProcess('dpkg-query', ['-W', '-f=${Version}', 'nvidia-l4t-core'], {
+    timeoutMs: 3000,
+    maxOutputBytes: 16 * 1024
+  }).catch(() => ({ status: 1, stdout: '', stderr: '' }));
+  const cudaProbe = await runProcess(String(options.nvidiaSmiPath || 'nvidia-smi'), ['--query-gpu=driver_version', '--format=csv,noheader'], {
+    timeoutMs: 3000,
+    maxOutputBytes: 16 * 1024
+  }).catch(() => ({ status: 1, stdout: '', stderr: '' }));
+  return {
+    l4tRelease: String(release || '').trim(),
+    l4tPackage: packageProbe.status === 0 ? String(packageProbe.stdout || '').trim() : '',
+    cudaDriver: cudaProbe.status === 0 ? String(cudaProbe.stdout || '').trim() : '',
+    elements: options.elements || {}
+  };
+}
+
 async function detectFfmpegAvatarCompositeBackend(ffmpegPath, { hwaccels = [], filterNames = new Set() } = {}) {
   const attempts = [];
   let cudaReason = '';
@@ -4132,6 +4153,7 @@ module.exports = {
   testFfmpegDesktopCudaPipeline,
   detectFfmpegAvatarCompositeBackend,
   detectDesktopCudaCapability,
+  detectJetsonRuntimeIdentity,
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,

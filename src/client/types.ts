@@ -379,6 +379,24 @@ export type FfmpegCapabilities = {
   probeError?: string;
 };
 
+export type AccelerationDiagnostics = {
+  version: number;
+  generatedAt: number;
+  platform: string;
+  arch: string;
+  appVersion: string;
+  checks: Record<string, {
+    id: string;
+    label: string;
+    ok: boolean;
+    reason: string;
+    details?: Record<string, unknown>;
+  }>;
+  finalCapability: Record<string, unknown>;
+};
+
+export type ExportDiagnosticReport = Record<string, unknown>;
+
 export type AvatarPreparationDiagnostics = {
   requested: number;
   prepared: number;
@@ -553,6 +571,10 @@ export type AppState = {
   update: UpdateState;
   ffmpegPath?: string;
   ffmpegCapabilities?: FfmpegCapabilities;
+  diagnostics?: {
+    acceleration?: AccelerationDiagnostics | null;
+    lastExportFailure?: ExportDiagnosticReport | null;
+  };
   hardwareSelfTest?: HardwareSelfTest;
   exportProgress?: FfmpegJobProgress | null;
   exportQueue?: ExportQueueItem[];

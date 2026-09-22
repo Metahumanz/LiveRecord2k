@@ -23,6 +23,11 @@ const {
   runDesktopCudaSceneConformance
 } = require('../danmaku/desktop-cuda-conformance.cjs');
 const {
+  buildAccelerationDiagnostics,
+  buildExportDiagnosticReport,
+  sanitizeDiagnosticReport
+} = require('./diagnostics.cjs');
+const {
   DanmakuClient,
   requestBiliJsonWithCookies,
   fetchWithTimeout,
@@ -122,6 +127,7 @@ const {
   parseFfmpegHwaccels,
   detectVideoAdapters,
   detectVideoAdapterVendor,
+  detectJetsonRuntimeIdentity,
   hasVideoAdapterVendor,
   testFfmpegEncoder,
   testFfmpegAvatarCompositeBackend,
@@ -1031,6 +1037,8 @@ class LiveRecordService {
     // Runtime probing alone never grants CUDA production eligibility.
     this.cudaSceneConformanceReportPath = String(process.env.BILI_RECORD_CUDA_SCENE_CONFORMANCE_REPORT || '').trim() ||
       path.join(appData, 'BiliRecord2K', 'cuda-scene-conformance.json');
+    this.lastExportDiagnosticPath = String(process.env.BILI_RECORD_LAST_EXPORT_DIAGNOSTIC || '').trim() ||
+      path.join(appData, 'BiliRecord2K', 'last-export-diagnostic.json');
     this.stateStore = new AtomicJsonStore(this.storePath);
     this.storeExists = false;
     this.previewCacheDir = path.join(appData, 'BiliRecord2K', 'preview-cache');
@@ -1126,6 +1134,7 @@ class LiveRecordService {
     this.recordings = [];
     this.recordingScanPromise = null;
     this.notifications = [];
+    this.diagnostics = { acceleration: null, lastExportFailure: null };
     this.notificationSeq = 0;
     this.webhookQueue = [];
     this.webhookQueueRunning = false;
@@ -1213,6 +1222,7 @@ class LiveRecordService {
 
   async init() {
     await this.loadStore();
+    await this.loadLastExportDiagnostic();
     await this.bootstrapPersistentConfiguration();
     await this.loadLastUpdateStatus();
     try {
@@ -1300,6 +1310,7 @@ class LiveRecordService {
     this.ffmpegCapabilities.sceneGpuVisualConformance = this.ffmpegCapabilities.sceneGpuRenderer.visualConformance ||
       createCudaSceneConformanceUnavailable();
     await this.initializeDesktopCudaConformance();
+    await this.refreshAccelerationDiagnostics();
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1455,6 +1466,56 @@ class LiveRecordService {
     await fsp.rename(temporaryPath, this.cudaSceneConformanceReportPath);
     this.applyDesktopCudaConformanceReport(report, { cached: false });
     this.emitState();
+    return report;
+  }
+
+  async refreshAccelerationDiagnostics() {
+    const isJetson = process.platform === 'linux' && process.arch === 'arm64';
+    const renderer = this.ffmpegCapabilities?.sceneGpuRenderer || {};
+    const availableElements = new Set(renderer.gstreamerElements || []);
+    const jetsonRuntime = isJetson
+      ? await detectJetsonRuntimeIdentity({
+          elements: {
+            nvv4l2decoder: availableElements.has('nvv4l2decoder'),
+            nvv4l2h264enc: availableElements.has('nvv4l2h264enc'),
+            nvv4l2h265enc: availableElements.has('nvv4l2h265enc'),
+            nvvidconv: availableElements.has('nvvidconv') || availableElements.has('nvvideoconvert'),
+            nvivafilter: availableElements.has('nvivafilter')
+          }
+        })
+      : {};
+    this.diagnostics.acceleration = buildAccelerationDiagnostics({
+      appVersion: APP_VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      ffmpegCapabilities: this.ffmpegCapabilities,
+      jetsonRuntime
+    });
+    return this.diagnostics.acceleration;
+  }
+
+  async loadLastExportDiagnostic() {
+    try {
+      this.diagnostics.lastExportFailure = sanitizeDiagnosticReport(
+        JSON.parse(await fsp.readFile(this.lastExportDiagnosticPath, 'utf8'))
+      );
+    } catch {
+      this.diagnostics.lastExportFailure = null;
+    }
+  }
+
+  async persistExportDiagnosticFailure(context, error) {
+    const report = buildExportDiagnosticReport({
+      appVersion: APP_VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      ...context
+    }, error);
+    await fsp.mkdir(path.dirname(this.lastExportDiagnosticPath), { recursive: true });
+    const temporaryPath = `${this.lastExportDiagnosticPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(temporaryPath, JSON.stringify(report, null, 2), 'utf8');
+    await fsp.rename(temporaryPath, this.lastExportDiagnosticPath);
+    this.diagnostics.lastExportFailure = report;
     return report;
   }
 
@@ -2294,6 +2355,7 @@ class LiveRecordService {
       currentHost: this.currentHost || DEFAULT_HOST,
       platform: UI_PLATFORM,
       uiCapabilities: createUiCapabilities(UI_PLATFORM, process.env, options),
+      diagnostics: this.diagnostics,
       storePath: this.storePath,
       appRoot: APP_ROOT,
       distRoot: DIST_ROOT
@@ -12106,6 +12168,15 @@ try {
     let sceneDirectory = '';
     const sceneFontFallbackWarnings = new Map();
     let flushSceneFontFallbackWarnings = () => {};
+    const diagnosticContext = {
+      decoder: decoderInfo,
+      encoder: burnCodec,
+      scene: { stylePreset, overlayMode, startTime, duration },
+      pipeline: null,
+      preflight: null,
+      ptsBridge: null,
+      fallback: null
+    };
     let cancelled = false;
     try {
       const estimatedExportBytes = Math.ceil(
@@ -12338,6 +12409,7 @@ try {
       };
       const recordNativePreflight = (result) => {
         nativePreflight = result || null;
+        diagnosticContext.preflight = nativePreflight;
         progress.nativePreflight = nativePreflight
           ? {
               status: nativePreflight.ok ? 'passed' : 'failed',
@@ -12445,7 +12517,10 @@ try {
               : null,
             onStderr,
             onChild,
-            onPipeline: (pipeline) => this.setProgressPipeline(progress, pipeline),
+            onPipeline: (pipeline) => {
+              diagnosticContext.pipeline = pipeline;
+              this.setProgressPipeline(progress, pipeline);
+            },
             onProgress: (value) => {
               const mediaSeconds = Math.max(0, Number(value) || 0);
               if (nativePreflight?.ok === true && nativeDecoderPath) {
@@ -12462,6 +12537,7 @@ try {
             onPreparing: onScenePreparing,
             onPhase: onScenePhase,
             onStageMetrics: (metrics) => {
+              diagnosticContext.ptsBridge = metrics?.ptsBridge || diagnosticContext.ptsBridge;
               if (this.exportProgress?.id === progress.id && setFfmpegJobStageFps(progress, metrics)) this.emitState('mediaJob');
             },
             beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
@@ -12593,6 +12669,17 @@ try {
       } else if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'error', 'Scene Graph 导出失败：' + error.message);
         this.emitState('mediaJob');
+        await this.persistExportDiagnosticFailure({
+          ...diagnosticContext,
+          pipeline: diagnosticContext.pipeline || progress.activePipeline,
+          fallback: diagnosticContext.fallback || {
+            decision: error.code === 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT'
+              ? 'abort-after-commit'
+              : 'native-failure'
+          }
+        }).catch((diagnosticError) => {
+          this.log('warn', `保存导出失败诊断报告失败：${diagnosticError.message}`);
+        });
       }
       if (!cancelled) throw error;
       return { ok: false, mode: 'burn', cleanPath: recording.cleanPath };
