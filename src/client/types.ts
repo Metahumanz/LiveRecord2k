@@ -361,6 +361,18 @@ export type FfmpegCapabilities = {
     decoder?: string;
     compositor?: string;
     fullSceneProduction?: boolean;
+    conformanceStatus?: 'pending' | 'running' | 'passed' | 'failed' | 'stale';
+    conformanceReason?: string;
+    conformanceCached?: boolean;
+    environmentFingerprint?: string;
+    environment?: {
+      platform: string;
+      arch: string;
+      appVersion?: string;
+      ffmpegVersion?: string;
+      gpu?: Array<{ name: string; driver: string; pciBusId: string }> | null;
+      videoAdapters?: Array<{ name: string; vendor: string }>;
+    };
     reason?: string;
   };
   probedAt: number;

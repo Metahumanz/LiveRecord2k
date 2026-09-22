@@ -9,6 +9,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { runCapturedProcess } = require('../shared/helpers.cjs');
 const { createAss } = require('./ass.cjs');
 const { buildSceneGraph } = require('./scene-graph.cjs');
 const { writeSceneFilterScript } = require('./scene-renderer.cjs');
@@ -94,6 +95,38 @@ function fingerprintEnvironment(environment) {
   return crypto.createHash('sha256').update(stableJson(normalized)).digest('hex');
 }
 
+async function collectDesktopCudaEnvironment(options = {}) {
+  const ffmpegPath = String(options.ffmpegPath || 'ffmpeg');
+  const runCommand = options.runCommand || runCapturedProcess;
+  const ffmpegResult = await runCommand(ffmpegPath, ['-version'], { timeoutMs: 5000, maxOutputBytes: 32 * 1024 });
+  const nvidiaResult = await runCommand(
+    String(options.nvidiaSmiPath || 'nvidia-smi'),
+    ['--query-gpu=name,driver_version,pci.bus_id', '--format=csv,noheader'],
+    { timeoutMs: 5000, maxOutputBytes: 32 * 1024 }
+  );
+  const gpu = String(nvidiaResult?.status === 0 ? nvidiaResult.stdout || '' : '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [name, driver, pciBusId] = line.split(',').map((item) => String(item || '').trim());
+      return { name, driver, pciBusId };
+    });
+  const environment = {
+    platform: String(options.platform || process.platform),
+    arch: String(options.arch || process.arch),
+    appVersion: String(options.appVersion || ''),
+    conformanceVersion: CUDA_SCENE_CONFORMANCE_VERSION,
+    ffmpegVersion: String(ffmpegResult?.stdout || '').split(/\r?\n/)[0].trim(),
+    gpu: gpu.length ? gpu : null,
+    // Some Windows driver setups hide nvidia-smi. Keep the capability probe's
+    // adapter inventory as a diagnostic fallback, but never invent a GPU.
+    videoAdapters: Array.isArray(options.videoAdapters) ? options.videoAdapters : []
+  };
+  environment.fingerprint = fingerprintEnvironment(environment);
+  return environment;
+}
+
 async function runDesktopCudaSceneConformance(options = {}) {
   const ffmpeg = String(options.ffmpegPath || 'ffmpeg');
   const runProcess = options.runProcess || defaultRunProcess;
@@ -170,5 +203,6 @@ module.exports = {
   SCENARIOS,
   pixelDelta,
   fingerprintEnvironment,
+  collectDesktopCudaEnvironment,
   runDesktopCudaSceneConformance
 };

@@ -19,6 +19,10 @@ const {
   canUseDesktopCudaSceneProduction
 } = require('../danmaku/gpu-scene-conformance.cjs');
 const {
+  collectDesktopCudaEnvironment,
+  runDesktopCudaSceneConformance
+} = require('../danmaku/desktop-cuda-conformance.cjs');
+const {
   DanmakuClient,
   requestBiliJsonWithCookies,
   fetchWithTimeout,
@@ -1181,11 +1185,17 @@ class LiveRecordService {
       avatarCompositeReason: '',
       cudaAvatarComposite: false,
       cudaAvatarCompositeReason: '',
-      desktopCuda: { available: false, reason: '尚未执行桌面 CUDA 合成/NVENC 自检。' },
+      desktopCuda: {
+        available: false,
+        conformanceStatus: 'pending',
+        conformanceCached: false,
+        reason: '尚未执行桌面 CUDA 合成/NVENC 自检。'
+      },
       probedAt: 0,
       probeError: ''
     };
     this.runtimeCapabilitiesPromise = null;
+    this.desktopCudaConformancePromise = null;
     this.settings = this.normalizeSettings(this.settings);
     this.statePublisher = new StatePublisher({
       getFullState: (options) => this.getState(options),
@@ -1289,14 +1299,7 @@ class LiveRecordService {
     this.ffmpegCapabilities.sceneGpuRenderer = await this.probeGpuSceneRenderer();
     this.ffmpegCapabilities.sceneGpuVisualConformance = this.ffmpegCapabilities.sceneGpuRenderer.visualConformance ||
       createCudaSceneConformanceUnavailable();
-    const desktopCudaConformance = await this.readCudaSceneConformanceReport();
-    if (this.ffmpegCapabilities.desktopCuda) {
-      this.ffmpegCapabilities.desktopCuda.visualConformance = desktopCudaConformance;
-      this.ffmpegCapabilities.desktopCuda.fullSceneProduction = canUseDesktopCudaSceneProduction(
-        this.ffmpegCapabilities.desktopCuda,
-        desktopCudaConformance
-      ).ok;
-    }
+    await this.initializeDesktopCudaConformance();
     this.settings = this.normalizeSettings(this.settings);
     this.log('info', `可用弹幕版编码：${this.ffmpegCapabilities.burnCodecs.map((codec) => codec.label).join('、') || '未探测到'}`);
     const selectedCodec = this.getBurnCodecInfo(this.settings.burnCodec);
@@ -1353,7 +1356,11 @@ class LiveRecordService {
     );
     const desktopCuda = this.ffmpegCapabilities.desktopCuda;
     if (desktopCuda?.available) {
-      const desktopCudaSceneProduction = canUseDesktopCudaSceneProduction(desktopCuda, desktopCuda.visualConformance);
+      const desktopCudaSceneProduction = canUseDesktopCudaSceneProduction(
+        desktopCuda,
+        desktopCuda.visualConformance,
+        { environmentFingerprint: desktopCuda.environmentFingerprint }
+      );
       this.log(
         'success',
         `桌面 NVIDIA CUDA 已通过真实自检：${desktopCuda.decoder ? 'CUDA 硬解、' : ''}${desktopCuda.compositor || 'overlay_cuda'} 合成、${desktopCuda.encoder}。${desktopCudaSceneProduction.ok ? 'ASS 金标准视觉门禁通过，三套旧样式将使用完整 CUDA Scene。' : `完整 CUDA Scene 尚未准入：${desktopCudaSceneProduction.reason}`}`
@@ -1362,6 +1369,93 @@ class LiveRecordService {
       this.log('info', `桌面 NVIDIA CUDA 合成链未启用：${desktopCuda?.reason || '尚未完成自检。'}`);
     }
     this.emitState();
+  }
+
+  async initializeDesktopCudaConformance() {
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda?.available) return;
+    let environment;
+    try {
+      environment = await collectDesktopCudaEnvironment({
+        ffmpegPath: this.ffmpegPath,
+        appVersion: APP_VERSION,
+        videoAdapters: this.ffmpegCapabilities.videoAdapters
+      });
+    } catch (error) {
+      desktopCuda.conformanceStatus = 'failed';
+      desktopCuda.conformanceReason = `无法读取桌面 CUDA 自检环境：${compactLogLine(error.message || error)}`;
+      desktopCuda.reason = desktopCuda.conformanceReason;
+      return;
+    }
+    desktopCuda.environment = environment;
+    desktopCuda.environmentFingerprint = environment.fingerprint;
+    const report = await this.readCudaSceneConformanceReport();
+    this.applyDesktopCudaConformanceReport(report, { cached: false });
+    const admission = canUseDesktopCudaSceneProduction(
+      desktopCuda,
+      report,
+      { environmentFingerprint: environment.fingerprint }
+    );
+    if (admission.ok) {
+      this.applyDesktopCudaConformanceReport(report, { cached: true });
+      return;
+    }
+    this.ensureDesktopCudaConformance().catch((error) => {
+      this.log('warn', `桌面 CUDA Scene 视觉门禁失败：${error.message}`);
+    });
+  }
+
+  applyDesktopCudaConformanceReport(report, options = {}) {
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda) return { ok: false, reason: '桌面 CUDA runtime 不可用。' };
+    desktopCuda.visualConformance = report;
+    const admission = canUseDesktopCudaSceneProduction(
+      desktopCuda,
+      report,
+      { environmentFingerprint: desktopCuda.environmentFingerprint }
+    );
+    desktopCuda.fullSceneProduction = admission.ok;
+    desktopCuda.conformanceCached = Boolean(options.cached && admission.ok);
+    desktopCuda.conformanceReason = admission.reason || '';
+    if (admission.ok) desktopCuda.conformanceStatus = 'passed';
+    else if (!report?.executedAt) desktopCuda.conformanceStatus = 'pending';
+    else if (report?.passed !== true) desktopCuda.conformanceStatus = 'failed';
+    else desktopCuda.conformanceStatus = 'stale';
+    return admission;
+  }
+
+  ensureDesktopCudaConformance() {
+    if (this.desktopCudaConformancePromise) return this.desktopCudaConformancePromise;
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda?.available || desktopCuda.fullSceneProduction) return Promise.resolve(null);
+    this.desktopCudaConformancePromise = this.startDesktopCudaConformance()
+      .finally(() => { this.desktopCudaConformancePromise = null; });
+    return this.desktopCudaConformancePromise;
+  }
+
+  async startDesktopCudaConformance() {
+    const desktopCuda = this.ffmpegCapabilities?.desktopCuda;
+    if (!desktopCuda?.available) return null;
+    if (this.exportProgress || this.burnQueue.some((item) => ['queued', 'running'].includes(item.status))) {
+      desktopCuda.conformanceStatus = 'pending';
+      desktopCuda.conformanceReason = '当前有媒体任务，桌面 CUDA 视觉门禁将在空闲时执行。';
+      return null;
+    }
+    desktopCuda.conformanceStatus = 'running';
+    desktopCuda.conformanceCached = false;
+    this.emitState();
+    const report = await runDesktopCudaSceneConformance({
+      ffmpegPath: this.ffmpegPath,
+      environment: desktopCuda.environment,
+      environmentFingerprint: desktopCuda.environmentFingerprint
+    });
+    await fsp.mkdir(path.dirname(this.cudaSceneConformanceReportPath), { recursive: true });
+    const temporaryPath = `${this.cudaSceneConformanceReportPath}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(temporaryPath, JSON.stringify(report, null, 2), 'utf8');
+    await fsp.rename(temporaryPath, this.cudaSceneConformanceReportPath);
+    this.applyDesktopCudaConformanceReport(report, { cached: false });
+    this.emitState();
+    return report;
   }
 
   startRuntimeCapabilitiesProbe() {

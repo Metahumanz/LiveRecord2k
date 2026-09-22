@@ -106,14 +106,20 @@ function canUseCudaSceneProduction(renderer, conformance) {
 // Desktop CUDA has no GStreamer helper: FFmpeg owns NVDEC, the CUDA texture
 // uploads/overlay_cuda compositor, and NVENC. It must nevertheless pass the
 // very same frozen-ASS visual gate before the legacy styles may use it.
-function canUseDesktopCudaSceneProduction(capability, conformance) {
+function canUseDesktopCudaSceneProduction(capability, conformance, options = {}) {
   if (!capability?.available || capability.backend !== 'cuda-ffmpeg') {
     return { ok: false, reason: '桌面 CUDA Scene runtime probe 未通过。' };
   }
   if (conformance?.backend !== 'cuda-ffmpeg') {
     return { ok: false, reason: '尚未执行本机桌面 CUDA Scene 像素一致性自检。' };
   }
-  return validateCudaSceneConformance(conformance);
+  const validation = validateCudaSceneConformance(conformance);
+  if (!validation.ok) return validation;
+  const expectedFingerprint = String(options.environmentFingerprint || '').trim();
+  if (expectedFingerprint && conformance.environmentFingerprint !== expectedFingerprint) {
+    return { ok: false, reason: '桌面 CUDA Scene 自检环境已变化，需要重新执行视觉一致性门禁。' };
+  }
+  return { ok: true, reason: '' };
 }
 
 module.exports = {
