@@ -1,6 +1,6 @@
 # AGX Orin 真实录像烧录回归
 
-2026-09-26，使用用户指定的 AGX Orin Developer Kit、L4T R39.2.1，在独立目录 `/var/tmp/br2k-orin-ca15664/` 运行当前 dev 服务代码。使用机器已安装的 Node、ffmpeg-full 和 CUDA 插件，单独上传修复后的 Python helper。没有替换 `/usr/lib/bili-record-2k` 正式安装、没有调用服务 init，也没有启动录制、监控或自动烧录。
+2026-09-26，使用用户指定的 AGX Orin Developer Kit、L4T R39.2.1，先在独立目录 `/var/tmp/br2k-orin-ca15664/` 运行 dev 服务代码。隔离测试使用机器已安装的 Node、ffmpeg-full 和 CUDA 插件，不调用服务 init，不启动录制、监控或自动烧录。通过真实样片验证后，按用户明确授权将 `2de5189` 覆盖到正式安装，并完成安装后验证，详见下文。
 
 ## 复现和修复
 
@@ -37,7 +37,18 @@ Orin 使用统一内存。`tegrastats` 的 RAM 峰值包含系统、其他进程
 - Orin 原生 PTS、真实黑场前导和未知/有理帧率测试通过。
 - 测试视频与报告：`/mnt/zzzz/哔哩录播2K/Orin修复验证_20260926/`，Windows 共享映射为 `X:\哔哩录播2K\Orin修复验证_20260926\`。
 - 失败样本、原生 CUDA 诊断、配置白名单、原始采样和抽帧留在 `/var/tmp/br2k-orin-ca15664/`。
-- 自动烧录在现有配置中已经为 false，本次没有更改它。正式服务尚未升级，因此运行中的旧版本尚未获得这些修复。
+- 自动烧录在现有配置中已经为 false，覆盖安装后仍保持 false。
+
+## 正式 Orin 覆盖安装
+
+用户授权“测试成功后覆盖 orin 安装”后，确认没有录制、烧录、预览或排队媒体任务，再备份和覆盖 `/usr/lib/bili-record-2k`。更新服务 bundle、前端、应用 assets 和 `bin/br2k-scene-gpu`，保留已安装的 Node、FFmpeg、CUDA 二进制插件、JetPack/L4T 和 systemd 单元。现有录像目录、账号配置、编码参数与用户布局继续使用。
+
+- 修复代码：`dev@2de5189`，应用版本仍为 `0.8.4`；`version.json` 记录 `buildCommit: 2de5189`。没有发布、推送或变更 main。
+- 旧安装和配置备份：`/var/backups/bili-record-2k/20260926T122037Z-before-2de5189/`，仅 root 可访问。配置归档未包含录像目录。
+- 用正式服务账号 `bili-record-2k` 对实际安装 helper 重跑六组 ASS/CUDA 测试，全部通过。新 v2 门禁报告安装到现有配置目录；重启后 API 确认 CUDA runtime 可用、视觉门禁通过、服务 active。
+- 安装后同一账号、实际安装 helper 对同一真实录像再跑隔离 30 秒样片：导出 37.250 秒，含外部验收 40.814 秒，文字匹配 99.90%。原 MP4 和四个 sidecar 的签名保持不变。该测试 CLI 使用同一修复代码，不调用正式服务的导出 API。
+- 部署记录和安装后样片：`/var/tmp/br2k-orin-2de5189-install/`。原安装、配置备份和隔离诊断均保留，自动烧录没有启用。完整长片和原片音画绝对同步仍属于上述未验收范围。
+- Windows 5060 Ti 测试包也重新生成，包含本次共享布局修复：`release/bili-record-2k-0.8.4-2de5189-5060Ti-test.zip`、同名前缀 `-setup.exe` 和 `-SHA256SUMS.txt`。尚未在 5060 Ti 实机执行。
 
 ## 重复执行
 
