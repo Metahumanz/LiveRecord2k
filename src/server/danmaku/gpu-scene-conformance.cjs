@@ -4,7 +4,9 @@
 // a complete, current visual run. A helper's advertised primitives are not
 // evidence that its pixels, alpha or timeline are compatible.
 
-const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v1';
+// v2 resolves selected side-stream bounds and compares frame-aligned leads.
+// A v1 report cannot admit code with the previous layout/clock contracts.
+const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v2';
 const CUDA_SCENE_CONFORMANCE_PRESETS = ['h5-card', 'bubble', 'minimal'];
 const CUDA_SCENE_CONFORMANCE_LEADS = [0, 1.019];
 const CUDA_SCENE_CONFORMANCE_COVERAGE = [

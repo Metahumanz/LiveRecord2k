@@ -136,7 +136,9 @@ function normalizeCanvas(videoInfo) {
 }
 
 function adaptStyleToCanvas(styleValues, videoInfo) {
-  const style = resolveStyle(styleValues, styleValues && styleValues.visualPreset);
+  // These values have already resolved the preset and user overrides.
+  // Reapplying preset defaults here silently discards dragged coordinates.
+  const style = resolveStyle(styleValues, styleValues && styleValues.visualPreset, styleValues);
   const canvas = normalizeCanvas(videoInfo);
   if (!canvas) return style;
   const baseWidth = Math.max(1, Number(style.playWidth) || DEFAULT_STYLE.playWidth);
@@ -617,7 +619,7 @@ class LayoutEngine {
     // Use the legacy timeline as the single source of truth and let Scene
     // Graph only translate that resolved geometry into renderer primitives.
     const legacyStyle = adaptLegacyDanmakuStyleToVideo(
-      resolveLegacyDanmakuStyle(this.sourceStyle, this.sourceStyle.visualPreset),
+      resolveLegacyDanmakuStyle(this.sourceStyle, this.sourceStyle.visualPreset, this.sourceStyle),
       this.videoInfo || { width: this.style.playWidth, height: this.style.playHeight }
     );
     const nativeBounds = resolveLayoutBounds(this.style, this.displayArea);

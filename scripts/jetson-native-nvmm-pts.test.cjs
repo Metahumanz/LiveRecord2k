@@ -26,6 +26,30 @@ const LEAD_SECONDS = 1.019;
 const WIDTH = 320;
 const HEIGHT = 180;
 
+test('native CUDA clock keeps requested fps for unknown caps and accepts precise rational rates', async (t) => {
+  if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('在 Orin Python 运行时验证解码器帧率契约');
+  const helper = process.env.BR2K_JETSON_NVMM_HELPER || '/usr/lib/bili-record-2k/bin/br2k-scene-gpu';
+  // Extract only the dependency-free resolver; importing the whole helper
+  // would start GStreamer and load libass for this numeric contract test.
+  const python = `import ast, pathlib, sys
+tree = ast.parse(pathlib.Path(sys.argv[1]).read_text())
+function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'resolve_native_scene_fps')
+scope = {}
+exec(compile(ast.Module(body=[function], type_ignores=[]), '<fps-contract>', 'exec'), scope)
+resolve = scope['resolve_native_scene_fps']
+for caps in ['video/x-raw,framerate=(fraction)0/1', 'framerate=(fraction)60/0', 'video/x-raw']:
+    assert resolve(caps, 59.9041043857) == ('unavailable', 59.9041043857)
+assert resolve('framerate=(fraction)60/1', 59.9) == ('60/1', 60)
+_, source_fps = resolve('framerate=(fraction)60/1', 59.9041043857)
+assert resolve('framerate=(fraction)0/1', source_fps) == ('unavailable', 60)
+name, fps = resolve('framerate=(fraction)60000/1001', 30)
+assert name == '60000/1001' and abs(fps - 59.94005994006) < 1e-9
+print('unknown and rational decoder rates passed')
+`;
+  const result = await run('/usr/bin/python3', ['-c', python, helper]);
+  assert.match(result.stdout, /decoder rates passed/);
+});
+
 function run(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });

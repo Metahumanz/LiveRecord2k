@@ -9,7 +9,7 @@ const { LiveRecordService } = require('../src/server/app/service.cjs');
 const { buildSceneGraph, clipSceneGraph, readSceneCacheEvents, sceneCacheRecord } = require('../src/server/danmaku/scene-graph.cjs');
 const { createSceneFilterScript } = require('../src/server/danmaku/scene-renderer.cjs');
 const { selectDesktopScenePath, planDesktopSceneSegments, filterLayerCount, selectSceneSample, classifyDecodeFailure } = require('../src/server/danmaku/desktop-scene-policy.cjs');
-const { canUseDesktopCudaSceneProduction, DESKTOP_CUDA_REPORT_MAX_AGE_MS } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
+const { canUseDesktopCudaSceneProduction, DESKTOP_CUDA_REPORT_MAX_AGE_MS, CUDA_SCENE_CONFORMANCE_VERSION } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
 const { compareSceneTextPixels } = require('../src/server/danmaku/scene-output-verifier.cjs');
 const { ffmpegEnvironment } = require('../src/server/recording/fontconfig.cjs');
 const { runFfmpegJob, runCapturedProcess } = require('../src/server/shared/helpers.cjs');
@@ -41,7 +41,7 @@ test('software composition with NVENC reserves CPU as well as encoder resources'
 test('desktop admission rejects old, future and missing environment reports at the final gate', () => {
   const now = Date.now();
   const capability = { available: true, backend: 'cuda-ffmpeg', environmentFingerprint: 'machine' };
-  const report = { version: 'ass-compat-v1', backend: 'cuda-ffmpeg', passed: true, executedAt: now,
+  const report = { version: CUDA_SCENE_CONFORMANCE_VERSION, backend: 'cuda-ffmpeg', passed: true, executedAt: now,
     environmentFingerprint: 'machine', cases: ['h5-card', 'bubble', 'minimal'].flatMap((preset) => [0, 1.019].map((leadingVideoPaddingSec) => ({
       preset, leadingVideoPaddingSec, passed: true, metrics: { meanAbsRgb: 0, changedRatio: 0 },
       coverage: Object.fromEntries(['danmaku', 'avatar', 'superchat', 'gift', 'roundedCorners', 'shadow', 'move', 'fade'].map((key) => [key, true]))

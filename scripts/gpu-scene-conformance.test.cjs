@@ -38,6 +38,10 @@ test('CUDA Scene production gate rejects an unexecuted visual report', () => {
   assert.equal(canUseCudaSceneProduction({ available: true, backend: 'cuda-gstreamer' }, report).ok, false);
 });
 
+test('CUDA Scene rejects a passing report from the old layout and lead clock', () => {
+  assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v1' }).ok, false);
+});
+
 test('CUDA Scene production gate requires every legacy style, lead-in and visual coverage item', () => {
   const report = passingReport();
   assert.equal(validateCudaSceneConformance(report).ok, true);

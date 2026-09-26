@@ -4,6 +4,7 @@ dist/
 release/
 smoke-output/
 .tmp/desktop-burn-regression/
+.tmp/orin-ca15664/
 *.log
 *.tsbuildinfo
 .DS_Store

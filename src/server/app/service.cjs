@@ -12025,6 +12025,13 @@ try {
     if (nativeDecode) {
       request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
       request.input.codec = String(nativeDecode.sourceCodec || '').toLowerCase();
+      // Unknown decoder caps (0/1) cannot supply the CUDA frame clock. The
+      // container average includes missing frames/edit-list gaps; prefer its
+      // rational frame clock so long exports do not accumulate overlay drift.
+      if (nativeDecode.decoderPath) {
+        const sourceMedia = await probeMediaFileInfo(this.ffmpegPath, cleanPath);
+        request.input.sourceFrameRate = String(sourceMedia.videoInfo?.rFrameRate || '');
+      }
     }
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
     this.log('info', `${label}：将在子进程实际启动后报告 CUDA Scene 运行链路。`);

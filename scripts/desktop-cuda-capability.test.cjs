@@ -9,7 +9,7 @@ const {
 const {
   fingerprintEnvironment
 } = require('../src/server/danmaku/desktop-cuda-conformance.cjs');
-const { canUseDesktopCudaSceneProduction } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
+const { canUseDesktopCudaSceneProduction, CUDA_SCENE_CONFORMANCE_VERSION } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
 
 const cudaFilters = new Set(['hwupload_cuda', 'overlay_cuda', 'scale_cuda']);
 const nvenc = [{ value: 'hevc_nvenc', kind: 'hardware' }];
@@ -58,7 +58,7 @@ test('desktop CUDA conformance cache is tied to the runtime fingerprint', () => 
   const fingerprint = fingerprintEnvironment(environment);
   assert.notEqual(fingerprint, fingerprintEnvironment({ ...environment, rendererRevision: 'before-alpha-fix' }));
   const report = {
-    version: 'ass-compat-v1', backend: 'cuda-ffmpeg', passed: true,
+    version: CUDA_SCENE_CONFORMANCE_VERSION, backend: 'cuda-ffmpeg', passed: true,
     executedAt: Date.now(),
     environmentFingerprint: fingerprint,
     cases: [

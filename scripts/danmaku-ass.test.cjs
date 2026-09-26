@@ -67,12 +67,13 @@ test('style presets keep the existing CSS untouched by default and apply preview
   assert.equal(styled.superChatBottom, 1000);
   assert.equal(styled.superChatWidth, 500);
   assert.equal(normalizeDanmakuStyleLayout({ superChatBottom: -200 }).superChatBottom, -200);
+  assert.deepEqual(normalizeDanmakuStyleLayout({ panelLeft: 0, danmakuAreaTop: null, danmakuAreaBottom: '' }), { panelLeft: 0 });
   const event = { type: 'superchat', time: 1, user: '预览用户', price: 30, text: '样式预览应与烧录一致' };
   const legacyAss = createAss([event], { style: resolveDanmakuStyle(existingCssStyle, 'current', {}) });
   const currentAss = createAss([event], { stylePreset: 'current', style: existingCssStyle, styleLayout: {} });
   const styledAss = createAss([event], { style: styled });
   assert.equal(legacyAss, currentAss);
-  assert.match(styledAss, /\\clip\(90,0,590,1000\)/);
+  assert.match(styledAss, /\\clip\(90,44,590,540\)/);
   assert.match(styledAss, /\\pos\(90,/);
 });
 
@@ -86,6 +87,27 @@ test('explicit danmaku area bounds are shared by ASS layout and clipping', () =>
     styleLayout: layout
   });
   assert.match(ass, /\\clip\(28,120,478,640\)/);
+});
+
+test('ASS cards and avatar queues share Scene display bounds at each selected area', () => {
+  const { buildSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
+  const events = [{ type: 'danmaku', time: 1, uid: 3, user: '区域用户', text: '中文区域一致性' }];
+  for (const stylePreset of ['h5-card', 'bubble', 'minimal']) {
+    for (const danmakuArea of ['quarter', 'half', 'three-quarter']) {
+      const options = { stylePreset, danmakuArea, videoInfo: { width: 2560, height: 1440 } };
+      const graph = buildSceneGraph(events, options);
+      const ass = createAss(events, options);
+      const clips = [...ass.matchAll(/\\clip\(([^)]+)\)/g)];
+      assert.ok(clips.length > 0);
+      for (const match of clips) {
+        const [, top, , bottom] = match[1].split(',').map(Number);
+        assert.ok(Math.abs(top - graph.metadata.layoutBounds.top) <= 0.01);
+        assert.ok(Math.abs(bottom - graph.metadata.layoutBounds.bottom) <= 0.01);
+      }
+      const avatars = createAvatarOverlayPlan(events, options);
+      assert.ok(Math.abs(avatars.panel.height - graph.metadata.layoutBounds.bottom) <= 0.01);
+    }
+  }
 });
 
 test('portrait source videos use their real ASS canvas and keep overlays inside it', () => {
@@ -119,7 +141,7 @@ test('portrait source videos use their real ASS canvas and keep overlays inside 
   });
   assert.match(sideAss, /PlayResX: 1080/);
   assert.match(sideAss, /PlayResY: 1920/);
-  assert.match(sideAss, /\\clip\(28,0,478,1880\)/);
+  assert.match(sideAss, /\\clip\(28,44,478,960\)/);
   assert.match(rollingAss, /\\move\(1140,36,-/);
 });
 
@@ -132,15 +154,15 @@ test('non-default presets turn ordinary danmaku into a fixed side conversation s
 
   assert.match(current, /\\move\(1980,36,-/);
   assert.doesNotMatch(current, /预览用户 · 普通弹幕也要有样式/);
-  assert.match(h5Card, /\\clip\(28,0,478,1040\)/);
+  assert.match(h5Card, /\\clip\(28,44,478,540\)/);
   assert.match(h5Card, /\\move\(28,/);
   assert.match(h5Card, /预览用户/);
   assert.match(h5Card, /\\1c&HD7CF59&\\1a&H04&/);
   assert.match(h5Card, /\\1c&HFFFFFF&\\1a&H40&/);
   assert.doesNotMatch(h5Card, /\\an5/);
-  assert.match(bubble, /\\clip\(54,0,474,1018\)/);
+  assert.match(bubble, /\\clip\(54,64,474,540\)/);
   assert.match(bubble, /\\1c&H2F2230&\\1a&H12&/);
-  assert.match(minimal, /\\clip\(24,0,384,1052\)/);
+  assert.match(minimal, /\\clip\(24,30,384,540\)/);
   assert.match(minimal, /预览用户\{\\b0\} · 普通弹幕也要有样式/);
   assert.doesNotMatch(minimal, /预览用户\\b0 · 普通弹幕也要有样式/);
   assert.doesNotMatch(minimal, /\\1c&H191710&\\1a&H30&/);
@@ -271,7 +293,7 @@ test('photo-avatar overlay plan reuses the side queue coordinates and keeps a sa
   const plan = createAvatarOverlayPlan(events, { stylePreset: 'h5-card', maxEntries: 8 });
 
   assert.equal(plan.visualPreset, 'h5-card');
-  assert.deepEqual(plan.panel, { left: 28, width: 450, height: 1040 });
+  assert.deepEqual(plan.panel, { left: 28, width: 450, height: 540 });
   assert.equal(plan.entries.length, 2);
   assert.equal(plan.entries[0].avatarUrl, 'https://i0.hdslb.com/bfs/face/avatar-a.jpg');
   assert.equal(plan.entries[1].uid, 202, 'a missing recorded URL can be resolved from the public UID card later');

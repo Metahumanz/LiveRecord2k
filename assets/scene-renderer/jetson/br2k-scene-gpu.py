@@ -725,6 +725,15 @@ def decode_native(args):
         fail('原生 NVDEC 仅解出 %d/%d 帧。' % (written, required_frames))
 
 
+def resolve_native_scene_fps(caps_text, requested_fps):
+    """Unknown (0/1) decoder rates must not replace the valid Scene clock."""
+    match = __import__('re').search(r'framerate=\(fraction\)(\d+)/(\d+)', caps_text)
+    if match and int(match.group(1)) > 0 and int(match.group(2)) > 0:
+        numerator, denominator = int(match.group(1)), int(match.group(2))
+        return str(numerator) + '/' + str(denominator), numerator / denominator
+    return 'unavailable', requested_fps
+
+
 def render_native_nvmm(request):
     """Decode, composite and encode entirely in NVMM for one finite request."""
     check_request(request)
@@ -734,6 +743,7 @@ def render_native_nvmm(request):
     input_path = str(source.get('path') or '')
     if not os.path.isfile(input_path): fail('原生零拷贝输入不存在：' + input_path)
     width, height, fps = int(output['width']), int(output['height']), number(output.get('fps'), 30)
+    _, scene_fps = resolve_native_scene_fps('framerate=(fraction)' + str(source.get('sourceFrameRate') or ''), fps)
     codec = str(source.get('codec') or '').lower()
     parser_factory = 'h265parse' if codec in ('hevc', 'h265') else 'h264parse'
     encoder = 'nvv4l2h265enc' if ('hevc' in str(output.get('codec') or '') or 'h265' in str(output.get('codec') or '')) else 'nvv4l2h264enc'
@@ -762,7 +772,7 @@ def render_native_nvmm(request):
         timeline_request['reportPreparation'] = True
         timeline = prepare_cuda_timeline(timeline_request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
-        os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
+        os.environ['BR2K_CUDA_SCENE_FPS'] = str(scene_fps)
         # Let GStreamer's delayed-link machinery bind qtdemux.video_0 before
         # streaming begins. This is the same graph syntax that succeeds under
         # gst-launch; hand-written pad-added linkage could admit one frame and
@@ -957,10 +967,9 @@ def render_native_nvmm(request):
                 # rate rather than the lossy decimal displayed by FFmpeg.
                 caps = _pad.get_current_caps()
                 caps_text = caps.to_string() if caps else ''
-                match = __import__('re').search(r'framerate=\(fraction\)(\d+)/(\d+)', caps_text)
-                if match and int(match.group(2)) > 0:
-                    numerator, denominator = int(match.group(1)), int(match.group(2))
-                    negotiated_fps['value'] = str(numerator) + '/' + str(denominator)
+                source_rate, scene_rate = resolve_native_scene_fps(caps_text, scene_fps)
+                if source_rate != 'unavailable':
+                    negotiated_fps['value'] = source_rate
                     # nvivafilter's customer-library ABI exposes no buffer
                     # PTS, so the CUDA renderer derives its media clock from
                     # frame index / BR2K_CUDA_SCENE_FPS.  The customer library
@@ -970,13 +979,17 @@ def render_native_nvmm(request):
                     # Preserve the source rational rate as a precise decimal
                     # for the renderer, while retaining the rational form in
                     # diagnostics.
-                    os.environ['BR2K_CUDA_SCENE_FPS'] = format(numerator / denominator, '.12g')
+                    os.environ['BR2K_CUDA_SCENE_FPS'] = format(scene_rate, '.12g')
                     native_nvmm_trace('negotiated source fps=' + negotiated_fps['value'] + ' (' + os.environ['BR2K_CUDA_SCENE_FPS'] + ')')
                 elif caps_text:
                     # Avoid re-querying once per decoded frame on unusual
-                    # streams whose negotiated caps omit framerate.
+                    # streams whose negotiated caps omit framerate or use
+                    # 0/1 for an unknown rate. Zero must never replace the
+                    # request's valid rate: CUDA clamps it to 1 fps, consumes
+                    # the entire overlay timeline in seconds, then emits
+                    # an otherwise successful video without danmaku.
                     negotiated_fps['value'] = 'unavailable'
-                    native_nvmm_trace('decoder caps omit framerate: ' + caps_text)
+                    native_nvmm_trace('decoder caps have no positive framerate; retaining source/request fps=' + str(scene_fps) + ': ' + caps_text)
             if counters[key] == 0:
                 native_nvmm_trace('first ' + key + ' buffer pts=' + str(buffer.pts))
             if key == 'decode' and buffer.pts != Gst.CLOCK_TIME_NONE:

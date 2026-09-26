@@ -212,6 +212,24 @@ test('Scene Graph publishes resolved display bounds for preview/export parity', 
   assert.deepEqual(rolling.metadata.layoutBounds, { top: 36, bottom: 540 });
 });
 
+test('Scene keeps user layout overrides through canvas scaling and legacy translation', () => {
+  for (const stylePreset of ['current', 'h5-card', 'bubble', 'minimal']) {
+    for (const panelLeft of [0, 90]) {
+      const graph = buildSceneGraph([{ type: 'danmaku', time: 1, text: '保留用户坐标', user: '测试' }], {
+        stylePreset, danmakuArea: 'quarter', videoInfo: { width: 2560, height: 1440 },
+        styleLayout: { panelLeft, superChatWidth: 510, danmakuAreaTop: 120, danmakuAreaBottom: 640 }
+      });
+      assert.deepEqual(graph.metadata.layoutBounds, { top: 160, bottom: 853.33 });
+      if (stylePreset !== 'current') {
+        const clipped = graph.objects.filter((object) => object.style?.clip);
+        assert.ok(clipped.length > 0);
+        assert.ok(clipped.every((object) => Math.abs(object.style.clip.x - panelLeft * 4 / 3) < 0.01));
+        assert.ok(clipped.every((object) => object.style.clip.width === 680));
+      }
+    }
+  }
+});
+
 test('all Scene styles resolve display areas to one shared top/bottom contract', () => {
   for (const stylePreset of ['current', 'h5-card', 'bubble', 'minimal']) {
     const bounds = {};
