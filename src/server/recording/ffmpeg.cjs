@@ -938,7 +938,7 @@ function createBurnArgs({
   const avatarCompositeBackend = gpuAvatarComposite
     ? normalizeAvatarCompositeBackend(avatarOverlay?.gpuCompositeBackend) || 'cuda'
     : '';
-  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   const sceneCudaDevice = sceneCuda ? 'br2k_scene_cuda' : '';
   if (sceneCuda) {
     args.push('-init_hw_device', `cuda=${sceneCudaDevice}:0`, '-filter_hw_device', sceneCudaDevice);

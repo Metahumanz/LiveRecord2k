@@ -8,6 +8,7 @@ const tls = require('node:tls');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { validateRemoteUrl } = require('./security.cjs');
+const { ffmpegEnvironment } = require('../recording/fontconfig.cjs');
 
 let ffmpegStatic = null;
 try {
@@ -1038,7 +1039,7 @@ function runCapturedProcess(command, args, options = {}) {
       child = spawn(command, args, {
         windowsHide: true,
         stdio: [hasInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-        env: options.env || process.env
+        env: ffmpegEnvironment(options.env || process.env)
       });
       options.onChild?.(child);
       if (hasInput) {
@@ -1541,6 +1542,7 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, {
       windowsHide: true,
+      env: ffmpegEnvironment(options.env || process.env),
       stdio: ['ignore', 'ignore', 'pipe']
     });
     options.onChild?.(child);

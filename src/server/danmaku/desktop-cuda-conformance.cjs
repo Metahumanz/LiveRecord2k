@@ -9,6 +9,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { ffmpegEnvironment } = require('../recording/fontconfig.cjs');
 const { runCapturedProcess } = require('../shared/helpers.cjs');
 const { createAss } = require('./ass.cjs');
 const { buildSceneGraph } = require('./scene-graph.cjs');
@@ -24,6 +25,7 @@ const {
 
 const CANVAS = { width: 640, height: 360, fps: 60 };
 const DURATION = 2;
+const DESKTOP_RENDERER_REVISION = 'ass-alpha-v2';
 const SAMPLE_TIMES = [0.9, 1.6];
 const EVENTS = [
   { type: 'danmaku', time: 0.25, uid: 1, user: '普通观众', text: 'CUDA 与 ASS 的基准弹幕正文', color: 0xffffff },
@@ -38,7 +40,7 @@ const SCENARIOS = [
 
 function defaultRunProcess(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(command, args, { windowsHide: true, env: ffmpegEnvironment(), stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-16000); });
     child.on('error', reject);
@@ -88,6 +90,7 @@ function fingerprintEnvironment(environment) {
     platform: environment?.platform || process.platform,
     arch: environment?.arch || process.arch,
     conformanceVersion: environment?.conformanceVersion || CUDA_SCENE_CONFORMANCE_VERSION,
+    rendererRevision: environment?.rendererRevision || DESKTOP_RENDERER_REVISION,
     ffmpegVersion: environment?.ffmpegVersion || '',
     gpu: environment?.gpu || null,
     videoAdapters: environment?.videoAdapters || []
@@ -117,6 +120,7 @@ async function collectDesktopCudaEnvironment(options = {}) {
     arch: String(options.arch || process.arch),
     appVersion: String(options.appVersion || ''),
     conformanceVersion: CUDA_SCENE_CONFORMANCE_VERSION,
+    rendererRevision: DESKTOP_RENDERER_REVISION,
     ffmpegVersion: String(ffmpegResult?.stdout || '').split(/\r?\n/)[0].trim(),
     gpu: gpu.length ? gpu : null,
     // Some Windows driver setups hide nvidia-smi. Keep the capability probe's

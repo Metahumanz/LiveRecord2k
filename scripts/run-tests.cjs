@@ -38,6 +38,7 @@ const GROUPS = {
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
     'desktop-cuda-capability.test.cjs',
+    'desktop-burn-regression.test.cjs',
     'diagnostics.test.cjs',
     'gpu-scene-conformance.test.cjs',
     'gpu-scene-renderer.test.cjs',

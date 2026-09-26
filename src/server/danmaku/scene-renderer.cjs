@@ -3,10 +3,10 @@
 const fsp = require('node:fs/promises');
 const { assertSceneGraph, evaluateSceneObject } = require('./scene-graph.cjs');
 
-// This renderer emits one FFmpeg filter graph directly over clean video. It
-// never turns ASS into video and never creates a transparent-video
-// intermediate. The same object/time evaluator is used by browser preview and
-// backend conformance tests.
+// Emit a filter graph over clean video using the preview's object/time
+// evaluator. Frozen legacy presets may supply an ASS compatibility layer;
+// per-object Scene textures have bounded lifetimes, and simple desktop text
+// can be drawn directly without a transparent input stream.
 
 function number(value, fallback) {
   const numeric = Number(value);
@@ -208,7 +208,10 @@ function objectShapeFilter(object, label, duration, fps, options) {
     ? ',pad=w=iw+' + padding * 2 + ':h=ih+' + padding * 2 + ':x=' + padding + ':y=' + padding + ':color=black@0'
     : '';
   const blurred = blur > 0 ? ',boxblur=lr=' + ff(blur) + ':lp=1:cr=' + ff(blur) + ':cp=1:ar=' + ff(blur) + ':ap=1' : '';
-  return 'color=c=' + color + ':s=' + width + 'x' + height + ':r=' + Math.max(1, number(fps, 30)) + ':d=' + ff(duration) +
+  const start = Math.max(0, number(object.start));
+  const life = Math.max(0.001, Math.min(duration, number(object.end, duration)) - start);
+  return 'color=c=' + color + ':s=' + width + 'x' + height + ':r=' + Math.max(1, number(fps, 30)) + ':d=' + ff(life) +
+    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB' +
     ',format=rgba' + roundedMask + dynamicScaleFilter(object) + fadeFilters(object) + padded + blurred + '[' + label + ']';
 }
 
@@ -229,8 +232,10 @@ function avatarFilter(object, label, duration) {
   const radius = Math.min(width, height) / 2;
   const alpha = "if(lte((X-W/2)^2+(Y-H/2)^2\\," + ff(radius * radius) + ")\\,alpha(X\\,Y)\\,0)";
   const opacity = Math.max(0, Math.min(1, number(object.style && object.style.opacity, 1)));
-  return "movie='" + quoteFilter(path) + "',loop=loop=-1:size=1:start=0,trim=duration=" + ff(duration) +
-    ',setpts=PTS-STARTPTS,scale=' + width + ':' + height + ',format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=' + "'" + alpha + "',colorchannelmixer=aa=" + ff(opacity) + fadeFilters(object) + dynamicScaleFilter(object) + '[' + label + ']';
+  const start = Math.max(0, number(object.start));
+  const life = Math.max(0.001, Math.min(duration, number(object.end, duration)) - start);
+  return "movie='" + quoteFilter(path) + "',loop=loop=-1:size=1:start=0,trim=duration=" + ff(life) +
+    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB,scale=' + width + ':' + height + ',format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=' + "'" + alpha + "',colorchannelmixer=aa=" + ff(opacity) + fadeFilters(object) + dynamicScaleFilter(object) + '[' + label + ']';
 }
 
 function overlayShape(previous, imageLabel, output, object, offset) {
@@ -341,12 +346,34 @@ function textLayerFilter(object, label, duration, fps) {
   const alpha = fadeExpression(object);
   const width = Math.max(2, Math.ceil(number(object.frame && object.frame.width, fontSize)));
   const height = Math.max(2, Math.ceil(number(object.frame && object.frame.height, fontSize * 1.3)));
-  return 'color=c=black@0.0:s=' + width + 'x' + height + ':r=' + Math.max(1, number(fps, 30)) + ':d=' + ff(duration) +
+  const start = Math.max(0, number(object.start));
+  const life = Math.max(0.001, Math.min(duration, number(object.end, duration)) - start);
+  return 'color=c=black@0.0:s=' + width + 'x' + height + ':r=' + Math.max(1, number(fps, 30)) + ':d=' + ff(life) +
+    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB' +
     ",format=rgba,drawtext=font='" + font + "':text='" + text + "':fontsize=" + ff(fontSize) +
     ':fontcolor=' + fill + ':borderw=' + ff(style.strokeWidth) + ':bordercolor=' + stroke +
     ':shadowx=' + ff(shadow.offsetX) + ':shadowy=' + ff(shadow.offsetY) +
     ':shadowcolor=' + rgbaColor(shadow.color || '#000000', number(shadow.opacity, 0)) +
     ":x=0:y=0:alpha='" + alpha + "'" + dynamicScaleFilter(object) + '[' + label + ']';
+}
+
+function directTextFilter(previous, output, object) {
+  const props = object.props || {};
+  const style = object.style || {};
+  const shadow = style.shadow || {};
+  return '[' + previous + "]drawtext=font='" + quoteFilter(props.fontFamily || 'Arial') +
+    "':text='" + quoteText(props.text || '') + "':fontsize=" + ff(props.fontSize || 20) +
+    ':fontcolor=' + rgbaColor(style.fill || '#ffffff', 1) +
+    ':borderw=' + ff(style.strokeWidth) + ':bordercolor=' + rgbaColor(style.stroke || '#000000', 1) +
+    ':shadowx=' + ff(shadow.offsetX) + ':shadowy=' + ff(shadow.offsetY) +
+    ':shadowcolor=' + rgbaColor(shadow.color || '#000000', number(shadow.opacity, 0)) +
+    ":x='" + motionExpression(object, 'x') + "':y='" + motionExpression(object, 'y') +
+    "':alpha='" + fadeExpression(object) + "':enable='" + objectEnable(object) + "'[" + output + ']';
+}
+
+function canDrawTextDirectly(object) {
+  return object.type === 'Text' && number(object.props?.fontSize) >= 20 &&
+    !(object.animations || []).some((animation) => animation.type === 'Scale');
 }
 
 function createSceneFilterScript(scene, options) {
@@ -383,7 +410,7 @@ function createSceneFilterScript(scene, options) {
       : [inputBase.replace('[scene_cuda_source]', '[scene_cuda_base]')];
     base.push(
       'color=c=black@0.0:s=' + canvasWidth + 'x' + canvasHeight + ':r=' + ff(fps) + ':d=' + ff(outputDuration) +
-        ',format=rgba,settb=AVTB,setpts=PTS-STARTPTS+' + lead + "/TB,ass=filename='" + quoteFilter(legacyAssPath) + "',format=yuva420p,hwupload_cuda[scene_cuda_ass]",
+        ',format=rgba,settb=AVTB,setpts=PTS-STARTPTS+' + lead + "/TB,ass=filename='" + quoteFilter(legacyAssPath) + "':alpha=1,format=yuva420p,hwupload_cuda[scene_cuda_ass]",
       '[scene_cuda_base][scene_cuda_ass]overlay_cuda=x=0:y=0:eof_action=pass:repeatlast=0[ vout ]'.replace('[ vout ]', '[vout]')
     );
     return { plan, script: base.join(';\n') + '\n', renderer: 'cuda-ass-texture-compatibility' };
@@ -394,13 +421,16 @@ function createSceneFilterScript(scene, options) {
   if (legacyAssPath) {
     if (leadingVideoPaddingSec > 0.0005) {
       const lead = ff(leadingVideoPaddingSec);
+      // libass reads the recording clock, but concat adds the black lead
+      // itself. Reset only after rasterisation to avoid adding that lead
+      // twice to the source video while keeping glyph timestamps correct.
       return {
         plan,
         script: [
           'color=c=black:s=' + canvasWidth + 'x' + canvasHeight + ':r=' + ff(fps) + ':d=' + lead +
             ',format=yuv420p,setpts=PTS-STARTPTS[scene_legacy_lead]',
           "[0:v]settb=AVTB,setpts=PTS-STARTPTS+" + lead + "/TB,ass=filename='" + quoteFilter(legacyAssPath) +
-            "'[scene_legacy_source]",
+            "',setpts=PTS-STARTPTS[scene_legacy_source]",
           '[scene_legacy_lead][scene_legacy_source]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
             ',setpts=PTS-STARTPTS,format=yuv420p[vout]'
         ].join(';\n') + '\n',
@@ -420,15 +450,20 @@ function createSceneFilterScript(scene, options) {
   // output timeline instead of extending the recording.
   const cudaInput = source.cudaInput === true;
   const uploadBase = cudaTarget && !cudaInput ? ',format=yuv420p,hwupload_cuda' : '';
+  // Text-only chunks can stay in the decoder's YUV colour space. This avoids
+  // converting every 1440p frame to RGBA and back merely to draw a few glyphs.
+  const softwareFormat = source.directText === true && plan.objects.every(canDrawTextDirectly)
+    ? ',format=yuv420p' : ',format=rgba';
+  const frameClock = source.normalizeFrameClock === true && !cudaTarget ? ',fps=fps=' + ff(fps) + ':round=near' : '';
   const filters = leadingVideoPaddingSec > 0.0005
     ? [
-        '[0:v]settb=AVTB,setpts=PTS-STARTPTS' + (cudaTarget ? uploadBase : ',format=rgba') + '[scene_source_0]',
+        '[0:v]settb=AVTB,setpts=PTS-STARTPTS' + (cudaTarget ? uploadBase : softwareFormat) + '[scene_source_0]',
         'color=c=black:s=' + canvasWidth + 'x' + canvasHeight + ':r=' + ff(fps) + ':d=' + ff(leadingVideoPaddingSec) +
-          (cudaTarget ? ',format=yuv420p,hwupload_cuda' : ',format=rgba') + ',setpts=PTS-STARTPTS[scene_lead_0]',
+          (cudaTarget ? ',format=yuv420p,hwupload_cuda' : softwareFormat) + ',setpts=PTS-STARTPTS[scene_lead_0]',
         '[scene_lead_0][scene_source_0]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
-          ',setpts=PTS-STARTPTS' + (cudaTarget ? '' : ',format=rgba') + '[scene_base_0]'
+          ',setpts=PTS-STARTPTS' + frameClock + (cudaTarget ? '' : softwareFormat) + '[scene_base_0]'
       ]
-    : ['[0:v]settb=AVTB,setpts=PTS-STARTPTS' + (cudaTarget ? uploadBase : ',format=rgba') + '[scene_base_0]'];
+    : ['[0:v]settb=AVTB,setpts=PTS-STARTPTS' + frameClock + (cudaTarget ? uploadBase : softwareFormat) + '[scene_base_0]'];
   let previous = 'scene_base_0';
   let index = 0;
   let cudaLayersInBatch = 0;
@@ -446,6 +481,18 @@ function createSceneFilterScript(scene, options) {
   for (const object of plan.objects) {
     if (object.type === 'Text') {
       for (const variant of textVariants(object)) {
+        // Simple scrolling text needs no animated texture. Drawing glyphs
+        // directly avoids an RGBA image stream and a full-canvas overlay for
+        // each message. Scaled/card text keeps the canonical texture path.
+        // Tiny glyphs amplify raster clipping/encoder rounding differences;
+        // preserve their established texture rasterisation as well.
+        if (source.directText === true && !cudaTarget && canDrawTextDirectly(variant)) {
+          const output = 'scene_direct_text_' + index;
+          filters.push(directTextFilter(previous, output, variant));
+          previous = output;
+          index += 1;
+          continue;
+        }
         const image = 'scene_text_image_' + index;
         const cpuImage = cudaTarget ? image + '_cpu' : image;
         const output = 'scene_text_' + index;

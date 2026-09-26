@@ -635,12 +635,15 @@ async function readSceneCacheEvents(cachePath) {
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
-      try {
-        const record = JSON.parse(line);
-        if (record && record.schema === SCENE_CACHE_SCHEMA && record.op === 'append' && record.event) events.push(record.event);
-      } catch {
-        // A partially written final line must not invalidate an otherwise
-        // useful capture cache.
+      // Older builds wrote a literal backslash-n delimiter. Recover caches
+      // without rewriting originals or splitting escaped newlines in text.
+      for (const fragment of line.split(/\\n(?=\{"schema":"bili-record2k\.scene-cache\/v1")/)) {
+        try {
+          const record = JSON.parse(fragment.replace(/\\n$/, ''));
+          if (record && record.schema === SCENE_CACHE_SCHEMA && record.op === 'append' && record.event) events.push(record.event);
+        } catch {
+          // Ignore a partially written final record.
+        }
       }
     }
   } catch (error) {
@@ -817,6 +820,14 @@ function clipSceneGraph(graph, startTime, endTime, options) {
       next.end = round(objectEnd - shift, 4);
       next.frame.x = round(state.x);
       next.frame.y = round(state.y);
+      if (object.props?.textKeyframes?.length) {
+        const keyframes = object.props.textKeyframes.slice().sort((a, b) => Number(a.time) - Number(b.time));
+        for (const keyframe of keyframes) {
+          if (Number(keyframe.time) <= objectStart) next.props.text = String(keyframe.text || '');
+        }
+        next.props.textKeyframes = keyframes.filter((keyframe) => Number(keyframe.time) > objectStart && Number(keyframe.time) < objectEnd)
+          .map((keyframe) => ({ ...keyframe, time: round(Number(keyframe.time) - shift, 4) }));
+      }
       next.animations = (object.animations || [])
         .map((animation) => clipAnimation(animation, objectStart, objectEnd, shift))
         .filter(Boolean);

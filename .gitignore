@@ -3,6 +3,7 @@ build/
 dist/
 release/
 smoke-output/
+.tmp/desktop-burn-regression/
 *.log
 *.tsbuildinfo
 .DS_Store
