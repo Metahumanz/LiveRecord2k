@@ -8,6 +8,8 @@ const {
   selectDesktopScenePath, selectSceneSample, selectDistributedSceneSamples, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
 } = require('../danmaku/desktop-scene-policy.cjs');
 const { runDesktopSceneExport } = require('../danmaku/desktop-scene-export.cjs');
+const { createSceneChunkProgress } = require('../danmaku/scene-chunk-progress.cjs');
+const { reuseVerifiedNativeVideo } = require('../danmaku/native-video-output.cjs');
 const { verifySceneOutputFrame } = require('../danmaku/scene-output-verifier.cjs');
 const QRCode = require('qrcode');
 const {
@@ -12194,6 +12196,11 @@ try {
         let nativeRenderingReported = false;
         let nativeMetrics = null;
         let formalNativeMediaSeconds = 0;
+        const chunkProgress = createSceneChunkProgress({
+          onStderr,
+          onProgress: (local) => onProgress?.(Math.min(duration, completed + Math.max(0, local))),
+          onPhase
+        });
         const common = {
           codec,
           quality: crf,
@@ -12219,11 +12226,7 @@ try {
                 decoderPath: nativeDecoderPath
               }
             : null,
-          onStderr: (line) => {
-            onStderr?.(line);
-            const local = parseFfmpegProgressTime(line);
-            if (Number.isFinite(local)) onProgress?.(Math.min(duration, completed + Math.max(0, local)));
-          },
+          onStderr: chunkProgress.onStderr,
           // The native NVMM helper has no FFmpeg stderr progress stream. Its
           // PTS-derived callback is therefore the only authoritative live
           // position for a running chunk; without forwarding it here the UI
@@ -12249,7 +12252,7 @@ try {
           },
           onChild,
           onPipeline: (pipeline) => this.setProgressPipeline(this.exportProgress, pipeline),
-          onPhase,
+          onPhase: chunkProgress.onPhase,
           onStageMetrics: (metrics) => {
             if (this.exportProgress?.status !== 'running') return;
             if (setFfmpegJobStageFps(this.exportProgress, metrics)) this.emitState('mediaJob');
@@ -12281,6 +12284,7 @@ try {
               duration: chunkDuration,
               timelineOffsetSec: chunkLeadingVideoPaddingSec,
               nativeTimestampedOutput: nativeTimestampedChunk,
+              nativeVideoOutputPath: nativeTimestampedChunk ? chunkPath : '',
               createRawArgs: (nextDecoder) => createBurnRawVideoArgs({
                 cleanPath, assPath: '', fps, startTime: chunkStart, duration: chunkDuration, inputSeek: true,
                 timelineOffset: 0, leadingVideoPaddingSec: chunkLeadingVideoPaddingSec, decoder: nextDecoder,
@@ -12338,6 +12342,7 @@ try {
           // access units. Its FFprobe presentation duration is therefore a
           // useful diagnostic only; treating it as an admission gate falsely
           // rejects an already validated fixed-frame media interval.
+          onStage?.('正在检查原生视频时间轴与帧连续性');
           const chunkInfo = await probeMediaFileInfo(this.ffmpegPath, chunkPath, { timeoutMs: 30_000 });
           const timeline = await probeMediaTimelineInfo(this.ffmpegPath, chunkPath, chunkInfo, { timeoutMs: 30_000 });
           const coverage = Number(timeline.videoPresentationDurationSec || timeline.videoDurationSec || 0);
@@ -12377,6 +12382,7 @@ try {
     duration,
     timelineOffsetSec = 0,
     nativeTimestampedOutput = false,
+    nativeVideoOutputPath = '',
     cleanPath,
     encodedVideoPath,
     sceneTemporaryDir = '',
@@ -12577,6 +12583,11 @@ try {
         });
       }
       onPhase?.('mux');
+      if (nativeVideoOutputPath && nativeTimestampedOutput && useNativeDecode && renderer.nativeNvmmScene) {
+        await reuseVerifiedNativeVideo(encodedVideoPath, nativeVideoOutputPath, completedNativeMetrics, { isCancelled });
+        this.log('info', `${label}：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。`);
+        return;
+      }
       await runFfmpegJob(
         this.ffmpegPath,
         createMuxArgs({ preserveVideoTimestamps: Boolean(nativeTimestampedOutput && useNativeDecode && renderer.nativeNvmmScene) }),

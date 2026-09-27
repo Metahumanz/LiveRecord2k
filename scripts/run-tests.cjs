@@ -50,6 +50,7 @@ const GROUPS = {
     'gpu-scene-conformance.test.cjs',
     'gpu-scene-renderer.test.cjs',
     'jetson-native-bridge.test.cjs',
+    'jetson-native-output.test.cjs',
     'jetson-export-recovery.test.cjs',
     'jetson-self-test.test.cjs',
     'keyframe-preview.test.cjs',

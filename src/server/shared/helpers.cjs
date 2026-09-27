@@ -1681,6 +1681,12 @@ function setFfmpegJobPhase(progress, phase, options = {}) {
     progress.percent = 100;
   }
   progress.phase = phase;
+  // Remux/verification has a new media clock. Do not display its rate as
+  // live rendering speed (or carry the previous render rate into that phase).
+  if (phase !== 'render') {
+    progress.renderFps = null;
+    progress.realtimeFactor = null;
+  }
   progress.phaseStartedAt = now;
   progress.phaseCurrentTimeSec = 0;
   progress.phasePercent = phase === 'verify' ? null : 0;
@@ -1695,6 +1701,7 @@ function setFfmpegJobPhase(progress, phase, options = {}) {
         ? Math.max(0, Number(progress.durationSec || 0))
         : 0;
   if (options.stageLabel !== undefined) progress.stageLabel = String(options.stageLabel || '');
+  if (progress.stageLabel) progress.message = progress.stageLabel;
   progress.updatedAt = now;
   resetFfmpegJobProgressRate(progress, phase);
   return true;
