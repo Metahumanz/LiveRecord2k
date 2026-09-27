@@ -6,6 +6,7 @@ const test = require('node:test');
 const ffmpegPath = require('ffmpeg-static');
 
 const { LiveRecordService, getMergeSegmentTimingAssessment } = require('../src/server/app/service.cjs');
+const { AtomicJsonStore } = require('../src/server/app/atomic-store.cjs');
 const { createNormalizeSegmentArgs, createNormalizeEncodedVideoMuxArgs } = require('../src/server/recording/ffmpeg.cjs');
 const {
   createFfmpegJobProgress,
@@ -50,6 +51,48 @@ function createMergeTestService() {
   service.getMergeRetryDelayMs = () => 1;
   return service;
 }
+
+test('cancelled groups and manual selection survive a real store reload without suppressing the next session', async t => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cancel-persist-'));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
+  const files = [];
+  for (let i = 0; i < 4; i++) { const file = path.join(directory, `${i}.clean.mp4`); await fsp.writeFile(file, 'source'); files.push(file); }
+  app.recordings = files.map((cleanPath, i) => ({ cleanPath, roomId: room.id, startedAt: i + 1, valid: true,
+    mergeGroup: i < 2 ? 'first-session' : 'second-session', mergeSequence: i % 2 + 1, durationSec: 10, segmentTargetDurationSec: 600 }));
+  app.storePath = path.join(directory, 'settings.json'); app.stateStore = new AtomicJsonStore(app.storePath);
+  app.saveStore = LiveRecordService.prototype.saveStore;
+  room.mergeProgress = { kind: 'merge', id: 'first-job', mergeGroup: 'first-session', status: 'retrying',
+    manual: true, sourcePaths: files.slice(0, 2), outputPath: path.join(directory, 'first.merged.mp4') };
+  await app.cancelMerge(room.id, 'first-job');
+  const restarted = createMergeTestService(); restarted.storePath = app.storePath; restarted.stateStore = new AtomicJsonStore(app.storePath);
+  await restarted.loadStore();
+  const restored = restarted.getRoom(room.id);
+  assert.equal(restored.mergeProgress.status, 'cancelled'); assert.deepEqual(restored.mergeProgress.sourcePaths, files.slice(0, 2));
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'first-session')), true);
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'second-session')), false);
+  assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'second-session');
+});
+
+test('a retry in another group displays its own output path rather than the previous completed merge', () => {
+  const app = createMergeTestService(); const room = { id: '883263', mergeProgress: {
+    kind: 'merge', status: 'completed', mergeGroup: 'first-session', outputPath: 'first.merged.mp4' } };
+  app.getMergeRetryDelayMs = () => 60000;
+  app.scheduleMergeRetry(room, 'second-session', { cleanPath: 'second.clean.mp4', mergeOutputPath: 'second.merged.mp4' }, new Error('retry'));
+  assert.equal(room.mergeProgress.outputPath, 'second.merged.mp4'); assert.equal(room.mergeProgress.mergeGroup, 'second-session');
+  app.clearMergeRetryStatesForRoom(room.id);
+});
+
+test('service shutdown does not persist an interruption as a user cancellation', async () => {
+  const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
+  const progress = createFfmpegJobProgress({ kind: 'merge', durationSec: 60, roomId: room.id });
+  progress.mergeGroup = 'not-user-cancelled'; room.mergeProgress = progress;
+  const lease = await app.acquireMergeMediaLease(room, progress, { preferred: 'libx264', requiresTranscode: true });
+  app.draining = true; await app.mediaJobs.shutdown();
+  assert.equal(app.mergeCancelRequests.size, 0);
+  assert.equal(app.mergePreemptRequests.has(app.getMergeRetryKey(room.id, progress.mergeGroup)), true);
+  lease.release();
+});
 
 test('cancelling one live session does not suppress finalization of a later single-segment session', async () => {
   const app = createMergeTestService();

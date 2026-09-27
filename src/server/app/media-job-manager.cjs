@@ -293,7 +293,7 @@ class MediaJobManager extends EventEmitter {
     this.draining = true;
     const queued = this.queue.splice(0);
     for (const job of queued) job.reject(new Error('服务正在关闭，排队媒体任务已取消。'));
-    for (const job of [...this.active.values(), ...this.external.values()]) job.cancel?.();
+    for (const job of [...this.active.values(), ...this.external.values()]) job.cancel?.({ reason: 'shutdown' });
     this.emit('change');
   }
 }

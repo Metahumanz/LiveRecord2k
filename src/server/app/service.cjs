@@ -1545,8 +1545,14 @@ class LiveRecordService {
       const store = result.store;
       this.storeExists = await fsp.stat(this.storePath).then((stat) => stat.isFile()).catch(() => false);
       this.settings = this.normalizeSettings({ ...this.settings, ...(store.settings || {}) });
+      this.mergeCancelRequests = new Set(store.mergeCancelledGroups || []);
       for (const savedRoom of store.rooms || []) {
         const room = this.normalizeRoom(savedRoom);
+        const cancelled = savedRoom.cancelledMergeProgress;
+        if (cancelled?.kind === 'merge' && cancelled.status === 'cancelled' && cancelled.manual && cancelled.sourcePaths?.length >= 2) {
+          room.cancelledMergeProgress = cancelled;
+          room.mergeProgress = { ...cancelled };
+        }
         this.rooms.set(room.id, room);
       }
       this.recordings = (store.recordings || []).map((recording) => this.normalizeRecording(recording)).filter(Boolean);
@@ -1575,13 +1581,15 @@ class LiveRecordService {
       keyframe: room.keyframe,
       liveStatus: room.liveStatus,
       monitoring: room.monitoring,
-      autoRecord: room.autoRecord !== false
+      autoRecord: room.autoRecord !== false,
+      cancelledMergeProgress: room.cancelledMergeProgress
     }));
     await this.stateStore.save({
       settings: options.settings ?? this.settings,
       rooms,
       recordings: this.recordings,
       mediaJobs: [],
+      mergeCancelledGroups: [...this.mergeCancelRequests],
       segmentCleanups: Array.from(this.pendingSegmentCleanups.values())
     });
   }
@@ -7228,6 +7236,7 @@ try {
       const groupId = String(recording?.mergeGroup || '').trim();
       if (
         !groupId ||
+        (preferredGroup !== groupId && this.mergeCancelRequests.has(this.getMergeRetryKey(roomId, groupId))) ||
         String(recording?.roomId || '') !== roomId ||
         recording?.mergedFrom?.length ||
         recording?.valid === false ||
@@ -7298,8 +7307,9 @@ try {
       return false;
     }
     const delayMs = Math.max(0, Number(options.delayMs ?? this.getMergeRetryDelayMs(attempts)) || 0);
-    const outputPath =
-      room.mergeProgress?.outputPath || fallbackRecording?.mergeOutputPath || deriveSiblingPath(fallbackRecording?.cleanPath || '', 'merged');
+    const outputPath = options.manualOptions?.outputPath ||
+      (room.mergeProgress?.mergeGroup === groupId ? room.mergeProgress.outputPath : '') ||
+      fallbackRecording?.mergeOutputPath || deriveSiblingPath(fallbackRecording?.cleanPath || '', 'merged');
     if (!room.mergeProgress || room.mergeProgress.kind !== 'merge' || room.mergeProgress.mergeGroup !== groupId) {
       room.mergeProgress = createFfmpegJobProgress({
         kind: 'merge',
@@ -7387,6 +7397,7 @@ try {
     }
     this.clearMergeRetryState(room.id, pending.mergeGroup);
     this.mergeCancelRequests.delete(this.getMergeRetryKey(room.id, pending.mergeGroup));
+    await this.saveStore();
     if (room.mergeProgress?.kind === 'merge') {
       room.mergeProgress.status = 'running';
       room.mergeProgress.message = '正在手动重新尝试合并，源分段会继续保留到合并成功。';
@@ -7428,6 +7439,7 @@ try {
     }
     segments.sort((left, right) => Number(left.startedAt || 0) - Number(right.startedAt || 0) || left.cleanPath.localeCompare(right.cleanPath));
     const groupId = `manual-${crypto.randomUUID()}`;
+    delete room.cancelledMergeProgress;
     const outputPath = deriveSiblingPath(segments[0].cleanPath, `${groupId}.merged`, getContainerFromPath(segments[0].cleanPath));
     const key = this.getMergeRetryKey(room.id, groupId);
     const task = this.mergeReconnectGroupIfNeededInternal(room, groupId, segments.at(-1), { segments, outputPath });
@@ -7444,6 +7456,7 @@ try {
       if (this.mergeInFlightGroups.get(key) === task) this.mergeInFlightGroups.delete(key);
     });
     this.log('info', `${roomLabel(room)} 已提交 ${segments.length} 个文件手动合并，按录制时间排序，保留所有源文件。`);
+    await this.saveStore();
     return this.getState();
   }
 
@@ -7609,7 +7622,7 @@ try {
       type: 'merge',
       ...resourcePlan,
       cancel: (request) => {
-        if (request?.reason === 'recording-preemption') this.mergePreemptRequests.add(key);
+        if (request?.reason === 'recording-preemption' || request?.reason === 'shutdown') this.mergePreemptRequests.add(key);
         else this.mergeCancelRequests.add(key);
         const child = this.mergeProcesses.get(room.id);
         if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
@@ -8684,8 +8697,8 @@ try {
       this.emitState(['room', 'mediaJob']);
       if (cancelled) return null;
       if (preempted) {
-        error.code = 'MERGE_PREEMPTED';
-        error.message = '录制优先，合并已让出资源；源分段已保留';
+        error.code = this.draining ? 'MERGE_INTERRUPTED' : 'MERGE_PREEMPTED';
+        error.message = this.draining ? '服务关闭，未完成的合并源分段已保留' : '录制优先，合并已让出资源；源分段已保留';
       }
       throw error;
     } finally {
@@ -9058,6 +9071,7 @@ try {
     const key = this.getMergeRetryKey(room.id, progress.mergeGroup || progress.id);
     this.mergePreemptRequests.delete(key);
     this.mergeCancelRequests.add(key);
+    if (progress.manual) room.cancelledMergeProgress = { ...progress, status: 'cancelled', message: '合并已取消，所有源分段均已保留' };
     this.clearMergeRetryState(room.id, progress.mergeGroup);
     const cancelledQueued = this.mediaJobs.cancel(progress.id);
     const child = this.mergeProcesses.get(room.id);
@@ -9070,6 +9084,7 @@ try {
     }
     this.log('info', `${roomLabel(room)} 已请求取消本次合并；其他场次的合并任务不受影响。`);
     this.emitState(['room', 'mediaJob']);
+    await this.saveStore();
     return this.getState();
   }
 
