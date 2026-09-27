@@ -8,6 +8,24 @@ const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
 const { LiveRecordService, createUiCapabilities } = require('../src/server/app/service.cjs');
+
+test('materialized CIFS wins over the autofs placeholder at the same mount point', async () => {
+  const service = new LiveRecordService();
+  const mountPoint = path.dirname(path.resolve('/mnt/zzzz/recordings')).replace(/\\/g, '/');
+  const root = '20 1 0:1 / / rw - ext4 /dev/root rw';
+  const autofs = `21 20 0:2 / ${mountPoint} rw - autofs systemd-1 rw`;
+  const cifs = `22 21 0:3 / ${mountPoint} rw - cifs //server/zzzz rw`;
+  for (const mountInfo of [[root, autofs, cifs], [root, cifs, autofs]]) {
+    const mount = await service.getLinuxRecordingRootMount('/mnt/zzzz/recordings', { platform: 'linux', mountInfo: mountInfo.join('\n') });
+    assert.equal(mount.fsType, 'cifs');
+  }
+  let called = false;
+  assert.equal(await service.normalizeLinuxRecordingRootPermissions('/mnt/zzzz/recordings', {
+    platform: 'linux', mount: { mountPoint: '/mnt/zzzz', fsType: 'autofs' },
+    fileSystem: { stat: async () => { called = true; } }
+  }), false);
+  assert.equal(called, false, 'an unresolved automount must never receive POSIX ownership changes');
+});
 const {
   cookieHeadersFromLoginUrl,
   deriveClipPath,

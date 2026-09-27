@@ -499,6 +499,7 @@ const BURN_CODEC_VALUES = new Set(BURN_CODEC_CANDIDATES.map((codec) => codec.val
 // signal there (and CIFS commonly rejects it altogether), so those mounts use
 // the service-account read/write probe as their authority instead.
 const NON_POSIX_RECORDING_FILESYSTEM_TYPES = new Set([
+  'autofs',
   'cifs',
   'smbfs',
   'smb3',
@@ -541,7 +542,10 @@ function findLinuxMountForPath(mountInfo, targetPath) {
       source: decodeLinuxMountInfoPath(fields[separator + 2] || '')
     });
   }
-  return candidates.sort((left, right) => right.mountPoint.length - left.mountPoint.length)[0] || null;
+  // An automount keeps its autofs entry after CIFS/NFS is mounted at the same
+  // path. Prefer the materialized filesystem over that placeholder.
+  return candidates.sort((left, right) => right.mountPoint.length - left.mountPoint.length ||
+    Number(left.fsType === 'autofs') - Number(right.fsType === 'autofs'))[0] || null;
 }
 
 function isNonPosixRecordingMount(mount) {
