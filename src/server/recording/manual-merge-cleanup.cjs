@@ -45,6 +45,7 @@ async function deleteManualMergeSources({ root, outputPath, segments, expected, 
       throw new Error('源配套文件在合并期间发生变化，源文件保留。');
     }
   }
+  if (segments.some(segment => isBusy(segment.cleanPath))) throw new Error('源录像开始被其它任务使用，源文件保留。');
   await onValidated();
   let deleted = 0;
   for (const plan of new Map(plans.map(item => [item.real, item])).values()) {

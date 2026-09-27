@@ -49,6 +49,11 @@ test('manual merge deletion validates all selected sources and protects output a
   assert.equal(await fs.readFile(segments[0].cleanPath, 'utf8'), 'source');
   expected[segments[1].cleanPath] = await fs.stat(segments[1].cleanPath);
   const artifactSnapshot = await snapshotManualMergeArtifacts(segments, options.artifacts);
+  let busyChecks = 0, cleanupCommitted = false;
+  await assert.rejects(deleteManualMergeSources({ ...options, artifactSnapshot,
+    isBusy: () => ++busyChecks > segments.length, onValidated: () => { cleanupCommitted = true; } }), /其它任务/);
+  assert.equal(cleanupCommitted, false);
+  assert.equal(await fs.readFile(segments[0].cleanPath, 'utf8'), 'source');
   await assert.rejects(deleteManualMergeSources({ ...options, artifactSnapshot, onValidated: () => { throw new Error('取消'); } }), /取消/);
   assert.equal(await fs.readFile(segments[0].cleanPath, 'utf8'), 'source');
   await fs.appendFile(segments[1].cleanPath + '.jsonl', '新增弹幕');

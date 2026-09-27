@@ -8799,7 +8799,8 @@ try {
         if (metadataSaved && sidecarsComplete && mergedRecording.sceneStatus === 'ready' && mergedRecording.valid !== false) {
           try {
             const busy = source => {
-              const rows = [...this.recordingSessions.values(), ...this.exportQueue, ...this.burnQueue, this.exportPreview,
+              const rows = [...this.recordingSessions.values(), ...this.exportQueue, ...this.burnQueue,
+                this.activeExportQueueItem, this.activeBurnQueueItem, this.exportPreview,
                 this.exportProgress?.status === 'running' ? this.exportProgress : null];
               return rows.some(row => row && JSON.stringify(row).includes(JSON.stringify(source).slice(1, -1)));
             };
@@ -11784,6 +11785,7 @@ try {
 
   async exportClip(options = {}) {
     const { item, recording, mode, outputPath } = await this.createExportQueueItem(options);
+    this.assertExportSourcePath(recording.cleanPath);
     this.exportQueue.push(item);
     const queuePosition = this.exportQueue.length;
     this.log('info', `已加入导出队列 #${queuePosition}：${item.label} -> ${path.basename(outputPath)}`);
