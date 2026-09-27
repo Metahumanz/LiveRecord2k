@@ -96,7 +96,13 @@ def ass_rgba(value):
     return (int(raw[6:8], 16), int(raw[4:6], 16), int(raw[2:4], 16), 255 - int(raw[0:2], 16))
 
 
+FONT_CACHE = {}
+
+
 def font_for(props, size):
+    key = (str(props.get('fontFamily') or 'Noto Sans CJK SC'), max(1, round(size)), number(props.get('fontWeight'), 400))
+    if key in FONT_CACHE:
+        return FONT_CACHE[key]
     family = str(props.get('fontFamily') or 'sans-serif').replace('\n', ' ').replace('\r', ' ').strip() or 'sans-serif'
     # Fontconfig resolves both the CJK face within a TTC and its weight.  PIL
     # otherwise silently loads face 0 (Japanese for NotoSansCJK) and regular
@@ -116,7 +122,11 @@ def font_for(props, size):
     for candidate, index in [(path, face_index), (fallback, 2), ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 0)]:
         try:
             if candidate and os.path.isfile(candidate):
-                return ImageFont.truetype(candidate, max(1, round(size)), index=index)
+                font = ImageFont.truetype(candidate, max(1, round(size)), index=index)
+                if len(FONT_CACHE) >= 16:
+                    FONT_CACHE.pop(next(iter(FONT_CACHE)))
+                FONT_CACHE[key] = font
+                return font
         except Exception:
             pass
     return ImageFont.load_default()
@@ -266,7 +276,7 @@ def rasterize_texture(entry):
     if kind == 'Text':
         font_size = max(1, number(props.get('fontSize'), 20))
         stroke = max(0, round(number(style.get('strokeWidth'), 0)))
-        if LIBASS_TEXT:
+        if LIBASS_TEXT and (entry.get('_legacyAssMetrics') or 'assText' in props):
             # The CUDA callback places Scene objects at rounded NV12 pixels,
             # while the ASS oracle rasterises at fractional \pos coordinates.
             # Preserve that residual phase inside the libass texture so glyph
@@ -276,7 +286,12 @@ def rasterize_texture(entry):
             image = LIBASS_TEXT.render(props, style, width, height, phase_x, phase_y)
         else:
             font = font_for(props, font_size)
-            draw.multiline_text((0, 0), str(props.get('text') or ''), font=font,
+            text = str(props.get('text') or '')
+            # Scene uses CSS/FreeType pixel sizes. ASS uses Windows font
+            # height metrics, which shrank modern glyphs by roughly one third.
+            # drawtext's y=0 refers to the glyph top, not Pillow's ascender.
+            top = draw.multiline_textbbox((0, 0), text, font=font, spacing=0)[1]
+            draw.multiline_text((0, -top), text, font=font,
                                 fill=rgba(style.get('fill'), 1), stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
     elif kind == 'Avatar':
         vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
@@ -398,6 +413,11 @@ def scene_state(entry, at, texture_width, texture_height):
     return state
 
 
+def scene_texture_entries(scene):
+    legacy_metrics = (scene.get('style') or {}).get('preset') in ('h5-card', 'bubble', 'minimal')
+    return [dict(entry, _legacyAssMetrics=legacy_metrics) for entry in scene.get('objects') or []]
+
+
 def prepare_cuda_timeline(request, work_dir):
     """Pre-render Scene assets once and emit GPU-friendly linear time spans.
 
@@ -407,7 +427,7 @@ def prepare_cuda_timeline(request, work_dir):
     """
     rows = []
     timeline_offset = max(0, number(request.get('timelineOffsetSec'), 0))
-    entries = sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex')))
+    entries = sorted(scene_texture_entries(request['scene']), key=lambda item: number(item.get('zIndex')))
     report_preparation = request.get('reportPreparation') is True
     preparation_started = GLib.get_monotonic_time() if report_preparation else 0
     last_reported = preparation_started
@@ -564,7 +584,7 @@ def create_pipeline(request, work_dir):
     if not upload.get_static_pad('src').link(base_pad) == Gst.PadLinkReturn.OK: fail('无法连接 base 到 GL mixer。')
     if not link_many(mixer, download, convert, raw_caps, nvvidconv, nv_caps, encode, parse, sink): fail('无法连接 GL → NVMM → nvv4l2 管线。')
 
-    for index, entry in enumerate(request['scene'].get('objects') or []):
+    for index, entry in enumerate(scene_texture_entries(request['scene'])):
         texture, texture_width, texture_height = draw_texture(entry, work_dir)
         source = make_element('filesrc', 'overlay-file-%d' % index)
         source.set_property('location', texture)

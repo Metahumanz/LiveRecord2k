@@ -28,6 +28,7 @@ const GROUPS = {
     'msix-package.test.cjs'
   ],
   hardware: [
+    'arm64-ffmpeg-text.test.cjs',
     'jetson-cuda-scene-conformance.test.cjs',
     'jetson-native-nvmm-pts.test.cjs',
     'desktop-cuda-scene-conformance.test.cjs'

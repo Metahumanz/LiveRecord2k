@@ -162,6 +162,7 @@ function createSceneRenderPlan(scene, options) {
     schema: 'bili-record2k.render-plan/v1',
     target: ['software', 'cuda', 'jetson'].includes(String(source.target || '')) ? String(source.target) : 'software',
     canvas: scene.canvas,
+    style: scene.style || {},
     duration,
     objects,
     metadata: {
@@ -334,12 +335,19 @@ function textVariants(object) {
   return variants.length ? variants : [Object.assign({}, object, { props: Object.assign({}, props, { text }) })];
 }
 
+function textFontOptions(props) {
+  const family = props.fontFamily || 'Arial';
+  // drawtext parses Fontconfig patterns from fontfile; font is only a family.
+  return "font='" + quoteFilter(family) + "':fontfile='" +
+    quoteFilter(family + (number(props.fontWeight, 400) >= 600 ? ':style=Bold' : ':style=Regular')) + "'";
+}
+
 function textLayerFilter(object, label, duration, fps) {
   const props = object.props || {};
   const style = object.style || {};
   const shadow = style.shadow || {};
   const fontSize = Math.max(1, number(props.fontSize, 20));
-  const font = quoteFilter(props.fontFamily || 'Arial');
+  const fontOptions = textFontOptions(props);
   const fill = rgbaColor(style.fill || '#ffffff', 1);
   const stroke = rgbaColor(style.stroke || '#000000', 1);
   const text = quoteText(props.text || '');
@@ -350,7 +358,7 @@ function textLayerFilter(object, label, duration, fps) {
   const life = Math.max(0.001, Math.min(duration, number(object.end, duration)) - start);
   return 'color=c=black@0.0:s=' + width + 'x' + height + ':r=' + Math.max(1, number(fps, 30)) + ':d=' + ff(life) +
     ',setpts=PTS-STARTPTS+' + ff(start) + '/TB' +
-    ",format=rgba,drawtext=font='" + font + "':text='" + text + "':fontsize=" + ff(fontSize) +
+    ",format=rgba,drawtext=" + fontOptions + ":text='" + text + "':fontsize=" + ff(fontSize) +
     ':fontcolor=' + fill + ':borderw=' + ff(style.strokeWidth) + ':bordercolor=' + stroke +
     ':shadowx=' + ff(shadow.offsetX) + ':shadowy=' + ff(shadow.offsetY) +
     ':shadowcolor=' + rgbaColor(shadow.color || '#000000', number(shadow.opacity, 0)) +
@@ -361,8 +369,8 @@ function directTextFilter(previous, output, object) {
   const props = object.props || {};
   const style = object.style || {};
   const shadow = style.shadow || {};
-  return '[' + previous + "]drawtext=font='" + quoteFilter(props.fontFamily || 'Arial') +
-    "':text='" + quoteText(props.text || '') + "':fontsize=" + ff(props.fontSize || 20) +
+  return '[' + previous + "]drawtext=" + textFontOptions(props) +
+    ":text='" + quoteText(props.text || '') + "':fontsize=" + ff(props.fontSize || 20) +
     ':fontcolor=' + rgbaColor(style.fill || '#ffffff', 1) +
     ':borderw=' + ff(style.strokeWidth) + ':bordercolor=' + rgbaColor(style.stroke || '#000000', 1) +
     ':shadowx=' + ff(shadow.offsetX) + ':shadowy=' + ff(shadow.offsetY) +
