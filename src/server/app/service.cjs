@@ -8733,7 +8733,7 @@ try {
         )}。`
       );
       this.emitState(['room', 'recording', 'mediaJob']);
-      setTimeout(() => {
+      if (!manualOptions) setTimeout(() => {
         if (room.mergeProgress?.id === progress.id) {
           delete room.mergeProgress;
           this.markRoomDirty(room.id);
