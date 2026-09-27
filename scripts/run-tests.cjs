@@ -9,6 +9,7 @@ const path = require('node:path');
 // packaging tests during an ordinary development pass.
 const GROUPS = {
   integration: [
+    'optimization-regression.test.cjs',
     'recording-merge.test.cjs',
     'recording-stability.test.cjs',
     'recording-stream-recovery.test.cjs',

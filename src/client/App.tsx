@@ -472,6 +472,7 @@ export default function App() {
     setExportDraft((current) => ({
       ...current,
       cleanPath: recording.cleanPath,
+      mode: state?.settings.defaultExportMode || 'clean',
       danmakuPath: recording.danmakuPath || '',
       cssPath: recording.cssPath || '',
       startTime: '00:00:00',
@@ -552,9 +553,12 @@ export default function App() {
         burnDanmakuStylePreset: sceneGraphDefaultStyle || exportDraft.stylePreset,
         burnDanmakuStyleLayout: exportDraft.styleLayout,
         burnAvatarMode: exportDraft.avatarMode,
+        defaultExportMode: exportDraft.mode,
+        burnOverlayMode: exportDraft.overlayMode,
+        burnDanmakuArea: exportDraft.danmakuArea,
         ...(sceneGraphDefaultStyle ? { sceneGraphDefaultStyle } : {})
       },
-      '已设为默认烧录样式；Scene Graph、自动烧录和下次导出会使用这组参数'
+      `已保存默认导出类型（${exportDraft.mode === 'clean' ? '纯净片段' : '烧录片段'}）、烧录内容、显示区域、样式参数及头像模式；下次选择录像时使用。烧录参数也用于自动烧录。`
     );
   }
 

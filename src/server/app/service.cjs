@@ -247,6 +247,11 @@ const {
   redactSensitive
 } = require('../shared/security.cjs');
 const { atomicReplaceFile, assertDiskSpace, selectSceneMediaWorkspace } = require('../recording/media-safety.cjs');
+const { deleteManualMergeSources, snapshotManualMergeArtifacts } = require('../recording/manual-merge-cleanup.cjs');
+const { createMediaLogAggregator } = require('../shared/media-log-aggregator.cjs');
+const { estimateSceneScratchBytes } = require('../recording/scene-resources.cjs');
+const { runBounded } = require('../shared/bounded-work.cjs');
+const { buildSceneGraphJob } = require('../danmaku/scene-build-job.cjs');
 const { getJetsonGstreamerBitrate } = require('../recording/ffmpeg.cjs');
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
@@ -573,6 +578,7 @@ const SETTINGS_UPDATE_KEYS = new Set([
   'burnDanmakuStylePreset',
   'burnDanmakuStyleLayout',
   'burnAvatarMode',
+  'defaultExportMode',
   'burnCodec',
   'burnCrf',
   'notifyLiveStarted',
@@ -4690,6 +4696,9 @@ try {
   }
 
   assertExportSourcePath(filePath) {
+    if (this.manualCleanupSourcePaths?.has(path.resolve(filePath))) {
+      throw businessError('MERGE_SOURCE_CLEANUP_PENDING', '合并成片已验收，所选源文件正在清理，请使用合并成片。', 409);
+    }
     if (!this.isPathInRecordingLibrary(filePath) || !this.isRecordingMediaFileName(filePath)) {
       throw new Error('导出源文件必须位于录像库目录且符合录播文件名格式。');
     }
@@ -6086,17 +6095,11 @@ try {
 
   async readSceneEventsForRecording(recording) {
     const cachePath = String(recording?.sceneCachePath || deriveSceneCachePath(recording?.cleanPath || '')).trim();
-    const [rawEvents, cachedEvents] = await Promise.all([
-      readDanmakuEvents(String(recording?.danmakuPath || '')).catch((error) => {
+    const rawEvents = await readDanmakuEvents(String(recording?.danmakuPath || '')).catch((error) => {
         if (error.code !== 'ENOENT') throw error;
         return [];
-      }),
-      cachePath ? readSceneCacheEvents(cachePath) : Promise.resolve([])
-    ]);
-    if (rawEvents.length && cachedEvents.length !== rawEvents.length) {
-      this.log('warn', `Scene 缓存 ${cachedEvents.length} 条与原始 JSONL ${rawEvents.length} 条不一致，使用原始弹幕。`);
-    }
-    return rawEvents.length ? rawEvents : cachedEvents;
+      });
+    return rawEvents.length ? rawEvents : cachePath ? readSceneCacheEvents(cachePath) : [];
   }
 
   getSceneGraphOptions(recording, options = {}) {
@@ -6118,7 +6121,14 @@ try {
       this.readSceneEventsForRecording(normalized),
       options.avatarAssets ? Promise.resolve(options.avatarAssets) : this.getSceneAvatarAssets(normalized)
     ]);
-    let graph = buildSceneGraph(events, this.getSceneGraphOptions(normalized, { ...options, avatarAssets }));
+    let graph = await buildSceneGraphJob(events, this.getSceneGraphOptions(normalized, { ...options, avatarAssets }), {
+      entry: String(process.env.BILI_RECORD_SERVER_ENTRY || '').trim() || path.join(APP_ROOT, 'src', 'server', 'index.cjs'),
+      singleExecutable: isSingleExecutableRuntime(), clipStart: options.clipStart, clipEnd: options.clipEnd,
+      onChild: options.clipEnd !== undefined ? child => {
+        this.exportProcess = child;
+        if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+      } : undefined
+    });
     const requestedDuration = Number(options.durationSec || normalized.durationSec || 0);
     if (Number.isFinite(requestedDuration) && requestedDuration > 0) {
       graph = clipSceneGraph(graph, 0, requestedDuration, { shiftTime: false });
@@ -6130,7 +6140,7 @@ try {
       sourceCachePath: normalized.sceneCachePath || '',
       capturedEventCount: events.length
     });
-    this.log('info', `Scene 构建：原始事件 ${events.length}，范围内事件 ${prepareAssEvents(events, { overlayMode: options.overlayMode, startTime: 0, endTime: requestedDuration > 0 ? requestedDuration : undefined }).length}，Scene 对象 ${graph.objects.length}。`);
+    this.log('info', `Scene 构建：原始事件 ${events.length}，范围内事件 ${prepareAssEvents(events, { overlayMode: options.overlayMode || this.settings.burnOverlayMode, startTime: options.clipStart || 0, endTime: Number.isFinite(options.clipEnd) ? options.clipEnd : requestedDuration > 0 ? requestedDuration : undefined }).length}，Scene 对象 ${graph.objects.length}。`);
     return {
       graph,
       // The legacy ASS compatibility renderer must consume the exact same
@@ -6186,55 +6196,41 @@ try {
     const targetDirectory = replaceExtension(targetPath, '');
     const targetManifestDirectory = path.dirname(targetPath);
     const mergedByKey = new Map();
-    let captureComplete = true;
-    let totalBytes = 0;
-    const total = sourceManifests.reduce((sum, manifest) => sum + manifest.entries.length, 0);
-    let completed = 0;
+    const candidates = new Map();
+    for (const manifest of sourceManifests) for (const entry of manifest.entries) {
+      const key = entry.avatarUrl || `uid:${entry.uid}`;
+      if (!candidates.has(key)) candidates.set(key, []);
+      candidates.get(key).push(entry);
+    }
+    const captureComplete = sourceManifests.every(manifest => manifest.captureComplete === true);
+    let totalBytes = 0, completed = 0;
+    const total = candidates.size;
     options.onProgress?.({ completed, total, unit: 'items' });
     await fsp.rm(targetDirectory, { recursive: true, force: true });
     await fsp.mkdir(targetDirectory, { recursive: true, mode: 0o770 });
     try {
-      for (const manifest of sourceManifests) {
-        captureComplete = captureComplete && manifest.captureComplete === true;
-        for (const sourceEntry of manifest.entries) {
+      await runBounded([...candidates], 4, async ([key, sources]) => {
+        options.signal?.throwIfAborted();
+        const first = sources[0];
+        const mergedEntry = { uid: first.uid, avatarUrl: first.avatarUrl, filePath: '', status: first.status, capturedAt: first.capturedAt };
+        for (const sourceEntry of sources) {
           options.signal?.throwIfAborted();
-          options.onProgress?.({ completed, total, unit: 'items' });
-          completed += 1;
-          const key = sourceEntry.avatarUrl || `uid:${sourceEntry.uid}`;
-          const existing = mergedByKey.get(key);
-          // The first successfully captured entry wins. Later copies of that
-          // avatar cannot change the manifest and only add shared-drive I/O.
-          if (existing?.filePath) continue;
-          const mergedEntry = {
-            uid: sourceEntry.uid,
-            avatarUrl: sourceEntry.avatarUrl,
-            filePath: '',
-            status: sourceEntry.status,
-            capturedAt: sourceEntry.capturedAt
-          };
-          if (sourceEntry.filePath && (await isExistingFile(sourceEntry.filePath))) {
-            const sourceBytes = await getFileSize(sourceEntry.filePath);
-            const digest = crypto
-              .createHash('sha256')
-              .update(`${sourceEntry.uid}|${sourceEntry.avatarUrl}|${sourceEntry.filePath}`)
-              .digest('hex')
-              .slice(0, 24);
-            const extension = path.extname(sourceEntry.filePath).toLowerCase() || '.img';
-            const targetFile = path.join(
-              targetDirectory,
-              `uid-${sourceEntry.uid > 0 ? sourceEntry.uid : 'unknown'}-${digest}${extension}`
-            );
-            if (!(await isExistingFile(targetFile))) await fsp.copyFile(sourceEntry.filePath, targetFile);
-            mergedEntry.filePath = targetFile;
-            mergedEntry.status = 'captured';
-            totalBytes += sourceBytes;
-          }
-          if (!existing || (!existing.filePath && mergedEntry.filePath)) mergedByKey.set(key, mergedEntry);
+          if (!sourceEntry.filePath) continue;
+          const stat = await fsp.stat(sourceEntry.filePath).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+          if (!stat?.isFile()) continue;
+          const digest = crypto.createHash('sha256').update(`${sourceEntry.uid}|${sourceEntry.avatarUrl}|${sourceEntry.filePath}`).digest('hex').slice(0, 24);
+          const targetFile = path.join(targetDirectory, `uid-${sourceEntry.uid > 0 ? sourceEntry.uid : 'unknown'}-${digest}${path.extname(sourceEntry.filePath).toLowerCase() || '.img'}`);
+          await fsp.copyFile(sourceEntry.filePath, targetFile);
+          Object.assign(mergedEntry, { uid: sourceEntry.uid, filePath: targetFile, status: 'captured', capturedAt: sourceEntry.capturedAt });
+          totalBytes += stat.size;
+          break;
         }
-      }
+        mergedByKey.set(key, mergedEntry);
+        completed += 1;
+        options.onProgress?.({ completed, total, unit: 'items' });
+      });
       options.signal?.throwIfAborted();
-      options.onProgress?.({ completed, total, unit: 'items' });
-      const entries = Array.from(mergedByKey.values()).map((entry) => ({
+      const entries = [...candidates.keys()].map(key => mergedByKey.get(key)).map((entry) => ({
         uid: Number(entry.uid || 0),
         avatarUrl: normalizeBiliAvatarUrl(entry.avatarUrl),
         file: entry.filePath ? path.relative(targetManifestDirectory, entry.filePath).split(path.sep).join('/') : '',
@@ -7489,7 +7485,7 @@ try {
     if (room.mergeProgress?.manual && room.mergeProgress.sourcePaths?.length >= 2) {
       this.clearMergeRetryState(room.id, room.mergeProgress.mergeGroup);
       this.mergeCancelRequests.delete(this.getMergeRetryKey(room.id, room.mergeProgress.mergeGroup));
-      return this.mergeSelectedRecordings({ cleanPaths: room.mergeProgress.sourcePaths });
+      return this.mergeSelectedRecordings({ cleanPaths: room.mergeProgress.sourcePaths, deleteSources: room.mergeProgress.deleteSources === true });
     }
     const preferredGroup = room.mergeProgress?.mergeGroup || [...this.mergeRetryStates.values()].find(state => state.roomId === room.id)?.mergeGroup || '';
     const pending = await this.getPendingMergeGroupForRoom(room, preferredGroup);
@@ -7513,7 +7509,8 @@ try {
     return this.getState();
   }
 
-  async mergeSelectedRecordings({ cleanPaths } = {}) {
+  async mergeSelectedRecordings({ cleanPaths, deleteSources = false } = {}) {
+    if (typeof deleteSources !== 'boolean') throw businessError('MERGE_SELECTION_INVALID', '删除源文件选项必须是布尔值。', 400);
     if (!Array.isArray(cleanPaths) || cleanPaths.length < 2 || cleanPaths.length > 160 ||
         cleanPaths.some(value => typeof value !== 'string') || new Set(cleanPaths).size !== cleanPaths.length) {
       throw businessError('MERGE_SELECTION_INVALID', '请选择至少两个不同的录像文件。', 400);
@@ -7545,11 +7542,15 @@ try {
     delete room.cancelledMergeProgress;
     const outputPath = deriveSiblingPath(segments[0].cleanPath, `${groupId}.merged`, getContainerFromPath(segments[0].cleanPath));
     const key = this.getMergeRetryKey(room.id, groupId);
-    const task = this.mergeReconnectGroupIfNeededInternal(room, groupId, segments.at(-1), { segments, outputPath });
+    const sourceFingerprints = {};
+    for (const segment of segments) { const stat = await fsp.stat(segment.cleanPath); sourceFingerprints[segment.cleanPath] = { size: stat.size, mtimeMs: stat.mtimeMs }; }
+    const artifactSnapshot = deleteSources ? await snapshotManualMergeArtifacts(segments, segment => this.manualMergeArtifacts(segment)) : undefined;
+    const manualOptions = { segments, outputPath, deleteSources, sourceFingerprints, artifactSnapshot };
+    const task = this.mergeReconnectGroupIfNeededInternal(room, groupId, segments.at(-1), manualOptions);
     this.mergeInFlightGroups.set(key, task);
     task.catch(error => {
       if (error?.code === 'MERGE_PREEMPTED') {
-        this.scheduleMergeRetry(room, groupId, segments.at(-1), error, { manualOptions: { segments, outputPath } });
+        this.scheduleMergeRetry(room, groupId, segments.at(-1), error, { manualOptions });
         return;
       }
       if (room.mergeProgress?.mergeGroup === groupId) finishFfmpegJobProgress(room.mergeProgress, 'error', `手动合并失败：${error.message}；源文件已保留，可重新尝试。`);
@@ -7558,7 +7559,7 @@ try {
     }).finally(() => {
       if (this.mergeInFlightGroups.get(key) === task) this.mergeInFlightGroups.delete(key);
     });
-    this.log('info', `${roomLabel(room)} 已提交 ${segments.length} 个文件手动合并，按录制时间排序，保留所有源文件。`);
+    this.log('info', `${roomLabel(room)} 已提交 ${segments.length} 个文件手动合并，按录制时间排序，${deleteSources ? '验证成功后删除所选源文件' : '保留所有源文件'}。`);
     await this.saveStore();
     return this.getState();
   }
@@ -7916,6 +7917,7 @@ try {
     } };
     if (manualOptions) {
       progress.manual = true;
+      progress.deleteSources = manualOptions.deleteSources === true;
       progress.sourcePaths = segments.map(segment => segment.cleanPath);
     }
     this.emitState();
@@ -8659,9 +8661,11 @@ try {
         );
         await Promise.all([fsp.stat(danmakuTmpPath), fsp.stat(cssTmpPath)]);
       });
+      let sidecarsComplete = true;
       await this.runMergePreparationStage(room, progress, '正在合并头像文件', (options) =>
         this.mergeAvatarManifests(segments, avatarManifestPath, options).catch((error) => {
           if (options.signal.aborted || ['MEDIA_JOB_CANCELLED', 'MERGE_PREEMPTED'].includes(error.code)) throw error;
+          sidecarsComplete = false;
           this.log('warn', `${roomLabel(room)} 合并头像记录失败，后续烧录将使用兼容回退：${error.message}`);
         }));
       try {
@@ -8772,7 +8776,9 @@ try {
           return recordingKey !== outputPathKey && (manualOptions || !segmentPathKeys.has(recordingKey));
         })
       ].slice(0, RECORDING_LIBRARY_LIMIT);
+      let metadataSaved = true;
       await this.writeRecordingMetadata(mergedRecording).catch((error) => {
+        metadataSaved = false;
         this.log('warn', `${roomLabel(room)} 写入合并录像元数据失败：${error.message}`);
       });
       if (!this.isRoomRecording(room)) {
@@ -8789,7 +8795,33 @@ try {
         mergedRecording: cloneRecordingState(mergedRecording)
       });
       await this.saveStore();
+      if (manualOptions?.deleteSources && !isStopped()) {
+        if (metadataSaved && sidecarsComplete && mergedRecording.sceneStatus === 'ready' && mergedRecording.valid !== false) {
+          try {
+            const busy = source => {
+              const rows = [...this.recordingSessions.values(), ...this.exportQueue, ...this.burnQueue, this.exportPreview,
+                this.exportProgress?.status === 'running' ? this.exportProgress : null];
+              return rows.some(row => row && JSON.stringify(row).includes(JSON.stringify(source).slice(1, -1)));
+            };
+            const deleted = await deleteManualMergeSources({ root: this.settings.outputDir, outputPath,
+              segments, expected: manualOptions.sourceFingerprints, artifactSnapshot: manualOptions.artifactSnapshot, isBusy: busy,
+              onValidated: () => {
+                if (isStopped()) throw new Error('合并已取消，源文件保留。');
+                progress.cleanupStarted = true;
+                this.manualCleanupSourcePaths ||= new Set();
+                for (const segment of segments) this.manualCleanupSourcePaths.add(path.resolve(segment.cleanPath));
+                this.setMergeProgressStage(room, progress, '合并已验收，正在清理所选源文件');
+              },
+              artifacts: segment => this.manualMergeArtifacts(segment) });
+            this.recordings = this.recordings.filter(row => !segmentPathKeys.has(path.resolve(row.cleanPath).toLowerCase()));
+            await this.saveStore();
+            this.log('success', `手动合并成片及配套文件已保存，已删除所选源文件与配套文件 ${deleted} 项。`);
+          } catch (error) { if (isStopped()) throw error; this.log('warn', `合并成片已保留，源文件清理未完成：${error.message}`); }
+          finally { for (const segment of segments) this.manualCleanupSourcePaths?.delete(path.resolve(segment.cleanPath)); }
+        } else this.log('warn', '合并配套文件或元数据未完整保存，已保留全部源文件。');
+      }
       if (!manualOptions) await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId, preserveSourceInputs: true });
+      if (isStopped() && !progress.cleanupStarted) throw new Error('合并已取消，源分段保留。');
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(room.mergeProgress, 'completed', '续录分段已合并');
       }
@@ -9189,6 +9221,13 @@ try {
     return recovered;
   }
 
+  manualMergeArtifacts(segment) {
+    return [...new Set([segment.cleanPath, `${segment.cleanPath}.metadata.json`, segment.capturePath,
+      segment.danmakuPath, segment.cssPath, segment.assPath,
+      segment.avatarManifestPath || deriveAvatarManifestPath(segment.cleanPath), deriveAvatarDirectory(segment.cleanPath),
+      segment.sceneCachePath || deriveSceneCachePath(segment.cleanPath), segment.scenePath || deriveSceneGraphPath(segment.cleanPath)].filter(Boolean))];
+  }
+
   async cancelMerge(roomId, expectedJobId = '') {
     const room = this.getRoom(roomId);
     const progress = room.mergeProgress;
@@ -9196,6 +9235,7 @@ try {
     if (expectedJobId && progress.id !== expectedJobId) {
       throw businessError('MERGE_TASK_CHANGED', '当前合并任务已变化，请刷新后操作。', 409);
     }
+    if (progress.cleanupStarted) throw businessError('MERGE_CLEANUP_COMMITTED', '合并成片已验收，正在清理所选源文件，不能中断清理。', 409);
     const key = this.getMergeRetryKey(room.id, progress.mergeGroup || progress.id);
     this.mergePreemptRequests.delete(key);
     this.mergeCancelRequests.add(key);
@@ -12380,6 +12420,7 @@ try {
         ? 'mkv'
         : ''
     });
+    request.scratchDirectory = sceneTemporaryDir || path.dirname(requestPath);
     if (nativeDecode) {
       request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
       request.input.codec = String(nativeDecode.sourceCodec || '').toLowerCase();
@@ -12608,6 +12649,7 @@ try {
       fallback: null
     };
     let cancelled = false;
+    const sceneWarnings = createMediaLogAggregator((level, message) => this.log(level, message), 'Scene Graph 导出：');
     try {
       const estimatedExportBytes = Math.ceil(
         Number(recording.fileSize || 0) * Math.min(1, duration / Math.max(1, durationSec || duration))
@@ -12618,6 +12660,14 @@ try {
       sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-scene-'));
       const jetson = isJetsonGstreamerCodec(burnCodec);
       const sharedOutput = isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)));
+      setExportPhase?.('prepare', { stageLabel: '正在准备 Scene Graph' });
+      setExportStage('正在从 Scene Graph 直接合成');
+      const sceneResult = await this.buildSceneGraphForRecording(recording, {
+        overlayMode, danmakuArea, stylePreset, styleLayout,
+        videoInfo: recording.videoInfo || mediaInfo.videoInfo, durationSec, clipStart: startTime, clipEnd: endTime
+      });
+      const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
+      const resources = estimateSceneScratchBytes(graph);
       if (jetson || sharedOutput) {
         // Account for both the native helper's target and the CPU bridge's
         // quality mapping, plus mux overhead. Compressed source size is not
@@ -12627,27 +12677,16 @@ try {
         const audioBytes = mediaInfo.audioInfo ? estimatedExportBytes : 0;
         const storage = await selectSceneMediaWorkspace(outputPath, sceneDirectory, {
           outputBytes: videoBytes + audioBytes, mediaPeakBytes: videoBytes * 2 + audioBytes,
-          scratchBytes: 1024 ** 3, allowDestinationMedia: jetson
+          scratchBytes: resources.scratchBytes, allowDestinationMedia: jetson
         });
         mediaDirectory = storage.mediaDirectory;
         separateMediaDirectory = storage.separateMediaDirectory;
         temporaryOutputPath = path.join(mediaDirectory, `completed.${outputContainer}`);
-        diagnosticContext.storage = { sceneDirectory, mediaDirectory, videoBytes, audioBytes, separateMediaDirectory };
+        diagnosticContext.storage = { sceneDirectory, mediaDirectory, videoBytes, audioBytes, separateMediaDirectory, ...resources };
         this.log('info', separateMediaDirectory
           ? `本机临时盘不足以保存整片中间文件，已改在输出磁盘工作目录 ${mediaDirectory} 编码及封装；Scene 请求和纹理仍在本机，验证后原子发布成片。`
           : `导出临时媒体位于本机 ${mediaDirectory}，预留 ${formatBytes(videoBytes * 2 + audioBytes)}，验证后发布成片。`);
       }
-      setExportPhase?.('prepare', { stageLabel: '正在准备 Scene Graph' });
-      setExportStage('正在从 Scene Graph 直接合成');
-      const sceneResult = await this.buildSceneGraphForRecording(recording, {
-        overlayMode,
-        danmakuArea,
-        stylePreset,
-        styleLayout,
-        videoInfo: recording.videoInfo || mediaInfo.videoInfo,
-        durationSec
-      });
-      const graph = clipSceneGraph(sceneResult.graph, startTime, endTime, { shiftTime: true });
       const fps = recording.videoInfo?.fps || mediaInfo.videoInfo?.fps || 30;
       const burnTimeline = getBurnTimelineAlignment(recording, startTime, duration, actualTimeline);
       if (!isJetsonGstreamerCodec(burnCodec)) {
@@ -12741,6 +12780,7 @@ try {
         progress.updatedAt = Date.now();
         this.emitState('mediaJob');
         let sceneFontFallbackLastSummaryAt = 0;
+        let sceneFontFallbackLastSummary = '';
         flushSceneFontFallbackWarnings = (force = false) => {
           const entries = [...sceneFontFallbackWarnings.entries()].filter(([, count]) => count > 1);
           if (!entries.length) return;
@@ -12751,6 +12791,8 @@ try {
             const [glyph, font] = key.split('|');
             return `${glyph}${font ? `(${font})` : ''}字体fallback警告重复${count}次`;
           }).join('；');
+          if (summary === sceneFontFallbackLastSummary) return;
+          sceneFontFallbackLastSummary = summary;
           this.log('warn', `Scene Graph 导出：${summary}，已折叠。`);
         };
         const foldSceneFontFallbackWarning = (line) => {
@@ -12772,8 +12814,10 @@ try {
           if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
             this.emitState('mediaJob');
           }
-          if (foldSceneFontFallbackWarning(line)) return;
-          if (/error|failed|invalid|失败|超时|回退|未通过/i.test(line)) this.log('warn', 'Scene Graph 导出：' + compactLogLine(line));
+          for (const entry of String(line).split(/\r?\n/).filter(Boolean)) {
+            if (foldSceneFontFallbackWarning(entry)) continue;
+            if (/error|failed|invalid|失败|超时|回退|未通过/i.test(entry)) sceneWarnings.write(compactLogLine(entry));
+          }
         };
         const onChild = (child) => {
           this.exportProcess = child;
@@ -13035,6 +13079,13 @@ try {
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
         throw new Error('Scene Graph 导出临时输出未通过视频流与文件大小验证。');
       }
+      const outputTiming = await probeMediaTimelineInfo(this.ffmpegPath, temporaryOutputPath, exportedMediaInfo, {
+        onChild: child => { this.exportProcess = child; if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 }); }
+      });
+      if (!outputTiming.timingSafeForCopy || Math.abs(outputTiming.videoPresentationDurationSec - duration) > Math.max(0.25, 3 / fps)) {
+        throw new Error(`Scene 成片时间轴验收失败：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s，音画差 ${outputTiming.avDeltaSec.toFixed(3)}s。`);
+      }
+      throwIfExportCancelled();
       try {
         await atomicReplaceFile(temporaryOutputPath, outputPath, { isCancelled: () => this.exportCancelRequested });
       } catch (error) {
@@ -13090,6 +13141,7 @@ try {
       return { ok: false, mode: 'burn', cleanPath: recording.cleanPath };
     } finally {
       flushSceneFontFallbackWarnings?.(true);
+      sceneWarnings.flush();
       if (!preserveCompletedOutput) {
         await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
         if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});

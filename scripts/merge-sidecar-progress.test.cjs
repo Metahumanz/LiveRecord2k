@@ -43,7 +43,7 @@ test('avatar merging copies a captured duplicate only once, reports records and 
   assert.equal(manifest.entryCount, 1); assert.equal(manifest.totalBytes, 6);
   assert.equal((await fsp.readdir(path.join(dir, 'out.avatars'))).length, 1);
   assert.equal(await fsp.readFile(path.join(dir, manifest.entries[0].file), 'utf8'), 'avatar');
-  assert.deepEqual(progress.at(-1), { completed: 6, total: 6, unit: 'items' });
+  assert.deepEqual(progress.at(-1), { completed: 1, total: 1, unit: 'items' });
   const controller = new AbortController();
   await assert.rejects(app.mergeAvatarManifests([{}, {}], path.join(dir, 'cancel.avatars.json'), {
     signal: controller.signal, onProgress: p => { if (p.completed >= 1) controller.abort(new Error('cancel avatars')); }

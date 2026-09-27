@@ -15,7 +15,7 @@ export function ManualMergeProgress({ rooms, busy, onCancel, onRetry }: {
     return <div key={room.id} className="manual-merge-hint">
       <p className="field-help">{room.anchor || room.title || room.id} · 房间号 {room.id}</p>
       <JobProgress progress={progress} />
-      {active ? <button type="button" className="wide-button danger fill"
+      {active && !progress.cleanupStarted ? <button type="button" className="wide-button danger fill"
         disabled={busy.has(`cancel-merge-${room.id}`)} onClick={() => onCancel(room.id, progress.id)}>
         <Square size={18} />中断合并
       </button> : ['error', 'cancelled'].includes(progress.status) ? <button type="button" className="wide-button fill"
@@ -46,13 +46,15 @@ export function getManualMergeSelection(recordings: RecordingState[], paths: str
   return { selected, reason };
 }
 
-export function ManualMergeControls({ selecting, count, reason, busy, onToggle, onMerge }: {
+export function ManualMergeControls({ selecting, count, reason, busy, onToggle, onMerge, deleteSources = false, onDeleteSourcesChange }: {
   selecting: boolean;
   count: number;
   reason: string;
   busy: boolean;
   onToggle: () => void;
   onMerge: () => void;
+  deleteSources?: boolean;
+  onDeleteSourcesChange?: (value: boolean) => void;
 }) {
   return <>
     <div className="manual-merge-actions split-buttons">
@@ -61,15 +63,20 @@ export function ManualMergeControls({ selecting, count, reason, busy, onToggle, 
         {selecting ? '退出多选' : '手动选择合并'}
       </button>
       {selecting ? <button type="button" className="wide-button primary" disabled={Boolean(reason) || busy}
-        title={reason || '按录制时间合并，保留源文件'} onClick={onMerge}>
+        title={reason || (deleteSources ? '合并验证成功后删除所选源录像及配套弹幕、头像和 Scene 文件' : '按录制时间合并，保留源文件')} onClick={onMerge}>
         <Merge size={18} />
         {busy ? '正在提交合并' : `合并所选 ${count} 段`}
       </button> : null}
     </div>
+    {selecting ? <label className="field-help manual-merge-hint">
+      <input type="checkbox" checked={deleteSources} disabled={busy}
+        onChange={event => onDeleteSourcesChange?.(event.target.checked)} /> 合并完成后删除源文件
+      <span>（仅验证成功后删除所选录像及配套弹幕、头像和 Scene 文件；合并失败或取消保留）</span>
+    </label> : null}
     {selecting ? reason && count >= 2 ? <div className="warning-line manual-merge-hint" role="status">
       <CircleAlert size={16} /><span>{reason}</span>
     </div> : <p className="field-help manual-merge-hint" role="status">
-      {reason || '按录制时间先后合并，保留源文件；进度显示在本页和对应直播间卡片。'}
+      {reason || `按录制时间先后合并，${deleteSources ? '验证成功后删除所选源文件' : '保留源文件'}；进度显示在本页和对应直播间卡片。`}
     </p> : null}
   </>;
 }

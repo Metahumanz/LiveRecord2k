@@ -40,6 +40,7 @@ struct Texture {
   std::string path;
   unsigned width = 0, height = 0;
   uchar4 *device = nullptr;
+  unsigned long long last_used = 0;
 };
 
 struct TimelineEntry {
@@ -63,6 +64,10 @@ struct SceneState {
   double fps = 30.0;
   unsigned long long frame = 0;
   bool ready = false;
+  size_t resident_bytes = 0;
+  size_t resident_peak = 0;
+  size_t upload_count = 0;
+  size_t cache_limit = 512ULL * 1024 * 1024;
   std::mutex lock;
 
   ~SceneState() {
@@ -72,13 +77,50 @@ struct SceneState {
 
 static SceneState g_scene;
 
+static void report_failure(const char *message) {
+  std::fprintf(stderr, "br2k CUDA Scene fatal: %s\n", message);
+  const char *timeline = std::getenv("BR2K_CUDA_SCENE_TIMELINE");
+  if (timeline) { std::ofstream marker(std::string(timeline) + ".error"); marker << message; }
+}
+
+static bool ensure_texture(Texture &texture) {
+  texture.last_used = g_scene.frame;
+  if (texture.device) return true;
+  const size_t expected = (size_t)texture.width * texture.height * 4;
+  while (g_scene.resident_bytes + expected > g_scene.cache_limit) {
+    Texture *oldest = nullptr;
+    for (auto &pair : g_scene.textures) {
+      Texture &candidate = pair.second;
+      if (candidate.device && candidate.last_used != g_scene.frame && (!oldest || candidate.last_used < oldest->last_used)) oldest = &candidate;
+    }
+    if (!oldest) { report_failure("active texture working set exceeds bounded CUDA cache"); return false; }
+    cudaFree(oldest->device); oldest->device = nullptr;
+    g_scene.resident_bytes -= (size_t)oldest->width * oldest->height * 4;
+  }
+  std::ifstream raw(texture.path, std::ios::binary | std::ios::ate);
+  if (!raw || (size_t)raw.tellg() != expected) { report_failure("invalid RGBA texture size"); return false; }
+  std::vector<unsigned char> bytes(expected);
+  raw.seekg(0); raw.read((char *)bytes.data(), (std::streamsize)expected);
+  if (!raw || cudaMalloc((void **)&texture.device, expected) != cudaSuccess ||
+      cudaMemcpy(texture.device, bytes.data(), expected, cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (texture.device) cudaFree(texture.device);
+    texture.device = nullptr;
+    report_failure("RGBA read or CUDA texture upload failed"); return false;
+  }
+  g_scene.resident_bytes += expected;
+  g_scene.resident_peak = std::max(g_scene.resident_peak, g_scene.resident_bytes);
+  ++g_scene.upload_count;
+  return true;
+}
+
 __global__ static void blend_rgba_nv12_array(
     cudaSurfaceObject_t y_surface, cudaSurfaceObject_t uv_surface,
     const uchar4 *texture, int texture_width, int texture_height,
     int frame_width, int frame_height, int left, int top, int draw_width,
-    int draw_height, float opacity, int clip_x, int clip_y, int clip_width, int clip_height) {
-  const int px = blockIdx.x * blockDim.x + threadIdx.x;
-  const int py = blockIdx.y * blockDim.y + threadIdx.y;
+    int draw_height, float opacity, int clip_x, int clip_y, int clip_width, int clip_height,
+    int pixel_offset_x, int pixel_offset_y) {
+  const int px = blockIdx.x * blockDim.x + threadIdx.x + pixel_offset_x;
+  const int py = blockIdx.y * blockDim.y + threadIdx.y + pixel_offset_y;
   if (px >= draw_width || py >= draw_height) return;
   const int x = left + px, y = top + py;
   if (x < 0 || y < 0 || x >= frame_width || y >= frame_height) return;
@@ -129,9 +171,10 @@ __global__ static void blend_rgba_nv12_pitch(
     unsigned char *y_plane, unsigned char *uv_plane, int y_pitch, int uv_pitch,
     const uchar4 *texture, int texture_width, int texture_height,
     int frame_width, int frame_height, int left, int top, int draw_width,
-    int draw_height, float opacity, int clip_x, int clip_y, int clip_width, int clip_height) {
-  const int px = blockIdx.x * blockDim.x + threadIdx.x;
-  const int py = blockIdx.y * blockDim.y + threadIdx.y;
+    int draw_height, float opacity, int clip_x, int clip_y, int clip_width, int clip_height,
+    int pixel_offset_x, int pixel_offset_y) {
+  const int px = blockIdx.x * blockDim.x + threadIdx.x + pixel_offset_x;
+  const int py = blockIdx.y * blockDim.y + threadIdx.y + pixel_offset_y;
   if (px >= draw_width || py >= draw_height) return;
   const int x = left + px, y = top + py;
   if (x < 0 || y < 0 || x >= frame_width || y >= frame_height) return;
@@ -223,15 +266,7 @@ static bool load_scene() {
         std::fprintf(stderr, "br2k CUDA Scene: invalid RGBA texture at row %u\n", line_number);
         return false;
       }
-      std::vector<unsigned char> bytes(expected);
-      raw.seekg(0); raw.read((char *)bytes.data(), (std::streamsize)bytes.size());
       Texture texture; texture.path = field[12]; texture.width = width; texture.height = height;
-      if (cudaMalloc((void **)&texture.device, expected) != cudaSuccess ||
-          cudaMemcpy(texture.device, bytes.data(), expected, cudaMemcpyHostToDevice) != cudaSuccess) {
-        if (texture.device) cudaFree(texture.device);
-        std::fprintf(stderr, "br2k CUDA Scene: texture upload failed at row %u\n", line_number);
-        return false;
-      }
       existing = g_scene.textures.emplace(texture.path, texture).first;
     }
     TimelineEntry entry = {as_number(field[0]), as_number(field[1]), as_number(field[2]), as_number(field[3]),
@@ -292,10 +327,11 @@ static void update_active_entries(double seconds) {
 
 static void gpu_process(EGLImageKHR image, void **) {
   std::lock_guard<std::mutex> guard(g_scene.lock);
-  if (!g_scene.ready && !load_scene()) return;
+  if (!g_scene.ready && !load_scene()) { report_failure("cannot load Scene timeline"); return; }
   const unsigned long long frame_index = g_scene.frame++;
   const double seconds = (double)frame_index / g_scene.fps;
   update_active_entries(seconds);
+  if (g_scene.active_entries.empty()) return;
   // nvivafilter can invoke fGPUProcess from a worker thread different from
   // init(). Make the Runtime primary context current on this callback thread
   // before using the Driver API's EGL interop entry points. Without this,
@@ -303,6 +339,7 @@ static void gpu_process(EGLImageKHR image, void **) {
   const cudaError_t context_result = cudaFree(0);
   if (context_result != cudaSuccess) {
     std::fprintf(stderr, "br2k CUDA Scene: cannot bind CUDA context: %s\n", cudaGetErrorString(context_result));
+    report_failure("cannot bind CUDA context");
     return;
   }
   CUgraphicsResource resource = nullptr;
@@ -315,10 +352,12 @@ static void gpu_process(EGLImageKHR image, void **) {
     const char *error_name = "unknown";
     cuGetErrorName(egl_result, &error_name);
     std::fprintf(stderr, "br2k CUDA Scene: failed to import nvivafilter EGLImage: %s (%d)\n", error_name, (int)egl_result);
+    report_failure("cannot import nvivafilter EGLImage");
     if (resource) cuGraphicsUnregisterResource(resource);
     return;
   }
   if (egl_frame.planeCount < 2) {
+    report_failure("nvivafilter returned too few CUDA planes");
     std::fprintf(stderr, "br2k CUDA Scene: nvivafilter returned CUDA frame with too few planes\n");
     cuGraphicsUnregisterResource(resource);
     return;
@@ -333,6 +372,7 @@ static void gpu_process(EGLImageKHR image, void **) {
     descriptor.res.array.array = (cudaArray_t)egl_frame.frame.pArray[1];
     if (result == cudaSuccess) result = cudaCreateSurfaceObject(&uv_surface, &descriptor);
   } else if (egl_frame.frameType != CU_EGL_FRAME_TYPE_PITCH) {
+    report_failure("unsupported nvivafilter CUDA frame type");
     std::fprintf(stderr, "br2k CUDA Scene: unsupported CUDA frame type=%d\n", (int)egl_frame.frameType);
     cuGraphicsUnregisterResource(resource);
     return;
@@ -347,20 +387,29 @@ static void gpu_process(EGLImageKHR image, void **) {
       const int x = (int)std::lround(entry.x0 + (entry.x1 - entry.x0) * progress);
       const int y = (int)std::lround(entry.y0 + (entry.y1 - entry.y0) * progress);
       const float alpha = (float)std::min(1.0, std::max(0.0, entry.alpha0 + (entry.alpha1 - entry.alpha0) * progress));
+      if (alpha <= 0 || x >= (int)egl_frame.width || y >= (int)egl_frame.height || x + width <= 0 || y + height <= 0) continue;
       const int clip_x = (int)std::lround(entry.clip_x);
       const int clip_y = (int)std::lround(entry.clip_y);
       const int clip_width = (int)std::lround(entry.clip_width);
       const int clip_height = (int)std::lround(entry.clip_height);
-      const dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+      int visible_left = std::max(0, x), visible_top = std::max(0, y);
+      int visible_right = std::min((int)egl_frame.width, x + width), visible_bottom = std::min((int)egl_frame.height, y + height);
+      if (clip_width > 0 && clip_height > 0) {
+        visible_left = std::max(visible_left, clip_x); visible_top = std::max(visible_top, clip_y);
+        visible_right = std::min(visible_right, clip_x + clip_width); visible_bottom = std::min(visible_bottom, clip_y + clip_height);
+      }
+      if (visible_right <= visible_left || visible_bottom <= visible_top) continue;
+      if (!ensure_texture(*entry.texture)) { result = cudaErrorMemoryAllocation; break; }
+      const dim3 grid((visible_right - visible_left + block.x - 1) / block.x, (visible_bottom - visible_top + block.y - 1) / block.y);
       if (egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
         blend_rgba_nv12_array<<<grid, block>>>(y_surface, uv_surface, entry.texture->device,
             entry.texture->width, entry.texture->height, (int)egl_frame.width, (int)egl_frame.height,
-            x, y, width, height, alpha, clip_x, clip_y, clip_width, clip_height);
+            x, y, width, height, alpha, clip_x, clip_y, clip_width, clip_height, visible_left - x, visible_top - y);
       } else {
         blend_rgba_nv12_pitch<<<grid, block>>>((unsigned char *)egl_frame.frame.pPitch[0],
             (unsigned char *)egl_frame.frame.pPitch[1], (int)egl_frame.pitch, (int)egl_frame.pitch,
             entry.texture->device, entry.texture->width, entry.texture->height,
-            (int)egl_frame.width, (int)egl_frame.height, x, y, width, height, alpha, clip_x, clip_y, clip_width, clip_height);
+            (int)egl_frame.width, (int)egl_frame.height, x, y, width, height, alpha, clip_x, clip_y, clip_width, clip_height, visible_left - x, visible_top - y);
       }
     }
     result = cudaGetLastError();
@@ -369,7 +418,7 @@ static void gpu_process(EGLImageKHR image, void **) {
   if (y_surface) cudaDestroySurfaceObject(y_surface);
   if (uv_surface) cudaDestroySurfaceObject(uv_surface);
   cuGraphicsUnregisterResource(resource);
-  if (result != cudaSuccess) std::fprintf(stderr, "br2k CUDA Scene: kernel failed: %s\n", cudaGetErrorString(result));
+  if (result != cudaSuccess) report_failure(cudaGetErrorString(result));
 }
 
 extern "C" void init(CustomerFunction *functions) {
@@ -385,8 +434,12 @@ extern "C" void init(CustomerFunction *functions) {
   functions->fPostProcess = nullptr;
 }
 
+extern "C" unsigned long long br2k_scene_cache_peak_bytes() { return g_scene.resident_peak; }
+extern "C" unsigned long long br2k_scene_texture_upload_count() { return g_scene.upload_count; }
+
 extern "C" void deinit(void) {
   std::lock_guard<std::mutex> guard(g_scene.lock);
+  std::fprintf(stderr, "br2k CUDA Scene cache: peak=%zu bytes uploads=%zu unique=%zu\n", g_scene.resident_peak, g_scene.upload_count, g_scene.textures.size());
   if (!g_scene.scheduler_trace || !g_scene.frame) return;
   const double average = (double)g_scene.active_total / (double)g_scene.frame;
   std::fprintf(

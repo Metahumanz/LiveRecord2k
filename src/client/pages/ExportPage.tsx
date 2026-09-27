@@ -68,6 +68,7 @@ export function ExportPage({
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [selectingMerge, setSelectingMerge] = useState(false);
   const [mergeSubmitted, setMergeSubmitted] = useState(false);
+  const [deleteMergeSources, setDeleteMergeSources] = useState(false);
   const { selected: mergeRecordings, reason: mergeReason } = getManualMergeSelection(recordings, mergeSelection, state.rooms);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
@@ -385,10 +386,11 @@ export function ExportPage({
           </div>
 
           <ManualMergeControls selecting={selectingMerge} count={mergeRecordings.length} reason={mergeReason}
+            deleteSources={deleteMergeSources} onDeleteSourcesChange={setDeleteMergeSources}
             busy={busy.has('manual-merge')}
             onToggle={() => { setSelectingMerge(!selectingMerge); setMergeSelection([]); }}
             onMerge={async () => {
-              if (await run('manual-merge', () => recorder.mergeRecordings(mergeRecordings.map(recording => recording.cleanPath)))) {
+              if (await run('manual-merge', () => recorder.mergeRecordings(mergeRecordings.map(recording => recording.cleanPath), deleteMergeSources))) {
                 setMergeSubmitted(true);
                 setMergeSelection([]); setSelectingMerge(false);
               }
@@ -825,6 +827,7 @@ export function ExportPage({
                 className="wide-button"
                 type="button"
                 disabled={busy.has('save-settings')}
+                title="保存当前导出类型（纯净片段或烧录片段）、烧录内容、弹幕显示区域、样式预设与调整参数、头像模式。下次选择录像时使用；烧录参数也用于自动烧录。不保存源文件、剪辑起止时间或本次输出目录。"
                 onClick={saveStyleAsDefault}
               >
                 设为默认

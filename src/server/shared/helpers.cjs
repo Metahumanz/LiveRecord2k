@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { validateRemoteUrl } = require('./security.cjs');
 const { ffmpegEnvironment } = require('../recording/fontconfig.cjs');
+const { scanFullMedia } = require('../recording/media-full-scan.cjs');
 
 let ffmpegStatic = null;
 try {
@@ -2128,50 +2129,16 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
 }
 
 async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
-  const timeoutMs = Number(options.timeoutMs || 90000);
-  const scanStream = async (selector) => {
-    const result = await runCapturedProcess(
-      ffmpegPath,
-      [
-        '-hide_banner',
-        '-nostdin',
-        '-loglevel',
-        'error',
-        '-i',
-        filePath,
-        '-map',
-        selector,
-        '-c',
-        'copy',
-        '-f',
-        'null',
-        '-',
-        '-progress',
-        'pipe:1'
-      ],
-      { timeoutMs, onChild: options.onChild }
-    );
-    if (result.timedOut) {
-      throw new Error(`媒体时间轴扫描超时：${path.basename(filePath)}`);
-    }
-    if (result.status !== 0) {
-      throw new Error(`媒体时间轴扫描失败：${path.basename(filePath)}（${compactLogLine(result.stderr)}）`);
-    }
-    const values = Array.from(String(result.stdout || '').matchAll(/out_time_us=(-?\d+)/g))
-      .map((match) => Number(match[1]) / 1_000_000)
-      .filter(Number.isFinite);
-    return values.length ? Math.max(0, values.at(-1)) : 0;
-  };
-
-  const videoDurationSec = await scanStream('0:v:0');
-  const audioDurationSec = mediaInfo.audioInfo ? await scanStream('0:a:0') : 0;
+  const fullScan = options.fullScan || await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess);
+  const videoDurationSec = fullScan.video.dtsEnd;
+  const audioDurationSec = mediaInfo.audioInfo ? Number(fullScan.audio?.ptsEnd || 0) : 0;
   const measuredAvDeltaSec = mediaInfo.audioInfo ? audioDurationSec - videoDurationSec : 0;
   // Stream-copy progress reports video DTS, which can trail presentation time by several B-frames.
   // Discount that known positive-only reorder gap before deciding whether the streams really drift.
   const fps = Number(mediaInfo.videoInfo?.fps || 0);
   const videoReorderAllowanceSec = fps > 0 ? Math.min(0.15, 3 / fps) : 0.12;
   const avDeltaSec = measuredAvDeltaSec > 0 ? Math.max(0, measuredAvDeltaSec - videoReorderAllowanceSec) : measuredAvDeltaSec;
-  const videoPresentationDurationSec = videoDurationSec > 0 ? videoDurationSec + videoReorderAllowanceSec : 0;
+  const videoPresentationDurationSec = fullScan.video.ptsEnd;
   const containerDurationSec = Number(mediaInfo.durationSec || 0);
   const streamDurationSec = Math.max(videoDurationSec, audioDurationSec);
   return {
@@ -2378,39 +2345,12 @@ async function probeMediaClipTimelineInfo(ffmpegPath, filePath, startTimeSec, du
 }
 
 async function scanMediaCopyWarnings(ffmpegPath, filePath, options = {}) {
-  const result = await runCapturedProcess(
-    ffmpegPath,
-    [
-      '-hide_banner',
-      '-nostdin',
-      '-loglevel',
-      'warning',
-      '-i',
-      filePath,
-      '-map',
-      '0:v?',
-      '-map',
-      '0:a?',
-      '-c',
-      'copy',
-      '-f',
-      'null',
-      '-'
-    ],
-    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 120_000)), maxOutputBytes: 128 * 1024 }
-  );
-  if (result.timedOut) throw new Error(`媒体完整性扫描超时：${path.basename(filePath)}`);
-  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
-  return {
-    exitCode: result.status,
-    corruptPacketCount: (output.match(/(?:corrupt|invalid (?:data|nal)|error while decoding)/gi) || []).length,
-    nonMonotonicCount: (output.match(/(?:non[- ]monoton(?:ous|ically)|timestamp.*discontinuity)/gi) || []).length,
-    output: compactLogLine(output)
-  };
+  return (options.fullScan || await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess)).warnings;
 }
 
 async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
-  const timingInfo = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo, options);
+  const fullScan = await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess);
+  const timingInfo = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo, { ...options, fullScan });
   const packetSampleDurationSec = Math.max(1, Number(options.packetSampleDurationSec || 3));
   const [videoStart, videoEnd, audioStart, audioEnd, copyWarnings] = await Promise.all([
     scanMediaPacketTimeline(ffmpegPath, filePath, '0:v:0', { ...options, packetSampleDurationSec }),
@@ -2429,7 +2369,7 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
           packetSampleFromEnd: true
         })
       : Promise.resolve(null),
-    scanMediaCopyWarnings(ffmpegPath, filePath, options)
+    scanMediaCopyWarnings(ffmpegPath, filePath, { ...options, fullScan })
   ]);
   const video = {
     ...videoStart,

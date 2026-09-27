@@ -661,7 +661,7 @@ async function writeSceneGraph(scenePath, graph) {
   assertSceneGraph(graph);
   const temporary = target + '.' + process.pid + '.' + Date.now() + '.tmp';
   try {
-    await fsp.writeFile(temporary, JSON.stringify(graph, null, 2) + '\n', { encoding: 'utf8', mode: 0o660 });
+    await fsp.writeFile(temporary, JSON.stringify(graph) + '\n', { encoding: 'utf8', mode: 0o660 });
     // Windows cannot atomically replace an existing destination with rename.
     // The Scene Graph is a derived cache; raw JSONL and media remain untouched.
     await fsp.rm(target, { force: true });
@@ -805,14 +805,14 @@ function clipSceneGraph(graph, startTime, endTime, options) {
   // chunking into quadratic work and can itself delay the first frame.
   const output = Object.assign({}, graph, {
     canvas: clone(graph.canvas || {}),
-    assets: clone(graph.assets || []),
+    assets: [],
     metadata: Object.assign({}, graph.metadata || {}),
     timeline: { start: round(start - shift, 4), end: round(end - shift, 4) }
   });
   output.objects = graph.objects
     .filter((object) => number(object.end) >= start && number(object.start) <= end)
     .map((object) => {
-      const next = clone(object);
+      const next = clone({ ...object, animations: [] });
       const objectStart = Math.max(start, number(object.start));
       const objectEnd = Math.min(end, number(object.end));
       const state = evaluateSceneObject(object, objectStart);
@@ -834,6 +834,8 @@ function clipSceneGraph(graph, startTime, endTime, options) {
       return next;
     });
   output.metadata = Object.assign({}, output.metadata, { clippedFrom: { start, end, shift } });
+  const usedAssets = new Set(output.objects.map(object => object.props?.assetId).filter(Boolean));
+  output.assets = (graph.assets || []).filter(asset => usedAssets.has(asset.id)).map(clone);
   return output;
 }
 

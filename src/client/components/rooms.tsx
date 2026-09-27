@@ -272,7 +272,7 @@ export function RoomCard({
         ) : null}
 
         {room.mergeProgress ? <JobProgress progress={room.mergeProgress} /> : null}
-        {mergeActive ? (
+        {mergeActive && !room.mergeProgress?.cleanupStarted ? (
           <button
             className="wide-button danger fill"
             type="button"

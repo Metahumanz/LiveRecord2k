@@ -5,6 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { pipeline } = require('node:stream/promises');
+const { Transform, Writable } = require('node:stream');
 
 const DISK_WARNING_BYTES = 10 * 1024 * 1024 * 1024;
 const DISK_HARD_MIN_BYTES = 2 * 1024 * 1024 * 1024;
@@ -27,7 +28,14 @@ async function atomicReplaceFile(temporaryPath, outputPath, options = {}) {
       const controller = new AbortController();
       const timer = setInterval(() => { if (options.isCancelled?.()) controller.abort(); }, 100);
       try {
-        await pipeline(fs.createReadStream(resolvedTemporary), fs.createWriteStream(partialPath, { flags: 'wx' }), { signal: controller.signal });
+        const expectedHash = crypto.createHash('sha256');
+        const hashing = new Transform({ transform(chunk, _encoding, callback) { expectedHash.update(chunk); callback(null, chunk); } });
+        await pipeline(fs.createReadStream(resolvedTemporary), hashing, fs.createWriteStream(partialPath, { flags: 'wx' }), { signal: controller.signal });
+        const actualHash = crypto.createHash('sha256');
+        await pipeline(fs.createReadStream(partialPath), new Writable({ write(chunk, _encoding, callback) { actualHash.update(chunk); callback(); } }), { signal: controller.signal });
+        if (expectedHash.digest('hex') !== actualHash.digest('hex')) {
+          throw new Error('成片跨磁盘复制校验失败，源成片保留；请检查共享盘写入链路。');
+        }
         if ((await fsp.stat(partialPath)).size !== source.size) throw new Error('媒体发布拷贝大小不一致；本地成片已保留。');
         throwIfCancelled();
         publishPath = partialPath;

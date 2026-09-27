@@ -4,6 +4,22 @@ const test = require('node:test');
 const { LiveRecordService } = require('../src/server/app/service.cjs');
 const { SettingsService } = require('../src/server/app/settings-service.cjs');
 
+test('default export mode validates and persists clean and burn independently of automatic burn', async () => {
+  const service = new LiveRecordService();
+  service.saveStore = async () => {};
+  service.refreshOutputDiskSpace = async () => {};
+  service.markSettingsDirty = () => {};
+  const originalAutoBurn = service.settings.autoBurnDanmaku;
+  assert.equal(service.settings.defaultExportMode, 'clean');
+  assert.throws(() => service.assertSettingsUpdate({ defaultExportMode: 'invalid' }), { code: 'INVALID_SETTINGS' });
+  for (const mode of ['burn', 'clean']) {
+    await service.saveSettings({ defaultExportMode: mode });
+    assert.equal(service.settings.defaultExportMode, mode);
+    assert.equal(service.normalizeSettings(service.settings).defaultExportMode, mode);
+    assert.equal(service.settings.autoBurnDanmaku, originalAutoBurn);
+  }
+});
+
 test('LiveRecordService 将设置默认值、归一化、校验与保存委托给 SettingsService', async () => {
   const service = new LiveRecordService();
   assert.ok(service.settingsService instanceof SettingsService);

@@ -136,6 +136,7 @@ export type AppSettings = {
   burnDanmakuStylePreset: DanmakuStylePreset;
   burnDanmakuStyleLayout: DanmakuStyleLayout;
   burnAvatarMode: BurnAvatarMode;
+  defaultExportMode: 'clean' | 'burn';
   burnCodec: string;
   burnCrf: number;
   notifyLiveStarted: boolean;
@@ -416,12 +417,14 @@ export type FfmpegJobProgress = {
   mergeGroup?: string;
   manual?: boolean;
   sourcePaths?: string[];
+  deleteSources?: boolean;
   sourceCount?: number;
   segmentIndex?: number;
   mergeMode?: 'copy' | 'normalize';
   mergeReason?: string;
   id: string;
   kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
+  cleanupStarted?: boolean;
   status: 'queued' | 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
   label: string;
   outputPath?: string;
@@ -627,7 +630,7 @@ export type RecorderApi = {
   stopRecording: (roomId: string) => Promise<AppState>;
   cancelMerge: (roomId: string, jobId?: string) => Promise<AppState>;
   retryMerge: (roomId: string) => Promise<AppState>;
-  mergeRecordings: (cleanPaths: string[]) => Promise<AppState>;
+  mergeRecordings: (cleanPaths: string[], deleteSources?: boolean) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
   startExportPreview: (request: { cleanPath: string }) => Promise<ExportPreviewResult>;
   cancelExportPreview: () => Promise<AppState>;

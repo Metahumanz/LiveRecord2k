@@ -45,6 +45,7 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
   return {
     ...current,
     cleanPath: '',
+    mode: state.settings.defaultExportMode || 'clean',
     danmakuPath: '',
     cssPath: '',
     endTime: '',

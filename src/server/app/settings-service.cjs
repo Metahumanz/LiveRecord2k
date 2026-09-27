@@ -37,6 +37,7 @@ class SettingsService {
       burnDanmakuStylePreset: 'current',
       burnDanmakuStyleLayout: {},
       burnAvatarMode: 'high',
+      defaultExportMode: 'clean',
       burnCodec: '',
       burnCrf: 24,
       notifyLiveStarted: true,
@@ -97,6 +98,7 @@ class SettingsService {
       burnDanmakuStylePreset,
       burnDanmakuStyleLayout: this.normalizeDanmakuStyleLayout(settings.burnDanmakuStyleLayout),
       burnAvatarMode: this.normalizeBurnAvatarMode(settings.burnAvatarMode),
+      defaultExportMode: settings.defaultExportMode === 'burn' ? 'burn' : 'clean',
       notifyLiveStarted: settings.notifyLiveStarted !== false,
       notifyLiveEnded: settings.notifyLiveEnded !== false,
       notifyRecordingStarted: settings.notifyRecordingStarted !== false,
@@ -277,6 +279,7 @@ class SettingsService {
       burnOverlayMode: ['danmaku', 'danmaku-gift'],
       burnDanmakuArea: ['quarter', 'half', 'three-quarter', 'no-overlap', 'unlimited'],
       burnAvatarMode: ['off', 'limited', 'high'],
+      defaultExportMode: ['clean', 'burn'],
       sceneGraphCaptureMode: ['cache-only', 'cache-and-export'],
       sceneGraphDefaultStyle: ['current', 'h5-card', 'bubble', 'minimal'],
       serverHost: ['127.0.0.1', '0.0.0.0', 'localhost', '::']

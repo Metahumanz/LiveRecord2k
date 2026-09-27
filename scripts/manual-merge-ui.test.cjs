@@ -24,6 +24,23 @@ progressModule._compile(buildSync({ entryPoints: [path.join(__dirname, '../src/c
 }).outputFiles[0].text, filename);
 const { JobProgress } = progressModule.exports;
 
+test('delete option is opt-in and validated cleanup no longer offers cancellation', () => {
+  let checked;
+  const props = { selecting: true, count: 2, reason: '', busy: false, onToggle() {}, onMerge() {},
+    onDeleteSourcesChange(value) { checked = value; } };
+  const tree = ManualMergeControls(props);
+  const checkbox = tree.props.children[1].props.children[0];
+  assert.equal(checkbox.props.checked, false);
+  checkbox.props.onChange({ target: { checked: true } });
+  assert.equal(checked, true);
+  const html = renderToStaticMarkup(React.createElement(ManualMergeControls, { ...props, deleteSources: true }));
+  assert.match(html, /checked=""/); assert.match(html, /配套弹幕、头像和 Scene/);
+  const cleanup = renderToStaticMarkup(React.createElement(ManualMergeProgress, { rooms: [{ ...rooms[0], mergeProgress: {
+    kind: 'merge', id: 'job', manual: true, status: 'running', cleanupStarted: true, message: '正在清理所选源文件'
+  } }], busy: new Set(), onCancel() {}, onRetry() {} }));
+  assert.doesNotMatch(cleanup, /中断合并/);
+});
+
 test('export merge panel retains live progress, completion and job-scoped cancellation in the existing style', () => {
   const progress = { kind: 'merge', id: 'current-job', manual: true, status: 'running', phase: 'verify',
     stageLabel: '正在合并弹幕记录', message: '正在合并弹幕记录', phasePercent: 50,

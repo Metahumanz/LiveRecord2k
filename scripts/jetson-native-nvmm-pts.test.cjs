@@ -19,6 +19,8 @@ test('native NVMM progress is driven by media PTS rather than wall clock or fram
   assert.match(source, /mediaClock/);
   assert.doesNotMatch(source, /media_seconds\s*=\s*max\(0\.0, min\(duration, counters\['scene'\] \/ max\(1\.0, fps\)\)\)/);
   assert.doesNotMatch(source, /media_seconds\s*=\s*.*wall_seconds/);
+  const native = source.slice(source.indexOf('def render_native_nvmm('));
+  assert(native.indexOf("add_probe(Gst.PadProbeType.BUFFER, count_buffer") < native.indexOf('pipeline.set_state(Gst.State.PLAYING)'), '逐帧探针必须在启动播放之前安装，不能丢失最初预取的帧');
 });
 
 const FPS = 30;
