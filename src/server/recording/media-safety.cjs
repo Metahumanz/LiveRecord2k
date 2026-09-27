@@ -9,6 +9,7 @@ const { Transform, Writable } = require('node:stream');
 
 const DISK_WARNING_BYTES = 10 * 1024 * 1024 * 1024;
 const DISK_HARD_MIN_BYTES = 2 * 1024 * 1024 * 1024;
+const PUBLISH_BUFFER_BYTES = 1024 * 1024;
 
 async function atomicReplaceFile(temporaryPath, outputPath, options = {}) {
   const resolvedTemporary = path.resolve(temporaryPath);
@@ -29,10 +30,13 @@ async function atomicReplaceFile(temporaryPath, outputPath, options = {}) {
       const timer = setInterval(() => { if (options.isCancelled?.()) controller.abort(); }, 100);
       try {
         const expectedHash = crypto.createHash('sha256');
-        const hashing = new Transform({ transform(chunk, _encoding, callback) { expectedHash.update(chunk); callback(null, chunk); } });
-        await pipeline(fs.createReadStream(resolvedTemporary), hashing, fs.createWriteStream(partialPath, { flags: 'wx' }), { signal: controller.signal });
+        const hashing = new Transform({ highWaterMark: PUBLISH_BUFFER_BYTES,
+          transform(chunk, _encoding, callback) { expectedHash.update(chunk); callback(null, chunk); } });
+        await pipeline(fs.createReadStream(resolvedTemporary, { highWaterMark: PUBLISH_BUFFER_BYTES }), hashing,
+          fs.createWriteStream(partialPath, { flags: 'wx', highWaterMark: PUBLISH_BUFFER_BYTES }), { signal: controller.signal });
         const actualHash = crypto.createHash('sha256');
-        await pipeline(fs.createReadStream(partialPath), new Writable({ write(chunk, _encoding, callback) { actualHash.update(chunk); callback(); } }), { signal: controller.signal });
+        await pipeline(fs.createReadStream(partialPath, { highWaterMark: PUBLISH_BUFFER_BYTES }),
+          new Writable({ highWaterMark: PUBLISH_BUFFER_BYTES, write(chunk, _encoding, callback) { actualHash.update(chunk); callback(); } }), { signal: controller.signal });
         if (expectedHash.digest('hex') !== actualHash.digest('hex')) {
           throw new Error('成片跨磁盘复制校验失败，源成片保留；请检查共享盘写入链路。');
         }

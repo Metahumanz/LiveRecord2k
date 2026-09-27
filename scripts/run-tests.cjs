@@ -65,6 +65,7 @@ const GROUPS = {
     'room-removal.test.cjs',
     'safety.test.cjs',
     'scene-graph.test.cjs',
+    'scene-cache-index.test.cjs',
     'scene-legacy-conformance.test.cjs',
     'settings-draft.test.cjs',
     'settings-service.test.cjs',

@@ -12,6 +12,7 @@ async function runSceneWorker() {
     const temporary = request.cachePath + '.' + process.pid + '.tmp';
     await writeGraph(temporary, graph, true);
     await fs.rename(temporary, request.cachePath);
+    await fs.rename(temporary + '.index.json', request.cachePath + '.index.json');
   }
   if (Number.isFinite(request.clipStart) && Number.isFinite(request.clipEnd)) {
     graph = clipSceneGraph(graph, request.clipStart, request.clipEnd, { shiftTime: false });

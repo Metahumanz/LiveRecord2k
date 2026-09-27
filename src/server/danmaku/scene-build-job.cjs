@@ -37,11 +37,15 @@ async function buildSceneGraphJob(events, options, runtime) {
     if (result.status !== 0 || result.timedOut) throw new Error('Scene 后台布局失败：' + (result.stderr || '任务超时或被取消').slice(-2000));
     const graph = JSON.parse(await fs.readFile(outputPath, 'utf8'));
     const stat = await fs.stat(cachePath);
-    caches.delete(cachePath); caches.set(cachePath, stat.size);
+    const indexStat = await fs.stat(cachePath + '.index.json').catch(error => {
+      if (error.code === 'ENOENT') return { size: 0 }; throw error;
+    });
+    caches.delete(cachePath); caches.set(cachePath, stat.size + indexStat.size);
     let bytes = [...caches.values()].reduce((a, b) => a + b, 0);
     for (const [file, size] of caches) {
       if (caches.size <= 2 && bytes <= 512 * 1024 ** 2) break;
       await fs.rm(file, { force: true }); caches.delete(file); bytes -= size;
+      await fs.rm(file + '.index.json', { force: true });
     }
     return graph;
   } finally {
