@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <mutex>
 #include <numeric>
@@ -76,6 +77,9 @@ struct SceneState {
 };
 
 static SceneState g_scene;
+static std::mutex g_clock_lock;
+static std::deque<double> g_frame_times;
+static bool g_external_clock = false;
 
 static void report_failure(const char *message) {
   std::fprintf(stderr, "br2k CUDA Scene fatal: %s\n", message);
@@ -329,7 +333,15 @@ static void gpu_process(EGLImageKHR image, void **) {
   std::lock_guard<std::mutex> guard(g_scene.lock);
   if (!g_scene.ready && !load_scene()) { report_failure("cannot load Scene timeline"); return; }
   const unsigned long long frame_index = g_scene.frame++;
-  const double seconds = (double)frame_index / g_scene.fps;
+  double seconds = (double)frame_index / g_scene.fps;
+  {
+    std::lock_guard<std::mutex> clock_guard(g_clock_lock);
+    if (g_external_clock) {
+      if (g_frame_times.empty()) { report_failure("missing Scene frame PTS"); return; }
+      seconds = g_frame_times.front();
+      g_frame_times.pop_front();
+    }
+  }
   update_active_entries(seconds);
   if (g_scene.active_entries.empty()) return;
   // nvivafilter can invoke fGPUProcess from a worker thread different from
@@ -436,6 +448,22 @@ extern "C" void init(CustomerFunction *functions) {
 
 extern "C" unsigned long long br2k_scene_cache_peak_bytes() { return g_scene.resident_peak; }
 extern "C" unsigned long long br2k_scene_texture_upload_count() { return g_scene.upload_count; }
+
+// The NVMM ABI has no PTS argument. The sink probe supplies one timestamp per
+// surface, in streaming order, before nvivafilter invokes its GPU callback.
+extern "C" void br2k_scene_enable_pts_clock() {
+  std::lock_guard<std::mutex> guard(g_clock_lock);
+  g_external_clock = true;
+  g_frame_times.clear();
+}
+extern "C" int br2k_scene_push_frame_time(double seconds) {
+  std::lock_guard<std::mutex> guard(g_clock_lock);
+  if (!std::isfinite(seconds) || seconds < 0 || g_frame_times.size() >= 4096) {
+    report_failure("invalid or overflowing Scene frame PTS queue"); return 0;
+  }
+  g_frame_times.push_back(seconds);
+  return 1;
+}
 
 extern "C" void deinit(void) {
   std::lock_guard<std::mutex> guard(g_scene.lock);

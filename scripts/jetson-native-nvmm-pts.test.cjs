@@ -28,6 +28,16 @@ const LEAD_SECONDS = 1.019;
 const WIDTH = 320;
 const HEIGHT = 180;
 
+test('native Scene drawing follows actual PTS across a two-second source gap', async (t) => {
+  if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('需要 Orin 原生 NVDEC/CUDA/NVENC 链路');
+  const result = await run('/usr/bin/python3', [path.join(__dirname, 'jetson-scene-pts-gap.py')]);
+  const pixels = result.stdout.split(/\r?\n/).find(line => line.startsWith('{"whiteGlyphPixels"'));
+  assert(pixels, result.stderr);
+  const report = JSON.parse(pixels);
+  assert.equal(report.ok, true);
+  assert(report.whiteGlyphPixels > 20);
+});
+
 test('native CUDA clock keeps requested fps for unknown caps and accepts precise rational rates', async (t) => {
   if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('在 Orin Python 运行时验证解码器帧率契约');
   const helper = process.env.BR2K_JETSON_NVMM_HELPER || '/usr/lib/bili-record-2k/bin/br2k-scene-gpu';

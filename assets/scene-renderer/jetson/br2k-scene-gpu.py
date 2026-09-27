@@ -1055,10 +1055,9 @@ def render_native_nvmm(request):
                 source_rate, scene_rate = resolve_native_scene_fps(caps_text, scene_fps)
                 if source_rate != 'unavailable':
                     negotiated_fps['value'] = source_rate
-                    # nvivafilter's customer-library ABI exposes no buffer
-                    # PTS, so the CUDA renderer derives its media clock from
-                    # frame index / BR2K_CUDA_SCENE_FPS.  The customer library
-                    # consumes a numeric value (not a GStreamer fraction):
+                    # Keep a numeric fallback for the raw-I420 compatibility
+                    # path; native NVMM drawing uses the ordered PTS queue.
+                    # The customer library consumes a numeric value:
                     # writing "60000/1001" previously made strtod() see
                     # 60000 fps, freezing all normal-time overlays near t=0.
                     # Preserve the source rational rate as a precise decimal
@@ -1208,6 +1207,28 @@ def render_native_nvmm(request):
                     end += buffer.duration
                 encoded_pts['end'] = max(encoded_pts['end'] or end, end)
             return Gst.PadProbeReturn.OK
+        clock_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
+        clock_library.br2k_scene_enable_pts_clock.argtypes = []
+        clock_library.br2k_scene_enable_pts_clock.restype = None
+        clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
+        clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
+        clock_library.br2k_scene_enable_pts_clock()
+        drawing_clock = {'first': None}
+        def supply_drawing_time(_pad, info):
+            buffer = info.get_buffer()
+            if not buffer:
+                return Gst.PadProbeReturn.OK
+            if buffer.pts == Gst.CLOCK_TIME_NONE:
+                with open(timeline + '.error', 'w', encoding='utf-8') as marker:
+                    marker.write('CUDA Scene 输入帧没有有效 PTS，拒绝按帧数猜测弹幕时间。')
+                return Gst.PadProbeReturn.DROP
+            if drawing_clock['first'] is None:
+                drawing_clock['first'] = int(buffer.pts)
+            seconds = (int(buffer.pts) - drawing_clock['first']) / Gst.SECOND
+            if not clock_library.br2k_scene_push_frame_time(seconds):
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+        composite.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, supply_drawing_time)
         for name, element in [('decode', decoder), ('scene', composite), ('encode', encode)]:
             element.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, count_buffer, name)
         output_digest = hashlib.sha256()
@@ -1384,6 +1405,7 @@ def render_native_nvmm(request):
                 scene_coverage_ns / Gst.SECOND, encode_coverage_ns / Gst.SECOND, duration))
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'mediaClock': media_clock, 'wallSeconds': wall_seconds,
+            'drawingClock': 'input-pts-fifo',
             'textures': timeline_request.get('_textureStats'),
             'textureCache': cache_stats,
             'outputStorageVerified': output_container == 'mkv',
