@@ -52,6 +52,10 @@ class BufferedJsonlWriter {
 
   end(callback) {
     this.ending = true;
+    if (this.stream.closed) {
+      if (callback) queueMicrotask(callback);
+      return;
+    }
     if (callback) this.stream.once('close', callback);
     if (this.failed) {
       this.stream.destroy();

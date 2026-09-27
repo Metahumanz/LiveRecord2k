@@ -663,7 +663,7 @@ export type RecorderApi = {
     styleLayout?: DanmakuStyleLayout;
   }) => Promise<SceneGraph>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
-  cancelExport: () => Promise<AppState>;
+  cancelExport: (jobId?: string) => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
   scanMergedResiduals: () => Promise<CleanupScanResult>;
   applyMergedResidualCleanup: (scanId: string) => Promise<AppState>;

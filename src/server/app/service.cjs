@@ -4963,7 +4963,8 @@ try {
         ? redactSensitive(session.ffmpegLogBuffer || '').replace(/https?:\/\/\S+/gi, '[stream URL]').slice(-4000)
         : undefined,
       firstVideoPts: health.firstVideoPts ?? null,
-      firstAudioPts: health.firstAudioPts ?? null
+      firstAudioPts: health.firstAudioPts ?? null,
+      recorder: { host: os.hostname(), platform: process.platform, arch: process.arch, ffmpegPath: this.ffmpegPath }
     });
     diagnostics.video.segmentCount = diagnostics.video.segments.length;
     diagnostics.video.disconnectCount = diagnostics.video.segments.filter((item) => /stream-eof|network-error|no-media-progress/i.test(item.reason)).length;
@@ -5119,6 +5120,7 @@ try {
       throw businessError('SERVICE_DRAINING', '服务正在退出，不能开始新的录制。', 409);
     }
     const room = this.getRoom(roomId);
+    if (autoStart && room.recordingManuallyStopped) return this.getState();
     if (this.removingRoomIds.has(room.id)) {
       throw businessError('ROOM_REMOVAL_IN_PROGRESS', `${roomLabel(room)} 正在删除，不能开始新的录制。`, 409);
     }
@@ -5132,13 +5134,18 @@ try {
       return this.getState();
     }
     this.recordingStartLocks.add(room.id);
+    if (!autoStart) room.recordingManuallyStopped = false;
+    const startCancellationVersion = Number(room.recordingStartCancellationVersion || 0);
+    const startCancelled = () => Number(room.recordingStartCancellationVersion || 0) !== startCancellationVersion;
     room.recordingState = 'waiting-stream';
     this.emitState();
     let streamResolved = false;
+    let initialIdentityRefreshed = false;
 
     try {
       if (!room.realRoomId || room.liveStatus !== 1) {
         Object.assign(room, await this.fetchRoomInfo(room.id));
+        initialIdentityRefreshed = true;
       }
       if (room.liveStatus !== 1) {
         const error = businessError('ROOM_NOT_LIVE', `${roomLabel(room)} 当前未开播，无法开始录制。`, 409);
@@ -5152,6 +5159,14 @@ try {
 
       const explicitStream = options.stream?.url ? { ...options.stream } : null;
       const fallbackStream = options.fallbackStream?.url ? { ...options.fallbackStream } : null;
+      // The light status poll/push does not refresh the room title. Fetch
+      // identity alongside initial stream selection, without failing capture
+      // when this optional metadata endpoint is unavailable.
+      const refreshedIdentity = !initialIdentityRefreshed && !explicitStream && !options.segmentContinue && !options.streamReconnect
+        ? this.fetchRoomInfo(room.id).catch(error => {
+          this.log('warn', `${roomLabel(room)} 本场资料刷新失败，继续录制并沿用已有资料：${error.message}`);
+          return null;
+        }) : null;
       let stream = explicitStream;
       if (stream) {
         room.stream = stream;
@@ -5178,6 +5193,15 @@ try {
       }
       streamResolved = Boolean(stream?.url);
       const streamResolvedAt = Date.now();
+      if (startCancelled()) return this.getState();
+      if (refreshedIdentity) {
+        const identity = await refreshedIdentity;
+        if (startCancelled()) return this.getState();
+        if (identity) {
+          room.title = String(identity.title ?? room.title ?? '');
+          room.anchor = String(identity.anchor ?? room.anchor ?? '');
+        }
+      }
       const timestamp = formatTimestamp(new Date());
       const outputRoot = String(this.settings.outputDir || '').trim() || this.settings.outputDir;
       await this.ensureRecordingOutputRootReady(outputRoot, { label: '录像保存根目录' });
@@ -5229,6 +5253,7 @@ try {
 
       const ffmpegSpawnAt = Date.now();
       const ffmpegSpawnMono = monotonicNowMs();
+      if (startCancelled()) return this.getState();
       room.recordingState = 'connecting';
       const ffmpeg = spawn(this.ffmpegPath, args, {
         windowsHide: true,
@@ -5261,6 +5286,8 @@ try {
       });
       session = {
         roomId: room.id,
+        roomTitle: String(room.title || ''),
+        anchor: String(room.anchor || ''),
         liveSessionId,
         ffmpeg,
         stream,
@@ -5547,6 +5574,7 @@ try {
 
       this.emitState();
     } catch (error) {
+      if (startCancelled()) return this.getState();
       room.lastError = error.message;
       room.recording = false;
       room.recordingState = 'failed';
@@ -6653,8 +6681,15 @@ try {
 
   async stopRecording(roomId) {
     const room = this.getRoom(roomId);
+    room.recordingStartCancellationVersion = Number(room.recordingStartCancellationVersion || 0) + 1;
+    room.recordingManuallyStopped = room.liveStatus === 1;
     const session = this.recordingSessions.get(room.id);
     if (!session) {
+      if (this.recordingStartLocks.has(room.id)) {
+        room.recordingState = 'completed';
+        this.log('info', `${roomLabel(room)} 已取消等待中的录制启动。`);
+        this.emitState();
+      }
       const retryTimer = this.streamStartRetryTimers.get(room.id);
       if (retryTimer) clearTimeout(retryTimer);
       this.streamStartRetryTimers.delete(room.id);
@@ -6691,17 +6726,6 @@ try {
     session.finished = true;
     this.transitionRecordingState(room, session, 'finalizing');
     session.danmakuClient?.close('录制结束');
-    await Promise.all([
-      new Promise((resolve) => session.eventStream.end(resolve)),
-      new Promise((resolve) => session.sceneStream ? session.sceneStream.end(resolve) : resolve())
-    ]);
-    const avatarsDrained = await this.flushAvatarCapture(session);
-    await this.scheduleAvatarManifestWrite(session, 'completed').catch((error) => {
-      this.log('warn', `${roomLabel(room)} 写入最终头像记录清单失败：${error.message}`);
-    });
-    if (!avatarsDrained) {
-      this.log('warn', `${roomLabel(room)} 头像记录仍有任务未完成，已保存已抓取的头像；未完成项将在烧录时使用回退图标。`);
-    }
     if (wasActiveSession) {
       room.recording = false;
     }
@@ -6725,6 +6749,19 @@ try {
       session.releaseMediaJob?.();
       this.recordingSessions.delete(roomId);
       await this.startNextSegmentNow(room, session);
+    }
+    // Start the next capture before draining old sidecars/avatars. Shared
+    // storage or avatar timeouts must not create a gap between video segments.
+    await Promise.all([
+      new Promise((resolve) => session.eventStream.end(resolve)),
+      new Promise((resolve) => session.sceneStream ? session.sceneStream.end(resolve) : resolve())
+    ]);
+    const avatarsDrained = await this.flushAvatarCapture(session);
+    await this.scheduleAvatarManifestWrite(session, 'completed').catch((error) => {
+      this.log('warn', `${roomLabel(room)} 写入最终头像记录清单失败：${error.message}`);
+    });
+    if (!avatarsDrained) {
+      this.log('warn', `${roomLabel(room)} 头像记录仍有任务未完成，已保存已抓取的头像；未完成项将在烧录时使用回退图标。`);
     }
     const capturePath = session.capturePath || session.cleanPath;
     const capturePathExists = capturePath !== session.cleanPath && (await isExistingFile(capturePath));
@@ -6794,6 +6831,7 @@ try {
     });
     const valid =
       !discardStartupSegment &&
+      Boolean(mediaInfo.videoInfo) && Number(mediaInfo.durationSec) > 0 &&
       isRecordingFileLikelyPlayable({
         fileSize,
         elapsedSec: wallElapsedSec,
@@ -6846,6 +6884,8 @@ try {
     const danmakuDurationSec = await readDanmakuDurationSec(session.danmakuPath).catch(() => 0);
     const finishedRecording = {
       startedAt: session.startedAt,
+      roomTitle: session.roomTitle,
+      anchor: session.anchor,
       liveSessionId: session.liveSessionId,
       cleanPath: session.cleanPath,
       danmakuPath: session.danmakuPath,
@@ -6929,7 +6969,7 @@ try {
       }
     }
     const unexpectedStreamEnd = wasActiveSession && !session.stopping && !shouldContinueSegment;
-    const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1;
+    const shouldReconnectLiveStream = unexpectedStreamEnd && room.monitoring && room.liveStatus === 1 && !room.recordingManuallyStopped;
     if (shouldReconnectLiveStream) {
       this.reconnectPendingRooms.add(roomId);
       room.recordingState = 'reconnecting';
@@ -6986,10 +7026,12 @@ try {
     } else if (shouldReconnectLiveStream) {
       const reconnectAttempt = Math.min(10, Number(session.streamReconnectAttempt || 0) + 1);
       const reconnectDelayMs = Math.min(30000, 1200 * 2 ** Math.min(reconnectAttempt - 1, 5)) + Math.floor(Math.random() * 500);
+      const reconnectCancellationVersion = Number(room.recordingStartCancellationVersion || 0);
       this.log('warn', `${roomLabel(room)} 将在 ${(reconnectDelayMs / 1000).toFixed(1)} 秒后进行第 ${reconnectAttempt} 次视频断流续录。`);
       setTimeout(() => {
         const currentRoom = this.rooms.get(roomId);
-        if (!currentRoom || !currentRoom.monitoring) {
+        if (!currentRoom || !currentRoom.monitoring || currentRoom.recordingManuallyStopped ||
+            Number(currentRoom.recordingStartCancellationVersion || 0) !== reconnectCancellationVersion) {
           this.reconnectPendingRooms.delete(roomId);
           if (currentRoom) {
             this.finalizeReconnectGroup(currentRoom, session.mergeGroup, valid ? finishedRecording : null).catch((mergeError) => {
@@ -7103,8 +7145,11 @@ try {
       );
       const finalizedSize = await getFileSize(tmpPath);
       if (finalizedSize >= MIN_PLAYABLE_BYTES) {
-        await fsp.rm(session.cleanPath, { force: true });
-        await fsp.rename(tmpPath, session.cleanPath);
+        const finalizedInfo = await probeMediaFileInfo(this.ffmpegPath, tmpPath);
+        if (!finalizedInfo.videoInfo || !(Number(finalizedInfo.durationSec) > 0)) {
+          throw new Error('MP4 封装结果没有可用视频流或有效时长。');
+        }
+        await atomicReplaceFile(tmpPath, session.cleanPath);
         if (sourcePath !== session.cleanPath) {
           await fsp.rm(sourcePath, { force: true }).catch(() => {});
         }
@@ -7151,8 +7196,8 @@ try {
       ...recording,
       id: `${recording.cleanPath}:${recording.startedAt || Date.now()}`,
       roomId: room.id,
-      roomTitle: room.title || '',
-      anchor: room.anchor || ''
+      roomTitle: (recording.roomTitle ?? room.title) || '',
+      anchor: (recording.anchor ?? room.anchor) || ''
     });
     if (!item) {
       return;
@@ -8867,8 +8912,8 @@ try {
       status: 'recording',
       liveSessionId: session.liveSessionId,
       roomId: String(room?.id || session.roomId || ''),
-      roomTitle: String(room?.title || ''),
-      anchor: String(room?.anchor || ''),
+      roomTitle: String(session.roomTitle ?? room?.title ?? ''),
+      anchor: String(session.anchor ?? room?.anchor ?? ''),
       startedAt: Number(session.startedAt || Date.now()),
       cleanPath: path.basename(session.cleanPath),
       capturePath: path.basename(session.capturePath || session.cleanPath),
@@ -9178,6 +9223,7 @@ try {
   async setAutoRecord(roomId, enabled) {
     const room = this.getRoom(roomId);
     room.autoRecord = Boolean(enabled);
+    if (room.autoRecord) room.recordingManuallyStopped = false;
     if (room.autoRecord && !room.monitoring) {
       await this.setMonitoring(room.id, true);
     } else {
@@ -13563,7 +13609,11 @@ try {
     };
   }
 
-  async cancelExportClip() {
+  async cancelExportClip(expectedJobId = '') {
+    if (expectedJobId && (this.exportProgress?.id !== expectedJobId || this.exportProgress?.status !== 'running')) {
+      throw businessError('EXPORT_TASK_CHANGED', '当前导出任务已变化，请刷新后操作。', 409);
+    }
+    if (!this.activeExportQueueItem && !this.exportProcess && this.exportProgress?.status !== 'running') return this.getState();
     this.exportCancelRequested = true;
     if (this.activeExportQueueItem) {
       this.cancelledExportQueueIds.add(this.activeExportQueueItem.id);

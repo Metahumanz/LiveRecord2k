@@ -569,6 +569,7 @@ test('recording start lock prevents simultaneous LIVE push and polling starts fr
   service.log = () => {};
   service.emitState = () => {};
   const room = { id: 'race', realRoomId: 'race', liveStatus: 1, recording: false, title: 'race', anchor: 'test' };
+  service.fetchRoomInfo = async () => room;
   service.rooms.set(room.id, room);
   let resolveStream;
   let resolveCalls = 0;

@@ -938,7 +938,7 @@ export function ExportPage({
               className="wide-button fill danger"
               type="button"
               disabled={busy.has('export-cancel')}
-              onClick={() => run('export-cancel', recorder.cancelExport)}
+              onClick={() => run('export-cancel', () => recorder.cancelExport(state.exportProgress?.id))}
             >
               <Square size={17} />
               中断当前导出

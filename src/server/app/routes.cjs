@@ -197,7 +197,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
     '/api/export/scene-tracks': () => service.prepareSceneTracks(body),
     '/api/export/clip': () => service.exportClip(body),
-    '/api/export/cancel': () => service.cancelExportClip(),
+    '/api/export/cancel': () => service.cancelExportClip(body.jobId),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/recordings/cleanup-merged': () =>
       service.cleanupMergedSegmentResiduals({ confirm: Boolean(body.confirm), scanId: body.scanId }),
