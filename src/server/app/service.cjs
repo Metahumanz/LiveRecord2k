@@ -12037,8 +12037,8 @@ try {
         const assPath = await this.writeLegacySceneCompatibilityAss(path.join(temporaryDir, 'preflight-reference.ass'), textVerification.events, {
           ...textVerification.options, startTime: probeStart, endTime: probeStart + probeDuration, shiftTime: true
         });
-        const textless = path.join(temporaryDir, 'preflight-clean.ass');
-        await fsp.writeFile(textless, (await fsp.readFile(assPath, 'utf8')).split(/\r?\n/).filter(line =>
+        const textless = assPath ? path.join(temporaryDir, 'preflight-clean.ass') : '';
+        if (assPath) await fsp.writeFile(textless, (await fsp.readFile(assPath, 'utf8')).split(/\r?\n/).filter(line =>
           !line.startsWith('Dialogue:') || /^Dialogue:\s*[^,]*,[^,]*,[^,]*,Shape,/.test(line)).join('\n'));
         const reference = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-reference.filter'), probeGraph,
           { duration: probeDuration, fps, target: 'software', legacyAssPath: assPath });
@@ -12622,8 +12622,8 @@ try {
       const ass = await this.writeLegacySceneCompatibilityAss(path.join(directory, prefix + '.ass'), events, {
         ...sceneOptions, startTime: startTime + sample.start, endTime: startTime + sample.start + sample.duration, shiftTime: true
       });
-      const noText = path.join(directory, prefix + '-clean.ass');
-      await fsp.writeFile(noText, (await fsp.readFile(ass, 'utf8')).split(/\r?\n/).filter(line =>
+      const noText = ass ? path.join(directory, prefix + '-clean.ass') : '';
+      if (ass) await fsp.writeFile(noText, (await fsp.readFile(ass, 'utf8')).split(/\r?\n/).filter(line =>
         !line.startsWith('Dialogue:') || /^Dialogue:\s*[^,]*,[^,]*,[^,]*,Shape,/.test(line)).join('\n'));
       const reference = await writeSceneFilterScript(path.join(directory, prefix + '.filter'), sampleGraph,
         { duration: sample.duration, fps, target: 'software', legacyAssPath: ass });
