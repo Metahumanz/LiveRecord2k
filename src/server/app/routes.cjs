@@ -185,7 +185,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/rooms/auto-record': () => service.setAutoRecord(body.roomId, body.enabled),
     '/api/rooms/record/start': () => service.startRecording(body.roomId, false),
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
-    '/api/rooms/merge/cancel': () => service.cancelMerge(body.roomId),
+    '/api/rooms/merge/cancel': () => service.cancelMerge(body.roomId, body.jobId),
     '/api/rooms/merge/retry': () => service.retryMerge(body.roomId),
     '/api/recordings/merge': () => service.mergeSelectedRecordings(body),
     '/api/rooms/preview/start': () => service.startPreview(body.roomId),

@@ -416,6 +416,10 @@ export type FfmpegJobProgress = {
   mergeGroup?: string;
   manual?: boolean;
   sourcePaths?: string[];
+  sourceCount?: number;
+  segmentIndex?: number;
+  mergeMode?: 'copy' | 'normalize';
+  mergeReason?: string;
   id: string;
   kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
   status: 'queued' | 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
@@ -620,7 +624,7 @@ export type RecorderApi = {
   setAutoRecord: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
-  cancelMerge: (roomId: string) => Promise<AppState>;
+  cancelMerge: (roomId: string, jobId?: string) => Promise<AppState>;
   retryMerge: (roomId: string) => Promise<AppState>;
   mergeRecordings: (cleanPaths: string[]) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;

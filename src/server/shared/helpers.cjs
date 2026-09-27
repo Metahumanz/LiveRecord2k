@@ -992,6 +992,7 @@ async function detectJetsonGstreamerDecoders(options = {}) {
 async function runFfmpegProbe(ffmpegPath, args, options = {}) {
   try {
     const result = await runCapturedProcess(ffmpegPath, args, {
+      onChild: options.onChild,
       timeoutMs: Number(options.timeoutMs || 8000),
       maxOutputBytes: Number(options.maxOutputBytes || 256 * 1024)
     });
@@ -2054,6 +2055,7 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
     return { durationSec: 0, videoInfo: null, audioInfo: null };
   }
   const probe = await runFfmpegProbe(ffmpegPath, ['-hide_banner', '-i', filePath], {
+    onChild: options.onChild,
     timeoutMs: Number(options.timeoutMs || 8000)
   });
   if (!probe.ok && /超时/.test(probe.error || '')) {
@@ -2118,7 +2120,7 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
   const result = await runCapturedProcess(
     ffprobe,
     ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time', '-of', 'json', filePath],
-    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024 }
+    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024, onChild: options.onChild }
   );
   if (result.status !== 0 || result.timedOut || result.error) return null;
   const parsed = JSON.parse(String(result.stdout || '{}'));
@@ -2147,7 +2149,7 @@ async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, opti
         '-progress',
         'pipe:1'
       ],
-      { timeoutMs }
+      { timeoutMs, onChild: options.onChild }
     );
     if (result.timedOut) {
       throw new Error(`媒体时间轴扫描超时：${path.basename(filePath)}`);
@@ -2218,6 +2220,7 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.onChild?.(null);
       if (error) {
         error.stderr = compactLogLine(stderrTail);
         reject(error);
@@ -2296,6 +2299,7 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
       finish(error);
       return;
     }
+    options.onChild?.(child);
     child.stderr.on('data', (chunk) => {
       const text = `${residual}${chunk.toString('utf8')}`;
       stderrTail = `${stderrTail}${text}`.slice(-16 * 1024);

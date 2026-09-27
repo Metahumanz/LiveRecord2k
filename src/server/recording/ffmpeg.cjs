@@ -2396,7 +2396,7 @@ function selectHighestResolutionVideoInfo(mediaInfos) {
   const sourceRate = rateDenominator > 0 ? rateNumerator / rateDenominator : 0;
   // Container averages such as 60.0017 are not a new encoder frame clock.
   // Jetson treats >60 caps as unsupported and silently encodes at 30 instead.
-  const frameRate = sourceRate > 0 && Math.abs(sourceRate - Number(highestResolution.fps)) < 0.01
+  const frameRate = sourceRate > 0 && sourceRate <= 240
     ? sourceRate : highestResolution.fps;
   return {
     ...highestResolution,
@@ -2460,7 +2460,10 @@ function createConcatStreamSignature(mediaInfo) {
   return [
     videoCodec,
     `${Number(videoInfo.width) || 0}x${Number(videoInfo.height) || 0}`,
-    normalizeMergeFps(videoInfo.fps) || 'unknown-fps',
+    // Average FPS includes dropped frames and container rounding. Compare the
+    // declared frame clock instead; packet/timeline verification still decides
+    // whether otherwise compatible streams may be copied safely.
+    normalizeMergeFps(getDeclaredMergeFrameRate(videoInfo)) || 'unknown-fps',
     String(videoInfo.profile || '').toLowerCase(),
     String(videoInfo.pixelFormat || '').toLowerCase(),
     Number(videoInfo.bitDepth || 0),
@@ -2472,6 +2475,12 @@ function createConcatStreamSignature(mediaInfo) {
     Number(audioInfo?.sampleRate) || 0,
     String(audioInfo?.channelLayout || '')
   ].join('|');
+}
+
+function getDeclaredMergeFrameRate(videoInfo) {
+  const [numerator, denominator] = String(videoInfo?.rFrameRate || '').split('/').map(Number);
+  const rate = denominator > 0 ? numerator / denominator : 0;
+  return rate > 0 && rate <= 240 ? rate : videoInfo?.fps;
 }
 
 function normalizeCodecFamily(codec) {

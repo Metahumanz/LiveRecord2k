@@ -221,7 +221,7 @@ class MediaJobManager extends EventEmitter {
     for (const activeJob of preemptions) {
       activeJob.preemptRequested = true;
       try {
-        activeJob.cancel?.();
+        activeJob.cancel?.({ reason: 'recording-preemption', recordingId: recording.id });
       } catch {
         // Capture startup must not be blocked by a best-effort cancellation.
       }
@@ -241,7 +241,7 @@ class MediaJobManager extends EventEmitter {
     }
     const job = this.active.get(key) || this.external.get(key);
     if (!job) return false;
-    job.cancel?.();
+    job.cancel?.({ reason: 'user' });
     return true;
   }
 

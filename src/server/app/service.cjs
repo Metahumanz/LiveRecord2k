@@ -1112,6 +1112,8 @@ class LiveRecordService {
     this.maintenanceCleanupPlans = new Map();
     this.mergeProcesses = new Map();
     this.mergeCancelRequests = new Set();
+    this.mergePreemptRequests = new Set();
+    this.mergeRoomTasks = new Map();
     this.mergeInFlightGroups = new Map();
     this.mergeRetryStates = new Map();
     this.mediaJobs = new MediaJobManager();
@@ -7271,7 +7273,7 @@ try {
       !groupId ||
       this.draining ||
       this.removingRoomIds.has(room?.id) ||
-      this.mergeCancelRequests.has(room.id) ||
+      this.mergeCancelRequests.has(this.getMergeRetryKey(room.id, groupId)) ||
       isFfmpegMemoryPressureError(error) ||
       error?.code === 'MERGE_SEGMENT_UNDECODABLE'
     ) {
@@ -7281,7 +7283,9 @@ try {
     const key = this.getMergeRetryKey(room.id, groupId);
     const existing = this.mergeRetryStates.get(key);
     if (existing?.timer) return true;
-    const attempts = Number(existing?.attempts || 0) + 1;
+    const preempted = error?.code === 'MERGE_PREEMPTED';
+    // Giving resources to a new recording is not a failed merge attempt.
+    const attempts = preempted ? Math.max(1, Number(existing?.attempts || 0)) : Number(existing?.attempts || 0) + 1;
     if (attempts > MERGE_RETRY_DELAYS_MS.length) {
       this.clearMergeRetryState(room.id, groupId);
       if (room.mergeProgress?.kind === 'merge') {
@@ -7296,7 +7300,7 @@ try {
     const delayMs = Math.max(0, Number(options.delayMs ?? this.getMergeRetryDelayMs(attempts)) || 0);
     const outputPath =
       room.mergeProgress?.outputPath || fallbackRecording?.mergeOutputPath || deriveSiblingPath(fallbackRecording?.cleanPath || '', 'merged');
-    if (!room.mergeProgress || room.mergeProgress.kind !== 'merge') {
+    if (!room.mergeProgress || room.mergeProgress.kind !== 'merge' || room.mergeProgress.mergeGroup !== groupId) {
       room.mergeProgress = createFfmpegJobProgress({
         kind: 'merge',
         label: `合并续录分段：${path.basename(outputPath)}`,
@@ -7305,9 +7309,11 @@ try {
         roomId: room.id
       });
     }
+    room.mergeProgress.mergeGroup = groupId;
     room.mergeProgress.status = 'retrying';
     room.mergeProgress.estimatedRemainingSec = Math.ceil(delayMs / 1000);
     room.mergeProgress.message = `合并失败，将在 ${formatDurationSeconds(Math.ceil(delayMs / 1000))}后自动重试（${attempts}/${MERGE_RETRY_DELAYS_MS.length}）；源分段已保留。`;
+    if (preempted) room.mergeProgress.message = '主播重新开播，合并已让出资源；录制优先，资源空闲后继续合并，源分段已保留。';
     room.mergeProgress.updatedAt = Date.now();
     const state = {
       roomId: room.id,
@@ -7317,17 +7323,23 @@ try {
       timer: null,
       lastError: compactLogLine(error?.message || '未知合并错误')
     };
+    state.manualOptions = options.manualOptions || existing?.manualOptions || null;
     this.mergeRetryStates.set(key, state);
     this.log(
-      'warn',
-      `${roomLabel(room)} 合并失败，${formatDurationSeconds(Math.ceil(delayMs / 1000))}后自动重试（${attempts}/${MERGE_RETRY_DELAYS_MS.length}）；源分段已保留。`
+      preempted ? 'info' : 'warn',
+      preempted ? `${roomLabel(room)} 合并已为直播录制让出资源，资源空闲后重新合并；源分段已保留。`
+        : `${roomLabel(room)} 合并失败，${formatDurationSeconds(Math.ceil(delayMs / 1000))}后自动重试（${attempts}/${MERGE_RETRY_DELAYS_MS.length}）；源分段已保留。`
     );
     this.emitState();
     state.timer = setTimeout(() => {
-      if (this.mergeRetryStates.get(key) !== state || this.draining || this.mergeCancelRequests.has(room.id)) return;
+      if (this.mergeRetryStates.get(key) !== state || this.draining || this.mergeCancelRequests.has(key)) return;
       state.timer = null;
       this.log('info', `${roomLabel(room)} 正在自动重试合并续录分段（${attempts}/${MERGE_RETRY_DELAYS_MS.length}）。`);
-      this.finalizeReconnectGroup(room, groupId, fallbackRecording).catch((retryError) => {
+      const retry = state.manualOptions
+        ? this.mergeReconnectGroupIfNeededInternal(room, groupId, fallbackRecording, state.manualOptions)
+        : this.finalizeReconnectGroup(room, groupId, fallbackRecording);
+      retry.catch((retryError) => {
+        if (state.manualOptions) this.scheduleMergeRetry(room, groupId, fallbackRecording, retryError, { manualOptions: state.manualOptions });
         this.log('warn', `${roomLabel(room)} 自动重试合并未立即完成：${retryError.message}`);
       });
     }, delayMs);
@@ -7339,7 +7351,7 @@ try {
     if (this.draining) return 0;
     let scheduled = 0;
     for (const room of this.rooms.values()) {
-      if (this.isRoomRecording(room) || this.mergeProcesses.has(room.id)) continue;
+      if (this.isRoomRecording(room) || this.mergeProcesses.has(room.id) || this.mergeRoomTasks.has(room.id)) continue;
       const pending = await this.getPendingMergeGroupForRoom(room);
       if (!pending) continue;
       const didSchedule = this.scheduleMergeRetry(
@@ -7360,10 +7372,12 @@ try {
   async retryMerge(roomId) {
     const room = this.getRoom(roomId);
     if (this.isRoomRecording(room)) throw businessError('MERGE_ALREADY_RUNNING', '该直播间正在录制，请等待录制完成后再合并。', 409);
-    if (this.mergeProcesses.has(room.id) || [...this.mergeInFlightGroups.keys()].some((key) => key.startsWith(`${room.id}\u0000`))) {
+    if (this.mergeRoomTasks.has(room.id) || this.mergeProcesses.has(room.id) || [...this.mergeInFlightGroups.keys()].some((key) => key.startsWith(`${room.id}\u0000`))) {
       throw businessError('MERGE_ALREADY_RUNNING', '当前已有合并任务在运行，请稍候。', 409);
     }
     if (room.mergeProgress?.manual && room.mergeProgress.sourcePaths?.length >= 2) {
+      this.clearMergeRetryState(room.id, room.mergeProgress.mergeGroup);
+      this.mergeCancelRequests.delete(this.getMergeRetryKey(room.id, room.mergeProgress.mergeGroup));
       return this.mergeSelectedRecordings({ cleanPaths: room.mergeProgress.sourcePaths });
     }
     const preferredGroup = room.mergeProgress?.mergeGroup || [...this.mergeRetryStates.values()].find(state => state.roomId === room.id)?.mergeGroup || '';
@@ -7372,7 +7386,7 @@ try {
       throw businessError('MERGE_TASK_NOT_FOUND', '没有找到可重新合并的完整源分段。', 404);
     }
     this.clearMergeRetryState(room.id, pending.mergeGroup);
-    this.mergeCancelRequests.delete(room.id);
+    this.mergeCancelRequests.delete(this.getMergeRetryKey(room.id, pending.mergeGroup));
     if (room.mergeProgress?.kind === 'merge') {
       room.mergeProgress.status = 'running';
       room.mergeProgress.message = '正在手动重新尝试合并，源分段会继续保留到合并成功。';
@@ -7400,7 +7414,7 @@ try {
       throw businessError('MERGE_ROOM_MISMATCH', '一次只能合并同一直播间的录像。', 400);
     }
     const room = this.getRoom(roomId);
-    if (this.isRoomRecording(room) || this.mergeProcesses.has(room.id) ||
+    if (this.isRoomRecording(room) || this.mergeRoomTasks.has(room.id) || this.mergeProcesses.has(room.id) ||
         [...this.mergeInFlightGroups.keys()].some(key => key.startsWith(`${room.id}\u0000`))) {
       throw businessError('MERGE_ALREADY_RUNNING', '该直播间正在录制或合并，请等待完成后再合并所选文件。', 409);
     }
@@ -7408,20 +7422,22 @@ try {
       this.assertExportSourcePath(segment.cleanPath);
       if (!(await isExistingFile(segment.cleanPath))) throw businessError('MERGE_SOURCE_MISSING', '所选源录像已不存在，请刷新历史。', 404);
     }
-    if (this.isRoomRecording(room) || this.mergeProcesses.has(room.id) ||
+    if (this.isRoomRecording(room) || this.mergeRoomTasks.has(room.id) || this.mergeProcesses.has(room.id) ||
         [...this.mergeInFlightGroups.keys()].some(key => key.startsWith(`${room.id}\u0000`))) {
       throw businessError('MERGE_ALREADY_RUNNING', '该直播间已有录制或合并任务，请等待完成。', 409);
     }
     segments.sort((left, right) => Number(left.startedAt || 0) - Number(right.startedAt || 0) || left.cleanPath.localeCompare(right.cleanPath));
     const groupId = `manual-${crypto.randomUUID()}`;
     const outputPath = deriveSiblingPath(segments[0].cleanPath, `${groupId}.merged`, getContainerFromPath(segments[0].cleanPath));
-    this.clearMergeRetryStatesForRoom(room.id);
-    this.mergeCancelRequests.delete(room.id);
     const key = this.getMergeRetryKey(room.id, groupId);
     const task = this.mergeReconnectGroupIfNeededInternal(room, groupId, segments.at(-1), { segments, outputPath });
     this.mergeInFlightGroups.set(key, task);
     task.catch(error => {
-      if (room.mergeProgress) finishFfmpegJobProgress(room.mergeProgress, 'error', `手动合并失败：${error.message}；源文件已保留，可重新尝试。`);
+      if (error?.code === 'MERGE_PREEMPTED') {
+        this.scheduleMergeRetry(room, groupId, segments.at(-1), error, { manualOptions: { segments, outputPath } });
+        return;
+      }
+      if (room.mergeProgress?.mergeGroup === groupId) finishFfmpegJobProgress(room.mergeProgress, 'error', `手动合并失败：${error.message}；源文件已保留，可重新尝试。`);
       this.log('error', `${roomLabel(room)} 手动合并失败：${error.message}；源文件未删除。`);
       this.emitState(['room', 'mediaJob']);
     }).finally(() => {
@@ -7443,7 +7459,7 @@ try {
       throw error;
     }
     this.clearMergeRetryState(room.id, mergeGroup);
-    if (room.mergeProgress?.kind === 'merge' && room.mergeProgress.status === 'cancelled') {
+    if (!recording) {
       // A cancellation deliberately leaves the reconnect group untouched. In
       // particular, do not finalize the live-session diagnostics or enqueue a
       // burn for only the last source segment.
@@ -7582,6 +7598,7 @@ try {
   }
 
   async acquireMergeMediaLease(room, progress, mergeEncoderPlan) {
+    const key = this.getMergeRetryKey(room.id, progress.mergeGroup || progress.id);
     const resourcePlan = mergeEncoderPlan.requiresTranscode
       ? this.getTranscodeResourcePlan(mergeEncoderPlan.preferred, mergeEncoderPlan.videoInfo)
       : { resources: ['diskRead', 'diskWrite'], resourceCosts: { diskRead: 2, diskWrite: 2 } };
@@ -7591,8 +7608,9 @@ try {
       id: progress.id,
       type: 'merge',
       ...resourcePlan,
-      cancel: () => {
-        this.mergeCancelRequests.add(room.id);
+      cancel: (request) => {
+        if (request?.reason === 'recording-preemption') this.mergePreemptRequests.add(key);
+        else this.mergeCancelRequests.add(key);
         const child = this.mergeProcesses.get(room.id);
         if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
       }
@@ -7604,9 +7622,11 @@ try {
     heartbeat.unref?.();
     try {
       const lease = await leasePromise;
-      if (this.mergeCancelRequests.has(room.id)) {
+      if (this.mergeCancelRequests.has(key) || this.mergePreemptRequests.has(key)) {
         lease.release();
-        return null;
+        const error = new Error('合并已停止，源分段已保留');
+        error.code = this.mergePreemptRequests.has(key) ? 'MERGE_PREEMPTED' : 'MEDIA_JOB_CANCELLED';
+        throw error;
       }
       if (room.mergeProgress?.id === progress.id) {
         const workStartedAt = Date.now();
@@ -7628,6 +7648,16 @@ try {
   }
 
   async runMergePreparationStage(room, progress, stageLabel, operation) {
+    const key = this.getMergeRetryKey(room.id, progress.mergeGroup || progress.id);
+    const assertActive = () => {
+      if (!this.mergeCancelRequests.has(key) && !this.mergePreemptRequests.has(key)) return;
+      const error = new Error(this.mergePreemptRequests.has(key) ? '录制优先，合并让出资源' : '合并已取消');
+      error.code = this.mergePreemptRequests.has(key) ? 'MERGE_PREEMPTED' : 'MEDIA_JOB_CANCELLED';
+      throw error;
+    };
+    assertActive();
+    setFfmpegJobPhase(progress, progress.workStartedAt ? 'verify' : 'prepare', { force: true, stageLabel });
+    progress.phasePercent = null;
     const startedAt = Date.now();
     this.setMergeProgressStage(room, progress, stageLabel, startedAt);
     const heartbeat = setInterval(() => {
@@ -7635,7 +7665,9 @@ try {
     }, MERGE_STAGE_HEARTBEAT_MS);
     heartbeat.unref?.();
     try {
-      return await operation();
+      const result = await operation();
+      assertActive();
+      return result;
     } finally {
       clearInterval(heartbeat);
     }
@@ -7663,6 +7695,25 @@ try {
   }
 
   async mergeReconnectGroupIfNeededInternal(room, mergeGroup, fallbackRecording, manualOptions = null) {
+    // Serialize this room's groups without allowing an older task's cleanup or
+    // child process map to overwrite a later live session.
+    const previous = this.mergeRoomTasks.get(room.id);
+    const task = Promise.resolve().then(async () => {
+      if (previous) await previous.catch(() => {});
+      if (this.mergeCancelRequests.has(this.getMergeRetryKey(room.id, mergeGroup))) return null;
+      const result = await this.performMergeReconnectGroup(room, mergeGroup, fallbackRecording, manualOptions);
+      this.clearMergeRetryState(room.id, mergeGroup);
+      return result;
+    });
+    this.mergeRoomTasks.set(room.id, task);
+    try {
+      return await task;
+    } finally {
+      if (this.mergeRoomTasks.get(room.id) === task) this.mergeRoomTasks.delete(room.id);
+    }
+  }
+
+  async performMergeReconnectGroup(room, mergeGroup, fallbackRecording, manualOptions = null) {
     const groupId = String(mergeGroup || '').trim();
     if (!groupId) {
       return fallbackRecording;
@@ -7689,7 +7740,7 @@ try {
       return fallbackRecording;
     }
 
-    room.recordingState = 'merging';
+    if (!this.isRoomRecording(room)) room.recordingState = 'merging';
 
     const outputPath = manualOptions?.outputPath || this.getReconnectMergeOutputPath(allSegments, segments);
     const container = getContainerFromPath(outputPath);
@@ -7713,230 +7764,218 @@ try {
     );
     const progress = createFfmpegJobProgress({
       kind: 'merge',
-      label: '合并续录分段：' + path.basename(outputPath),
+      label: `${manualOptions ? '手动合并' : '合并续录'} ${segments.length} 段录像`,
       outputPath,
       durationSec: fallbackMergeDurationSec,
       roomId: room.id
     });
     room.mergeProgress = progress;
     progress.mergeGroup = groupId;
+    progress.sourceCount = segments.length;
+    const mergeKey = this.getMergeRetryKey(room.id, groupId);
+    const isStopped = () => this.mergeCancelRequests.has(mergeKey) || this.mergePreemptRequests.has(mergeKey);
+    let mergeLease;
+    const mergeProbeOptions = { onChild: (child) => {
+      if (child) {
+        this.mergeProcesses.set(room.id, child);
+        if (isStopped()) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+      } else this.mergeProcesses.delete(room.id);
+    } };
     if (manualOptions) {
       progress.manual = true;
       progress.sourcePaths = segments.map(segment => segment.cleanPath);
     }
     this.emitState();
-    const segmentMediaInfos = [];
-    const segmentTimelineInfos = [];
-    for (let index = 0; index < segments.length; index += 1) {
-      const segment = segments[index];
-      const mediaInfo = await this.runMergePreparationStage(
-        room,
-        progress,
-        '正在读取分段 ' + (index + 1) + '/' + segments.length + ' 的媒体信息',
-        () => probeMediaFileInfo(this.ffmpegPath, segment.cleanPath, { timeoutMs: 15000 })
-      );
-      if (!mediaInfo.videoInfo) {
-        throw new Error(`无法读取分段视频信息：${path.basename(segment.cleanPath)}`);
-      }
-      segmentMediaInfos.push({
-        ...mediaInfo,
-        durationSec:
-          Number(mediaInfo.durationSec) || Number(segment.durationSec) || getSegmentDurationForMerge(segment, segments[index + 1])
-      });
-      const quickDurationSec = Number(mediaInfo.durationSec || segment.durationSec || 0);
-      const recordedTiming =
-        segment.timelineHealth && typeof segment.timelineHealth === 'object'
-          ? { ...(segment.timingInfo || {}), ...segment.timelineHealth }
-          : segment.timingInfo || {};
-      const recordedVideoDurationSec = getMergeSegmentVideoDurationSec(
-        recordedTiming,
-        mediaInfo,
-        segment,
-        segments[index + 1]
-      );
-      const recordedAudioDurationSec = Number(recordedTiming.audioDurationSec || 0);
-      segmentTimelineInfos.push({
-        ...recordedTiming,
-        containerDurationSec: quickDurationSec,
-        videoDurationSec: recordedVideoDurationSec || quickDurationSec,
-        audioDurationSec: mediaInfo.audioInfo ? recordedAudioDurationSec || quickDurationSec : 0,
-        avDeltaSec: Number(recordedTiming.avDeltaSec || 0),
-        containerDeltaSec: 0,
-        timingSafeForCopy: recordedTiming.timingSafeForCopy !== false,
-        auditMode: recordedTiming.timelineHealth ? 'recorded' : 'metadata'
-      });
-    }
-    let mergeDurationSec =
-      segmentTimelineInfos.reduce(
-        (sum, timingInfo, index) =>
-          sum + getMergeSegmentVideoDurationSec(timingInfo, segmentMediaInfos[index], segments[index], segments[index + 1]),
-        0
-      ) ||
-      fallbackMergeDurationSec;
-    const targetVideoInfo = selectHighestResolutionVideoInfo(segmentMediaInfos);
-    if (!targetVideoInfo) {
-      throw new Error('没有找到可用于合并的目标分辨率。');
-    }
-    const timingAssessments = [];
-    for (let index = 0; index < segments.length; index += 1) {
-      let assessment = getMergeSegmentTimingAssessment(segments[index], Boolean(segmentMediaInfos[index].audioInfo));
-      if (!assessment.known) {
-        try {
-          const auditedTiming = await this.runMergePreparationStage(
-            room,
-            progress,
-            '正在检查分段 ' + (index + 1) + '/' + segments.length + ' 的音画时间轴',
-            () => probeMediaTimelineHealth(this.ffmpegPath, segments[index].cleanPath, segmentMediaInfos[index], { timeoutMs: 120000 })
-          );
-          auditedTiming.auditMode = 'merge-preflight';
-          segments[index].timelineHealth = auditedTiming;
-          segments[index].timingInfo = {
-            videoDurationSec: Number(auditedTiming.videoDurationSec || 0),
-            audioDurationSec: Number(auditedTiming.audioDurationSec || 0),
-            avDeltaSec: Number(auditedTiming.avDeltaSec || 0),
-            timingSafeForCopy: Boolean(auditedTiming.timingSafeForCopy)
-          };
-          segmentTimelineInfos[index] = auditedTiming;
-          assessment = getMergeSegmentTimingAssessment(segments[index], Boolean(segmentMediaInfos[index].audioInfo));
-        } catch (error) {
-          const failedTiming = {
-            ...segmentTimelineInfos[index],
-            timelineHealth: 'warning',
-            timingSafeForCopy: false,
-            auditMode: 'failed',
-            error: error.message
-          };
-          segments[index].timelineHealth = failedTiming;
-          segments[index].timingInfo = failedTiming;
-          segmentTimelineInfos[index] = failedTiming;
-          assessment = getMergeSegmentTimingAssessment(segments[index], Boolean(segmentMediaInfos[index].audioInfo));
-          this.log('warn', roomLabel(room) + ' 分段 ' + (index + 1) + '/' + segments.length + ' 音画预检失败，将安全规范化：' + error.message);
+    try {
+      const segmentMediaInfos = [];
+      const segmentTimelineInfos = [];
+      for (let index = 0; index < segments.length; index += 1) {
+        const segment = segments[index];
+        const mediaInfo = await this.runMergePreparationStage(
+          room,
+          progress,
+          '正在读取分段 ' + (index + 1) + '/' + segments.length + ' 的媒体信息',
+          () => probeMediaFileInfo(this.ffmpegPath, segment.cleanPath, { ...mergeProbeOptions, timeoutMs: 15000 })
+        );
+        if (!mediaInfo.videoInfo) {
+          throw new Error(`无法读取分段视频信息：${path.basename(segment.cleanPath)}`);
         }
+        segmentMediaInfos.push({
+          ...mediaInfo,
+          durationSec:
+            Number(mediaInfo.durationSec) || Number(segment.durationSec) || getSegmentDurationForMerge(segment, segments[index + 1])
+        });
+        const quickDurationSec = Number(mediaInfo.durationSec || segment.durationSec || 0);
+        const recordedTiming =
+          segment.timelineHealth && typeof segment.timelineHealth === 'object'
+            ? { ...(segment.timingInfo || {}), ...segment.timelineHealth }
+            : segment.timingInfo || {};
+        const recordedVideoDurationSec = getMergeSegmentVideoDurationSec(
+          recordedTiming,
+          mediaInfo,
+          segment,
+          segments[index + 1]
+        );
+        const recordedAudioDurationSec = Number(recordedTiming.audioDurationSec || 0);
+        segmentTimelineInfos.push({
+          ...recordedTiming,
+          containerDurationSec: quickDurationSec,
+          videoDurationSec: recordedVideoDurationSec || quickDurationSec,
+          audioDurationSec: mediaInfo.audioInfo ? recordedAudioDurationSec || quickDurationSec : 0,
+          avDeltaSec: Number(recordedTiming.avDeltaSec || 0),
+          containerDeltaSec: 0,
+          timingSafeForCopy: recordedTiming.timingSafeForCopy !== false,
+          auditMode: recordedTiming.timelineHealth ? 'recorded' : 'metadata'
+        });
       }
-      timingAssessments.push(assessment);
-    }
-    mergeDurationSec =
-      segmentTimelineInfos.reduce(
-        (sum, timingInfo, index) =>
-          sum + getMergeSegmentVideoDurationSec(timingInfo, segmentMediaInfos[index], segments[index], segments[index + 1]),
-        0
-      ) ||
-      fallbackMergeDurationSec;
-    progress.durationSec = mergeDurationSec;
-    progress.currentTimeSec = 0;
-    progress.percent = mergeDurationSec > 0 ? 0 : null;
-    this.setMergeProgressStage(room, progress, '分段预检完成，正在准备合并');
-    const streamSpecsChanged = shouldTranscodeConcat(segmentMediaInfos);
-    const timingRequiresNormalization = timingAssessments.some((assessment) => assessment.requiresNormalization);
-    const timingIssueSummary = timingAssessments
-      .map((assessment, index) => (assessment.requiresNormalization ? '#' + (index + 1) + ' ' + assessment.reason : ''))
-      .filter(Boolean);
-    const timingAdvisorySummary = timingAssessments
-      .map((assessment, index) =>
-        assessment.requiresPostMergeVerification ? '#' + (index + 1) + ' ' + assessment.reason : ''
-      )
-      .filter(Boolean);
-    const requiresTranscode = streamSpecsChanged || timingRequiresNormalization;
-    // Tracks whether this merge has already used the timestamp-preserving
-    // normalizer. A copy concat that fails final timing validation gets one
-    // safe retry; we never "fix" it later by warping the completed audio.
-    let usedTimelinePreservingNormalization = requiresTranscode;
-    const mergePlanReason = [
-      streamSpecsChanged ? '分辨率、帧率或编码规格变化' : '',
-      timingRequiresNormalization ? '单段音画时间轴风险（' + timingIssueSummary.join('；') + '）' : ''
-    ]
-      .filter(Boolean)
-      .join('；');
-    if (timingAdvisorySummary.length) {
+      let mergeDurationSec =
+        segmentTimelineInfos.reduce(
+          (sum, timingInfo, index) =>
+            sum + getMergeSegmentVideoDurationSec(timingInfo, segmentMediaInfos[index], segments[index], segments[index + 1]),
+          0
+        ) ||
+        fallbackMergeDurationSec;
+      const targetVideoInfo = selectHighestResolutionVideoInfo(segmentMediaInfos);
+      if (!targetVideoInfo) {
+        throw new Error('没有找到可用于合并的目标分辨率。');
+      }
+      const timingAssessments = [];
+      for (let index = 0; index < segments.length; index += 1) {
+        let assessment = getMergeSegmentTimingAssessment(segments[index], Boolean(segmentMediaInfos[index].audioInfo));
+        if (!assessment.known) {
+          try {
+            const auditedTiming = await this.runMergePreparationStage(
+              room,
+              progress,
+              '正在检查分段 ' + (index + 1) + '/' + segments.length + ' 的音画时间轴',
+              () => probeMediaTimelineHealth(this.ffmpegPath, segments[index].cleanPath, segmentMediaInfos[index], { ...mergeProbeOptions, timeoutMs: 120000 })
+            );
+            auditedTiming.auditMode = 'merge-preflight';
+            segments[index].timelineHealth = auditedTiming;
+            segments[index].timingInfo = {
+              videoDurationSec: Number(auditedTiming.videoDurationSec || 0),
+              audioDurationSec: Number(auditedTiming.audioDurationSec || 0),
+              avDeltaSec: Number(auditedTiming.avDeltaSec || 0),
+              timingSafeForCopy: Boolean(auditedTiming.timingSafeForCopy)
+            };
+            segmentTimelineInfos[index] = auditedTiming;
+            assessment = getMergeSegmentTimingAssessment(segments[index], Boolean(segmentMediaInfos[index].audioInfo));
+          } catch (error) {
+            if (isStopped()) throw error;
+            const failedTiming = {
+              ...segmentTimelineInfos[index],
+              timelineHealth: 'warning',
+              timingSafeForCopy: false,
+              auditMode: 'failed',
+              error: error.message
+            };
+            segments[index].timelineHealth = failedTiming;
+            segments[index].timingInfo = failedTiming;
+            segmentTimelineInfos[index] = failedTiming;
+            assessment = getMergeSegmentTimingAssessment(segments[index], Boolean(segmentMediaInfos[index].audioInfo));
+            this.log('warn', roomLabel(room) + ' 分段 ' + (index + 1) + '/' + segments.length + ' 音画预检失败，将安全规范化：' + error.message);
+          }
+        }
+        timingAssessments.push(assessment);
+      }
+      mergeDurationSec =
+        segmentTimelineInfos.reduce(
+          (sum, timingInfo, index) =>
+            sum + getMergeSegmentVideoDurationSec(timingInfo, segmentMediaInfos[index], segments[index], segments[index + 1]),
+          0
+        ) ||
+        fallbackMergeDurationSec;
+      progress.durationSec = mergeDurationSec;
+      progress.currentTimeSec = 0;
+      progress.percent = mergeDurationSec > 0 ? 0 : null;
+      this.setMergeProgressStage(room, progress, '分段预检完成，正在准备合并');
+      const streamSpecsChanged = shouldTranscodeConcat(segmentMediaInfos);
+      const timingRequiresNormalization = timingAssessments.some((assessment) => assessment.requiresNormalization);
+      const timingIssueSummary = timingAssessments
+        .map((assessment, index) => (assessment.requiresNormalization ? '#' + (index + 1) + ' ' + assessment.reason : ''))
+        .filter(Boolean);
+      const timingAdvisorySummary = timingAssessments
+        .map((assessment, index) =>
+          assessment.requiresPostMergeVerification ? '#' + (index + 1) + ' ' + assessment.reason : ''
+        )
+        .filter(Boolean);
+      const requiresTranscode = streamSpecsChanged || timingRequiresNormalization;
+      progress.mergeMode = requiresTranscode ? 'normalize' : 'copy';
+      progress.mergeReason = requiresTranscode ? '统一分段规格或修复时间轴后再拼接' : '分段规格一致，直接无损拼接';
+      // Tracks whether this merge has already used the timestamp-preserving
+      // normalizer. A copy concat that fails final timing validation gets one
+      // safe retry; we never "fix" it later by warping the completed audio.
+      let usedTimelinePreservingNormalization = requiresTranscode;
+      const mergePlanReason = [
+        streamSpecsChanged ? '分辨率、帧率或编码规格变化' : '',
+        timingRequiresNormalization ? '单段音画时间轴风险（' + timingIssueSummary.join('；') + '）' : ''
+      ]
+        .filter(Boolean)
+        .join('；');
+      if (timingAdvisorySummary.length) {
+        this.log(
+          'info',
+          `${roomLabel(room)} 分段时间轴提示：${timingAdvisorySummary.join('；')}。仅 PTS 起点偏移不会再触发规范化重编码。`
+        );
+      }
+      assertSafeMergeTargetProfile(segmentMediaInfos, targetVideoInfo, { requiresVideoTranscode: requiresTranscode });
+      await this.waitForRuntimeCapabilities();
+      const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
+      mergeEncoderPlan.requiresTranscode = requiresTranscode;
+      progress.codec = mergeEncoderPlan.preferred;
+      progress.codecKind = mergeEncoderPlan.preferred.includes('libx') ? 'software' : 'hardware';
+      progress.encoderBackend = this.getEncoderBackendLabel(this.getBurnCodecInfo(mergeEncoderPlan.preferred));
+      const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
+      const sourceBytes = segmentFileSizes.reduce((sum, fileSize) => sum + Number(fileSize || 0), 0);
+      const targetPixels = Number(targetVideoInfo.width || 0) * Number(targetVideoInfo.height || 0);
+      const normalizedBytesEstimate = segmentMediaInfos.reduce((sum, mediaInfo, index) => {
+        const sourcePixels = Number(mediaInfo?.videoInfo?.width || 0) * Number(mediaInfo?.videoInfo?.height || 0);
+        const scaleFactor = targetPixels > 0 && sourcePixels > 0 ? Math.max(1, targetPixels / sourcePixels) : 1;
+        return sum + Math.ceil(Number(segmentFileSizes[index] || 0) * scaleFactor);
+      }, 0);
+      // A cross-spec merge first creates uniform intermediates and only then
+      // concat-copies them.  Reserve both the intermediates and the final output
+      // up front so a low-disk failure cannot leave a half-written merge behind.
+      const boundedTranscodeTemporaryBytes = Math.max(sourceBytes, normalizedBytesEstimate) * 2;
+      const estimatedTemporaryBytes = requiresTranscode ? boundedTranscodeTemporaryBytes : sourceBytes;
+      await this.runMergePreparationStage(room, progress, '正在检查本次合并的磁盘空间', () =>
+        assertDiskSpace(outputPath, { estimatedBytes: estimatedTemporaryBytes })
+      );
+      if (isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)))) {
+        await assertDiskSpace(os.tmpdir(), { estimatedBytes: estimatedTemporaryBytes });
+        localPublishDirectory = path.join(os.tmpdir(), `br2k-merge-publish-${crypto.randomUUID()}`);
+        tmpPath = path.join(localPublishDirectory, `completed.${container}`);
+        concatPath = path.join(localPublishDirectory, 'concat.txt');
+        normalizeTempDir = path.join(localPublishDirectory, 'segments');
+      }
+      if (isStopped()) throw new Error('合并已停止');
+      mergeLease = await this.acquireMergeMediaLease(room, progress, mergeEncoderPlan);
+
       this.log(
         'info',
-        `${roomLabel(room)} 分段时间轴提示：${timingAdvisorySummary.join('；')}。仅 PTS 起点偏移不会再触发规范化重编码。`
+        `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}。${
+          requiresTranscode
+            ? `检测到${mergePlanReason}，将逐段重建时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height}，再无损拼接（临时工作区预留 ${formatBytes(estimatedTemporaryBytes)}）`
+            : '各分段规格一致，使用快速无损合并'
+        }`
       );
-    }
-    assertSafeMergeTargetProfile(segmentMediaInfos, targetVideoInfo, { requiresVideoTranscode: requiresTranscode });
-    await this.waitForRuntimeCapabilities();
-    const mergeEncoderPlan = this.getMergeEncoderPlan(targetVideoInfo);
-    mergeEncoderPlan.requiresTranscode = requiresTranscode;
-    progress.codec = mergeEncoderPlan.preferred;
-    progress.codecKind = mergeEncoderPlan.preferred.includes('libx') ? 'software' : 'hardware';
-    progress.encoderBackend = this.getEncoderBackendLabel(this.getBurnCodecInfo(mergeEncoderPlan.preferred));
-    const segmentFileSizes = await Promise.all(segments.map((segment) => getFileSize(segment.cleanPath)));
-    const sourceBytes = segmentFileSizes.reduce((sum, fileSize) => sum + Number(fileSize || 0), 0);
-    const targetPixels = Number(targetVideoInfo.width || 0) * Number(targetVideoInfo.height || 0);
-    const normalizedBytesEstimate = segmentMediaInfos.reduce((sum, mediaInfo, index) => {
-      const sourcePixels = Number(mediaInfo?.videoInfo?.width || 0) * Number(mediaInfo?.videoInfo?.height || 0);
-      const scaleFactor = targetPixels > 0 && sourcePixels > 0 ? Math.max(1, targetPixels / sourcePixels) : 1;
-      return sum + Math.ceil(Number(segmentFileSizes[index] || 0) * scaleFactor);
-    }, 0);
-    // A cross-spec merge first creates uniform intermediates and only then
-    // concat-copies them.  Reserve both the intermediates and the final output
-    // up front so a low-disk failure cannot leave a half-written merge behind.
-    const boundedTranscodeTemporaryBytes = Math.max(sourceBytes, normalizedBytesEstimate) * 2;
-    const estimatedTemporaryBytes = requiresTranscode ? boundedTranscodeTemporaryBytes : sourceBytes;
-    await this.runMergePreparationStage(room, progress, '正在检查本次合并的磁盘空间', () =>
-      assertDiskSpace(outputPath, { estimatedBytes: estimatedTemporaryBytes })
-    );
-    if (isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)))) {
-      await assertDiskSpace(os.tmpdir(), { estimatedBytes: estimatedTemporaryBytes });
-      localPublishDirectory = path.join(os.tmpdir(), `br2k-merge-publish-${crypto.randomUUID()}`);
-      tmpPath = path.join(localPublishDirectory, `completed.${container}`);
-      concatPath = path.join(localPublishDirectory, 'concat.txt');
-      normalizeTempDir = path.join(localPublishDirectory, 'segments');
-    }
-    if (this.mergeCancelRequests.has(room.id)) {
-      if (room.mergeProgress?.id === progress.id) {
-        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
-      }
-      this.mergeCancelRequests.delete(room.id);
       this.emitState(['room', 'mediaJob']);
-      return null;
-    }
-    let mergeLease;
-    try {
-      mergeLease = await this.acquireMergeMediaLease(room, progress, mergeEncoderPlan);
-    } catch (error) {
-      if (this.mergeCancelRequests.has(room.id) || error?.code === 'MEDIA_JOB_CANCELLED') {
-        if (room.mergeProgress?.id === progress.id) {
-          finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消排队合并，所有源分段均已保留');
-        }
-        this.mergeCancelRequests.delete(room.id);
-        this.emitState(['room', 'mediaJob']);
-        return null;
-      }
-      throw error;
-    }
-    if (!mergeLease) {
-      if (room.mergeProgress?.id === progress.id) {
-        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
-      }
-      this.mergeCancelRequests.delete(room.id);
-      this.emitState(['room', 'mediaJob']);
-      return null;
-    }
-    this.mergeCancelRequests.delete(room.id);
-
-    this.log(
-      'info',
-      `${roomLabel(room)} 正在合并 ${segments.length} 个续录片段：${path.basename(outputPath)}。${
-        requiresTranscode
-          ? `检测到${mergePlanReason}，将逐段重建时间轴并统一为 ${targetVideoInfo.width}x${targetVideoInfo.height}，再无损拼接（临时工作区预留 ${formatBytes(estimatedTemporaryBytes)}）`
-          : '各分段规格一致，使用快速无损合并'
-      }`
-    );
-    this.emitState(['room', 'mediaJob']);
-    try {
       if (localPublishDirectory) await fsp.mkdir(localPublishDirectory);
       await fsp.rm(tmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
       await fsp.rm(cssTmpPath, { force: true });
       const mergeSoftwareThreads = Math.max(1, Math.min(2, Math.floor((os.cpus()?.length || 4) / 2)));
       const runMergeFfmpeg = async (args, options = {}) => {
-        if (this.mergeCancelRequests.has(room.id)) throw new Error('合并已取消');
+        if (isStopped()) throw new Error('合并已取消');
         const progressOffsetSec = Math.max(0, Number(options.progressOffsetSec || 0));
         const trackProgress = options.trackProgress !== false;
         const stageLabel = String(options.stageLabel || '合并处理');
         const segmentDurationSec = Math.max(0, Number(options.segmentDurationSec || 0));
         const stageStartedAt = Date.now();
+        setFfmpegJobPhase(progress, options.phase || (options.segmentDurationSec ? 'render' : 'mux'), {
+          now: stageStartedAt, force: true, stageLabel,
+          phaseDurationSec: mergeDurationSec
+        });
         let child = null;
         let sawMediaProgress = false;
         let lastMediaProgressSec = Number.NEGATIVE_INFINITY;
@@ -8017,7 +8056,7 @@ try {
               }
               if (trackProgress && room.mergeProgress?.id === progress.id) {
                 const progressLine = Number.isFinite(processedSec)
-                  ? `time=${formatFfmpegSeconds(progressOffsetSec + Math.max(0, processedSec))}`
+                  ? `out_time_us=${Math.round((progressOffsetSec + Math.max(0, processedSec)) * 1_000_000)}`
                   : line;
                 if (updateFfmpegJobProgress(room.mergeProgress, progressLine)) {
                   this.markRoomDirty(room.id);
@@ -8050,7 +8089,13 @@ try {
             };
             const onChild = (nextChild) => {
               child = nextChild;
-              if (nextChild) this.mergeProcesses.set(room.id, nextChild);
+              if (nextChild) {
+                this.mergeProcesses.set(room.id, nextChild);
+                progress.activePipeline = progress.phase === 'mux'
+                  ? { decoder: '', sceneRenderer: '', encoder: '无损拼接（不重编码）' }
+                  : { decoder: progress.decoderLabel || '', sceneRenderer: '', encoder: progress.encoderBackend || '' };
+              }
+              if (nextChild && isStopped()) requestFfmpegStop(nextChild, { graceful: false, timeoutMs: 1500 });
             };
             if (typeof options.run === 'function') {
               await options.run(onStderr, onChild);
@@ -8098,7 +8143,8 @@ try {
         const normalizedDurations = [];
         let progressOffsetSec = 0;
         for (let index = 0; index < segments.length; index += 1) {
-          if (this.mergeCancelRequests.has(room.id)) throw new Error('合并已取消');
+          progress.segmentIndex = index + 1;
+          if (isStopped()) throw new Error('合并已取消');
           const sourceDurationSec = getMergeSegmentVideoDurationSec(
             segmentTimelineInfos[index],
             segmentMediaInfos[index],
@@ -8229,7 +8275,7 @@ try {
               decoderThreads: preferredDecoder.kind === 'hardware' ? 1 : 2
             });
           } catch (error) {
-            if (this.mergeCancelRequests.has(room.id)) throw error;
+            if (isStopped()) throw error;
             let recoveryError = error;
             if (
               preferredDecoder.kind === 'hardware' &&
@@ -8295,7 +8341,7 @@ try {
             room,
             progress,
             '正在验证规范化分段 ' + (index + 1) + '/' + segments.length,
-            () => probeMediaFileInfo(this.ffmpegPath, normalizedPath, { timeoutMs: 15000 })
+            () => probeMediaFileInfo(this.ffmpegPath, normalizedPath, { ...mergeProbeOptions, timeoutMs: 15000 })
           );
           if (!normalizedInfo.videoInfo) {
             throw new Error(`规范化分段后没有检测到视频流：${path.basename(segments[index].cleanPath)}`);
@@ -8323,10 +8369,13 @@ try {
             container,
             streamCodec: targetVideoInfo.codec
           }),
-          { trackProgress: false, stageLabel: '无损拼接已规范化分段' }
+          { stageLabel: '无损拼接已规范化分段' }
         );
       };
       const runSafeTranscode = async () => {
+        progress.mergeMode = 'normalize';
+        progress.mergeReason = requiresTranscode ? '统一分段规格或修复时间轴后再拼接' : '无损拼接未通过检查，正在修复源时间轴后重新合并';
+        progress.sourceFps = targetVideoInfo.fps;
         // A healthy-looking copy merge can still fail because of malformed
         // timestamps.  Its fallback uses the same bounded workspace, so make
         // the larger disk reservation immediately before starting it too.
@@ -8342,10 +8391,11 @@ try {
           // allocation/status failures alike.
           if (
             !mergeEncoderPlan.fallback ||
-            this.mergeCancelRequests.has(room.id) ||
+            isStopped() ||
             isFfmpegMemoryPressureError(error) ||
             error?.code === 'FFMPEG_NO_PROGRESS' ||
-            error?.code === 'MERGE_SEGMENT_UNDECODABLE'
+            error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
+            error?.code === 'MERGE_PREEMPTED'
           ) {
             throw error;
           }
@@ -8369,7 +8419,7 @@ try {
           );
         } catch (error) {
           this.mergeProcesses.delete(room.id);
-          if (this.mergeCancelRequests.has(room.id)) throw error;
+          if (isStopped()) throw error;
           if (targetVideoInfo.hdr) {
             throw new Error(`HDR 无损 copy 合并失败；为避免丢失 HDR metadata，不会自动转码：${error.message}`);
           }
@@ -8388,7 +8438,7 @@ try {
         room,
         progress,
         '正在验证合并媒体文件',
-        () => probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 15000 })
+        () => probeMediaFileInfo(this.ffmpegPath, tmpPath, { ...mergeProbeOptions, timeoutMs: 15000 })
       );
       if (!mergedMediaInfo.videoInfo) {
         throw new Error('合并文件生成后没有检测到视频流。');
@@ -8405,7 +8455,7 @@ try {
           room,
           progress,
           '正在检查合并后的音画时间轴',
-          () => probeMediaTimelineInfo(this.ffmpegPath, tmpPath, mergedMediaInfo, { timeoutMs: 120000 })
+          () => probeMediaTimelineInfo(this.ffmpegPath, tmpPath, mergedMediaInfo, { ...mergeProbeOptions, timeoutMs: 120000 })
         );
         this.log(
           Math.abs(mergedTimingInfo.avDeltaSec) > 0.08 ? 'warn' : 'success',
@@ -8435,7 +8485,7 @@ try {
               room,
               progress,
               '正在验证重建后的合并媒体文件',
-              () => probeMediaFileInfo(this.ffmpegPath, tmpPath, { timeoutMs: 15000 })
+              () => probeMediaFileInfo(this.ffmpegPath, tmpPath, { ...mergeProbeOptions, timeoutMs: 15000 })
             );
             if (!mergedMediaInfo.videoInfo) {
               throw new Error('重建后的合并文件没有检测到视频流。');
@@ -8444,7 +8494,7 @@ try {
               room,
               progress,
               '正在复验重建后的音画时间轴',
-              () => probeMediaTimelineInfo(this.ffmpegPath, tmpPath, mergedMediaInfo, { timeoutMs: 120000 })
+              () => probeMediaTimelineInfo(this.ffmpegPath, tmpPath, mergedMediaInfo, { ...mergeProbeOptions, timeoutMs: 120000 })
             );
             this.log(
               Math.abs(mergedTimingInfo.avDeltaSec) > 0.08 ? 'warn' : 'success',
@@ -8479,9 +8529,11 @@ try {
         await Promise.all([fsp.stat(danmakuTmpPath), fsp.stat(cssTmpPath)]);
       });
       try {
-        await atomicReplaceFile(tmpPath, outputPath, { isCancelled: () => this.mergeCancelRequests.has(room.id) });
+        this.setMergeProgressStage(room, progress, '正在写入录像目录，保留源文件');
+        if (isStopped()) throw new Error('合并已停止');
+        await atomicReplaceFile(tmpPath, outputPath, { isCancelled: () => isStopped() });
       } catch (error) {
-        if (localPublishDirectory && !this.mergeCancelRequests.has(room.id)) {
+        if (localPublishDirectory && !isStopped()) {
           preserveMergedOutput = true;
           this.log('error', `合并成片发布失败，已验证的本地成片保留在 ${tmpPath}：${error.message}`);
         }
@@ -8557,13 +8609,16 @@ try {
           : null
       });
       try {
-        const sceneResult = await this.finalizeSceneGraphForRecording(mergedRecording, {
-          durationSec: mergedRecording.durationSec,
-          videoInfo: mergedRecording.videoInfo
-        });
+        const sceneResult = await this.runMergePreparationStage(room, progress, '正在整理合并弹幕与 Scene 缓存', () =>
+          this.finalizeSceneGraphForRecording(mergedRecording, {
+            durationSec: mergedRecording.durationSec,
+            videoInfo: mergedRecording.videoInfo
+          })
+        );
         mergedRecording.sceneStatus = 'ready';
         mergedRecording.sceneEventCount = sceneResult.eventCount;
       } catch (error) {
+        if (isStopped()) throw error;
         mergedRecording.sceneStatus = 'degraded';
         this.log('warn', roomLabel(room) + ' 合并录像 Scene Graph 收尾失败；原始分段和合并 JSONL 均已保留：' + error.message);
       }
@@ -8612,7 +8667,8 @@ try {
       }, 5000).unref?.();
       return mergedRecording;
     } catch (error) {
-      const cancelled = this.mergeCancelRequests.has(room.id);
+      const preempted = this.mergePreemptRequests.has(mergeKey);
+      const cancelled = this.mergeCancelRequests.has(mergeKey) && !preempted;
       const memoryPressure = !cancelled && isFfmpegMemoryPressureError(error);
       const failureMessage = memoryPressure
         ? `合并 FFmpeg 疑似因内存不足而中止（请检查系统内存/事件日志）：${String(error.message).slice(-900)}`
@@ -8620,18 +8676,22 @@ try {
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(
           room.mergeProgress,
-          cancelled ? 'cancelled' : 'error',
-          cancelled ? '合并已取消，所有源分段均已保留' : `${failureMessage}；所有源分段均已保留`
+          cancelled ? 'cancelled' : preempted ? 'retrying' : 'error',
+          cancelled ? '合并已取消，所有源分段均已保留' : preempted ? '录制优先，合并让出资源；录制结束后重新合并' : `${failureMessage}；所有源分段均已保留`
         );
       }
-      this.log(cancelled ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : failureMessage}；源分段未删除。`);
+      this.log(cancelled || preempted ? 'info' : 'error', `${roomLabel(room)} ${cancelled ? '合并已取消' : preempted ? '录制优先，合并让出资源' : failureMessage}；源分段未删除。`);
       this.emitState(['room', 'mediaJob']);
       if (cancelled) return null;
+      if (preempted) {
+        error.code = 'MERGE_PREEMPTED';
+        error.message = '录制优先，合并已让出资源；源分段已保留';
+      }
       throw error;
     } finally {
-      mergeLease.release();
+      mergeLease?.release();
       this.mergeProcesses.delete(room.id);
-      this.mergeCancelRequests.delete(room.id);
+      this.mergePreemptRequests.delete(mergeKey);
       await fsp.rm(concatPath, { force: true }).catch(() => {});
       if (!preserveMergedOutput) await fsp.rm(tmpPath, { force: true }).catch(() => {});
       await fsp.rm(danmakuTmpPath, { force: true }).catch(() => {});
@@ -8988,36 +9048,27 @@ try {
     return recovered;
   }
 
-  async cancelMerge(roomId) {
+  async cancelMerge(roomId, expectedJobId = '') {
     const room = this.getRoom(roomId);
+    const progress = room.mergeProgress;
+    if (!progress || !['running', 'queued', 'retrying'].includes(progress.status)) return this.getState();
+    if (expectedJobId && progress.id !== expectedJobId) {
+      throw businessError('MERGE_TASK_CHANGED', '当前合并任务已变化，请刷新后操作。', 409);
+    }
+    const key = this.getMergeRetryKey(room.id, progress.mergeGroup || progress.id);
+    this.mergePreemptRequests.delete(key);
+    this.mergeCancelRequests.add(key);
+    this.clearMergeRetryState(room.id, progress.mergeGroup);
+    const cancelledQueued = this.mediaJobs.cancel(progress.id);
     const child = this.mergeProcesses.get(room.id);
-    const running = room.mergeProgress?.status === 'running';
-    const queued = room.mergeProgress?.status === 'queued';
-    const retrying = room.mergeProgress?.status === 'retrying';
-    const queuedProgressId = queued ? room.mergeProgress?.id : '';
-    if (queued) this.mergeCancelRequests.add(room.id);
-    const cancelledQueuedJob = queuedProgressId ? this.mediaJobs.cancel(queuedProgressId) : false;
-    const cancelledRetryCount = this.clearMergeRetryStatesForRoom(room.id);
-    if (cancelledQueuedJob) {
-      if (room.mergeProgress?.kind === 'merge') {
-        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消排队合并，所有源分段均已保留');
-      }
-      this.log('info', `${roomLabel(room)} 已取消排队合并；源分段未删除。`);
-      this.emitState(['room', 'mediaJob']);
-      return this.getState();
-    }
-    if (!child && !running && !queued && !retrying && !cancelledRetryCount) return this.getState();
-    if (!child && !running && !queued) {
-      if (room.mergeProgress?.kind === 'merge') {
-        finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '已取消自动合并重试，所有源分段均已保留');
-      }
-      this.log('info', `${roomLabel(room)} 已取消自动合并重试；源分段未删除。`);
-      this.emitState(['room', 'mediaJob']);
-      return this.getState();
-    }
-    this.mergeCancelRequests.add(room.id);
     if (child) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
-    if (running || queued) room.mergeProgress.message = queued ? '正在取消排队合并，源分段会全部保留' : '正在取消合并，源分段会全部保留';
+    if (progress.status === 'retrying' || (progress.status === 'queued' && cancelledQueued)) {
+      finishFfmpegJobProgress(progress, 'cancelled', '已取消排队合并或自动合并重试，所有源分段均已保留');
+    } else {
+      progress.message = '正在取消当前合并，源分段全部保留；后续直播合并不受影响';
+      progress.updatedAt = Date.now();
+    }
+    this.log('info', `${roomLabel(room)} 已请求取消本次合并；其他场次的合并任务不受影响。`);
     this.emitState(['room', 'mediaJob']);
     return this.getState();
   }
