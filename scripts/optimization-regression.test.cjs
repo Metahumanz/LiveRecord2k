@@ -13,6 +13,26 @@ const { probeMediaTimelineInfo, probeMediaTimelineHealth, runCapturedProcess } =
 const { buildSceneGraphJob } = require('../src/server/danmaku/scene-build-job.cjs');
 const { buildSceneGraph, clipSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
 const { scanFullMedia } = require('../src/server/recording/media-full-scan.cjs');
+const { writeGraph, readGraphLines } = require('../src/server/danmaku/scene-graph-io.cjs');
+
+test('streamed Scene cache preserves unicode, animation history and JSON output without loading irrelevant objects', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-scene-stream-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const graph = buildSceneGraph(Array.from({ length: 400 }, (_, index) => ({
+    type: 'danmaku', time: index, text: `中文测试😀${index}`, uid: String(index), username: '观众'
+  })), { width: 640, height: 360, fps: 30, durationSec: 410, stylePreset: 'h5-card' });
+  const cache = path.join(root, 'graph.jsonl');
+  await writeGraph(cache, graph, true);
+  const selected = await readGraphLines(cache, 350, 360);
+  assert(selected.objects.length < graph.objects.length);
+  assert.deepEqual(clipSceneGraph(selected, 350, 360, { shiftTime: false }),
+    clipSceneGraph(graph, 350, 360, { shiftTime: false }));
+  const output = path.join(root, 'graph.json');
+  await writeGraph(output, selected);
+  assert.deepEqual(JSON.parse(await fs.readFile(output, 'utf8')), selected);
+  await fs.appendFile(cache, '{broken\n');
+  await assert.rejects(readGraphLines(cache, 350, 360), SyntaxError);
+});
 
 test('corrupt MKV stops the scan immediately and retains the first cause even when later stderr overflows', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-corrupt-scan-'));

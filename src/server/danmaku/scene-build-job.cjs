@@ -25,7 +25,7 @@ async function buildSceneGraphJob(events, options, runtime) {
     return directory;
   }).catch(error => { directoryPromise = null; throw error; });
   const directory = await directoryPromise;
-  const cachePath = path.join(directory, key + '.json');
+  const cachePath = path.join(directory, key + '.jsonl');
   const requestPath = path.join(directory, crypto.randomUUID() + '.request.json');
   const outputPath = requestPath + '.result';
   await fs.writeFile(requestPath, JSON.stringify({ events, options, cachePath, outputPath,
