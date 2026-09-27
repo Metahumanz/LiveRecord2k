@@ -1112,6 +1112,7 @@ class LiveRecordService {
     this.maintenanceCleanupPlans = new Map();
     this.mergeProcesses = new Map();
     this.mergeCancelRequests = new Set();
+    this.mergeCancelledSelections = new Map();
     this.mergePreemptRequests = new Set();
     this.mergeRoomTasks = new Map();
     this.mergeInFlightGroups = new Map();
@@ -1546,6 +1547,9 @@ class LiveRecordService {
       this.storeExists = await fsp.stat(this.storePath).then((stat) => stat.isFile()).catch(() => false);
       this.settings = this.normalizeSettings({ ...this.settings, ...(store.settings || {}) });
       this.mergeCancelRequests = new Set(store.mergeCancelledGroups || []);
+      this.mergeCancelledSelections = new Map((store.mergeCancelledSelections || [])
+        .filter(item => item?.roomId && item?.mergeGroup && Array.isArray(item.sourcePaths) && item.sourcePaths.length >= 2)
+        .map(item => [this.getMergeRetryKey(item.roomId, item.mergeGroup), item]));
       for (const savedRoom of store.rooms || []) {
         const room = this.normalizeRoom(savedRoom);
         const cancelled = savedRoom.cancelledMergeProgress;
@@ -1590,6 +1594,7 @@ class LiveRecordService {
       recordings: this.recordings,
       mediaJobs: [],
       mergeCancelledGroups: [...this.mergeCancelRequests],
+      mergeCancelledSelections: [...this.mergeCancelledSelections.values()],
       segmentCleanups: Array.from(this.pendingSegmentCleanups.values())
     });
   }
@@ -7203,6 +7208,25 @@ try {
     return `${String(roomId || '')}\u0000${String(mergeGroup || '').trim()}`;
   }
 
+  isCancelledMergeSelection(roomId, segments) {
+    if (segments.length < 2) return false;
+    return [...this.mergeCancelledSelections.values()].some(selection => {
+      if (String(selection.roomId) !== String(roomId)) return false;
+      const paths = new Set(selection.sourcePaths.map(file => path.resolve(file)));
+      return segments.every(segment => paths.has(path.resolve(segment.cleanPath)));
+    });
+  }
+
+  clearCancelledMergeSelection(roomId, sourcePaths) {
+    const paths = new Set(sourcePaths.map(file => path.resolve(file)));
+    for (const [key, selection] of this.mergeCancelledSelections) {
+      if (String(selection.roomId) !== String(roomId) || selection.sourcePaths.length !== paths.size) continue;
+      if (!selection.sourcePaths.every(file => paths.has(path.resolve(file)))) continue;
+      this.mergeCancelledSelections.delete(key);
+      this.mergeCancelRequests.delete(key);
+    }
+  }
+
   getMergeRetryDelayMs(attempt) {
     return MERGE_RETRY_DELAYS_MS[Math.max(0, Number(attempt || 1) - 1)] || 0;
   }
@@ -7259,6 +7283,7 @@ try {
       })
       .sort((left, right) => Number(right.segments.at(-1)?.startedAt || 0) - Number(left.segments.at(-1)?.startedAt || 0));
     for (const candidate of candidates) {
+      if (preferredGroup !== candidate.mergeGroup && this.isCancelledMergeSelection(room.id, candidate.segments)) continue;
       const outputPath = this.getReconnectMergeOutputPath(candidate.allSegments, candidate.segments);
       if (preferredGroup && candidate.mergeGroup !== preferredGroup) continue;
       if (await isExistingFile(outputPath)) {
@@ -7269,6 +7294,7 @@ try {
       if (!exists.every(Boolean)) continue;
       return {
         mergeGroup: candidate.mergeGroup,
+        sourcePaths: candidate.segments.map(segment => segment.cleanPath),
         fallbackRecording: candidate.segments.at(-1)
       };
     }
@@ -7397,6 +7423,7 @@ try {
     }
     this.clearMergeRetryState(room.id, pending.mergeGroup);
     this.mergeCancelRequests.delete(this.getMergeRetryKey(room.id, pending.mergeGroup));
+    if (pending.sourcePaths) this.clearCancelledMergeSelection(room.id, pending.sourcePaths);
     await this.saveStore();
     if (room.mergeProgress?.kind === 'merge') {
       room.mergeProgress.status = 'running';
@@ -7439,6 +7466,7 @@ try {
     }
     segments.sort((left, right) => Number(left.startedAt || 0) - Number(right.startedAt || 0) || left.cleanPath.localeCompare(right.cleanPath));
     const groupId = `manual-${crypto.randomUUID()}`;
+    this.clearCancelledMergeSelection(room.id, cleanPaths);
     delete room.cancelledMergeProgress;
     const outputPath = deriveSiblingPath(segments[0].cleanPath, `${groupId}.merged`, getContainerFromPath(segments[0].cleanPath));
     const key = this.getMergeRetryKey(room.id, groupId);
@@ -7753,6 +7781,10 @@ try {
       return fallbackRecording;
     }
 
+    if (!manualOptions && this.isCancelledMergeSelection(room.id, segments)) {
+      this.log('info', `${roomLabel(room)} 这组源分段已被手动取消合并，跳过自动恢复；可手动重新尝试。`);
+      return null;
+    }
     if (!this.isRoomRecording(room)) room.recordingState = 'merging';
 
     const outputPath = manualOptions?.outputPath || this.getReconnectMergeOutputPath(allSegments, segments);
@@ -9071,7 +9103,12 @@ try {
     const key = this.getMergeRetryKey(room.id, progress.mergeGroup || progress.id);
     this.mergePreemptRequests.delete(key);
     this.mergeCancelRequests.add(key);
-    if (progress.manual) room.cancelledMergeProgress = { ...progress, status: 'cancelled', message: '合并已取消，所有源分段均已保留' };
+    if (progress.manual) {
+      room.cancelledMergeProgress = { ...progress, status: 'cancelled', message: '合并已取消，所有源分段均已保留' };
+      if (progress.sourcePaths?.length >= 2) this.mergeCancelledSelections.set(key, {
+        roomId: room.id, mergeGroup: progress.mergeGroup || progress.id, sourcePaths: [...progress.sourcePaths]
+      });
+    }
     this.clearMergeRetryState(room.id, progress.mergeGroup);
     const cancelledQueued = this.mediaJobs.cancel(progress.id);
     const child = this.mergeProcesses.get(room.id);

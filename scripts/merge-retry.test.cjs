@@ -58,20 +58,24 @@ test('cancelled groups and manual selection survive a real store reload without 
   const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
   const files = [];
   for (let i = 0; i < 4; i++) { const file = path.join(directory, `${i}.clean.mp4`); await fsp.writeFile(file, 'source'); files.push(file); }
-  app.recordings = files.map((cleanPath, i) => ({ cleanPath, roomId: room.id, startedAt: i + 1, valid: true,
+  app.recordings = files.map((cleanPath, i) => ({ cleanPath, roomId: room.id, startedAt: i < 2 ? i + 10 : i, valid: true,
     mergeGroup: i < 2 ? 'first-session' : 'second-session', mergeSequence: i % 2 + 1, durationSec: 10, segmentTargetDurationSec: 600 }));
   app.storePath = path.join(directory, 'settings.json'); app.stateStore = new AtomicJsonStore(app.storePath);
   app.saveStore = LiveRecordService.prototype.saveStore;
-  room.mergeProgress = { kind: 'merge', id: 'first-job', mergeGroup: 'first-session', status: 'retrying',
+  room.mergeProgress = { kind: 'merge', id: 'first-job', mergeGroup: 'manual-first-session', status: 'retrying',
     manual: true, sourcePaths: files.slice(0, 2), outputPath: path.join(directory, 'first.merged.mp4') };
   await app.cancelMerge(room.id, 'first-job');
   const restarted = createMergeTestService(); restarted.storePath = app.storePath; restarted.stateStore = new AtomicJsonStore(app.storePath);
   await restarted.loadStore();
   const restored = restarted.getRoom(room.id);
   assert.equal(restored.mergeProgress.status, 'cancelled'); assert.deepEqual(restored.mergeProgress.sourcePaths, files.slice(0, 2));
-  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'first-session')), true);
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'manual-first-session')), true);
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'first-session')), false);
   assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'second-session')), false);
   assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'second-session');
+  assert.equal(restarted.isCancelledMergeSelection(room.id, restarted.recordings.slice(0, 2)), true);
+  restarted.clearCancelledMergeSelection(room.id, files.slice(0, 2));
+  assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'first-session');
 });
 
 test('a retry in another group displays its own output path rather than the previous completed merge', () => {
