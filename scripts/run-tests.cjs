@@ -11,6 +11,7 @@ const GROUPS = {
   integration: [
     'recording-merge.test.cjs',
     'recording-stability.test.cjs',
+    'recording-stream-recovery.test.cjs',
     'merge-retry.test.cjs',
     'recording-cleanup.test.cjs',
     'nonblocking.test.cjs',

@@ -4771,13 +4771,16 @@ try {
   }
 
   getStreamHealthKey(stream) {
-    const host = String(stream?.host || '').trim().toLowerCase();
-    if (host) return host;
+    let host = String(stream?.host || '').trim().toLowerCase();
     try {
-      return new URL(String(stream?.url || '')).host.toLowerCase();
-    } catch {
-      return String(stream?.url || '').slice(0, 160).toLowerCase();
-    }
+      host = new URL(host || String(stream?.url || '')).host.toLowerCase();
+    } catch { /* Keep non-URL test/backward-compatible host names. */ }
+    return `${host}|${this.getStreamFormatHealthKey(stream)}`;
+  }
+
+  getStreamFormatHealthKey(stream) {
+    return ['format', stream?.protocol, stream?.format, stream?.codec, Number(stream?.qn || 0)]
+      .map(value => String(value || '').trim().toLowerCase()).join('|');
   }
 
   getLiveDanmakuDeduper(liveSessionId) {
@@ -4795,7 +4798,8 @@ try {
     const sessionId = String(liveSessionId || '');
     if (!sessionId) return 0;
     const health = this.liveStreamHealth.get(sessionId)?.get(this.getStreamHealthKey(stream));
-    return Math.max(0, Number(health?.penalty || 0));
+    const formatHealth = this.liveStreamHealth.get(sessionId)?.get(this.getStreamFormatHealthKey(stream));
+    return Math.max(0, Number(health?.penalty || 0), Number(formatHealth?.penalty || 0));
   }
 
   recordStreamHealth(liveSessionId, stream, reason) {
@@ -4815,6 +4819,14 @@ try {
     current.lastFailureAt = Date.now();
     current.lastReason = reason || 'unknown';
     bucket.set(key, current);
+    if (reason === 'startup-corruption') {
+      // A fresh URL/another CDN must not immediately reset a failed input
+      // format. Keep alternatives of the same quality eligible, including
+      // HLS on the very same host. Scope this preference to this live session.
+      bucket.set(this.getStreamFormatHealthKey(stream), {
+        penalty: 90_000, lastFailureAt: Date.now(), lastReason: reason
+      });
+    }
   }
 
   createStreamMetadata(stream) {
@@ -4945,6 +4957,11 @@ try {
       host: recording.streamMetadata?.host || '',
       resolution: recording.videoInfo ? `${recording.videoInfo.width || 0}x${recording.videoInfo.height || 0}` : '',
       timelineHealth: health.timelineHealth || 'warning',
+      containerStage: session.containerStage || '',
+      validReason: redactSensitive(recording.validReason || session.validReason || ''),
+      failureDetail: recording.valid === false || session.discardStartupSegment
+        ? redactSensitive(session.ffmpegLogBuffer || '').replace(/https?:\/\/\S+/gi, '[stream URL]').slice(-4000)
+        : undefined,
       firstVideoPts: health.firstVideoPts ?? null,
       firstAudioPts: health.firstAudioPts ?? null
     });
