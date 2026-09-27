@@ -6685,6 +6685,7 @@ try {
     room.recordingManuallyStopped = room.liveStatus === 1;
     const session = this.recordingSessions.get(room.id);
     if (!session) {
+      this.reconnectPendingRooms.delete(room.id);
       if (this.recordingStartLocks.has(room.id)) {
         room.recordingState = 'completed';
         this.log('info', `${roomLabel(room)} 已取消等待中的录制启动。`);
@@ -6694,7 +6695,7 @@ try {
       if (retryTimer) clearTimeout(retryTimer);
       this.streamStartRetryTimers.delete(room.id);
       this.streamStartRetryRooms.delete(room.id);
-      if (room.recordingState === 'waiting-stream') room.recordingState = 'completed';
+      if (['waiting-stream', 'reconnecting'].includes(room.recordingState)) room.recordingState = 'completed';
       return this.getState();
     }
     session.stopping = true;

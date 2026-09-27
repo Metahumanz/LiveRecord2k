@@ -71,6 +71,16 @@ test('old export cancellation cannot affect a newer task, and idle cancel leaves
   await service.cancelExportClip('new-export');assert.equal(service.exportCancelRequested,true);
 });
 
+test('stopping between reconnect attempts releases the recording intent immediately', async () => {
+  const service=app();const room=service.rooms.get('1');
+  room.recordingState='reconnecting';service.reconnectPendingRooms.add('1');
+  await service.stopRecording('1');
+  assert.equal(service.reconnectPendingRooms.has('1'),false);
+  assert.equal(service.isRoomRecording(room),false);
+  assert.equal(room.recordingState,'completed');
+  assert.equal(room.recordingManuallyStopped,true);
+});
+
 test('finishing an old recording retains its original title after the live room changes', () => {
   const service=app();
   service.rememberRecording({id:'1',title:'new live title',anchor:'new anchor'},
