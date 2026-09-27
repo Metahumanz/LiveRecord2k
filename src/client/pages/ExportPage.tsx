@@ -11,11 +11,13 @@ import {
   Scissors,
   SkipBack,
   SkipForward,
+  SquareCheck,
   Square
 } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
+import { getManualMergeSelection, ManualMergeControls } from '../components/ManualMergeControls';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
 import {
   burnAvatarModeOptions,
@@ -65,15 +67,7 @@ export function ExportPage({
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [selectingMerge, setSelectingMerge] = useState(false);
-  const mergeRecordings = recordings.filter(recording => mergeSelection.includes(recording.cleanPath))
-    .sort((left, right) => left.startedAt - right.startedAt || left.cleanPath.localeCompare(right.cleanPath));
-  const mergeRoomId = mergeRecordings[0]?.roomId;
-  const mergeRoom = state.rooms.find(room => String(room.id) === String(mergeRoomId));
-  const mergeReason = mergeRecordings.length < 2 ? '勾选至少两个已完成的源文件。'
-    : mergeRecordings.some(recording => !mergeRoomId || recording.roomId !== mergeRoomId) ? '一次只能合并同一直播间的录像。'
-      : !mergeRoom ? '请先在房间列表中添加这些录像所属的直播间。'
-        : mergeRoom.recording || ['running', 'queued', 'retrying'].includes(mergeRoom.mergeProgress?.status || '') ? '该房间正在录制或合并，请等待完成。'
-          : '';
+  const { selected: mergeRecordings, reason: mergeReason } = getManualMergeSelection(recordings, mergeSelection, state.rooms);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [decodedVideoSize, setDecodedVideoSize] = useState<{ width: number; height: number } | null>(null);
@@ -389,20 +383,14 @@ export function ExportPage({
             <span className="source-count">共 {recordings.length} 个，可用 {validRecordingCount} 个</span>
           </div>
 
-          <div className="manual-merge-actions">
-            <button type="button" onClick={() => { setSelectingMerge(!selectingMerge); setMergeSelection([]); }}>
-              {selectingMerge ? '退出多选' : '手动选择合并'}
-            </button>
-            {selectingMerge ? <>
-              <button type="button" className="primary" disabled={Boolean(mergeReason) || busy.has('manual-merge')}
-                onClick={async () => {
-                  if (await run('manual-merge', () => recorder.mergeRecordings(mergeRecordings.map(recording => recording.cleanPath)))) {
-                    setMergeSelection([]); setSelectingMerge(false);
-                  }
-                }}>合并所选 {mergeRecordings.length} 段</button>
-              <p>{mergeReason || '按录制时间先后拼接，保留原视频和弹幕文件。进度及重试操作在对应房间卡片显示。'}</p>
-            </> : null}
-          </div>
+          <ManualMergeControls selecting={selectingMerge} count={mergeRecordings.length} reason={mergeReason}
+            busy={busy.has('manual-merge')}
+            onToggle={() => { setSelectingMerge(!selectingMerge); setMergeSelection([]); }}
+            onMerge={async () => {
+              if (await run('manual-merge', () => recorder.mergeRecordings(mergeRecordings.map(recording => recording.cleanPath)))) {
+                setMergeSelection([]); setSelectingMerge(false);
+              }
+            }} />
 
           <div className="recording-list">
             {recordings.length === 0 ? (
@@ -417,6 +405,7 @@ export function ExportPage({
                   key={recording.id || recording.cleanPath}
                   className={[
                     'recording-row',
+                    selectingMerge ? 'merge-selectable' : '',
                     (selectingMerge ? mergeSelection.includes(recording.cleanPath) : recording.cleanPath === draft.cleanPath) ? 'active' : '',
                     recording.valid === false ? 'invalid' : ''
                   ]
@@ -432,11 +421,16 @@ export function ExportPage({
                       ? current.filter(value => value !== recording.cleanPath) : [...current, recording.cleanPath])
                     : selectRecording(recording)}
                 >
-                  <span>{selectingMerge ? `${mergeSelection.includes(recording.cleanPath) ? '☑' : '☐'} ` : ''}{recordingLabel(recording)}</span>
-                  <span className="recording-meta">
-                    {filename(recording.cleanPath)}
-                    {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
-                    {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
+                  {selectingMerge ? mergeSelection.includes(recording.cleanPath)
+                    ? <SquareCheck className="recording-selection-icon" size={18} />
+                    : <Square className="recording-selection-icon" size={18} /> : null}
+                  <span className="recording-row-content">
+                    <span>{recordingLabel(recording)}</span>
+                    <span className="recording-meta">
+                      {filename(recording.cleanPath)}
+                      {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
+                      {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
+                    </span>
                   </span>
                 </button>
               ))

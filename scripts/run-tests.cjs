@@ -35,6 +35,8 @@ const GROUPS = {
     'av-clock-regression.test.cjs',
     'avatar-capture.test.cjs',
     'client-code-splitting.test.cjs',
+    'manual-merge-ui.test.cjs',
+    'recording-identity.test.cjs',
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
     'desktop-cuda-capability.test.cjs',

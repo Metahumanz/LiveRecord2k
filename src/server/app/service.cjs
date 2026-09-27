@@ -210,6 +210,8 @@ const {
   isCurrentRecordingSession,
   formatBytes,
   discoverRecordingFiles,
+  inferRecordingIdentity,
+  parseRecordingStartedAtFromName,
   countDanmakuLines,
   requestUrlViaHttpProxy,
   collectUrlResponse,
@@ -2092,14 +2094,16 @@ class LiveRecordService {
     const timelineHealth =
       typeof recording.timelineHealth === 'string'
         ? { timelineHealth: recording.timelineHealth, warnings: [] }
-        : recording.timelineHealth || recording.timelineDetails || null;
+      : recording.timelineHealth || recording.timelineDetails || null;
+    const identity = inferRecordingIdentity(recording);
+    const owner = [...this.rooms.values()].find(room => [room.id, room.realRoomId, room.shortId]
+      .some(id => id != null && String(id) === identity.roomId));
     return {
       id: String(recording.id || cleanPath),
-      roomId: recording.roomId ? String(recording.roomId) : '',
-      roomTitle: String(recording.roomTitle || ''),
-      anchor: String(recording.anchor || ''),
+      ...identity,
+      roomId: owner?.id || identity.roomId,
       liveSessionId: String(recording.liveSessionId || ''),
-      startedAt: Number(recording.startedAt || Date.now()),
+      startedAt: Number((!recording.roomId && parseRecordingStartedAtFromName(cleanPath)) || recording.startedAt || Date.now()),
       cleanPath,
       danmakuPath: String(recording.danmakuPath || deriveSiblingPath(cleanPath, 'danmaku', 'jsonl')),
       avatarManifestPath: String(recording.avatarManifestPath || deriveAvatarManifestPath(cleanPath)),
@@ -7387,7 +7391,7 @@ try {
         cleanPaths.some(value => typeof value !== 'string') || new Set(cleanPaths).size !== cleanPaths.length) {
       throw businessError('MERGE_SELECTION_INVALID', '请选择至少两个不同的录像文件。', 400);
     }
-    const segments = cleanPaths.map(cleanPath => this.recordings.find(recording => recording.cleanPath === cleanPath));
+    const segments = cleanPaths.map(cleanPath => this.normalizeRecording(this.recordings.find(recording => recording.cleanPath === cleanPath)));
     if (segments.some(segment => !segment || segment.valid === false || segment.containerStage === 'capturing' || segment.containerStage === 'finalizing')) {
       throw businessError('MERGE_SOURCE_INVALID', '所选录像必须已完成录制且通过完整性检查；请刷新历史后重选。', 400);
     }
@@ -7410,7 +7414,7 @@ try {
     }
     segments.sort((left, right) => Number(left.startedAt || 0) - Number(right.startedAt || 0) || left.cleanPath.localeCompare(right.cleanPath));
     const groupId = `manual-${crypto.randomUUID()}`;
-    const outputPath = deriveSiblingPath(segments[0].cleanPath, groupId, getContainerFromPath(segments[0].cleanPath));
+    const outputPath = deriveSiblingPath(segments[0].cleanPath, `${groupId}.merged`, getContainerFromPath(segments[0].cleanPath));
     this.clearMergeRetryStatesForRoom(room.id);
     this.mergeCancelRequests.delete(room.id);
     const key = this.getMergeRetryKey(room.id, groupId);

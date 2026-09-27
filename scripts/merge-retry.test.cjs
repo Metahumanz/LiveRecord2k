@@ -57,10 +57,10 @@ test('manual selection merges complete segments chronologically and preserves so
   const app = createMergeTestService();
   app.ffmpegPath = ffmpegPath;
   app.settings.outputDir = dir;
-  const room = { id: 'manual', title: 'Manual', recording: false };
+  const room = { id: '883263', title: 'Manual', recording: false };
   app.rooms.set(room.id, room);
   for (let index = 0; index < 2; index++) {
-    const cleanPath = path.join(dir, `${index}.clean.mp4`);
+    const cleanPath = path.join(dir, `883263_真栗_20260926_22275${index + 3}.clean.mp4`);
     const result = await runCapturedProcess(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-y',
       '-f', 'lavfi', '-i', `testsrc2=size=320x180:rate=30:duration=1`,
       '-f', 'lavfi', '-i', `sine=frequency=${440 + index * 220}:sample_rate=48000:duration=1`,
@@ -68,7 +68,7 @@ test('manual selection merges complete segments chronologically and preserves so
     assert.equal(result.status, 0, result.stderr);
     const danmakuPath = path.join(dir, `${index}.danmaku.jsonl`);
     await fsp.writeFile(danmakuPath, JSON.stringify({ type: 'danmaku', time: 0.2, text: `分段${index}`, uid: index }) + '\n');
-    app.recordings.push({ cleanPath, danmakuPath, roomId: room.id, startedAt: index + 1,
+    app.recordings.push({ cleanPath, danmakuPath, roomId: '', startedAt: index + 1,
       durationSec: 1, segmentTargetDurationSec: 1, valid: true, eventCount: 1 });
   }
   const original = [...app.recordings];
@@ -82,6 +82,8 @@ test('manual selection merges complete segments chronologically and preserves so
   assert.equal(app.recordings.length, 3);
   for (const row of original) assert.ok((await fsp.stat(row.cleanPath)).size > 0);
   assert.equal(app.pendingSegmentCleanups.size, 0);
+  const rescanned = await discoverRecordingFiles(dir, { ffmpegPath });
+  assert.ok(rescanned.some(row => row.cleanPath === merged.cleanPath), 'manual output disappeared after refreshing the library');
   const events = (await fsp.readFile(merged.danmakuPath, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(events.length, 2);
   assert.ok(events[1].time > events[0].time);

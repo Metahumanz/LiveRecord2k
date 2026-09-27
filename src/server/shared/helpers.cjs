@@ -1998,7 +1998,7 @@ function resolveReliableDurationSec({
 }
 
 function parseRecordingStartedAtFromName(filePath) {
-  const name = path.basename(String(filePath || ''));
+  const name = String(filePath || '').split(/[\\/]/).at(-1);
   const matches = Array.from(name.matchAll(/_(\d{8})_(\d{6})(?=.*\.(?:clean|merged)\.(?:mp4|mkv)$)/gi));
   const match = matches.at(-1);
   if (!match) {
@@ -2015,6 +2015,22 @@ function parseRecordingStartedAtFromName(filePath) {
     Number(time.slice(4, 6))
   ).getTime();
   return Number.isFinite(startedAt) ? startedAt : 0;
+}
+
+function inferRecordingIdentity(recording = {}) {
+  const explicitRoomId = String(recording.roomId || '').trim();
+  const parts = String(recording.cleanPath || '').split(/[\\/]/);
+  const match = (parts.at(-1) || '').match(/^([1-9]\d*)_(.+)_\d{8}_\d{6}(?:\.[^.]+)*\.(?:clean|merged)\.(?:mp4|mkv)$/i);
+  const roomDirectory = (parts.at(-3) || '').match(/^([1-9]\d*)-(.+)$/);
+  // Only the recorder's numeric filename prefix establishes ownership. A
+  // display name or an unrelated parent directory must never combine rooms.
+  const inferred = match && (!roomDirectory || roomDirectory[1] === match[1]) ? match : null;
+  const session = inferred && (parts.at(-2) || '').match(/^\d{8}_\d{6}-(.+)$/);
+  return {
+    roomId: explicitRoomId || inferred?.[1] || '',
+    anchor: String(recording.anchor || inferred?.[2] || ''),
+    roomTitle: String(recording.roomTitle || session?.[1] || '')
+  };
 }
 
 function estimateRecordingDurationFromStats(filePath, stat) {
@@ -3122,10 +3138,8 @@ async function discoverRecordingFiles(outputDir, options = {}) {
       }
       recordings[index] = {
         id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
-        roomId: String(metadata?.roomId || ''),
-        roomTitle: String(metadata?.roomTitle || ''),
-        anchor: String(metadata?.anchor || ''),
-        startedAt: Number(metadata?.startedAt || stat.mtimeMs),
+        ...inferRecordingIdentity({ ...metadata, cleanPath }),
+        startedAt: Number(metadata?.startedAt || parseRecordingStartedAtFromName(cleanPath) || stat.mtimeMs),
         cleanPath,
         danmakuPath,
         avatarManifestPath:
@@ -4207,6 +4221,7 @@ module.exports = {
   parseFfmpegDuration,
   resolveReliableDurationSec,
   parseRecordingStartedAtFromName,
+  inferRecordingIdentity,
   estimateRecordingDurationFromStats,
   readDanmakuDurationSec,
   probeMediaFileInfo,
