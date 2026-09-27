@@ -202,3 +202,17 @@ Orin 复用此次 9172.63 秒合并源录像测试：完整长片的保守临时
 证据：`.tmp/orin-ca15664/media-storage-tests.log`、`export-storage-quick.log`、`export-storage-integration.log`、`cleanup-test-temp-report.json`、`storage-device-report.json`、`deployment-export-storage.json`、`full-export-retry.json`；运行快照另存 `full-export-status.json`。
 
 恢复后的后续快照：纹理准备完成 159791/282692（56.52%），本机剩余约 30.12 GiB，共享盘约 1485.49 GiB，任务仍运行且没有新的失败日志。准备阶段后半程变慢，helper 运行约五分钟时 CPU 约 86.9%、RSS 约 1 GiB；整片尚未开始报告媒体渲染时长，不能宣称长片性能或最终成片已经通过。代码检查显示纹理逐对象栅格化并写入 PNG，再重复打开转换成 RGBA，没有跨对象的纹理复用；这是下一步性能调查点，本次磁盘修复没有改动该路径。未中止活动任务或再次覆盖运行服务。
+
+## 录制链路排查与失败流恢复
+
+用户补充此前 Orin 持续录制失败，后来使用 5060 Ti 机器录制。普通录制调用 `createRecordingArgs()`，直接拉直播流并用 `-c copy` 写 Matroska，随后无重编码封装 MP4；它不依赖 CUDA/NVENC 或 Jetson 硬编能力自检。Orin 正式录制 FFmpeg 为内置 ARM64 6.1.1。
+
+读取共享录像的历史 `diagnostics.json`，9 月 26 日 21:04 场次多次 HTTP-FLV/H.265 启动后没有视频，随后 HLS/fMP4 或 TS 获得有效视频；23:20 场次也先有三次 FLV 零时长，再由 HLS 获得 272 秒、1216 秒及 3156 秒视频。诊断缺少采集机器标识，且目录同时包含 Windows 录像，不能把这些分段全部认定为 Orin 采集；systemd 历史日志主要为服务启动/停止，未保存当时全部应用 FFmpeg 末尾日志，因此也不能断言已定位过去所有 Orin 失败的唯一原因。
+
+代码确认一个恢复缺陷：流健康评分只用 CDN 主机作为键，FLV 失败会同时处罚同主机的 HLS；换一个 CDN 又会重新优先选择相同的失败格式。`788b63e222e59f3e950510552da3229a322cdf4a` 按主机、协议、格式、编码和清晰度隔离评分。启动损坏时在当前直播场次给相同格式组合增加有限惩罚，优先同清晰度的其它格式，而普通网络错误仍允许尝试其它 CDN 的原格式。新场次不继承处罚，不按显卡型号硬禁用 FLV。失败分段诊断增加容器阶段、有效性原因及脱敏且有长度限制的 FFmpeg 末尾，保留以后拉流、写盘及封装失败的实际证据。
+
+选流恢复与录制稳定性 28 项回归通过，quick 36 个文件通过。Orin 隔离测试先从原合并录像只读抽取 HEVC/AAC 样本，构建本机 HTTP HLS/fMP4，再通过实际 `LiveRecordService.startRecording()`、写入 CIFS、录制收尾和库有效性检查。普通账户及正式服务账户 UID 996 均成功：成片 6.04 秒，1920×1080 HEVC/AAC，容器阶段 ready；媒体进度可观察，合成测试弹幕含 emoji 的 JSONL 保留，源文件大小及 mtime 不变。测试弹幕绕过 B 站 WebSocket，不声称验证了真实弹幕连接。两个房间当时均未开播，本次也不声称验证了真实 B 站现场流或长期录制。两个明确隔离测试目录在检查进程引用并保存报告后已清理，共约 18.1 MB。
+
+为保留活动长片导出，备份并原子替换正式服务 bundle 与版本文件，仅将五个录制健康评分/诊断方法从已测试的候选模块应用到运行实例，不修改导出方法、不重启服务。备份 `/var/backups/bili-record-2k/20260927T145542Z-before-recording-recovery/`。服务 PID 仍为 515588；设置未变、活动导出 ID 未变、状态继续 running，Inspector 操作完成立即关闭。正式安装版本为上述 `788b63e`。随后长片纹理准备约 75.59%，本机剩余约 28.92 GiB，未出现新的任务失败日志，完整成片仍未验收。
+
+证据：`.tmp/orin-ca15664/recording-audit.log`、`recording-recovery-tests.log`、`recording-quick.log`、`recording-device-service-report.json`、`deployment-recording-recovery.json`。因安全审批拒绝给报告扩大到 0666 权限，正式账户测试改为将报告写入自己创建的隔离目录，没有放宽文件权限。
