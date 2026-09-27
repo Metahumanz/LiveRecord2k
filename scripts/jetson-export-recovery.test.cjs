@@ -114,6 +114,39 @@ test('native run reuses the source frame clock and does not generate unused CPU 
   assert.deepEqual(await fs.readdir(dir), []);
 });
 
+test('native scene requests and texture scratch stay local when encoded media goes to a separate volume', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-split-storage-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const cache = path.join(dir, 'cache'), media = path.join(dir, 'media'); await fs.mkdir(cache); await fs.mkdir(media);
+  const app = service();
+  capturedRun = async (_command, args, opts) => {
+    assert.equal(path.dirname(args[1]), cache); assert.equal(opts.env.TMPDIR, cache);
+    const request = JSON.parse(await fs.readFile(args[1], 'utf8'));
+    assert.equal(path.dirname(request.output.path), media);
+    return { status: 0, stdout: JSON.stringify({ nativeNvmmMetrics: { ptsBridge: { ok: true } } }) };
+  };
+  await app.runJetsonCudaSceneGraphTranscode({ ...options(cache), sceneTemporaryDir: cache,
+    encodedVideoPath: path.join(media, 'encoded.mkv'), nativeDecode: { decoderPath: '/fake/helper',
+      sourceCodec: 'hevc', sourceFrameRate: '60/1', duration: 65 }, createRawArgs: () => [], createMuxArgs: () => [] });
+  assert.deepEqual(await fs.readdir(cache), []); assert.deepEqual(await fs.readdir(media), []);
+});
+
+test('compatibility chunks separate local filter scripts from media files and clean both directories', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-chunk-storage-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const cache = path.join(dir, 'cache'), media = path.join(dir, 'media'); await fs.mkdir(cache); await fs.mkdir(media);
+  const app = service(); app.probeJetsonNativeSceneForSource = async () => ({ ok: false, reason: 'use compatibility' });
+  let chunks = 0;
+  app.runJetsonGstreamerTranscode = async opts => {
+    chunks++; assert.equal(path.dirname(opts.encodedVideoPath), media);
+    assert.equal(path.dirname(opts.nativeDecode.filterScriptPath), cache);
+    assert.equal(opts.sceneTemporaryDir, cache);
+    await fs.writeFile(opts.createMuxArgs().at(-1), Buffer.alloc(2048));
+  };
+  await app.runChunkedJetsonSceneGraphExport({ ...options(cache), mediaTemporaryDir: media });
+  assert.equal(chunks, 4); assert.deepEqual(await fs.readdir(cache), []); assert.deepEqual(await fs.readdir(media), []);
+});
+
 test('Argus warning with late media progress never restarts native helper and keeps stderr tail', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-native-tail-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));

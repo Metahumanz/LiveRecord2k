@@ -53,6 +53,7 @@ const GROUPS = {
     'maintenance-confirmation.test.cjs',
     'maintenance-service.test.cjs',
     'media-publication.test.cjs',
+    'media-storage.test.cjs',
     'release-notes.test.cjs',
     'room-behavior.test.cjs',
     'room-monitor-scheduler.test.cjs',

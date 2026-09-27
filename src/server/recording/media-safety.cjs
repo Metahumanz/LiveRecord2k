@@ -61,7 +61,7 @@ async function getDiskAvailability(targetPath) {
   const stats = await fsp.statfs(directory);
   const freeBytes = Number(stats.bavail) * Number(stats.bsize);
   const totalBytes = Number(stats.blocks) * Number(stats.bsize);
-  return { freeBytes, totalBytes, warning: freeBytes < DISK_WARNING_BYTES, hardBlocked: freeBytes < DISK_HARD_MIN_BYTES };
+  return { directory: path.resolve(directory), freeBytes, totalBytes, warning: freeBytes < DISK_WARNING_BYTES, hardBlocked: freeBytes < DISK_HARD_MIN_BYTES };
 }
 
 async function assertDiskSpace(targetPath, options = {}) {
@@ -69,10 +69,35 @@ async function assertDiskSpace(targetPath, options = {}) {
   const estimatedBytes = Math.max(0, Number(options.estimatedBytes || 0));
   const requiredBytes = Math.max(DISK_HARD_MIN_BYTES, estimatedBytes + DISK_HARD_MIN_BYTES);
   if (availability.freeBytes < requiredBytes) {
-    const gib = (availability.freeBytes / 1024 / 1024 / 1024).toFixed(2);
-    throw new Error(`磁盘剩余 ${gib} GiB，低于媒体任务安全阈值，已拒绝开始以保护已有录像。`);
+    const gib = bytes => (bytes / 1024 / 1024 / 1024).toFixed(2);
+    throw Object.assign(new Error(`磁盘空间不足：${availability.directory} 剩余 ${gib(availability.freeBytes)} GiB，` +
+      `本任务预计需要 ${gib(estimatedBytes)} GiB，另保留 ${gib(DISK_HARD_MIN_BYTES)} GiB，` +
+      `合计需要 ${gib(requiredBytes)} GiB；已拒绝开始以保护已有录像。`), {
+      code: 'BR2K_DISK_SPACE_INSUFFICIENT', targetPath: availability.directory,
+      freeBytes: availability.freeBytes, estimatedBytes, requiredBytes
+    });
   }
   return availability;
+}
+
+async function selectSceneMediaWorkspace(outputPath, sceneDirectory, options = {}) {
+  const mediaPeakBytes = Math.max(0, Number(options.mediaPeakBytes) || 0);
+  const scratchBytes = Math.max(0, Number(options.scratchBytes) || 0);
+  await assertDiskSpace(outputPath, { estimatedBytes: options.outputBytes });
+  try {
+    await assertDiskSpace(sceneDirectory, { estimatedBytes: mediaPeakBytes + scratchBytes });
+    return { mediaDirectory: sceneDirectory, separateMediaDirectory: false };
+  } catch (error) {
+    if (error.code !== 'BR2K_DISK_SPACE_INSUFFICIENT' || !options.allowDestinationMedia) throw error;
+    const destination = path.dirname(outputPath);
+    const [local, remote] = await Promise.all([fsp.stat(sceneDirectory), fsp.stat(destination)]);
+    // Moving intermediates within the same filesystem cannot create space.
+    if (local.dev === remote.dev) throw error;
+    await assertDiskSpace(sceneDirectory, { estimatedBytes: scratchBytes });
+    await assertDiskSpace(outputPath, { estimatedBytes: mediaPeakBytes });
+    const mediaDirectory = await fsp.mkdtemp(path.join(destination, '.br2k-export-media-'));
+    return { mediaDirectory, separateMediaDirectory: true, localSpaceError: error.message };
+  }
 }
 
 module.exports = {
@@ -80,5 +105,6 @@ module.exports = {
   DISK_HARD_MIN_BYTES,
   atomicReplaceFile,
   getDiskAvailability,
-  assertDiskSpace
+  assertDiskSpace,
+  selectSceneMediaWorkspace
 };

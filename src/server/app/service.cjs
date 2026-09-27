@@ -246,7 +246,8 @@ const {
   validateRemoteUrl,
   redactSensitive
 } = require('../shared/security.cjs');
-const { atomicReplaceFile, assertDiskSpace } = require('../recording/media-safety.cjs');
+const { atomicReplaceFile, assertDiskSpace, selectSceneMediaWorkspace } = require('../recording/media-safety.cjs');
+const { getJetsonGstreamerBitrate } = require('../recording/ffmpeg.cjs');
 const { BufferedJsonlWriter } = require('../recording/jsonl-writer.cjs');
 const { runJetsonEndToEndSelfTest: runJetsonBurnEndToEndSelfTest } = require('../recording/jetson-self-test.cjs');
 const { createAss } = require('../danmaku/ass.cjs');
@@ -11971,7 +11972,7 @@ try {
   async runChunkedJetsonSceneGraphExport({
     graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec, sourceFrameRate = '',
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
-    leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
+    leadingAudioPaddingSec = 0, decoder, temporaryDir, mediaTemporaryDir = temporaryDir, legacyEvents = [], legacySceneOptions = {},
     onStderr, onChild, onProgress, onPreparing, onPhase, onStage, onNativePreflight, isCancelled, label
   }) {
     const chunkPaths = [];
@@ -12049,7 +12050,7 @@ try {
         const chunkLeadingVideoPaddingSec = index === 0 ? Math.min(leadingVideoPaddingSec, chunkDuration) : 0;
         const chunkGraph = clipSceneGraph(graph, graphChunkStart, graphChunkStart + chunkDuration, { shiftTime: true });
         const scriptPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.filter`);
-        const chunkPath = path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
+        const chunkPath = path.join(mediaTemporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.mkv`);
         // Native PTS chunks are admitted only when the CUDA/NVMM runtime
         // probe passed. A later per-chunk bridge or coverage failure aborts
         // this pass rather than mixing an elementary fallback chunk into the
@@ -12090,6 +12091,7 @@ try {
         const common = {
           codec,
           quality: crf,
+          sceneTemporaryDir: temporaryDir,
           width,
           height,
           fps,
@@ -12271,6 +12273,7 @@ try {
     nativeTimestampedOutput = false,
     cleanPath,
     encodedVideoPath,
+    sceneTemporaryDir = '',
     createRawArgs,
     createMuxArgs,
     decoder = 'software',
@@ -12294,7 +12297,9 @@ try {
     if (!isJetsonGstreamerCodec(codec) || typeof createRawArgs !== 'function' || typeof createMuxArgs !== 'function') {
       throw new Error('Jetson CUDA Scene Graph 编码缺少有效参数。');
     }
-    const requestPath = `${encodedVideoPath}.scene-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`;
+    const requestPath = sceneTemporaryDir
+      ? path.join(sceneTemporaryDir, `scene-request-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`)
+      : `${encodedVideoPath}.scene-${process.pid}-${crypto.randomBytes(4).toString('hex')}.json`;
     const keepSceneRequestForDiagnostics = process.env.BR2K_KEEP_SCENE_REQUEST === '1';
     const request = createGpuSceneRenderRequest(graph, {
       backend: 'cuda-gstreamer',
@@ -12369,7 +12374,7 @@ try {
           const runNativeHelper = () => runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
             timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024,
             onChild,
-            env: { ...process.env, TMPDIR: path.dirname(encodedVideoPath) },
+            env: { ...process.env, TMPDIR: sceneTemporaryDir || path.dirname(encodedVideoPath) },
             onStdout: (chunk) => {
               nativeStdoutRemainder += chunk;
               const lines = nativeStdoutRemainder.split(/\r?\n/);
@@ -12524,6 +12529,8 @@ try {
     throwIfExportCancelled
   }) {
     let sceneDirectory = '';
+    let mediaDirectory = '';
+    let separateMediaDirectory = false;
     let preserveCompletedOutput = false;
     const sceneFontFallbackWarnings = new Map();
     let flushSceneFontFallbackWarnings = () => {};
@@ -12541,22 +12548,30 @@ try {
       const estimatedExportBytes = Math.ceil(
         Number(recording.fileSize || 0) * Math.min(1, duration / Math.max(1, durationSec || duration))
       );
-      await assertDiskSpace(outputPath, {
-        estimatedBytes: estimatedExportBytes * (isJetsonGstreamerCodec(burnCodec) ? 2 : 1)
-      });
+      await assertDiskSpace(outputPath, { estimatedBytes: estimatedExportBytes });
       await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
       throwIfExportCancelled();
       sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-scene-'));
-      // Native intermediates are local even when the destination is SMB. The
-      // encoder uses 15 Mbps; reserve intermediates plus the muxed output.
-      const localEstimate = Math.max(estimatedExportBytes, Math.ceil(duration * 15000000 / 8));
-      if (isJetsonGstreamerCodec(burnCodec)) {
-        await assertDiskSpace(sceneDirectory, { estimatedBytes: localEstimate * 2 });
-      }
-      if (isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)))) {
-        await assertDiskSpace(sceneDirectory, { estimatedBytes: localEstimate * 2 });
-        temporaryOutputPath = path.join(sceneDirectory, `completed.${outputContainer}`);
-        this.log('info', '共享盘导出：先在本地完成封装和验证，再发布成片；发布失败会保留本地成片。');
+      const jetson = isJetsonGstreamerCodec(burnCodec);
+      const sharedOutput = isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)));
+      if (jetson || sharedOutput) {
+        // Account for both the native helper's target and the CPU bridge's
+        // quality mapping, plus mux overhead. Compressed source size is not
+        // an upper bound for a newly encoded long video.
+        const bitrate = jetson ? Math.max(15_000_000, getJetsonGstreamerBitrate(burnCrf, burnCodec)) : 15_000_000;
+        const videoBytes = Math.max(estimatedExportBytes, Math.ceil(duration * bitrate / 8 * 1.15));
+        const audioBytes = mediaInfo.audioInfo ? estimatedExportBytes : 0;
+        const storage = await selectSceneMediaWorkspace(outputPath, sceneDirectory, {
+          outputBytes: videoBytes + audioBytes, mediaPeakBytes: videoBytes * 2 + audioBytes,
+          scratchBytes: 1024 ** 3, allowDestinationMedia: jetson
+        });
+        mediaDirectory = storage.mediaDirectory;
+        separateMediaDirectory = storage.separateMediaDirectory;
+        temporaryOutputPath = path.join(mediaDirectory, `completed.${outputContainer}`);
+        diagnosticContext.storage = { sceneDirectory, mediaDirectory, videoBytes, audioBytes, separateMediaDirectory };
+        this.log('info', separateMediaDirectory
+          ? `本机临时盘不足以保存整片中间文件，已改在输出磁盘工作目录 ${mediaDirectory} 编码及封装；Scene 请求和纹理仍在本机，验证后原子发布成片。`
+          : `导出临时媒体位于本机 ${mediaDirectory}，预留 ${formatBytes(videoBytes * 2 + audioBytes)}，验证后发布成片。`);
       }
       setExportPhase?.('prepare', { stageLabel: '正在准备 Scene Graph' });
       setExportStage('正在从 Scene Graph 直接合成');
@@ -12789,7 +12804,7 @@ try {
               sourceFrameRate: mediaInfo.videoInfo?.rFrameRate,
               startTime, duration, outputContainer, includeAudio: Boolean(mediaInfo.audioInfo), copyAudio: copySourceAudio,
               leadingVideoPaddingSec: burnTimeline.videoPaddingSec, leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
-              decoder: decoderInfo, temporaryDir: sceneDirectory, onStderr, onChild,
+              decoder: decoderInfo, temporaryDir: sceneDirectory, mediaTemporaryDir: mediaDirectory || sceneDirectory, onStderr, onChild,
               legacyEvents: sceneResult.events,
               legacySceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
               onProgress: (value) => {
@@ -12815,6 +12830,7 @@ try {
             const common = {
               codec: burnCodec,
               quality: burnCrf,
+              sceneTemporaryDir: sceneDirectory,
               width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
               height: recording.videoInfo?.height || mediaInfo.videoInfo?.height,
               fps,
@@ -12958,10 +12974,11 @@ try {
       try {
         await atomicReplaceFile(temporaryOutputPath, outputPath, { isCancelled: () => this.exportCancelRequested });
       } catch (error) {
-        if (!this.exportCancelRequested && temporaryOutputPath.startsWith(sceneDirectory + path.sep)) {
+        if (!this.exportCancelRequested && (temporaryOutputPath.startsWith(sceneDirectory + path.sep) ||
+            mediaDirectory && temporaryOutputPath.startsWith(mediaDirectory + path.sep))) {
           preserveCompletedOutput = true;
           error.completedOutputPath = temporaryOutputPath;
-          this.log('error', `成片发布失败，本地已验证成片保留在 ${temporaryOutputPath}，无需重新渲染：${error.message}`);
+          this.log('error', `成片发布失败，已验证成片保留在 ${temporaryOutputPath}，无需重新渲染：${error.message}`);
           diagnosticContext.completedOutputPath = temporaryOutputPath;
         }
         throw error;
@@ -13012,6 +13029,7 @@ try {
       if (!preserveCompletedOutput) {
         await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
         if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
+        if (separateMediaDirectory && mediaDirectory) await fsp.rm(mediaDirectory, { recursive: true, force: true }).catch(() => {});
       }
       if (this.exportProgress?.id === progress.id) {
         this.exportProcess = null;
