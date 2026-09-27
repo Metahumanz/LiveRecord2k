@@ -2239,6 +2239,9 @@ function createNormalizeEncodedVideoMuxArgs({
   if (!encodedVideoPath || !outputPath) {
     throw new Error('Jetson 规范化分段缺少临时视频或输出路径。');
   }
+  if (path.resolve(encodedVideoPath) === path.resolve(outputPath)) {
+    throw new Error('Jetson 规范化视频中间文件与封装输出不能使用同一路径。');
+  }
   if (hasAudio && !inputPath) {
     throw new Error('Jetson 规范化分段缺少音频源路径。');
   }

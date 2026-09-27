@@ -7707,7 +7707,7 @@ try {
     const assPath = deriveSiblingPath(outputPath, 'danmaku', 'ass');
     const burnedPath = deriveBurnedPath(outputPath, this.settings.burnOverlayMode);
     const fallbackMergeDurationSec = segments.reduce((sum, segment) => sum + Number(segment.durationSec || 0), 0);
-    const normalizeTempDir = path.join(
+    let normalizeTempDir = path.join(
       path.dirname(outputPath),
       `.br2k-merge-${process.pid}-${crypto.randomUUID().slice(0, 8)}`
     );
@@ -7881,6 +7881,7 @@ try {
       localPublishDirectory = path.join(os.tmpdir(), `br2k-merge-publish-${crypto.randomUUID()}`);
       tmpPath = path.join(localPublishDirectory, `completed.${container}`);
       concatPath = path.join(localPublishDirectory, 'concat.txt');
+      normalizeTempDir = path.join(localPublishDirectory, 'segments');
     }
     if (this.mergeCancelRequests.has(room.id)) {
       if (room.mergeProgress?.id === progress.id) {
@@ -8150,7 +8151,7 @@ try {
             if (isJetsonGstreamerCodec(videoCodec)) {
               const encodedVideoPath = path.join(
                 normalizeTempDir,
-                `${String(index + 1).padStart(3, '0')}.normalized.mkv`
+                `${String(index + 1).padStart(3, '0')}.video.mkv`
               );
               await runMergeFfmpeg(null, {
                 ...normalizeOptions,
@@ -8330,6 +8331,7 @@ try {
         // timestamps.  Its fallback uses the same bounded workspace, so make
         // the larger disk reservation immediately before starting it too.
         await assertDiskSpace(outputPath, { estimatedBytes: boundedTranscodeTemporaryBytes });
+        if (localPublishDirectory) await assertDiskSpace(os.tmpdir(), { estimatedBytes: boundedTranscodeTemporaryBytes });
         try {
           await runBoundedTranscode(mergeEncoderPlan.preferred);
         } catch (error) {
@@ -8613,8 +8615,8 @@ try {
       const cancelled = this.mergeCancelRequests.has(room.id);
       const memoryPressure = !cancelled && isFfmpegMemoryPressureError(error);
       const failureMessage = memoryPressure
-        ? `合并 FFmpeg 疑似因内存不足而中止（请检查系统内存/事件日志）：${error.message}`
-        : `合并失败：${error.message}`;
+        ? `合并 FFmpeg 疑似因内存不足而中止（请检查系统内存/事件日志）：${String(error.message).slice(-900)}`
+        : `合并失败：${String(error.message).slice(-900)}`;
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(
           room.mergeProgress,

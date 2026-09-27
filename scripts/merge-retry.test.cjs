@@ -6,7 +6,7 @@ const test = require('node:test');
 const ffmpegPath = require('ffmpeg-static');
 
 const { LiveRecordService, getMergeSegmentTimingAssessment } = require('../src/server/app/service.cjs');
-const { createNormalizeSegmentArgs } = require('../src/server/recording/ffmpeg.cjs');
+const { createNormalizeSegmentArgs, createNormalizeEncodedVideoMuxArgs } = require('../src/server/recording/ffmpeg.cjs');
 const {
   createFfmpegJobProgress,
   discoverRecordingFiles,
@@ -50,6 +50,49 @@ function createMergeTestService() {
   service.getMergeRetryDelayMs = () => 1;
   return service;
 }
+
+test('Jetson merge rejects a mux that would overwrite its video input before launching FFmpeg', () => {
+  assert.throws(() => createNormalizeEncodedVideoMuxArgs({ encodedVideoPath: 'same.mkv', outputPath: './same.mkv' }), /同一路径/);
+});
+
+test('Jetson cross-resolution merge uses separate video and mux files on a local workspace', async t => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-jetson-mux-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const app = createMergeTestService();
+  app.ffmpegPath = ffmpegPath;
+  app.settings.outputDir = dir;
+  const room = { id: '883263', recording: false };
+  app.rooms.set(room.id, room);
+  app.getMergeEncoderPlan = () => ({ preferred: 'h264_nvv4l2', fallback: '', software: '' });
+  app.getLinuxRecordingRootMount = async () => ({ fsType: 'cifs', mountPoint: dir });
+  const originals = [];
+  for (let i = 0; i < 2; i++) {
+    const cleanPath = path.join(dir, `883263_test_20260926_22275${i + 3}.clean.mp4`);
+    const generated = await runCapturedProcess(ffmpegPath, ['-y', '-f', 'lavfi', '-i', `testsrc2=size=${i ? '640x360' : '320x180'}:rate=30:duration=1`,
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1', '-c:v', 'libx264', '-c:a', 'aac', '-shortest', cleanPath], { timeoutMs: 20_000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    originals.push(cleanPath);
+    app.recordings.push({ cleanPath, roomId: room.id, startedAt: i + 1, durationSec: 1, valid: true });
+  }
+  let attempts = 0;
+  app.runJetsonGstreamerTranscode = async options => {
+    attempts++;
+    const mux = options.createMuxArgs();
+    const source = mux[mux.indexOf('-i', mux.indexOf('-i') + 1) + 1];
+    assert.notEqual(path.resolve(options.encodedVideoPath), path.resolve(mux.at(-1)));
+    assert.equal(path.basename(options.encodedVideoPath), `${String(attempts).padStart(3, '0')}.video.mkv`);
+    assert.ok(path.dirname(options.encodedVideoPath).includes('br2k-merge-publish-'));
+    const encoded = await runCapturedProcess(ffmpegPath, ['-y', '-i', source, '-an', '-vf', `scale=${options.width}:${options.height}`,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0', options.encodedVideoPath], { timeoutMs: 20_000 });
+    assert.equal(encoded.status, 0, encoded.stderr);
+    await runFfmpegJob(ffmpegPath, mux, options.onStderr, { onChild: options.onChild });
+  };
+  await app.mergeSelectedRecordings({ cleanPaths: originals });
+  const result = await [...app.mergeInFlightGroups.values()][0];
+  assert.equal(attempts, 2);
+  assert.equal((await probeMediaFileInfo(ffmpegPath, result.cleanPath)).videoInfo.width, 640);
+  for (const source of originals) assert.ok((await fsp.stat(source)).size);
+});
 
 test('manual selection merges complete segments chronologically and preserves source files and rows', async t => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-manual-merge-'));
