@@ -14,6 +14,18 @@ const { buildSceneGraphJob } = require('../src/server/danmaku/scene-build-job.cj
 const { buildSceneGraph, clipSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
 const { scanFullMedia } = require('../src/server/recording/media-full-scan.cjs');
 const { writeGraph, readGraphLines } = require('../src/server/danmaku/scene-graph-io.cjs');
+const { selectDistributedSceneSamples } = require('../src/server/danmaku/desktop-scene-policy.cjs');
+
+test('long output text checks cover the middle and tail, skip empty intervals and reject textless output', () => {
+  const objects = [1, 250, 500, 750, 990].map((start, id) => ({ id: String(id), type: 'Text', start, end: start + 5,
+    props: { text: '中文' }, frame: { x: 10, y: 10, width: 100, height: 40 } }));
+  const graph = { canvas: { width: 640, height: 360 }, objects };
+  assert.deepEqual(selectDistributedSceneSamples(graph, 1000).map(sample => sample.objectId), ['0', '1', '2', '3', '4']);
+  assert.equal(selectDistributedSceneSamples({ ...graph, objects: [objects[2]] }, 1000).length, 1);
+  assert.equal(selectDistributedSceneSamples(graph, 300).length, 1);
+  assert.throws(() => selectDistributedSceneSamples({ ...graph, objects: [] }, 1000),
+    error => error.code === 'BR2K_SCENE_NO_VISIBLE_TEXT');
+});
 
 test('streamed Scene cache preserves unicode, animation history and JSON output without loading irrelevant objects', async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-scene-stream-'));

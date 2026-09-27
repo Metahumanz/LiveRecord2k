@@ -5,7 +5,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const {
-  selectDesktopScenePath, selectSceneSample, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
+  selectDesktopScenePath, selectSceneSample, selectDistributedSceneSamples, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
 } = require('../danmaku/desktop-scene-policy.cjs');
 const { runDesktopSceneExport } = require('../danmaku/desktop-scene-export.cjs');
 const { verifySceneOutputFrame } = require('../danmaku/scene-output-verifier.cjs');
@@ -12611,6 +12611,40 @@ try {
     }
   }
 
+  async verifyFinalSceneTextOutput({ graph, events, sceneOptions, cleanPath, outputPath, startTime, duration, fps, directory, onChild, isCancelled, onStage }) {
+    const samples = selectDistributedSceneSamples(graph, duration);
+    const results = [];
+    for (const [index, sample] of samples.entries()) {
+      if (isCancelled?.()) { const error = new Error('导出已取消。'); error.code = 'BR2K_MEDIA_CANCELLED'; throw error; }
+      onStage?.(`正在检查成片弹幕 ${index + 1}/${samples.length}（${sample.outputTime.toFixed(1)}秒）`);
+      const sampleGraph = clipSceneGraph(graph, sample.start, sample.start + sample.duration, { shiftTime: true });
+      const prefix = `final-text-${index}`;
+      const ass = await this.writeLegacySceneCompatibilityAss(path.join(directory, prefix + '.ass'), events, {
+        ...sceneOptions, startTime: startTime + sample.start, endTime: startTime + sample.start + sample.duration, shiftTime: true
+      });
+      const noText = path.join(directory, prefix + '-clean.ass');
+      await fsp.writeFile(noText, (await fsp.readFile(ass, 'utf8')).split(/\r?\n/).filter(line =>
+        !line.startsWith('Dialogue:') || /^Dialogue:\s*[^,]*,[^,]*,[^,]*,Shape,/.test(line)).join('\n'));
+      const reference = await writeSceneFilterScript(path.join(directory, prefix + '.filter'), sampleGraph,
+        { duration: sample.duration, fps, target: 'software', legacyAssPath: ass });
+      const clean = await writeSceneFilterScript(path.join(directory, prefix + '-clean.filter'),
+        { ...sampleGraph, objects: sampleGraph.objects.filter(object => object.type !== 'Text') },
+        { duration: sample.duration, fps, target: 'software', legacyAssPath: noText });
+      const at = Math.round(sample.time * fps) / fps;
+      try {
+        const pixels = await verifySceneOutputFrame({ runJob: (...args) => runFfmpegJob(this.ffmpegPath, ...args),
+          sourcePath: cleanPath, outputPath, referenceScript: reference.filterScriptPath, cleanScript: clean.filterScriptPath,
+          sourceStart: startTime + sample.start, time: at, outputTime: sample.start + at,
+          graph: sampleGraph, directory, prefix, onChild, ffmpegPath: this.ffmpegPath, textMask: true });
+        results.push({ sample, pixels });
+      } catch (error) {
+        error.diagnosticDirectory = directory;
+        throw error;
+      }
+    }
+    return results;
+  }
+
   async runSceneGraphClipExport({
     recording,
     burnCodec,
@@ -12711,7 +12745,9 @@ try {
           runFallback: this.runFfmpegWithHardwareDecodeFallback.bind(this),
           onStderr: (line) => {
             if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(progress, line)) this.emitState('mediaJob');
-            if (/error|failed|invalid/i.test(line)) this.log('warn', '桌面 Scene 导出：' + compactLogLine(line));
+            for (const entry of String(line).split(/\r?\n/)) {
+              if (/error|failed|invalid/i.test(entry)) sceneWarnings.write(compactLogLine(entry));
+            }
           },
           onChild: (child) => { this.exportProcess = child; },
           onStage: setExportStage,
@@ -13087,6 +13123,13 @@ try {
       if (!outputTiming.timingSafeForCopy || Math.abs(outputTiming.videoPresentationDurationSec - duration) > Math.max(0.25, 3 / fps)) {
         throw new Error(`Scene 成片时间轴验收失败：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s，音画差 ${outputTiming.avDeltaSec.toFixed(3)}s。`);
       }
+      diagnosticContext.finalTextVerification = await this.verifyFinalSceneTextOutput({
+        graph, events: sceneResult.events,
+        sceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
+        cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, startTime, duration, fps, directory: sceneDirectory,
+        onChild: child => { this.exportProcess = child; if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 }); },
+        isCancelled: () => this.exportCancelRequested, onStage: setExportStage
+      });
       throwIfExportCancelled();
       try {
         await atomicReplaceFile(temporaryOutputPath, outputPath, { isCancelled: () => this.exportCancelRequested });

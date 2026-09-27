@@ -57,17 +57,22 @@ function planDesktopSceneSegments(graph, duration, fps = 30, options = {}) {
   return segments;
 }
 
-function selectSceneSample(graph, duration) {
-  for (const object of graph.objects) {
-    if (object.render === false || object.type !== 'Text' || !String(object.props?.text || '').trim()) continue;
-    if (duration > 1 && object.end - object.start < 0.5) continue;
+function sampleSceneObject(graph, object, duration) {
+    if (object.render === false || object.type !== 'Text' || !String(object.props?.text || '').trim()) return null;
+    if (duration > 1 && object.end - object.start < 0.5) return null;
     const time = Math.min(duration - 0.05, object.start + Math.min(2, (object.end - object.start) / 2));
     const state = evaluateSceneObject(object, time);
     if (!state.visible || state.opacity < 0.5 || state.x >= graph.canvas.width || state.y >= graph.canvas.height ||
-      state.x + object.frame.width <= 0 || state.y + object.frame.height <= 0) continue;
+      state.x + object.frame.width <= 0 || state.y + object.frame.height <= 0) return null;
     const sampleDuration = Math.min(10, duration);
     const start = Math.max(0, Math.min(time - 2, duration - sampleDuration));
     return { start, duration: sampleDuration, time: time - start, outputTime: time, objectId: object.id };
+}
+
+function selectSceneSample(graph, duration) {
+  for (const object of graph.objects) {
+    const sample = sampleSceneObject(graph, object, duration);
+    if (sample) return sample;
   }
   const error = new Error('剪辑范围内没有有效可见弹幕文字，已停止烧录；请检查弹幕时间轴、JSONL 与 Scene 缓存。');
   error.code = 'BR2K_SCENE_NO_VISIBLE_TEXT';
@@ -83,5 +88,23 @@ function classifyDecodeFailure(error) {
   return 'other';
 }
 
+function selectDistributedSceneSamples(graph, duration) {
+  if (duration <= 300) return [selectSceneSample(graph, duration)];
+  const targets = [0, duration * .25, duration * .5, duration * .75, duration];
+  const best = targets.map(() => null);
+  for (const object of graph.objects) {
+    const sample = sampleSceneObject(graph, object, duration);
+    if (!sample) continue;
+    for (let index = 0; index < targets.length; index++) {
+      const distance = Math.abs(sample.outputTime - targets[index]);
+      if (!best[index] || distance < best[index].distance) best[index] = { sample, distance };
+    }
+  }
+  if (!best[0]) return [selectSceneSample(graph, duration)];
+  const selected = new Map();
+  for (const value of best) selected.set(value.sample.outputTime, value.sample);
+  return [...selected.values()].sort((a, b) => a.outputTime - b.outputTime);
+}
+
 module.exports = { LEGACY_PRESETS, MAX_FILTER_LAYERS, MAX_SEGMENT_SECONDS, AUTO_LONG_BURN_SECONDS,
-  selectDesktopScenePath, filterLayerCount, planDesktopSceneSegments, selectSceneSample, classifyDecodeFailure };
+  selectDesktopScenePath, filterLayerCount, planDesktopSceneSegments, selectSceneSample, selectDistributedSceneSamples, classifyDecodeFailure };
