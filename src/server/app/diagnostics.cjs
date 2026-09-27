@@ -93,10 +93,13 @@ function buildExportDiagnosticReport(context = {}, error = null) {
     preflight: context.preflight,
     ptsBridge: context.ptsBridge,
     fallback: context.fallback,
+    completedOutputPath: context.completedOutputPath,
     lastError: error ? {
       code: error.code,
       message: error.message,
-      processedMediaSeconds: error.processedMediaSeconds
+      processedMediaSeconds: error.processedMediaSeconds,
+      nativeFailure: error.nativeFailure,
+      cause: error.cause ? { code: error.cause.code, message: error.cause.message } : undefined
     } : context.lastError
   });
 }

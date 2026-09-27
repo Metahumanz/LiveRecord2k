@@ -16,6 +16,7 @@ const GPU_SCENE_BACKENDS = new Set(['cuda-gstreamer', 'vulkan-gstreamer', 'gl-gs
 // NVIDIA's supported callback bridge for the NVMM allocator emitted by
 // nvvidconv, so the Scene CUDA library receives EGLImage without CPU mapping.
 const JETSON_CUDA_NVMM_REQUIRED_ELEMENTS = [
+  'capssetter',
   'nvivafilter',
   'nvvidconv',
   'nvv4l2h264enc',

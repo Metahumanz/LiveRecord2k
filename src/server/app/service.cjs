@@ -5,9 +5,10 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const {
-  selectDesktopScenePath, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
+  selectDesktopScenePath, selectSceneSample, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
 } = require('../danmaku/desktop-scene-policy.cjs');
 const { runDesktopSceneExport } = require('../danmaku/desktop-scene-export.cjs');
+const { verifySceneOutputFrame } = require('../danmaku/scene-output-verifier.cjs');
 const QRCode = require('qrcode');
 const {
   createGpuSceneProbeArgs,
@@ -7209,7 +7210,7 @@ try {
     return cleared;
   }
 
-  async getPendingMergeGroupForRoom(room) {
+  async getPendingMergeGroupForRoom(room, preferredGroup = '') {
     if (!room?.id) return null;
     const roomId = String(room.id);
     const groups = new Map();
@@ -7240,7 +7241,11 @@ try {
       .sort((left, right) => Number(right.segments.at(-1)?.startedAt || 0) - Number(left.segments.at(-1)?.startedAt || 0));
     for (const candidate of candidates) {
       const outputPath = this.getReconnectMergeOutputPath(candidate.allSegments, candidate.segments);
-      if (await isExistingFile(outputPath)) continue;
+      if (preferredGroup && candidate.mergeGroup !== preferredGroup) continue;
+      if (await isExistingFile(outputPath)) {
+        const outputInfo = await probeMediaFileInfo(this.ffmpegPath, outputPath, { timeoutMs: 15_000 }).catch(() => null);
+        if (outputInfo?.videoInfo && (await getFileSize(outputPath)) >= 32 * 1024) continue;
+      }
       const exists = await Promise.all(candidate.segments.map((segment) => isExistingFile(segment.cleanPath)));
       if (!exists.every(Boolean)) continue;
       return {
@@ -7346,14 +7351,20 @@ try {
 
   async retryMerge(roomId) {
     const room = this.getRoom(roomId);
+    if (this.isRoomRecording(room)) throw businessError('MERGE_ALREADY_RUNNING', '该直播间正在录制，请等待录制完成后再合并。', 409);
     if (this.mergeProcesses.has(room.id) || [...this.mergeInFlightGroups.keys()].some((key) => key.startsWith(`${room.id}\u0000`))) {
       throw businessError('MERGE_ALREADY_RUNNING', '当前已有合并任务在运行，请稍候。', 409);
     }
-    const pending = await this.getPendingMergeGroupForRoom(room);
+    if (room.mergeProgress?.manual && room.mergeProgress.sourcePaths?.length >= 2) {
+      return this.mergeSelectedRecordings({ cleanPaths: room.mergeProgress.sourcePaths });
+    }
+    const preferredGroup = room.mergeProgress?.mergeGroup || [...this.mergeRetryStates.values()].find(state => state.roomId === room.id)?.mergeGroup || '';
+    const pending = await this.getPendingMergeGroupForRoom(room, preferredGroup);
     if (!pending) {
       throw businessError('MERGE_TASK_NOT_FOUND', '没有找到可重新合并的完整源分段。', 404);
     }
     this.clearMergeRetryState(room.id, pending.mergeGroup);
+    this.mergeCancelRequests.delete(room.id);
     if (room.mergeProgress?.kind === 'merge') {
       room.mergeProgress.status = 'running';
       room.mergeProgress.message = '正在手动重新尝试合并，源分段会继续保留到合并成功。';
@@ -7364,6 +7375,51 @@ try {
     this.finalizeReconnectGroup(room, pending.mergeGroup, pending.fallbackRecording).catch(() => {
       // finalizeReconnectGroup has updated the visible failure/retry state.
     });
+    return this.getState();
+  }
+
+  async mergeSelectedRecordings({ cleanPaths } = {}) {
+    if (!Array.isArray(cleanPaths) || cleanPaths.length < 2 || cleanPaths.length > 160 ||
+        cleanPaths.some(value => typeof value !== 'string') || new Set(cleanPaths).size !== cleanPaths.length) {
+      throw businessError('MERGE_SELECTION_INVALID', '请选择至少两个不同的录像文件。', 400);
+    }
+    const segments = cleanPaths.map(cleanPath => this.recordings.find(recording => recording.cleanPath === cleanPath));
+    if (segments.some(segment => !segment || segment.valid === false || segment.containerStage === 'capturing' || segment.containerStage === 'finalizing')) {
+      throw businessError('MERGE_SOURCE_INVALID', '所选录像必须已完成录制且通过完整性检查；请刷新历史后重选。', 400);
+    }
+    const roomId = String(segments[0].roomId || '');
+    if (!roomId || segments.some(segment => String(segment.roomId || '') !== roomId)) {
+      throw businessError('MERGE_ROOM_MISMATCH', '一次只能合并同一直播间的录像。', 400);
+    }
+    const room = this.getRoom(roomId);
+    if (this.isRoomRecording(room) || this.mergeProcesses.has(room.id) ||
+        [...this.mergeInFlightGroups.keys()].some(key => key.startsWith(`${room.id}\u0000`))) {
+      throw businessError('MERGE_ALREADY_RUNNING', '该直播间正在录制或合并，请等待完成后再合并所选文件。', 409);
+    }
+    for (const segment of segments) {
+      this.assertExportSourcePath(segment.cleanPath);
+      if (!(await isExistingFile(segment.cleanPath))) throw businessError('MERGE_SOURCE_MISSING', '所选源录像已不存在，请刷新历史。', 404);
+    }
+    if (this.isRoomRecording(room) || this.mergeProcesses.has(room.id) ||
+        [...this.mergeInFlightGroups.keys()].some(key => key.startsWith(`${room.id}\u0000`))) {
+      throw businessError('MERGE_ALREADY_RUNNING', '该直播间已有录制或合并任务，请等待完成。', 409);
+    }
+    segments.sort((left, right) => Number(left.startedAt || 0) - Number(right.startedAt || 0) || left.cleanPath.localeCompare(right.cleanPath));
+    const groupId = `manual-${crypto.randomUUID()}`;
+    const outputPath = deriveSiblingPath(segments[0].cleanPath, groupId, getContainerFromPath(segments[0].cleanPath));
+    this.clearMergeRetryStatesForRoom(room.id);
+    this.mergeCancelRequests.delete(room.id);
+    const key = this.getMergeRetryKey(room.id, groupId);
+    const task = this.mergeReconnectGroupIfNeededInternal(room, groupId, segments.at(-1), { segments, outputPath });
+    this.mergeInFlightGroups.set(key, task);
+    task.catch(error => {
+      if (room.mergeProgress) finishFfmpegJobProgress(room.mergeProgress, 'error', `手动合并失败：${error.message}；源文件已保留，可重新尝试。`);
+      this.log('error', `${roomLabel(room)} 手动合并失败：${error.message}；源文件未删除。`);
+      this.emitState(['room', 'mediaJob']);
+    }).finally(() => {
+      if (this.mergeInFlightGroups.get(key) === task) this.mergeInFlightGroups.delete(key);
+    });
+    this.log('info', `${roomLabel(room)} 已提交 ${segments.length} 个文件手动合并，按录制时间排序，保留所有源文件。`);
     return this.getState();
   }
 
@@ -7598,13 +7654,13 @@ try {
     }
   }
 
-  async mergeReconnectGroupIfNeededInternal(room, mergeGroup, fallbackRecording) {
+  async mergeReconnectGroupIfNeededInternal(room, mergeGroup, fallbackRecording, manualOptions = null) {
     const groupId = String(mergeGroup || '').trim();
     if (!groupId) {
       return fallbackRecording;
     }
-    const segmentCandidates = this.recordings
-      .filter((recording) => recording.mergeGroup === groupId && !recording.mergedFrom?.length)
+    const segmentCandidates = manualOptions?.segments || this.recordings
+      .filter((recording) => String(recording.roomId || '') === String(room.id) && recording.mergeGroup === groupId && !recording.mergedFrom?.length)
       .filter((recording) => recording.valid !== false)
       .filter((recording) => recording.cleanPath && recording.cleanPath !== recording.mergeOutputPath);
     const segmentExists = await Promise.all(segmentCandidates.map((recording) => isExistingFile(recording.cleanPath)));
@@ -7614,7 +7670,7 @@ try {
         const sequenceDiff = Number(a.mergeSequence || 0) - Number(b.mergeSequence || 0);
         return sequenceDiff || Number(a.startedAt || 0) - Number(b.startedAt || 0);
       });
-    const segments = this.selectPartialReconnectCluster(allSegments, fallbackRecording);
+    const segments = manualOptions ? segmentCandidates : this.selectPartialReconnectCluster(allSegments, fallbackRecording);
     if (segments.length < 2) {
       if (allSegments.length >= 2) {
         this.log(
@@ -7627,10 +7683,12 @@ try {
 
     room.recordingState = 'merging';
 
-    const outputPath = this.getReconnectMergeOutputPath(allSegments, segments);
+    const outputPath = manualOptions?.outputPath || this.getReconnectMergeOutputPath(allSegments, segments);
     const container = getContainerFromPath(outputPath);
-    const tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
-    const concatPath = replaceExtension(outputPath, '.concat.txt');
+    let tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
+    let concatPath = replaceExtension(outputPath, '.concat.txt');
+    let preserveMergedOutput = false;
+    let localPublishDirectory = '';
     const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
     const avatarManifestPath = deriveAvatarManifestPath(outputPath);
     const sceneCachePath = deriveSceneCachePath(outputPath);
@@ -7653,6 +7711,11 @@ try {
       roomId: room.id
     });
     room.mergeProgress = progress;
+    progress.mergeGroup = groupId;
+    if (manualOptions) {
+      progress.manual = true;
+      progress.sourcePaths = segments.map(segment => segment.cleanPath);
+    }
     this.emitState();
     const segmentMediaInfos = [];
     const segmentTimelineInfos = [];
@@ -7805,6 +7868,12 @@ try {
     await this.runMergePreparationStage(room, progress, '正在检查本次合并的磁盘空间', () =>
       assertDiskSpace(outputPath, { estimatedBytes: estimatedTemporaryBytes })
     );
+    if (isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)))) {
+      await assertDiskSpace(os.tmpdir(), { estimatedBytes: estimatedTemporaryBytes });
+      localPublishDirectory = path.join(os.tmpdir(), `br2k-merge-publish-${crypto.randomUUID()}`);
+      tmpPath = path.join(localPublishDirectory, `completed.${container}`);
+      concatPath = path.join(localPublishDirectory, 'concat.txt');
+    }
     if (this.mergeCancelRequests.has(room.id)) {
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(room.mergeProgress, 'cancelled', '合并已取消，所有源分段均已保留');
@@ -7847,6 +7916,7 @@ try {
     );
     this.emitState(['room', 'mediaJob']);
     try {
+      if (localPublishDirectory) await fsp.mkdir(localPublishDirectory);
       await fsp.rm(tmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
       await fsp.rm(cssTmpPath, { force: true });
@@ -8398,7 +8468,15 @@ try {
         });
         await Promise.all([fsp.stat(danmakuTmpPath), fsp.stat(cssTmpPath)]);
       });
-      await atomicReplaceFile(tmpPath, outputPath);
+      try {
+        await atomicReplaceFile(tmpPath, outputPath, { isCancelled: () => this.mergeCancelRequests.has(room.id) });
+      } catch (error) {
+        if (localPublishDirectory && !this.mergeCancelRequests.has(room.id)) {
+          preserveMergedOutput = true;
+          this.log('error', `合并成片发布失败，已验证的本地成片保留在 ${tmpPath}：${error.message}`);
+        }
+        throw error;
+      }
       await atomicReplaceFile(danmakuTmpPath, danmakuPath);
       await atomicReplaceFile(cssTmpPath, cssPath);
       await fsp.rm(concatPath, { force: true });
@@ -8485,7 +8563,7 @@ try {
         mergedRecording,
         ...this.recordings.filter((recording) => {
           const recordingKey = path.resolve(recording.cleanPath).toLowerCase();
-          return recordingKey !== outputPathKey && !segmentPathKeys.has(recordingKey);
+          return recordingKey !== outputPathKey && (manualOptions || !segmentPathKeys.has(recordingKey));
         })
       ].slice(0, RECORDING_LIBRARY_LIMIT);
       await this.writeRecordingMetadata(mergedRecording).catch((error) => {
@@ -8495,7 +8573,7 @@ try {
         room.currentRecording = mergedRecording;
         room.recordingState = 'completed';
       }
-      this.pendingSegmentCleanups.set(cleanupId, {
+      if (!manualOptions) this.pendingSegmentCleanups.set(cleanupId, {
         cleanupId,
         roomId: room.id,
         status: 'pending',
@@ -8505,7 +8583,7 @@ try {
         mergedRecording: cloneRecordingState(mergedRecording)
       });
       await this.saveStore();
-      await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId, preserveSourceInputs: true });
+      if (!manualOptions) await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId, preserveSourceInputs: true });
       if (room.mergeProgress?.id === progress.id) {
         finishFfmpegJobProgress(room.mergeProgress, 'completed', '续录分段已合并');
       }
@@ -8545,10 +8623,11 @@ try {
       this.mergeProcesses.delete(room.id);
       this.mergeCancelRequests.delete(room.id);
       await fsp.rm(concatPath, { force: true }).catch(() => {});
-      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+      if (!preserveMergedOutput) await fsp.rm(tmpPath, { force: true }).catch(() => {});
       await fsp.rm(danmakuTmpPath, { force: true }).catch(() => {});
       await fsp.rm(cssTmpPath, { force: true }).catch(() => {});
       await fsp.rm(normalizeTempDir, { recursive: true, force: true }).catch(() => {});
+      if (localPublishDirectory && !preserveMergedOutput) await fsp.rm(localPublishDirectory, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -11539,11 +11618,15 @@ try {
           return;
         }
         exportStarted = true;
-        await this.runExportClipNow({ ...item.request, codec, onProgressCreated: removeWaitingItem });
+        await this.runExportClipNow({ ...item.request, codec, onProgressCreated: () => {
+          removeWaitingItem();
+          if (this.cancelledExportQueueIds.has(item.id)) this.exportCancelRequested = true;
+        } });
       } catch (error) {
-        this.log('error', `导出队列任务失败：${item.label}，${error.message || String(error)}`);
+        const cancelled = this.cancelledExportQueueIds.has(item.id) || ['BR2K_MEDIA_CANCELLED', 'MEDIA_JOB_CANCELLED'].includes(error.code);
+        this.log(cancelled ? 'info' : 'error', cancelled ? `已取消导出队列任务：${item.label}` : `导出队列任务失败：${item.label}，${error.message || String(error)}`);
         if (this.exportProgress?.id === capabilityProgress.id) {
-          finishFfmpegJobProgress(this.exportProgress, 'error', `导出启动失败：${error.message || String(error)}`);
+          finishFfmpegJobProgress(this.exportProgress, cancelled ? 'cancelled' : 'error', cancelled ? '导出已取消' : `导出启动失败：${error.message || String(error)}`);
         }
       } finally {
         removeWaitingItem();
@@ -11569,6 +11652,7 @@ try {
     cleanPath,
     codec,
     sourceCodec,
+    sourceFrameRate = '',
     crf,
     fps,
     width,
@@ -11579,13 +11663,18 @@ try {
     decoder,
     label = 'Jetson CUDA Scene',
     onPreparing,
-    onStage
+    onStage,
+    onChild,
+    isCancelled,
+    textVerification = null
   } = {}) {
-    const probeDuration = Math.min(5, Math.max(0.001, Number(duration) || 0.001));
-    const probeStart = Math.max(0, Number(startTime) || 0);
+    const sample = textVerification ? selectSceneSample(graph, duration) : { start: 0, duration: 5 };
+    const probeDuration = Math.min(sample.duration, Math.max(0.001, Number(duration) || 0.001));
+    const probeStart = Math.max(0, Number(startTime) || 0) + sample.start;
     const requestPath = path.join(temporaryDir, 'native-preflight.json');
     const outputPath = path.join(temporaryDir, 'native-preflight.mkv');
     let metrics = null;
+    let preservePreflightDiagnostic = false;
     try {
       if (process.env.BR2K_FORCE_NATIVE_PREFLIGHT_FAIL === '1' && process.env.NODE_ENV === 'test') {
         return { ok: false, reason: 'BR2K_FORCE_NATIVE_PREFLIGHT_FAIL=1', metrics: null, durationSec: probeDuration };
@@ -11597,7 +11686,7 @@ try {
       if (!cleanPath || !isJetsonGstreamerCodec(codec)) {
         return { ok: false, reason: '缺少真实 clean 源或 Jetson 硬编参数。', metrics: null, durationSec: probeDuration };
       }
-      const probeGraph = clipSceneGraph(graph, 0, probeDuration, { shiftTime: true });
+      const probeGraph = clipSceneGraph(graph, sample.start, sample.start + probeDuration, { shiftTime: true });
       const request = createGpuSceneRenderRequest(probeGraph, {
         backend: 'cuda-gstreamer',
         inputPath: cleanPath,
@@ -11613,8 +11702,9 @@ try {
       });
       request.input.startTime = probeStart;
       request.input.codec = String(sourceCodec || '').toLowerCase();
+      request.input.sourceFrameRate = String(sourceFrameRate || '');
       await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
-      onStage?.('正在验证 Jetson CUDA Scene（5秒真实样本）');
+      onStage?.(`正在验证 Jetson CUDA Scene（${probeDuration.toFixed(0)}秒真实样本）`);
       let stdoutRemainder = '';
       const consumeLine = (line) => {
         let parsed;
@@ -11623,12 +11713,14 @@ try {
           onPreparing?.(parsed.nativeNvmmPreparing);
         }
         if (parsed?.nativeNvmmProgress && typeof parsed.nativeNvmmProgress === 'object') {
-          onStage?.('正在验证 Jetson CUDA Scene（5秒真实样本）');
+          onStage?.(`正在验证 Jetson CUDA Scene（${probeDuration.toFixed(0)}秒真实样本）`);
         }
       };
       const result = await runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
         timeoutMs: Math.max(30_000, Math.ceil(probeDuration * 10_000)),
         maxOutputBytes: 256 * 1024,
+        onChild,
+        env: { ...process.env, TMPDIR: temporaryDir },
         onStdout: (chunk) => {
           stdoutRemainder += chunk;
           const lines = stdoutRemainder.split(/\r?\n/);
@@ -11636,6 +11728,11 @@ try {
           for (const line of lines) consumeLine(line);
         }
       });
+      if (isCancelled?.()) {
+        const error = new Error('导出已取消。');
+        error.code = 'BR2K_MEDIA_CANCELLED';
+        throw error;
+      }
       if (stdoutRemainder) consumeLine(stdoutRemainder);
       for (const line of String(result.stdout || '').trim().split(/\r?\n/).reverse()) {
         try {
@@ -11652,7 +11749,7 @@ try {
       if (result.status !== 0 || result.error || result.timedOut) {
         return {
           ok: false,
-          reason: compactLogLine(result.stderr || result.stdout || result.error?.message || '真实源 CUDA Scene helper 失败。'),
+          reason: redactSensitive(String(result.stderr || result.stdout || result.error?.message || '真实源 CUDA Scene helper 失败。')).replace(/\s+/g, ' ').trim().slice(-900),
           metrics,
           durationSec: probeDuration
         };
@@ -11682,8 +11779,39 @@ try {
       if (!encodedInfo?.videoInfo) {
         return { ok: false, reason: '真实源预检 MKV 没有可读取的视频流。', metrics, durationSec: probeDuration };
       }
-      return { ok: true, metrics, durationSec: probeDuration };
+      let pixels = null;
+      if (textVerification) {
+        onStage?.('正在检查真实样片中的弹幕文字');
+        const assPath = await this.writeLegacySceneCompatibilityAss(path.join(temporaryDir, 'preflight-reference.ass'), textVerification.events, {
+          ...textVerification.options, startTime: probeStart, endTime: probeStart + probeDuration, shiftTime: true
+        });
+        const textless = path.join(temporaryDir, 'preflight-clean.ass');
+        await fsp.writeFile(textless, (await fsp.readFile(assPath, 'utf8')).split(/\r?\n/).filter(line =>
+          !line.startsWith('Dialogue:') || /^Dialogue:\s*[^,]*,[^,]*,[^,]*,Shape,/.test(line)).join('\n'));
+        const reference = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-reference.filter'), probeGraph,
+          { duration: probeDuration, fps, target: 'software', legacyAssPath: assPath });
+        const clean = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-clean.filter'),
+          { ...probeGraph, objects: probeGraph.objects.filter(object => object.type !== 'Text') },
+          { duration: probeDuration, fps, target: 'software', legacyAssPath: textless });
+        const at = Math.round(sample.time * fps) / fps;
+        pixels = await verifySceneOutputFrame({
+          runJob: (...args) => runFfmpegJob(this.ffmpegPath, ...args), sourcePath: cleanPath, outputPath,
+          referenceScript: reference.filterScriptPath, cleanScript: clean.filterScriptPath,
+          sourceStart: probeStart, time: at, outputTime: at, graph: probeGraph, directory: temporaryDir,
+          prefix: 'native-preflight', onChild, ffmpegPath: this.ffmpegPath, textMask: true
+        });
+      }
+      return { ok: true, metrics, pixels, durationSec: probeDuration };
     } catch (error) {
+      if (isCancelled?.() || error?.code === 'BR2K_MEDIA_CANCELLED') {
+        error.code = 'BR2K_MEDIA_CANCELLED';
+        throw error;
+      }
+      if (error?.code === 'BR2K_SCENE_TEXT_VERIFICATION_FAILED') {
+        preservePreflightDiagnostic = true;
+        error.diagnosticDirectory = temporaryDir;
+        throw error;
+      }
       return {
         ok: false,
         reason: compactLogLine(error?.message || String(error) || '真实源 CUDA Scene 预检失败。'),
@@ -11691,12 +11819,12 @@ try {
         durationSec: probeDuration
       };
     } finally {
-      await Promise.all([requestPath, outputPath].map((file) => fsp.rm(file, { force: true }).catch(() => {})));
+      if (!preservePreflightDiagnostic) await Promise.all([requestPath, outputPath].map((file) => fsp.rm(file, { force: true }).catch(() => {})));
     }
   }
 
   async runChunkedJetsonSceneGraphExport({
-    graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec,
+    graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec, sourceFrameRate = '',
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
     leadingAudioPaddingSec = 0, decoder, temporaryDir, legacyEvents = [], legacySceneOptions = {},
     onStderr, onChild, onProgress, onPreparing, onPhase, onStage, onNativePreflight, isCancelled, label
@@ -11721,6 +11849,7 @@ try {
         cleanPath,
         codec,
         sourceCodec,
+        sourceFrameRate,
         crf,
         fps,
         width,
@@ -11731,7 +11860,10 @@ try {
         decoder,
         label,
         onPreparing,
-        onStage
+        onStage,
+        onChild,
+        isCancelled,
+        textVerification: legacyEvents.length ? { events: legacyEvents, options: legacySceneOptions } : null
       });
       onNativePreflight?.(nativePreflight);
       if (nativePreflight.ok) {
@@ -11743,7 +11875,7 @@ try {
     }
     const nativeTimestampedAdmission = nativePreflight?.ok === true;
     const useCudaSceneRenderer = cudaSceneAdmission.ok && (!nativeCandidate || nativeTimestampedAdmission);
-    const nativeDecoderPath = nativeTimestampedAdmission && gpuSceneRenderer?.available && gpuSceneRenderer.helper
+    const nativeDecoderPath = gpuSceneRenderer?.available && gpuSceneRenderer.helper
       ? gpuSceneRenderer.helper
       : '';
     // A concat pass has one timestamp contract.  Native NVMM and I420
@@ -11754,8 +11886,8 @@ try {
     // Native NVMM keeps one media clock for the entire export. The historical
     // 20s loop remains only for the CPU/I420 compatibility path; splitting a
     // timestamped NVDEC stream would make every concat boundary a new clock.
-    const chunkSeconds = nativeTimestampedAdmission ? Math.max(0.001, Number(duration) || 0.001) : 20;
     let nativeTimestampedPass = nativeTimestampedAdmission;
+    let compatibilityPass = !useCudaSceneRenderer;
     let completed = 0;
     try {
       while (completed < duration - 0.001) {
@@ -11767,6 +11899,7 @@ try {
         const index = chunkPaths.length;
         const chunkStart = startTime + completed;
         const graphChunkStart = Math.max(0, Number(graph?.timeline?.start) || 0) + completed;
+        const chunkSeconds = nativeTimestampedPass && !compatibilityPass ? duration : 20;
         const chunkDuration = Math.min(chunkSeconds, duration - completed);
         const chunkLeadingVideoPaddingSec = index === 0 ? Math.min(leadingVideoPaddingSec, chunkDuration) : 0;
         const chunkGraph = clipSceneGraph(graph, graphChunkStart, graphChunkStart + chunkDuration, { shiftTime: true });
@@ -11782,7 +11915,7 @@ try {
         // uses the same matroskamux contract so concat never reconstructs a
         // clock from a rounded fps or a bare elementary stream.
         const encodedVideoPath = `${chunkPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.mkv`;
-        const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+        const legacyAssPath = nativeTimestampedChunk ? '' : await this.writeLegacySceneCompatibilityAss(
           path.join(temporaryDir, `scene-chunk-${String(index).padStart(4, '0')}.legacy.ass`),
           legacyEvents,
           {
@@ -11792,10 +11925,10 @@ try {
             shiftTime: true
           }
         );
-        onStage?.(nativeTimestampedAdmission
+        onStage?.(nativeTimestampedChunk
           ? `正在连续合成 CUDA Scene Graph（${chunkGraph.objects.length} 个对象）`
           : `正在直接合成 Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
-        const sceneLayer = await writeSceneFilterScript(scriptPath, chunkGraph, {
+        const sceneLayer = nativeTimestampedChunk ? { filterScriptPath: '' } : await writeSceneFilterScript(scriptPath, chunkGraph, {
           duration: chunkDuration,
           outputDuration: chunkDuration,
           leadingVideoPaddingSec: chunkLeadingVideoPaddingSec,
@@ -11826,6 +11959,7 @@ try {
             ? {
                 cleanPath,
                 sourceCodec,
+                sourceFrameRate,
                 filterScriptPath: sceneLayer.filterScriptPath,
                 startTime: chunkStart,
                 duration: chunkDuration,
@@ -11847,9 +11981,9 @@ try {
             }
             if (!nativeRenderingReported && Number(localSeconds) > 0.001) {
               nativeRenderingReported = true;
-              onStage?.(nativeTimestampedAdmission
+              onStage?.(nativeTimestampedChunk
                 ? `正在连续合成 CUDA Scene Graph（${chunkGraph.objects.length} 个对象）`
-                : `正在直接合成 CUDA Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
+                : `正在直接合成 ${compatibilityPass ? 'CPU' : 'CUDA'} Scene Graph 分段 ${index + 1}（${chunkGraph.objects.length} 个对象）`);
             }
             onProgress?.(Math.min(duration, completed + Math.max(0, Number(localSeconds) || 0)));
           },
@@ -11873,6 +12007,7 @@ try {
             }
           },
           beforeRetry: () => fsp.rm(chunkPath, { force: true }).catch(() => {}),
+          isCancelled,
           label: `${label} 分段 ${index + 1}`
         };
         const createCpuRawArgs = (nextDecoder) => createBurnRawVideoArgs({
@@ -11880,9 +12015,9 @@ try {
           startTime: chunkStart, duration: chunkDuration, inputSeek: true, timelineOffset: 0,
           leadingVideoPaddingSec: 0, decoder: nextDecoder, sourceCodec, videoWidth: width, videoHeight: height
         });
-        if (!useCudaSceneRenderer) {
-            onPhase?.('render');
-            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+        if (compatibilityPass) {
+          onPhase?.('render');
+          await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
         } else {
           try {
             onPhase?.('render');
@@ -11913,15 +12048,23 @@ try {
             if (decision === 'abort') {
               throw createCommittedJetsonNativeRuntimeError(formalNativeMediaSeconds, error);
             }
-            onStderr?.(`CUDA Scene 分段 ${index + 1} 失败，回退兼容链：${compactLogLine(error.message)}`);
+            this.log('warn', `CUDA Scene 分段 ${index + 1} 失败，切换不超过20秒的兼容分段：${compactLogLine(error.message)}`);
+            await this.persistExportDiagnosticFailure({
+              decoder, encoder: codec, preflight: nativePreflight,
+              scene: { startTime: chunkStart, duration: chunkDuration },
+              fallback: { decision: 'early-cpu-fallback', processedMediaSeconds: formalNativeMediaSeconds }
+            }, error).catch(() => {});
             // The fallback still uses the CPU/I420 renderer, but its GStreamer
             // output is also Matroska. It must not be judged by the native
             // NVMM PTS coverage gate below. This is only allowed during the
             // first five seconds of a preflight-committed native run.
             nativeTimestampedChunk = false;
             nativeTimestampedPass = false;
+            compatibilityPass = true;
             onPhase?.('render', { force: true });
-            await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
+            // Rebuild this window with the compatibility duration and filter
+            // budget; never feed an entire native-length chunk to CPU Scene.
+            continue;
           }
         }
         if ((await getFileSize(chunkPath)) < 1024) throw new Error(`Scene Graph 分段 ${index + 1} 未产生有效视频。`);
@@ -11996,6 +12139,7 @@ try {
     onPhase,
     beforeRetry,
     onFallback,
+    isCancelled,
     label = 'Jetson CUDA Scene Graph 烧录'
   } = {}) {
     const renderer = this.ffmpegCapabilities?.sceneGpuRenderer;
@@ -12029,8 +12173,11 @@ try {
       // container average includes missing frames/edit-list gaps; prefer its
       // rational frame clock so long exports do not accumulate overlay drift.
       if (nativeDecode.decoderPath) {
-        const sourceMedia = await probeMediaFileInfo(this.ffmpegPath, cleanPath);
-        request.input.sourceFrameRate = String(sourceMedia.videoInfo?.rFrameRate || '');
+        request.input.sourceFrameRate = String(nativeDecode.sourceFrameRate || '');
+        if (!request.input.sourceFrameRate) {
+          const sourceMedia = await probeMediaFileInfo(this.ffmpegPath, cleanPath);
+          request.input.sourceFrameRate = String(sourceMedia.videoInfo?.rFrameRate || '');
+        }
       }
     }
     await fsp.writeFile(requestPath, JSON.stringify(request), 'utf8');
@@ -12054,6 +12201,7 @@ try {
       if (useNativeDecode) {
         if (renderer.nativeNvmmScene) {
           let nativeStdoutRemainder = '';
+          let nativeAttemptMediaSeconds = 0;
           const consumeNativeReportLine = (line) => {
             let parsed;
             try {
@@ -12063,6 +12211,7 @@ try {
             }
             if (parsed?.nativeNvmmProgress && typeof parsed.nativeNvmmProgress === 'object') {
               const metrics = parsed.nativeNvmmProgress;
+              nativeAttemptMediaSeconds = Math.max(nativeAttemptMediaSeconds, Number(metrics.mediaSeconds) || 0);
               onProgress?.(Math.max(0, Math.min(Number(nativeDecode?.duration || duration) || duration, Number(metrics.mediaSeconds) || 0)));
               onStageMetrics?.({
                 decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total), pipelineFps: Number(metrics.pipelineFps),
@@ -12074,6 +12223,8 @@ try {
           };
           const runNativeHelper = () => runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
             timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024,
+            onChild,
+            env: { ...process.env, TMPDIR: path.dirname(encodedVideoPath) },
             onStdout: (chunk) => {
               nativeStdoutRemainder += chunk;
               const lines = nativeStdoutRemainder.split(/\r?\n/);
@@ -12082,26 +12233,42 @@ try {
             }
           });
           let nativeResult = await runNativeHelper();
+          const throwIfCancelled = () => {
+            if (!isCancelled?.()) return;
+            const error = new Error('导出已取消。');
+            error.code = 'BR2K_MEDIA_CANCELLED';
+            throw error;
+          };
+          throwIfCancelled();
           const nativeFailureText = String(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '');
-          // JetPack occasionally refuses a fresh nvivafilter/NVENC context
-          // after many short helper processes with an Argus connection error.
-          // Retry the same timestamped chunk once; it is safe because no
-          // concat state has been committed yet.  Do not downgrade this chunk
-          // to a different timestamp contract after earlier native chunks.
-          if ((nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) &&
-              /(?:\bArgus\b|NvBuf|resource busy|connecting to.*daemon)/i.test(nativeFailureText)) {
+          if (nativeStdoutRemainder) consumeNativeReportLine(nativeStdoutRemainder);
+          // Argus warnings also occur on successful exports. Only explicit
+          // context startup errors, before any media progress, allow one retry.
+          if ((nativeResult.status !== 0 || nativeResult.error) && !nativeResult.timedOut &&
+              nativeAttemptMediaSeconds === 0 &&
+              /(?:resource busy|failed to (?:create|initialize).*(?:context|decoder|encoder))/i.test(nativeFailureText)) {
             this.log('warn', `${label} 的原生 NVMM 上下文启动异常，正在原链路重试一次。`);
             nativeStdoutRemainder = '';
             await fsp.rm(encodedVideoPath, { force: true }).catch(() => {});
             await new Promise((resolve) => setTimeout(resolve, 750));
+            throwIfCancelled();
             nativeResult = await runNativeHelper();
+            throwIfCancelled();
           }
           if (nativeStdoutRemainder) consumeNativeReportLine(nativeStdoutRemainder);
           if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut) {
-            const nativeDiagnostic = compactLogLine(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。');
+            const nativeDiagnostic = redactSensitive(String(nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。')).replace(/\s+/g, ' ').trim().slice(-900);
             onStderr?.(`原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
             this.log('warn', `${label}：原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
-            throw new Error(nativeDiagnostic);
+            const nativeError = new Error(nativeDiagnostic);
+            nativeError.code = 'BR2K_JETSON_NATIVE_SCENE_FAILED';
+            nativeError.nativeFailure = {
+              exitCode: nativeResult.status, signal: nativeResult.signal, timedOut: nativeResult.timedOut,
+              processedMediaSeconds: nativeAttemptMediaSeconds,
+              stderrTail: redactSensitive(nativeResult.stderr || '').slice(-1000),
+              stdoutTail: redactSensitive(nativeResult.stdout || '').slice(-1000)
+            };
+            throw nativeError;
           }
           let metrics = null;
           for (const line of String(nativeResult.stdout || '').trim().split(/\r?\n/).reverse()) {
@@ -12212,6 +12379,7 @@ try {
     throwIfExportCancelled
   }) {
     let sceneDirectory = '';
+    let preserveCompletedOutput = false;
     const sceneFontFallbackWarnings = new Map();
     let flushSceneFontFallbackWarnings = () => {};
     const diagnosticContext = {
@@ -12234,6 +12402,17 @@ try {
       await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
       throwIfExportCancelled();
       sceneDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-export-scene-'));
+      // Native intermediates are local even when the destination is SMB. The
+      // encoder uses 15 Mbps; reserve intermediates plus the muxed output.
+      const localEstimate = Math.max(estimatedExportBytes, Math.ceil(duration * 15000000 / 8));
+      if (isJetsonGstreamerCodec(burnCodec)) {
+        await assertDiskSpace(sceneDirectory, { estimatedBytes: localEstimate * 2 });
+      }
+      if (isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)))) {
+        await assertDiskSpace(sceneDirectory, { estimatedBytes: localEstimate * 2 });
+        temporaryOutputPath = path.join(sceneDirectory, `completed.${outputContainer}`);
+        this.log('info', '共享盘导出：先在本地完成封装和验证，再发布成片；发布失败会保留本地成片。');
+      }
       setExportPhase?.('prepare', { stageLabel: '正在准备 Scene Graph' });
       setExportStage('正在从 Scene Graph 直接合成');
       const sceneResult = await this.buildSceneGraphForRecording(recording, {
@@ -12277,7 +12456,7 @@ try {
           isCancelled: () => this.exportCancelRequested
         });
       } else {
-        const legacyAssPath = await this.writeLegacySceneCompatibilityAss(
+        const createLegacyAss = () => this.writeLegacySceneCompatibilityAss(
           path.join(sceneDirectory, 'scene.legacy.ass'),
           sceneResult.events,
           {
@@ -12297,9 +12476,11 @@ try {
         // Graph composition bounded; every source frame is still composed and
         // hardware-encoded exactly once, then the encoded chunks are copied.
         const useChunkedJetsonScene = isJetsonGstreamerCodec(burnCodec) && graph.objects.length > 1200;
-        const sceneLayer = useChunkedJetsonScene
-          ? null
-          : await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
+        let sceneLayer = null;
+        const ensureCpuSceneLayer = async () => {
+          if (sceneLayer) return sceneLayer;
+          const legacyAssPath = await createLegacyAss();
+          sceneLayer = await writeSceneFilterScript(path.join(sceneDirectory, 'scene.filter'), graph, {
               duration,
               outputDuration: duration,
               leadingVideoPaddingSec: burnTimeline.videoPaddingSec,
@@ -12307,6 +12488,8 @@ try {
               target,
               legacyAssPath
             });
+          return sceneLayer;
+        };
         const cudaSceneAdmission = canUseCudaSceneProduction(
           this.ffmpegCapabilities?.sceneGpuRenderer,
           this.ffmpegCapabilities?.sceneGpuVisualConformance
@@ -12366,10 +12549,11 @@ try {
             this.emitState('mediaJob');
           }
           if (foldSceneFontFallbackWarning(line)) return;
-          if (/error|failed|invalid/i.test(line)) this.log('warn', 'Scene Graph 导出：' + compactLogLine(line));
+          if (/error|failed|invalid|失败|超时|回退|未通过/i.test(line)) this.log('warn', 'Scene Graph 导出：' + compactLogLine(line));
         };
         const onChild = (child) => {
           this.exportProcess = child;
+          if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
         };
         const onScenePhase = (phase, options = {}) => {
           if (this.exportProgress?.id !== progress.id || progress.status !== 'running') return;
@@ -12424,6 +12608,7 @@ try {
             cleanPath: recording.cleanPath,
             codec: burnCodec,
             sourceCodec: decoderInfo.codec,
+            sourceFrameRate: mediaInfo.videoInfo?.rFrameRate,
             crf: burnCrf,
             fps,
             width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
@@ -12434,7 +12619,11 @@ try {
             decoder: decoderInfo,
             label: 'Jetson CUDA Scene',
             onPreparing: onScenePreparing,
-            onStage: setExportStage
+            onStage: setExportStage,
+            onChild,
+            isCancelled: () => this.exportCancelRequested,
+            textVerification: { events: sceneResult.events,
+              options: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo } }
           }));
           if (nativePreflight.ok) {
             this.log('info', `Jetson CUDA Scene真实源预检通过：${nativePreflight.durationSec.toFixed(2)}s，${Number(nativePreflight.metrics?.pipelineFps || 0).toFixed(1)}fps，PTS bridge通过；正式导出使用连续NVMM链路。`);
@@ -12452,6 +12641,7 @@ try {
               graph, cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, codec: burnCodec, crf: burnCrf,
               fps, width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
               height: recording.videoInfo?.height || mediaInfo.videoInfo?.height, sourceCodec: decoderInfo.codec,
+              sourceFrameRate: mediaInfo.videoInfo?.rFrameRate,
               startTime, duration, outputContainer, includeAudio: Boolean(mediaInfo.audioInfo), copyAudio: copySourceAudio,
               leadingVideoPaddingSec: burnTimeline.videoPaddingSec, leadingAudioPaddingSec: burnTimeline.audioPaddingSec,
               decoder: decoderInfo, temporaryDir: sceneDirectory, onStderr, onChild,
@@ -12503,7 +12693,8 @@ try {
                 ? {
                     cleanPath: recording.cleanPath,
                     sourceCodec: decoderInfo.codec,
-                    filterScriptPath: sceneLayer.filterScriptPath,
+                    sourceFrameRate: mediaInfo.videoInfo?.rFrameRate,
+                    filterScriptPath: sceneLayer?.filterScriptPath || '',
                     startTime,
                     duration,
                     decoderPath: nativeDecoderPath
@@ -12535,6 +12726,7 @@ try {
                 if (this.exportProgress?.id === progress.id && setFfmpegJobStageFps(progress, metrics)) this.emitState('mediaJob');
               },
               beforeRetry: () => fsp.rm(temporaryOutputPath, { force: true }).catch(() => {}),
+              isCancelled: () => this.exportCancelRequested,
               onFallback: onDecoderFallback,
               label: 'Jetson Scene Graph 烧录'
             };
@@ -12555,6 +12747,7 @@ try {
                 videoHeight: common.height
               });
             if (!useCudaSceneRenderer) {
+              await ensureCpuSceneLayer();
               await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
             } else {
               try {
@@ -12598,8 +12791,12 @@ try {
                   'warn',
                   `CUDA Scene Graph 在正式处理 ${nonChunkedFormalNativeMediaSeconds.toFixed(1)}s 后失败，仍处于允许早期回退窗口，切换兼容 Scene filter：${compactLogLine(error.message)}`
                 );
+                diagnosticContext.fallback = { decision: 'early-cpu-fallback', processedMediaSeconds: nonChunkedFormalNativeMediaSeconds };
+                await this.persistExportDiagnosticFailure(diagnosticContext, error).catch(() => {});
                 progress.avatarCompositeBackend = 'Scene Graph 直接合成（CPU 回退）';
                 setExportPhase?.('render', { force: true, stageLabel: '正在使用兼容 Scene filter 重新渲染' });
+                await ensureCpuSceneLayer();
+                if (common.nativeDecode) common.nativeDecode.filterScriptPath = sceneLayer.filterScriptPath;
                 await this.runJetsonGstreamerTranscode({ ...common, createRawArgs: createCpuRawArgs });
               }
             }
@@ -12613,7 +12810,17 @@ try {
       if (!exportedMediaInfo.videoInfo || (await getFileSize(temporaryOutputPath)) < 32 * 1024) {
         throw new Error('Scene Graph 导出临时输出未通过视频流与文件大小验证。');
       }
-      await atomicReplaceFile(temporaryOutputPath, outputPath);
+      try {
+        await atomicReplaceFile(temporaryOutputPath, outputPath, { isCancelled: () => this.exportCancelRequested });
+      } catch (error) {
+        if (!this.exportCancelRequested && temporaryOutputPath.startsWith(sceneDirectory + path.sep)) {
+          preserveCompletedOutput = true;
+          error.completedOutputPath = temporaryOutputPath;
+          this.log('error', `成片发布失败，本地已验证成片保留在 ${temporaryOutputPath}，无需重新渲染：${error.message}`);
+          diagnosticContext.completedOutputPath = temporaryOutputPath;
+        }
+        throw error;
+      }
       if (this.exportProgress?.id === progress.id) {
         finishFfmpegJobProgress(this.exportProgress, 'completed', 'Scene Graph 片段已导出');
         this.emitState('mediaJob');
@@ -12649,7 +12856,7 @@ try {
               ? 'abort-after-commit'
               : 'native-failure'
           }
-        }).catch((diagnosticError) => {
+        }, error).catch((diagnosticError) => {
           this.log('warn', `保存导出失败诊断报告失败：${diagnosticError.message}`);
         });
       }
@@ -12657,8 +12864,10 @@ try {
       return { ok: false, mode: 'burn', cleanPath: recording.cleanPath };
     } finally {
       flushSceneFontFallbackWarnings?.(true);
-      await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
-      if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
+      if (!preserveCompletedOutput) {
+        await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+        if (sceneDirectory) await fsp.rm(sceneDirectory, { recursive: true, force: true }).catch(() => {});
+      }
       if (this.exportProgress?.id === progress.id) {
         this.exportProcess = null;
         this.exportCancelRequested = false;
@@ -13176,6 +13385,12 @@ try {
 
   async cancelExportClip() {
     this.exportCancelRequested = true;
+    if (this.activeExportQueueItem) {
+      this.cancelledExportQueueIds.add(this.activeExportQueueItem.id);
+      if (this.mediaJobs.snapshot().some(job => job.id === this.activeExportQueueItem.id && job.status === 'queued')) {
+        this.mediaJobs.cancel(this.activeExportQueueItem.id);
+      }
+    }
     if (this.exportProgress?.status === 'running') {
       this.exportProgress.message = this.exportProcess ? '正在中断导出' : '正在取消准备中的导出';
       this.exportProgress.updatedAt = Date.now();

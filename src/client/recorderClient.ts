@@ -50,6 +50,7 @@ export const recorder: RecorderApi = {
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
   cancelMerge: (roomId) => api<AppState>('/api/rooms/merge/cancel', { roomId }),
   retryMerge: (roomId) => api<AppState>('/api/rooms/merge/retry', { roomId }),
+  mergeRecordings: (cleanPaths) => api<AppState>('/api/recordings/merge', { cleanPaths }),
   startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }, { timeoutMs: 120000 }),
   startExportPreview: (request) => api('/api/export/preview/start', request, { timeoutMs: 0 }),
   cancelExportPreview: () => api<AppState>('/api/export/preview/cancel', {}),

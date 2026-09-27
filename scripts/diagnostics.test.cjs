@@ -40,3 +40,15 @@ test('diagnostic reports omit sensitive values and preserve useful failure code'
   assert.equal(sanitizeDiagnosticReport({ password: 'secret' }).password, '[redacted]');
 });
 
+test('export diagnostic retains native exit details and the late error cause', () => {
+  const cause = Object.assign(new Error('PTS coverage insufficient'), { code: 'BR2K_JETSON_NATIVE_SCENE_FAILED' });
+  const report = buildExportDiagnosticReport({}, Object.assign(new Error('native stopped after 35s'), {
+    cause, code: 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT', processedMediaSeconds: 35,
+    nativeFailure: { exitCode: 1, timedOut: false, stderrTail: '实际末尾错误', password: 'secret' }
+  }));
+  assert.equal(report.lastError.nativeFailure.exitCode, 1);
+  assert.equal(report.lastError.nativeFailure.stderrTail, '实际末尾错误');
+  assert.equal(report.lastError.cause.code, cause.code);
+  assert.doesNotMatch(JSON.stringify(report), /secret/);
+});
+

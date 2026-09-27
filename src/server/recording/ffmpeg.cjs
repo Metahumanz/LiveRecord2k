@@ -2389,11 +2389,17 @@ function selectHighestResolutionVideoInfo(mediaInfos) {
     }
     return Number(candidate.height) > Number(best.height) ? candidate : best;
   });
+  const [rateNumerator, rateDenominator] = String(highestResolution.rFrameRate || '').split('/').map(Number);
+  const sourceRate = rateDenominator > 0 ? rateNumerator / rateDenominator : 0;
+  // Container averages such as 60.0017 are not a new encoder frame clock.
+  // Jetson treats >60 caps as unsupported and silently encodes at 30 instead.
+  const frameRate = sourceRate > 0 && Math.abs(sourceRate - Number(highestResolution.fps)) < 0.01
+    ? sourceRate : highestResolution.fps;
   return {
     ...highestResolution,
     width: makeEvenDimension(highestResolution.width),
     height: makeEvenDimension(highestResolution.height),
-    fps: highestResolution.fps
+    fps: frameRate
   };
 }
 

@@ -12,6 +12,20 @@
   align-self: start;
 }
 
+.manual-merge-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.manual-merge-actions p {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted, #9fb6b2);
+}
+
 .export-result-panel {
   grid-column: 1 / -1;
 }

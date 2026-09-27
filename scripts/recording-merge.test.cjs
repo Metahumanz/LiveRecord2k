@@ -195,6 +195,13 @@ test('mixed segment specifications select the highest resolution and require tra
   );
 });
 
+test('merge normalization retains the source rational clock when the container average is just above 60', () => {
+  const target = selectHighestResolutionVideoInfo([{ videoInfo: {
+    width: 2560, height: 1440, fps: 60.001667, rFrameRate: '60/1'
+  } }]);
+  assert.equal(target.fps, 60);
+});
+
 test('旧版 FFmpeg 兼容缩放不依赖 force_divisible_by，并保持偶数输出尺寸', async () => {
   const scaleFilter = createBoundedEvenScaleFilter(1280, 720);
   assert.equal(

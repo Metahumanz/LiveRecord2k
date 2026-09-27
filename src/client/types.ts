@@ -413,6 +413,9 @@ export type AvatarPreparationDiagnostics = {
 };
 
 export type FfmpegJobProgress = {
+  mergeGroup?: string;
+  manual?: boolean;
+  sourcePaths?: string[];
   id: string;
   kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
   status: 'queued' | 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
@@ -619,6 +622,7 @@ export type RecorderApi = {
   stopRecording: (roomId: string) => Promise<AppState>;
   cancelMerge: (roomId: string) => Promise<AppState>;
   retryMerge: (roomId: string) => Promise<AppState>;
+  mergeRecordings: (cleanPaths: string[]) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
   startExportPreview: (request: { cleanPath: string }) => Promise<ExportPreviewResult>;
   cancelExportPreview: () => Promise<AppState>;
