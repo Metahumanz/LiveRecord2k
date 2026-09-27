@@ -2,7 +2,8 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { readDanmakuEvents, getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
+const readline = require('node:readline');
+const { getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -2548,19 +2549,49 @@ function escapeConcatPath(filePath) {
   return String(filePath).replace(/\\/g, '/').replace(/'/g, "'\\''");
 }
 
-async function mergeDanmakuFiles(segments, outputPath) {
-  const lines = [];
+async function mergeDanmakuFiles(segments, outputPath, options = {}) {
+  const sizes = await Promise.all(segments.map(segment => segment.danmakuPath
+    ? fsp.stat(segment.danmakuPath).then(stat => stat.size).catch(error => {
+      if (error.code === 'ENOENT') return 0;
+      throw error;
+    }) : 0));
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  const output = await fsp.open(outputPath, 'w');
+  let completed = 0;
+  let eventCount = 0;
   let offset = 0;
-  for (let index = 0; index < segments.length; index += 1) {
-    const segment = segments[index];
-    const events = await readDanmakuEvents(segment.danmakuPath);
-    for (const event of events) {
-      const videoTime = Math.max(0, getDanmakuEventVideoTime(event) + offset);
-      lines.push(JSON.stringify({ ...event, videoTime, time: videoTime }));
+  try {
+    options.onProgress?.({ completed, total, unit: 'bytes', eventCount });
+    for (let index = 0; index < segments.length; index += 1) {
+      options.signal?.throwIfAborted();
+      const segment = segments[index];
+      if (segment.danmakuPath && sizes[index] > 0) {
+        const input = fs.createReadStream(segment.danmakuPath, { encoding: 'utf8', signal: options.signal });
+        const lines = readline.createInterface({ input, crlfDelay: Infinity });
+        let batch = [];
+        try {
+          for await (const line of lines) {
+            options.signal?.throwIfAborted();
+            let event;
+            try { event = JSON.parse(line); } catch { continue; }
+            const videoTime = Math.max(0, getDanmakuEventVideoTime(event) + offset);
+            batch.push(JSON.stringify({ ...event, videoTime, time: videoTime }));
+            eventCount += 1;
+            if (batch.length >= 256) {
+              await output.writeFile(`${batch.join('\n')}\n`, 'utf8');
+              batch = [];
+              options.onProgress?.({ completed: completed + Math.min(input.bytesRead, sizes[index]), total,
+                unit: 'bytes', eventCount });
+            }
+          }
+          if (batch.length) await output.writeFile(`${batch.join('\n')}\n`, 'utf8');
+        } finally { lines.close(); input.destroy(); }
+      }
+      completed += sizes[index];
+      options.onProgress?.({ completed, total, unit: 'bytes', eventCount });
+      offset += getSegmentDurationForMerge(segment, segments[index + 1]);
     }
-    offset += getSegmentDurationForMerge(segment, segments[index + 1]);
-  }
-  await fsp.writeFile(outputPath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+  } finally { await output.close(); }
 }
 
 function getSegmentDurationForMerge(segment, nextSegment) {

@@ -1,5 +1,30 @@
-import { CircleAlert, ListChecks, Merge, X } from 'lucide-react';
+import { CircleAlert, ListChecks, Merge, X, Square, RotateCcw } from 'lucide-react';
 import type { RecordingState, RoomState } from '../types';
+import { JobProgress } from './common';
+
+export function ManualMergeProgress({ rooms, busy, onCancel, onRetry }: {
+  rooms: RoomState[];
+  busy: Set<string>;
+  onCancel: (roomId: string, jobId: string) => void;
+  onRetry: (roomId: string) => void;
+}) {
+  return <>{rooms.filter(room => room.mergeProgress && (room.mergeProgress.manual ||
+    ['queued', 'running', 'retrying'].includes(room.mergeProgress.status))).map(room => {
+    const progress = room.mergeProgress!;
+    const active = ['queued', 'running', 'retrying'].includes(progress.status);
+    return <div key={room.id} className="manual-merge-hint">
+      <p className="field-help">{room.anchor || room.title || room.id} · 房间号 {room.id}</p>
+      <JobProgress progress={progress} />
+      {active ? <button type="button" className="wide-button danger fill"
+        disabled={busy.has(`cancel-merge-${room.id}`)} onClick={() => onCancel(room.id, progress.id)}>
+        <Square size={18} />中断合并
+      </button> : ['error', 'cancelled'].includes(progress.status) ? <button type="button" className="wide-button fill"
+        disabled={busy.has(`retry-merge-${room.id}`)} onClick={() => onRetry(room.id)}>
+        <RotateCcw size={18} />重试合并
+      </button> : null}
+    </div>;
+  })}</>;
+}
 
 export function getManualMergeSelection(recordings: RecordingState[], paths: string[], rooms: RoomState[]) {
   const selected = recordings.filter(recording => paths.includes(recording.cleanPath))
@@ -44,7 +69,7 @@ export function ManualMergeControls({ selecting, count, reason, busy, onToggle, 
     {selecting ? reason && count >= 2 ? <div className="warning-line manual-merge-hint" role="status">
       <CircleAlert size={16} /><span>{reason}</span>
     </div> : <p className="field-help manual-merge-hint" role="status">
-      {reason || '按录制时间先后合并，保留源文件；进度显示在对应房间卡片。'}
+      {reason || '按录制时间先后合并，保留源文件；进度显示在本页和对应直播间卡片。'}
     </p> : null}
   </>;
 }

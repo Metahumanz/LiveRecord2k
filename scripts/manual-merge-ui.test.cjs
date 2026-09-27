@@ -12,7 +12,7 @@ compiled.paths = module.paths;
 compiled._compile(buildSync({ entryPoints: [path.join(__dirname, '../src/client/components/ManualMergeControls.tsx')],
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/jsx-runtime', 'lucide-react'], write: false
 }).outputFiles[0].text, filename);
-const { getManualMergeSelection, ManualMergeControls } = compiled.exports;
+const { getManualMergeSelection, ManualMergeControls, ManualMergeProgress } = compiled.exports;
 const rooms = [{ id: '883263', realRoomId: 883263, shortId: 123, recording: false }];
 const rows = [{ cleanPath: 'later', roomId: '883263', startedAt: 2, valid: true },
   { cleanPath: 'earlier', roomId: 883263, startedAt: 1, valid: true }];
@@ -23,6 +23,27 @@ progressModule._compile(buildSync({ entryPoints: [path.join(__dirname, '../src/c
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/jsx-runtime', 'lucide-react'], write: false
 }).outputFiles[0].text, filename);
 const { JobProgress } = progressModule.exports;
+
+test('export merge panel retains live progress, completion and job-scoped cancellation in the existing style', () => {
+  const progress = { kind: 'merge', id: 'current-job', manual: true, status: 'running', phase: 'verify',
+    stageLabel: '正在合并弹幕记录', message: '正在合并弹幕记录', phasePercent: 50,
+    stageProgress: { completed: 1048576, total: 2097152, unit: 'bytes', eventCount: 256 } };
+  const props = { rooms: [{ ...rooms[0], mergeProgress: progress }], busy: new Set(), onCancel() {}, onRetry() {} };
+  const html = renderToStaticMarkup(React.createElement(ManualMergeProgress, props));
+  assert.match(html, /合并弹幕记录 50%/); assert.match(html, /1.00 \/ 2.00 MB/);
+  assert.match(html, /256 条弹幕/); assert.match(html, /wide-button danger fill/);
+  assert.doesNotMatch(html, /正在验证输出|indeterminate|检查合并结果与音画时间轴/);
+  let cancelled;
+  const card = ManualMergeProgress({ ...props, onCancel: (...args) => { cancelled = args; } }).props.children[0];
+  card.props.children[2].props.onClick();
+  assert.deepEqual(cancelled, ['883263', 'current-job']);
+  const avatar = renderToStaticMarkup(React.createElement(JobProgress, { progress: { ...progress,
+    stageLabel: '正在合并头像文件', stageProgress: { completed: 12, total: 24, unit: 'items' } } }));
+  assert.match(avatar, /合并头像文件 50%/); assert.match(avatar, /12 \/ 24 条头像记录/);
+  const done = renderToStaticMarkup(React.createElement(ManualMergeProgress, { ...props,
+    rooms: [{ ...rooms[0], mergeProgress: { ...progress, status: 'completed' } }] }));
+  assert.match(done, /完成/); assert.doesNotMatch(done, /中断合并/);
+});
 
 test('merge progress renders its true media progress with the existing visual classes', () => {
   const progress = { kind: 'merge', status: 'running', id: 'job', label: 'very-long-uuid.merged.mp4', manual: true,

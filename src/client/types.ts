@@ -465,6 +465,7 @@ export type FfmpegJobProgress = {
   realtimeFactor?: number | null;
   stageLabel?: string;
   stageStartedAt?: number;
+  stageProgress?: { completed: number; total: number; unit: 'bytes' | 'items' | 'files'; eventCount?: number } | null;
   percent?: number | null;
   message?: string;
 };

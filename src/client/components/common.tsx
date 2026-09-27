@@ -133,6 +133,7 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
 
 export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const isMerge = progress.kind === 'merge';
+  const stageProgress = isMerge ? progress.stageProgress : null;
   // Older servers emitted media PTS while leaving phase=prepare. This also
   // allows a UI update to describe an in-flight merge without restarting it.
   const legacyMergeRender = isMerge && progress.status === 'running' && progress.phase === 'prepare' && Boolean(progress.workStartedAt) &&
@@ -145,7 +146,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
     ? progress.phasePercent
     : progress.percent;
   const hasPercent = typeof phasePercentValue === 'number' && Number.isFinite(phasePercentValue);
-  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent || (phase === 'verify' && progress.status === 'running');
+  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent || (phase === 'verify' && progress.status === 'running' && !stageProgress?.total);
   const percent = hasPercent ? clampNumber(phasePercentValue || 0, 0, 100) : 0;
   const phaseCurrentTime = Number(progress.phaseCurrentTimeSec ?? progress.currentTimeSec ?? 0);
   const phaseDuration = Number(legacyMergeRender ? progress.durationSec : progress.phaseDurationSec ?? progress.durationSec ?? 0);
@@ -170,7 +171,9 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const renderFpsLabel = Number.isFinite(renderFps) && renderFps > 0 ? `${isMerge ? '处理' : '渲染'} ${renderFps.toFixed(renderFps >= 10 ? 1 : 2)} fps` : '';
   const realtimeFactor = Number(progress.realtimeFactor);
   const realtimeLabel = Number.isFinite(realtimeFactor) && realtimeFactor > 0 ? `${realtimeFactor.toFixed(2)}×实时` : '';
-  const runningPhaseLabel = phase === 'prepare'
+  const runningPhaseLabel = isMerge && phase === 'verify' && progress.stageLabel
+    ? `${progress.stageLabel.replace(/^正在/, '')}${stageProgress?.total ? ` ${Math.round(percent)}%` : ''}`
+    : phase === 'prepare'
     ? hasPercent ? `准备 ${Math.round(percent)}%` : '准备中'
     : phase === 'mux'
       ? hasPercent ? `${isMerge ? '拼接' : '封装'} ${Math.round(percent)}%` : isMerge ? '正在拼接' : '正在封装'
@@ -193,10 +196,16 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
           : runningPhaseLabel;
   const primaryMessage = legacyMergeRender ? progress.stageLabel || progress.message
     : progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
-  const phaseTimingLabel = isMerge
+  const phaseTimingLabel = stageProgress
+    ? stageProgress.unit === 'bytes'
+      ? `已读取 ${(stageProgress.completed / 1048576).toFixed(2)} / ${(stageProgress.total / 1048576).toFixed(2)} MB${stageProgress.eventCount != null ? ` · ${stageProgress.eventCount} 条弹幕` : ''}`
+      : stageProgress.unit === 'files'
+        ? `已复制 ${stageProgress.completed} / ${stageProgress.total} 个计划头像文件`
+        : `已处理 ${stageProgress.completed} / ${stageProgress.total} 条头像记录（重复头像跳过）`
+    : isMerge
     ? phase === 'render' || phase === 'mux'
       ? `整体已处理 ${formatCompactDuration(phaseCurrentTime)} / ${formatCompactDuration(phaseDuration)}`
-      : phase === 'verify' ? '检查合并结果与音画时间轴' : '检查分段媒体信息与可用空间'
+      : phase === 'verify' ? progress.stageLabel || '检查合并结果与音画时间轴' : '检查分段媒体信息与可用空间'
     : phase === 'prepare'
     ? phaseDuration > 0
       ? `正在预渲染纹理 ${Math.max(0, Math.floor(phaseCurrentTime))}/${Math.max(0, Math.floor(phaseDuration))}`

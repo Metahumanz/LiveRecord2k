@@ -17,7 +17,7 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
-import { getManualMergeSelection, ManualMergeControls } from '../components/ManualMergeControls';
+import { getManualMergeSelection, ManualMergeControls, ManualMergeProgress } from '../components/ManualMergeControls';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
 import {
   burnAvatarModeOptions,
@@ -67,6 +67,7 @@ export function ExportPage({
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [selectingMerge, setSelectingMerge] = useState(false);
+  const [mergeSubmitted, setMergeSubmitted] = useState(false);
   const { selected: mergeRecordings, reason: mergeReason } = getManualMergeSelection(recordings, mergeSelection, state.rooms);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
@@ -388,9 +389,17 @@ export function ExportPage({
             onToggle={() => { setSelectingMerge(!selectingMerge); setMergeSelection([]); }}
             onMerge={async () => {
               if (await run('manual-merge', () => recorder.mergeRecordings(mergeRecordings.map(recording => recording.cleanPath)))) {
+                setMergeSubmitted(true);
                 setMergeSelection([]); setSelectingMerge(false);
               }
             }} />
+
+          {mergeSubmitted ? <p className="field-help manual-merge-hint" role="status">
+            合并任务已提交，进度显示在下方，也可在“直播间”页面查看。合并完成后，成片会自动加入录像列表。
+          </p> : null}
+          <ManualMergeProgress rooms={state.rooms} busy={busy}
+            onCancel={(roomId, jobId) => { void run(`cancel-merge-${roomId}`, () => recorder.cancelMerge(roomId, jobId)); }}
+            onRetry={(roomId) => { void run(`retry-merge-${roomId}`, () => recorder.retryMerge(roomId)); }} />
 
           <div className="recording-list">
             {recordings.length === 0 ? (

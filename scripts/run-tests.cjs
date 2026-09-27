@@ -36,6 +36,7 @@ const GROUPS = {
     'avatar-capture.test.cjs',
     'client-code-splitting.test.cjs',
     'manual-merge-ui.test.cjs',
+    'merge-sidecar-progress.test.cjs',
     'recording-identity.test.cjs',
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',

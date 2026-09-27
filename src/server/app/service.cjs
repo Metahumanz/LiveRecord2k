@@ -6126,9 +6126,10 @@ try {
     return result;
   }
 
-  async mergeAvatarManifests(segments, targetManifestPath) {
+  async mergeAvatarManifests(segments, targetManifestPath, options = {}) {
     const sourceManifests = [];
     for (const segment of segments || []) {
+      options.signal?.throwIfAborted();
       const manifestPath = String(segment?.avatarManifestPath || deriveAvatarManifestPath(segment?.cleanPath || '')).trim();
       const manifest = await this.readAvatarManifestFile(manifestPath);
       if (manifest.present) sourceManifests.push(manifest);
@@ -6141,15 +6142,23 @@ try {
     const mergedByKey = new Map();
     let captureComplete = true;
     let totalBytes = 0;
+    const total = sourceManifests.reduce((sum, manifest) => sum + manifest.entries.length, 0);
+    let completed = 0;
+    options.onProgress?.({ completed, total, unit: 'items' });
     await fsp.rm(targetDirectory, { recursive: true, force: true });
     await fsp.mkdir(targetDirectory, { recursive: true, mode: 0o770 });
     try {
       for (const manifest of sourceManifests) {
         captureComplete = captureComplete && manifest.captureComplete === true;
         for (const sourceEntry of manifest.entries) {
+          options.signal?.throwIfAborted();
+          options.onProgress?.({ completed, total, unit: 'items' });
+          completed += 1;
           const key = sourceEntry.avatarUrl || `uid:${sourceEntry.uid}`;
           const existing = mergedByKey.get(key);
-          if (existing?.filePath && !sourceEntry.filePath) continue;
+          // The first successfully captured entry wins. Later copies of that
+          // avatar cannot change the manifest and only add shared-drive I/O.
+          if (existing?.filePath) continue;
           const mergedEntry = {
             uid: sourceEntry.uid,
             avatarUrl: sourceEntry.avatarUrl,
@@ -6177,6 +6186,8 @@ try {
           if (!existing || (!existing.filePath && mergedEntry.filePath)) mergedByKey.set(key, mergedEntry);
         }
       }
+      options.signal?.throwIfAborted();
+      options.onProgress?.({ completed, total, unit: 'items' });
       const entries = Array.from(mergedByKey.values()).map((entry) => ({
         uid: Number(entry.uid || 0),
         avatarUrl: normalizeBiliAvatarUrl(entry.avatarUrl),
@@ -7697,16 +7708,29 @@ try {
       throw error;
     };
     assertActive();
+    const controller = new AbortController();
     setFfmpegJobPhase(progress, progress.workStartedAt ? 'verify' : 'prepare', { force: true, stageLabel });
     progress.phasePercent = null;
+    progress.stageProgress = null;
     const startedAt = Date.now();
     this.setMergeProgressStage(room, progress, stageLabel, startedAt);
     const heartbeat = setInterval(() => {
+      try { assertActive(); } catch (error) { controller.abort(error); }
       this.setMergeProgressStage(room, progress, stageLabel, startedAt);
     }, MERGE_STAGE_HEARTBEAT_MS);
     heartbeat.unref?.();
     try {
-      const result = await operation();
+      let lastPublishedAt = 0;
+      const result = await operation({ signal: controller.signal, onProgress: (value) => {
+        assertActive();
+        progress.stageProgress = { ...value };
+        progress.phasePercent = value.total > 0 ? Math.min(100, value.completed / value.total * 100) : null;
+        const now = Date.now();
+        if (now - lastPublishedAt >= 500 || value.completed === value.total) {
+          lastPublishedAt = now;
+          this.setMergeProgressStage(room, progress, stageLabel, startedAt);
+        }
+      } });
       assertActive();
       return result;
     } finally {
@@ -8561,19 +8585,24 @@ try {
         this.log('warn', `${roomLabel(room)} 合并后时轴检查失败：${error.message}`);
         throw error;
       }
-      await this.runMergePreparationStage(room, progress, '正在合并弹幕记录', async () => {
-        await mergeDanmakuFiles(segments, danmakuTmpPath);
+      await this.runMergePreparationStage(room, progress, '正在合并弹幕记录', (options) =>
+        mergeDanmakuFiles(segments, danmakuTmpPath, options));
+      await this.runMergePreparationStage(room, progress, '正在整理弹幕样式', async () => {
         await copyFirstExistingFile(
           segments.map((segment) => segment.cssPath).filter(Boolean),
           cssTmpPath,
           createDefaultDanmakuCss()
         );
-        await this.mergeAvatarManifests(segments, avatarManifestPath).catch((error) => {
-          this.log('warn', `${roomLabel(room)} 合并头像记录失败，后续烧录将使用兼容回退：${error.message}`);
-        });
         await Promise.all([fsp.stat(danmakuTmpPath), fsp.stat(cssTmpPath)]);
       });
+      await this.runMergePreparationStage(room, progress, '正在合并头像文件', (options) =>
+        this.mergeAvatarManifests(segments, avatarManifestPath, options).catch((error) => {
+          if (options.signal.aborted || ['MEDIA_JOB_CANCELLED', 'MERGE_PREEMPTED'].includes(error.code)) throw error;
+          this.log('warn', `${roomLabel(room)} 合并头像记录失败，后续烧录将使用兼容回退：${error.message}`);
+        }));
       try {
+        progress.stageProgress = null;
+        progress.phasePercent = null;
         this.setMergeProgressStage(room, progress, '正在写入录像目录，保留源文件');
         if (isStopped()) throw new Error('合并已停止');
         await atomicReplaceFile(tmpPath, outputPath, { isCancelled: () => isStopped() });
