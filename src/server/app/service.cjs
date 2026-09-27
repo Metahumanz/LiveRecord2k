@@ -7186,7 +7186,7 @@ try {
         ...(current || {}),
         ...recording,
         roomId: current?.roomId || recording.roomId,
-        roomTitle: current?.roomTitle || recording.roomTitle,
+        roomTitle: recording.roomTitle || current?.roomTitle,
         anchor: current?.anchor || recording.anchor,
         durationSec: Number(recording.durationSec || current?.durationSec || 0),
         videoInfo: recording.videoInfo || current?.videoInfo
@@ -8618,10 +8618,13 @@ try {
       await fsp.rm(concatPath, { force: true });
 
       const cleanupId = crypto.randomUUID();
+      // A merge may finish days later or after the next broadcast starts.
+      // Its title belongs to the earliest source, never the live room state.
+      const sourceTitle = segments.map(segment => inferRecordingIdentity(segment).roomTitle).find(Boolean) || '';
       const mergedRecording = this.normalizeRecording({
         id: `${outputPath}:${Date.now()}`,
         roomId: room.id,
-        roomTitle: room.title || '',
+        roomTitle: sourceTitle,
         anchor: room.anchor || '',
         startedAt: segments[0].startedAt,
         liveSessionId: segments[0].liveSessionId || '',

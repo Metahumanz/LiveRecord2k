@@ -216,7 +216,7 @@ test('manual selection merges complete segments chronologically and preserves so
   const app = createMergeTestService();
   app.ffmpegPath = ffmpegPath;
   app.settings.outputDir = dir;
-  const room = { id: '883263', title: 'Manual', recording: false };
+  const room = { id: '883263', title: '今天的直播标题', recording: false };
   app.rooms.set(room.id, room);
   for (let index = 0; index < 2; index++) {
     const cleanPath = path.join(dir, `883263_真栗_20260926_22275${index + 3}.clean.mp4`);
@@ -228,6 +228,7 @@ test('manual selection merges complete segments chronologically and preserves so
     const danmakuPath = path.join(dir, `${index}.danmaku.jsonl`);
     await fsp.writeFile(danmakuPath, JSON.stringify({ type: 'danmaku', time: 0.2, text: `分段${index}`, uid: index }) + '\n');
     app.recordings.push({ cleanPath, danmakuPath, roomId: '', startedAt: index + 1,
+      roomTitle: index === 0 ? '录制时的原始标题' : '同场后来修改的标题',
       durationSec: 1, segmentTargetDurationSec: 1, valid: true, eventCount: 1 });
   }
   const original = [...app.recordings];
@@ -237,12 +238,15 @@ test('manual selection merges complete segments chronologically and preserves so
   assert.ok(task);
   const merged = await task;
   assert.deepEqual(merged.mergedFrom, original.map(row => row.cleanPath));
+  assert.equal(merged.roomTitle, '录制时的原始标题');
+  assert.equal(room.title, '今天的直播标题');
   assert.ok((await probeMediaFileInfo(ffmpegPath, merged.cleanPath)).videoInfo);
   assert.equal(app.recordings.length, 3);
   for (const row of original) assert.ok((await fsp.stat(row.cleanPath)).size > 0);
   assert.equal(app.pendingSegmentCleanups.size, 0);
   const rescanned = await discoverRecordingFiles(dir, { ffmpegPath });
   assert.ok(rescanned.some(row => row.cleanPath === merged.cleanPath), 'manual output disappeared after refreshing the library');
+  assert.equal(rescanned.find(row => row.cleanPath === merged.cleanPath).roomTitle, '录制时的原始标题');
   const events = (await fsp.readFile(merged.danmakuPath, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(events.length, 2);
   assert.ok(events[1].time > events[0].time);

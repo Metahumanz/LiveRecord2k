@@ -54,3 +54,20 @@ test('library discovery restores missing room fields without rewriting videos or
   assert.deepEqual(await fs.readFile(cleanPath), bytes);
   assert.equal(await fs.readFile(metadataPath, 'utf8'), metadata);
 });
+
+test('refresh prefers the recorded title over a stale cached merge title without changing live room title', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-title-refresh-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const cleanPath = path.join(directory, '883263_真栗_20260912_214923.merged.mp4');
+  await fs.writeFile(cleanPath, Buffer.alloc(64 * 1024, 7));
+  const stat = await fs.stat(cleanPath);
+  await fs.writeFile(cleanPath + '.metadata.json', JSON.stringify({ schemaVersion: 2, fileSize: stat.size,
+    fileMtimeMs: stat.mtimeMs, roomId: '883263', roomTitle: '进来不许咕咕嘎嘎', durationSec: 37, eventCount: 0 }));
+  const app = new LiveRecordService(); app.settings.outputDir = directory;
+  app.rooms.set('883263', { id: '883263', title: '真栗提到了你' });
+  app.recordings = [{ cleanPath, roomId: '883263', roomTitle: '真栗提到了你', valid: true }];
+  app.saveStore = async () => {}; app.emitState = () => {}; app.log = () => {};
+  await app.performRecordingLibraryRefresh({ silent: true });
+  assert.equal(app.recordings[0].roomTitle, '进来不许咕咕嘎嘎');
+  assert.equal(app.rooms.get('883263').title, '真栗提到了你');
+});
