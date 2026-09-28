@@ -12763,7 +12763,16 @@ try {
             if (parsed?.nativeNvmmProgress && typeof parsed.nativeNvmmProgress === 'object') {
               const metrics = parsed.nativeNvmmProgress;
               nativeAttemptMediaSeconds = Math.max(nativeAttemptMediaSeconds, Number(metrics.mediaSeconds) || 0);
-              onProgress?.(Math.max(0, Math.min(Number(nativeDecode?.duration || duration) || duration, Number(metrics.mediaSeconds) || 0)));
+              const mediaSeconds = Math.max(0, Number(metrics.mediaSeconds) || 0);
+              const reportedFrames = Number(metrics.frames);
+              // Corrupt HEVC can jump the source PTS by many minutes after
+              // decoding only a handful of frames. That is an attempted seek,
+              // not completed output; wait for the chunk coverage gate before
+              // advancing the user-visible clock.
+              if (!Number.isFinite(reportedFrames) || mediaSeconds <= 1 ||
+                  reportedFrames >= mediaSeconds * Math.max(1, Number(fps) || 30) * 0.25) {
+                onProgress?.(Math.min(Number(nativeDecode?.duration || duration) || duration, mediaSeconds));
+              }
               onStageMetrics?.({
                 decode: Number(metrics.decode), scene: Number(metrics.scene), encode: Number(metrics.encode), total: Number(metrics.total), pipelineFps: Number(metrics.pipelineFps),
                 frames: Number(metrics.frames), mediaSeconds: Number(metrics.mediaSeconds), wallSeconds: Number(metrics.wallSeconds)

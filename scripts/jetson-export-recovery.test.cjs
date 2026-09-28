@@ -289,6 +289,25 @@ test('Argus warning with late media progress never restarts native helper and ke
   assert.equal(calls, 1);
 });
 
+test('corrupt source PTS jump does not advance the visible native chunk clock', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-native-pts-gap-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const app = service();
+  const progress = [];
+  capturedRun = async (_command, _args, opts) => {
+    opts.onStdout(JSON.stringify({ nativeNvmmProgress: { mediaSeconds: 10, frames: 600 } }) + '\n');
+    opts.onStdout(JSON.stringify({ nativeNvmmProgress: { mediaSeconds: 65, frames: 610 } }) + '\n');
+    return { status: 1, stderr: 'damaged source' };
+  };
+  await assert.rejects(app.runJetsonCudaSceneGraphTranscode({
+    ...options(dir), encodedVideoPath: path.join(dir, 'video.mkv'),
+    nativeDecode: { decoderPath: '/fake/helper', sourceFrameRate: '60/1', duration: 65 },
+    onProgress: seconds => progress.push(seconds),
+    createRawArgs: () => [], createMuxArgs: () => []
+  }), error => error.code === 'BR2K_JETSON_NATIVE_SCENE_FAILED');
+  assert.deepEqual(progress, [10]);
+});
+
 test('native cancellation exposes the child and stops without retry or mux', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-native-cancel-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
