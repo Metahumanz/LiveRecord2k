@@ -70,6 +70,8 @@ export const recorder: RecorderApi = {
     return api<SceneGraph>('/api/scene?' + params.toString(), undefined, { timeoutMs: 60000 });
   },
   exportClip: (request) => api('/api/export/clip', request),
+  listSceneMuxRecoveries: () => api('/api/export/mux-recoveries'),
+  retrySceneMux: (id) => api('/api/export/mux-recover', { id }),
   cancelExport: (jobId?: string) => api<AppState>('/api/export/cancel', { jobId }),
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}, { timeoutMs: 180000 }),
   scanMergedResiduals: () => api('/api/recordings/cleanup-merged', {}, { timeoutMs: 180000 }),

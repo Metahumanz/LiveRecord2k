@@ -21,7 +21,7 @@ import {
   getManualMergeSelection, getSameLiveMergeSuggestions, ManualMergeControls, ManualMergeProgress,
   MergeConfirmation, SameLiveMergeSuggestions
 } from '../components/ManualMergeControls';
-import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
+import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState, SceneMuxRecovery } from '../types';
 import {
   burnAvatarModeOptions,
   danmakuAreaOptions,
@@ -87,6 +87,8 @@ export function ExportPage({
   const [previewDeclined, setPreviewDeclined] = useState(false);
   const [previewStarting, setPreviewStarting] = useState(false);
   const [sceneTracksMessage, setSceneTracksMessage] = useState('');
+  const [muxRecoveries, setMuxRecoveries] = useState<SceneMuxRecovery[]>([]);
+  const [muxRecoveryError, setMuxRecoveryError] = useState('');
   const [pathPickerBusy, setPathPickerBusy] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -142,6 +144,16 @@ export function ExportPage({
   const playheadTime = canUseTimeline ? clampNumber(playbackTime, 0, timelineDuration) : 0;
   const playheadLeft = canUseTimeline ? clampNumber((playheadTime / timelineDuration) * 100, 0, 100) : 0;
   const exportQueue = state.exportQueue || [];
+  const exportStatus = state.exportProgress?.status;
+  useEffect(() => {
+    let active = true;
+    void recorder.listSceneMuxRecoveries().then(items => {
+      if (active) { setMuxRecoveries(items); setMuxRecoveryError(''); }
+    }).catch(error => {
+      if (active) setMuxRecoveryError(error instanceof Error ? error.message : '恢复任务读取失败。');
+    });
+    return () => { active = false; };
+  }, [exportStatus]);
   const hasExportBacklog = state.exportProgress?.status === 'running' || exportQueue.length > 0;
   const previewVideoInfo = decodedVideoSize || selectedRecording?.videoInfo || null;
   const previewWidth = Math.round(Number(previewVideoInfo?.width || 0));
@@ -998,6 +1010,33 @@ export function ExportPage({
               </div>
             </div>
           ) : null}
+          {muxRecoveries.length > 0 ? (
+            <div className="export-queue">
+              <div className="export-queue-heading">
+                <RefreshCw size={17} />
+                <span>封装失败后恢复</span>
+                <strong>{muxRecoveries.length}</strong>
+              </div>
+              <p className="field-help">烧录视频已保留。重试只封装源音频并验收成片，不会重新渲染整段录像。</p>
+              <div className="export-queue-list">
+                {muxRecoveries.map(item => {
+                  const queued = exportQueue.some(job => job.recoveryId === item.id);
+                  return <div className="export-queue-row" key={item.id}>
+                    <span>{filename(item.outputPath || item.cleanPath || item.id)}</span>
+                    <small>{item.videoCount || 0} 段烧录视频 · {Math.round(item.durationSec || 0)} 秒</small>
+                    {item.outputPath ? <small title={item.outputPath}>输出：{item.outputPath}</small> : null}
+                    {item.unavailableReason ? <small>暂不可恢复：{item.unavailableReason}</small> :
+                      <button className="wide-button fill" type="button"
+                        disabled={queued || busy.has(`mux-recover-${item.id}`)}
+                        onClick={() => { void run(`mux-recover-${item.id}`, () => recorder.retrySceneMux(item.id)); }}>
+                        {queued ? '已加入导出队列' : '仅重试封装'}
+                      </button>}
+                  </div>;
+                })}
+              </div>
+            </div>
+          ) : null}
+          {muxRecoveryError ? <p className="field-help" role="alert">恢复任务读取失败：{muxRecoveryError}</p> : null}
         </section>
 
         <section className="inspector-card export-panel export-result-panel">

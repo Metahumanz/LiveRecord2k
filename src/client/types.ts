@@ -491,11 +491,22 @@ export type ExportQueueItem = {
   id: string;
   label: string;
   mode: 'clean' | 'burn';
+  recoveryId?: string;
   cleanPath: string;
   outputPath?: string;
   startTime: string;
   endTime: string;
   createdAt: number;
+};
+
+export type SceneMuxRecovery = {
+  id: string;
+  createdAt?: string;
+  cleanPath?: string;
+  outputPath?: string;
+  durationSec?: number;
+  videoCount?: number;
+  unavailableReason: string;
 };
 
 export type BurnQueueItem = {
@@ -667,6 +678,8 @@ export type RecorderApi = {
     styleLayout?: DanmakuStyleLayout;
   }) => Promise<SceneGraph>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
+  listSceneMuxRecoveries: () => Promise<SceneMuxRecovery[]>;
+  retrySceneMux: (id: string) => Promise<{ ok: boolean; queued: boolean; queueId: string; outputPath: string }>;
   cancelExport: (jobId?: string) => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
   scanMergedResiduals: () => Promise<CleanupScanResult>;

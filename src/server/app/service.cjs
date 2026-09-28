@@ -11,6 +11,7 @@ const { runDesktopSceneExport } = require('../danmaku/desktop-scene-export.cjs')
 const { createSceneChunkProgress } = require('../danmaku/scene-chunk-progress.cjs');
 const { reuseVerifiedNativeVideo } = require('../danmaku/native-video-output.cjs');
 const { runSceneAudioMuxWithRetry } = require('../danmaku/scene-audio-mux.cjs');
+const { readRecovery, checkRecoveryFiles, listRecoveries } = require('../danmaku/scene-mux-recovery.cjs');
 const { verifySceneOutputFrame } = require('../danmaku/scene-output-verifier.cjs');
 const QRCode = require('qrcode');
 const {
@@ -2413,6 +2414,7 @@ class LiveRecordService {
       id: item.id,
       label: item.label,
       mode: item.mode,
+      recoveryId: item.recoveryId || undefined,
       cleanPath: item.cleanPath,
       outputPath: item.outputPath,
       startTime: item.startTime,
@@ -11807,6 +11809,38 @@ try {
     };
   }
 
+  getSceneMuxRecoveryDirectory() {
+    return path.join(path.dirname(this.lastExportDiagnosticPath), 'export-recovery');
+  }
+
+  async listSceneMuxRecoveries() {
+    return listRecoveries(this.getSceneMuxRecoveryDirectory());
+  }
+
+  async queueSceneMuxRecovery(id) {
+    const recovery = await readRecovery(this.getSceneMuxRecoveryDirectory(), id);
+    this.assertExportSourcePath(recovery.cleanPath);
+    this.assertExportOutputPath(path.dirname(recovery.finalOutputPath), recovery.finalOutputPath);
+    const reason = await checkRecoveryFiles(recovery);
+    if (reason) throw businessError('SCENE_MUX_RECOVERY_UNAVAILABLE', reason, 409);
+    if (this.exportQueue.some(item => item.recoveryId === id) || this.activeExportQueueItem?.recoveryId === id) {
+      throw businessError('SCENE_MUX_RECOVERY_QUEUED', '这个封装恢复任务已经在队列中。', 409);
+    }
+    const item = {
+      id: crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      recoveryId: id, mode: 'burn', cleanPath: recovery.cleanPath,
+      outputPath: recovery.finalOutputPath,
+      label: `仅重试音视频封装：${path.basename(recovery.finalOutputPath)}`,
+      startTime: formatFfmpegSeconds(recovery.startTime),
+      endTime: formatFfmpegSeconds(recovery.startTime + recovery.duration), createdAt: Date.now()
+    };
+    this.exportQueue.push(item);
+    this.log('info', `已加入仅封装恢复队列：${path.basename(recovery.finalOutputPath)}；复用已烧录视频，不重新渲染。`);
+    this.emitState();
+    this.pumpExportQueue();
+    return { ok: true, queued: true, queueId: item.id, outputPath: item.outputPath };
+  }
+
   pumpExportQueue() {
     if (this.exportQueueRunning || this.exportProcess || this.exportProgress?.status === 'running') {
       return;
@@ -11856,12 +11890,13 @@ try {
           }
           return;
         }
-        const codec = this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
-        if (item.mode === 'burn') this.requireAvailableBurnCodec(codec, '片段烧录');
+        const recoveryOnly = Boolean(item.recoveryId);
+        const codec = recoveryOnly ? '' : this.chooseBurnCodec(item.request.codec || this.settings.burnCodec);
+        if (item.mode === 'burn' && !recoveryOnly) this.requireAvailableBurnCodec(codec, '片段烧录');
         lease = await this.mediaJobs.acquire({
           id: item.id,
           type: 'export',
-          ...(item.mode === 'clean'
+          ...(item.mode === 'clean' || recoveryOnly
             ? { resources: ['diskRead', 'diskWrite'], resourceCosts: { diskRead: 2, diskWrite: 2 } }
             : this.getTranscodeResourcePlan(codec, item.request.recording?.videoInfo,
               { gpuComposite: true, cpuComposite: !isJetsonGstreamerCodec(codec) })),
@@ -11873,13 +11908,16 @@ try {
           return;
         }
         exportStarted = true;
-        await this.runExportClipNow({ ...item.request, codec, onProgressCreated: () => {
+        const onProgressCreated = () => {
           removeWaitingItem();
           if (this.cancelledExportQueueIds.has(item.id)) this.exportCancelRequested = true;
-        } });
+        };
+        if (recoveryOnly) await this.runSceneMuxRecovery(item.recoveryId, { onProgressCreated });
+        else await this.runExportClipNow({ ...item.request, codec, onProgressCreated });
       } catch (error) {
         const cancelled = this.cancelledExportQueueIds.has(item.id) || ['BR2K_MEDIA_CANCELLED', 'MEDIA_JOB_CANCELLED'].includes(error.code);
-        this.log(cancelled ? 'info' : 'error', cancelled ? `已取消导出队列任务：${item.label}` : `导出队列任务失败：${item.label}，${error.message || String(error)}`);
+        const detail = item.recoveryId ? compactLogLine(error.message || String(error)) : error.message || String(error);
+        this.log(cancelled ? 'info' : 'error', cancelled ? `已取消导出队列任务：${item.label}` : `导出队列任务失败：${item.label}，${detail}`);
         if (this.exportProgress?.id === capabilityProgress.id) {
           finishFfmpegJobProgress(this.exportProgress, cancelled ? 'cancelled' : 'error', cancelled ? '导出已取消' : `导出启动失败：${error.message || String(error)}`);
         }
@@ -11900,6 +11938,119 @@ try {
         }
       }
     });
+  }
+
+  async runSceneMuxRecovery(id, { onProgressCreated } = {}) {
+    const recovery = await readRecovery(this.getSceneMuxRecoveryDirectory(), id);
+    this.assertExportSourcePath(recovery.cleanPath);
+    this.assertExportOutputPath(path.dirname(recovery.finalOutputPath), recovery.finalOutputPath);
+    const reason = await checkRecoveryFiles(recovery);
+    if (reason) throw businessError('SCENE_MUX_RECOVERY_UNAVAILABLE', reason, 409);
+    const sceneDir = path.dirname(recovery.concatPath);
+    const mediaDir = path.dirname(recovery.chunkPaths[0]);
+    if (path.basename(recovery.concatPath) !== 'scene-chunks.ffconcat' ||
+        !path.basename(sceneDir).startsWith('br2k-export-scene-') ||
+        !isPathInsideDirectory(sceneDir, os.tmpdir()) ||
+        (mediaDir !== sceneDir && (!path.basename(mediaDir).startsWith('.br2k-export-media-') ||
+          !this.isPathInRecordingLibrary(mediaDir))) ||
+        path.dirname(recovery.outputPath) !== mediaDir ||
+        path.basename(recovery.outputPath) !== `completed.${recovery.outputContainer}` ||
+        !recovery.chunkPaths.every((file, index) => path.dirname(file) === mediaDir &&
+          path.basename(file) === `scene-chunk-${String(index).padStart(4, '0')}.mkv`)) {
+      throw new Error('封装恢复清单中的工作文件路径不符合导出布局。');
+    }
+    if (await isExistingFile(recovery.finalOutputPath)) {
+      throw businessError('SCENE_MUX_OUTPUT_EXISTS', '目标成片已存在，请先检查成片，恢复任务不会覆盖它。', 409);
+    }
+    await this.ensureDirectoryReady(path.dirname(recovery.finalOutputPath), { label: '剪辑输出目录' });
+    const estimatedMuxBytes = Math.ceil(recovery.chunkSizes.reduce((sum, size) => sum + size, 0) * 1.08 +
+      Math.min(Number(recovery.sourceSize || 0) * 0.06, 512 * 1024 * 1024));
+    await assertDiskSpace(mediaDir, { estimatedBytes: estimatedMuxBytes });
+    if ((await fsp.stat(mediaDir)).dev !== (await fsp.stat(path.dirname(recovery.finalOutputPath))).dev) {
+      await assertDiskSpace(recovery.finalOutputPath, { estimatedBytes: estimatedMuxBytes });
+    }
+    const progress = createFfmpegJobProgress({ kind: 'export',
+      label: `仅封装恢复：${path.basename(recovery.finalOutputPath)}`,
+      outputPath: recovery.finalOutputPath, durationSec: recovery.duration,
+      encoderBackend: '无重编码封装' });
+    clearTimeout(this.exportProgressClearTimer);
+    this.exportProgress = progress;
+    this.exportProcess = null;
+    this.exportCancelRequested = false;
+    setFfmpegJobPhase(progress, 'mux', { stageLabel: '正在复用已烧录视频，仅封装源音频' });
+    onProgressCreated?.(progress);
+    this.emitState('mediaJob');
+    const attemptPath = path.join(mediaDir, `scene-mux-retry-${process.pid}-${crypto.randomBytes(4).toString('hex')}.${recovery.outputContainer}`);
+    let completed = false;
+    let verifiedOutput = false;
+    try {
+      // The original concat list may have lived in a separate temporary
+      // directory. Rebuild it from the checked video chunks after restart.
+      const concatPath = path.join(sceneDir, `scene-mux-retry-${process.pid}-${crypto.randomBytes(4).toString('hex')}.ffconcat`);
+      await fsp.mkdir(sceneDir, { recursive: true });
+      await writeConcatFile(concatPath, recovery.chunkPaths, { durations: recovery.chunkDurations });
+      try {
+        const args = createBurnAudioMuxArgs({ ...recovery, concatPath, outputPath: attemptPath,
+          container: recovery.outputContainer });
+        await runSceneAudioMuxWithRetry({
+          run: stderr => runFfmpegJob(this.ffmpegPath, args, line => {
+            stderr(line);
+            if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(progress, line)) this.emitState('mediaJob');
+          }, { onChild: child => {
+            this.exportProcess = child;
+            if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
+          } }),
+          outputPath: attemptPath, sharedOutput: true,
+          isCancelled: () => this.exportCancelRequested,
+          onRetry: () => this.log('warn', '封装恢复遇到共享盘拒绝访问，正在仅重试封装一次。')
+        });
+      } finally {
+        await fsp.rm(concatPath, { force: true }).catch(() => {});
+      }
+      if (this.exportCancelRequested) throw Object.assign(new Error('封装恢复已取消。'), { code: 'BR2K_MEDIA_CANCELLED' });
+      setFfmpegJobPhase(progress, 'verify', { stageLabel: '正在验证恢复成片' });
+      this.emitState('mediaJob');
+      const info = await probeMediaFileInfo(this.ffmpegPath, attemptPath, { timeoutMs: 15000 });
+      if (!info.videoInfo || (await getFileSize(attemptPath)) < 32 * 1024) throw new Error('封装恢复成片没有有效视频流。');
+      if (recovery.includeAudio && !info.audioInfo) throw new Error('封装恢复成片缺少预期的源音频。');
+      const timing = await probeMediaTimelineInfo(this.ffmpegPath, attemptPath, info, { timeoutMs: 30000 });
+      if (!timing.timingSafeForCopy || Math.abs(timing.videoPresentationDurationSec - recovery.duration) > 0.25) {
+        throw new Error(`封装恢复成片时间轴未通过验收：${Number(timing.videoPresentationDurationSec || 0).toFixed(3)}s / ${recovery.duration.toFixed(3)}s。`);
+      }
+      verifiedOutput = true;
+      await atomicReplaceFile(attemptPath, recovery.finalOutputPath, { isCancelled: () => this.exportCancelRequested });
+      completed = true;
+      finishFfmpegJobProgress(progress, 'completed', '已复用烧录视频完成音视频封装');
+      this.log('success', `仅封装恢复完成：${path.basename(recovery.finalOutputPath)}。`);
+      this.emitState('mediaJob');
+      // Cleanup follows publication, never a failed or cancelled attempt.
+      await Promise.all([...recovery.chunkPaths, recovery.concatPath, recovery.outputPath,
+        recovery.manifestPath].map(file => fsp.rm(file, { force: true }).catch(() => {})));
+      if (mediaDir !== sceneDir && path.basename(mediaDir).startsWith('.br2k-export-media-')) {
+        await fsp.rm(mediaDir, { recursive: true, force: true }).catch(() => {});
+      }
+      await fsp.rm(sceneDir, { recursive: true, force: true }).catch(() => {});
+    } catch (error) {
+      if (verifiedOutput && !completed && !this.exportCancelRequested) {
+        this.log('warn', `封装成片已通过验收，但发布失败；成片保留在 ${attemptPath}，可修复存储后再次仅重试封装。`);
+      }
+      finishFfmpegJobProgress(progress, this.exportCancelRequested ? 'cancelled' : 'error',
+        this.exportCancelRequested ? '封装恢复已取消，烧录视频已保留' : `仅封装恢复失败，烧录视频已保留：${compactLogLine(error.message)}`);
+      this.emitState('mediaJob');
+      if (!this.exportCancelRequested) throw error;
+    } finally {
+      if (!completed && (!verifiedOutput || this.exportCancelRequested)) {
+        await fsp.rm(attemptPath, { force: true }).catch(() => {});
+      }
+      if (this.exportProgress?.id === progress.id) {
+        this.exportProcess = null;
+        this.exportCancelRequested = false;
+      }
+      this.exportProgressClearTimer = setTimeout(() => {
+        if (this.exportProgress?.id === progress.id) { this.exportProgress = null; this.emitState('mediaJob'); }
+      }, 5000);
+      this.exportProgressClearTimer.unref?.();
+    }
   }
 
   async probeJetsonNativeSceneForSource({
@@ -13235,7 +13386,10 @@ try {
         }
         this.log('info', '已取消 Scene Graph 导出片段：' + path.basename(outputPath));
       } else if (this.exportProgress?.id === progress.id) {
-        finishFfmpegJobProgress(this.exportProgress, 'error', 'Scene Graph 导出失败：' + error.message);
+        const recoveryReady = Boolean(error.sceneMuxRecovery?.recoveryPath);
+        finishFfmpegJobProgress(this.exportProgress, 'error', recoveryReady
+          ? '音视频封装失败；烧录视频已保留。请在剪辑导出页使用“仅重试封装”。'
+          : 'Scene Graph 导出失败：' + error.message);
         this.emitState('mediaJob');
         await this.persistExportDiagnosticFailure({
           ...diagnosticContext,

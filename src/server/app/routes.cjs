@@ -133,6 +133,11 @@ async function handleApi(service, parsed, port, request, response, access) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/export/mux-recoveries') {
+    writeJson(response, 200, await service.listSceneMuxRecoveries());
+    return;
+  }
+
   if (request.method === 'GET' && pathname.startsWith('/api/preview/')) {
     await service.servePreview(parsed, request, response);
     return;
@@ -197,6 +202,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
     '/api/export/scene-tracks': () => service.prepareSceneTracks(body),
     '/api/export/clip': () => service.exportClip(body),
+    '/api/export/mux-recover': () => service.queueSceneMuxRecovery(body.id),
     '/api/export/cancel': () => service.cancelExportClip(body.jobId),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/recordings/cleanup-merged': () =>

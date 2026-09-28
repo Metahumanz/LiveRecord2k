@@ -20,6 +20,7 @@ const GROUPS = {
     'file-stream-lifecycle.test.cjs',
     'burn-queue.test.cjs',
     'export-queue.test.cjs',
+    'scene-mux-recovery-integration.test.cjs',
     'preview-queue.test.cjs'
   ],
   package: [
@@ -52,6 +53,7 @@ const GROUPS = {
     'jetson-native-bridge.test.cjs',
     'jetson-native-output.test.cjs',
     'scene-audio-mux.test.cjs',
+    'scene-mux-recovery.test.cjs',
     'jetson-export-recovery.test.cjs',
     'jetson-self-test.test.cjs',
     'keyframe-preview.test.cjs',
