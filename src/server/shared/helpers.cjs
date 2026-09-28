@@ -1686,6 +1686,7 @@ function setFfmpegJobPhase(progress, phase, options = {}) {
   if (phase !== 'render') {
     progress.renderFps = null;
     progress.realtimeFactor = null;
+    progress.stageFps = undefined;
   }
   progress.phaseStartedAt = now;
   progress.phaseCurrentTimeSec = 0;

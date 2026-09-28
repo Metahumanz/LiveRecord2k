@@ -38,11 +38,13 @@ test('remux stderr cannot restart the render clock or lower completed media prog
   });
   callbacks.onStderr('out_time_us=29000000'); assert.equal(renderReports, 1);
   progress.renderFps = 300; progress.realtimeFactor = 5;
+  progress.stageFps = { pipelineFps: 170.9, scene: 170.9 };
   callbacks.onPhase('mux', { stageLabel: '正在封装输出' }); callbacks.onStderr('out_time_us=1000000');
   assert.equal(renderReports, 1); assert.equal(progress.phase, 'mux');
   assert.equal(progress.currentTimeSec, 30); assert.equal(progress.percent, 100);
   assert.equal(progress.phaseCurrentTimeSec, 1);
   assert.equal(progress.renderFps, null); assert.equal(progress.realtimeFactor, null);
+  assert.equal(progress.stageFps, undefined);
   assert.match(progress.message, /封装/);
   callbacks.onPhase('render', { force: true }); callbacks.onStderr('out_time_us=2000000');
   assert.equal(renderReports, 2); assert.equal(progress.phase, 'render');

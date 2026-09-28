@@ -12358,7 +12358,9 @@ try {
       }
       await writeConcatFile(concatPath, chunkPaths, { durations: chunkDurations });
       onPhase?.('mux');
-      onStage?.('正在无重编码拼接 Scene Graph 分段并封装源音频');
+      onStage?.(chunkPaths.length === 1
+        ? '正在无重编码封装烧录视频与源音频'
+        : '正在无重编码拼接 Scene Graph 分段并封装源音频');
       await runFfmpegJob(this.ffmpegPath, createBurnAudioMuxArgs({
         concatPath, cleanPath, outputPath, codec, sourceCodec, startTime, duration, container: outputContainer,
         leadingAudioPaddingSec, includeAudio, copyAudio
