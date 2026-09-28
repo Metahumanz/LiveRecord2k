@@ -1,6 +1,6 @@
 # 同场候选与手动合并设备验收（2026-09-28）
 
-本轮在 dev 分支对剪辑导出页候选识别和现有手动合并链路进行实测。Orin 正式服务仍安装 `107dc98`，新代码以隔离脚本运行，未覆盖正式 WebUI。真实录像仅只读扫描或复制到系统临时目录；原片、JSONL 和 Scene 缓存均未改动。验收脚本位于 `scripts/merge-candidate-device-acceptance.cjs` 和 `scripts/merge-device-acceptance.cjs`。
+本轮在 dev 分支对剪辑导出页候选识别和现有手动合并链路进行实测。测试阶段 Orin 正式服务安装的是 `107dc98`，新代码先以隔离脚本运行；通过验收后按用户要求覆盖正式 WebUI 和服务。真实录像仅只读扫描或复制到系统临时目录；原片、JSONL 和 Scene 缓存均未改动。验收脚本位于 `scripts/merge-candidate-device-acceptance.cjs` 和 `scripts/merge-device-acceptance.cjs`。
 
 ## 真实录像候选
 
@@ -21,6 +21,12 @@
 
 Windows 随包只有 FFmpeg，未附带 ffprobe。真实源的平均帧率被分别报告为约 60.01 与 60.00 fps，但 FFmpeg 同时报告两者固定时钟为 `60 tbr`。探测逻辑此前未在缺少 ffprobe 时保留该时钟，导致相同规格的片段误走重编码。现从 FFmpeg 的 `tbr` 恢复声明帧率，保留真实规格不同时的重编码判断；真实录像和集成回归均通过。
 
-验收范围不含 RTX 5060 Ti，也未在正式 Orin WebUI 上点击新确认弹窗或提交真实用户录像。新前端仍需部署后做页面交互验收；本轮已在两台设备以当前代码验证实际候选计算、媒体合并、弹幕、音画时长和可选的临时源文件清理。
+验收范围不含 RTX 5060 Ti，也未在正式 Orin WebUI 上点击新确认弹窗或提交真实用户录像。本轮已在两台设备以当前代码验证实际候选计算、媒体合并、弹幕、音画时长和可选的临时源文件清理；正式 WebUI 随后已覆盖更新，页面按钮交互仍待实际使用时观察。
 
 复测时，`merge-device-acceptance.cjs` 可直接在本机 Node 运行；用 `BR2K_ACCEPT_FFMPEG` 选实际打包 FFmpeg，用 `BR2K_ACCEPT_REAL_SOURCE_A/B` 选两段只读源片，`BR2K_ACCEPT_DELETE_SOURCES=1` 只删除隔离目录内的副本。`merge-candidate-device-acceptance.cjs` 含 TSX 组件，需先用 esbuild 打包，再设置 `BR2K_ACCEPT_RECORDINGS` 只读扫描目录，或设置 `BR2K_ACCEPT_STATE_URL` 对当前服务状态计算候选。两份脚本均输出单行 JSON，成功后自动清理生成的媒体临时目录。
+
+## 正式 Orin 覆盖更新
+
+用户随后要求覆盖更新。2026-09-28 香港时间约 18:00，在正式服务无录制、导出、烧录及合并任务时，将 `dev@642050a` 的服务 bundle、WebUI 资源和版本元数据覆盖到 Orin。部署前校验上传 SHA256、Node 语法、当前构建和空闲状态，并备份原程序、WebUI 和设置到 `/var/backups/bili-record-2k/20260928T095958Z-before-same-live-merge`；旧 WebUI 另保留于 `/usr/lib/bili-record-2k/dist.rollback-642050a`。
+
+部署脚本报告服务启动成功、CUDA Scene 视觉门禁通过、设置内容及 50 个现存源文件指纹不变，新的 `ExportPage-OTzF7bAZ.js` 与 HTTP 实际返回完全一致且包含“疑似同场直播”。独立复查服务 active、当前无任务、CUDA Scene 与视觉门禁仍通过，启动后的 warning 级 journal 无新条目。服务重扫后录像列表由包含 4 条已不存在旧路径的 54 条，收敛为现存 50 条。正式 WebUI 尚未提交用户的真实合并任务；新页面的实际按钮交互仍可在下次使用时观察。
