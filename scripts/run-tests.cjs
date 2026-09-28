@@ -51,6 +51,7 @@ const GROUPS = {
     'gpu-scene-renderer.test.cjs',
     'jetson-native-bridge.test.cjs',
     'jetson-native-output.test.cjs',
+    'scene-audio-mux.test.cjs',
     'jetson-export-recovery.test.cjs',
     'jetson-self-test.test.cjs',
     'keyframe-preview.test.cjs',

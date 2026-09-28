@@ -10,6 +10,7 @@ const {
 const { runDesktopSceneExport } = require('../danmaku/desktop-scene-export.cjs');
 const { createSceneChunkProgress } = require('../danmaku/scene-chunk-progress.cjs');
 const { reuseVerifiedNativeVideo } = require('../danmaku/native-video-output.cjs');
+const { runSceneAudioMuxWithRetry } = require('../danmaku/scene-audio-mux.cjs');
 const { verifySceneOutputFrame } = require('../danmaku/scene-output-verifier.cjs');
 const QRCode = require('qrcode');
 const {
@@ -12081,6 +12082,7 @@ try {
     graph, cleanPath, outputPath, codec, crf, fps, width, height, sourceCodec, sourceFrameRate = '',
     startTime, duration, outputContainer, includeAudio, copyAudio, leadingVideoPaddingSec = 0,
     leadingAudioPaddingSec = 0, decoder, temporaryDir, mediaTemporaryDir = temporaryDir, legacyEvents = [], legacySceneOptions = {},
+    finalOutputPath = '', sharedOutput = false,
     onStderr, onChild, onProgress, onPreparing, onPhase, onStage, onNativePreflight, isCancelled, label
   }) {
     const chunkPaths = [];
@@ -12143,6 +12145,7 @@ try {
     let nativeTimestampedPass = nativeTimestampedAdmission;
     let compatibilityPass = !useCudaSceneRenderer;
     let completed = 0;
+    let preserveMuxInputs = false;
     try {
       while (completed < duration - 0.001) {
         if (isCancelled?.()) {
@@ -12361,12 +12364,50 @@ try {
       onStage?.(chunkPaths.length === 1
         ? '正在无重编码封装烧录视频与源音频'
         : '正在无重编码拼接 Scene Graph 分段并封装源音频');
-      await runFfmpegJob(this.ffmpegPath, createBurnAudioMuxArgs({
+      const muxArgs = createBurnAudioMuxArgs({
         concatPath, cleanPath, outputPath, codec, sourceCodec, startTime, duration, container: outputContainer,
         leadingAudioPaddingSec, includeAudio, copyAudio
-      }), onStderr, { onChild });
+      });
+      try {
+        await runSceneAudioMuxWithRetry({
+          run: (stderr) => runFfmpegJob(this.ffmpegPath, muxArgs, stderr, { onChild }),
+          outputPath, sharedOutput, onStderr, isCancelled,
+          onRetry: () => {
+            this.log('warn', `${label}：共享盘在封装时拒绝访问；原生烧录视频已完成，正在仅重试音视频封装一次。`);
+            onPhase?.('mux', { force: true });
+            onStage?.('共享盘访问恢复后，正在仅重试音视频封装');
+          }
+        });
+      } catch (error) {
+        if (!isCancelled?.() && error?.code !== 'BR2K_MEDIA_CANCELLED' && chunkPaths.length) {
+          preserveMuxInputs = true;
+          const recovery = {
+            version: 1, createdAt: new Date().toISOString(),
+            cleanPath, finalOutputPath, outputPath, concatPath, chunkPaths: [...chunkPaths],
+            chunkDurations: [...chunkDurations],
+            codec, sourceCodec, startTime, duration, outputContainer,
+            leadingAudioPaddingSec, includeAudio, copyAudio
+          };
+          try {
+            const source = await fsp.stat(cleanPath);
+            recovery.sourceSize = source.size;
+            recovery.sourceMtimeMs = source.mtimeMs;
+            recovery.chunkSizes = await Promise.all(chunkPaths.map(async (file) => (await fsp.stat(file)).size));
+            const recoveryDir = path.join(path.dirname(this.lastExportDiagnosticPath), 'export-recovery');
+            await fsp.mkdir(recoveryDir, { recursive: true, mode: 0o700 });
+            const recoveryPath = path.join(recoveryDir, `scene-mux-${Date.now()}-${process.pid}.json`);
+            await fsp.writeFile(recoveryPath, JSON.stringify(recovery, null, 2), { mode: 0o600 });
+            error.sceneMuxRecovery = { ...recovery, recoveryPath };
+          } catch (recoveryError) {
+            error.sceneMuxRecovery = recovery;
+            this.log('warn', `保存封装恢复清单失败，仍保留原生视频：${compactLogLine(recoveryError.message)}`);
+          }
+        }
+        throw error;
+      }
     } finally {
-      await Promise.all([...chunkPaths, ...scriptPaths, concatPath].map((file) => fsp.rm(file, { force: true }).catch(() => {})));
+      await Promise.all((preserveMuxInputs ? scriptPaths : [...chunkPaths, ...scriptPaths, concatPath])
+        .map((file) => fsp.rm(file, { force: true }).catch(() => {})));
     }
   }
 
@@ -12958,6 +12999,7 @@ try {
           if (useChunkedJetsonScene) {
             await this.runChunkedJetsonSceneGraphExport({
               graph, cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, codec: burnCodec, crf: burnCrf,
+              finalOutputPath: outputPath, sharedOutput,
               fps, width: recording.videoInfo?.width || mediaInfo.videoInfo?.width,
               height: recording.videoInfo?.height || mediaInfo.videoInfo?.height, sourceCodec: decoderInfo.codec,
               sourceFrameRate: mediaInfo.videoInfo?.rFrameRate,
@@ -13169,6 +13211,18 @@ try {
         scenePath: recording.scenePath || deriveSceneGraphPath(recording.cleanPath)
       };
     } catch (error) {
+      if (error.sceneMuxRecovery && !this.exportCancelRequested) {
+        preserveCompletedOutput = true;
+        await fsp.rm(temporaryOutputPath, { force: true }).catch(() => {});
+        const recovery = error.sceneMuxRecovery;
+        diagnosticContext.recovery = {
+          manifestPath: recovery.recoveryPath || '',
+          videoPaths: recovery.chunkPaths,
+          concatPath: recovery.concatPath
+        };
+        this.log('error', `音视频封装失败；已保留完整烧录视频 ${recovery.chunkPaths.join('、')} 与拼接清单 ${recovery.concatPath}。` +
+          (recovery.recoveryPath ? `恢复清单：${recovery.recoveryPath}。` : '恢复清单未写入，以上文件仍可手动封装。'));
+      }
       if (error.diagnosticDirectory) {
         this.log('error', `Scene 失败诊断已保留：${error.diagnosticDirectory}`);
         sceneDirectory = '';

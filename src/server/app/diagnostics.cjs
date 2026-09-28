@@ -94,6 +94,7 @@ function buildExportDiagnosticReport(context = {}, error = null) {
     ptsBridge: context.ptsBridge,
     fallback: context.fallback,
     completedOutputPath: context.completedOutputPath,
+    recovery: context.recovery,
     lastError: error ? {
       code: error.code,
       message: error.message,
