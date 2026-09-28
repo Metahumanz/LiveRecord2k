@@ -1017,13 +1017,26 @@ async function runFfmpegProbe(ffmpegPath, args, options = {}) {
 function runCapturedProcess(command, args, options = {}) {
   return new Promise((resolve) => {
     const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
+    const idleTimeoutMs = Math.max(0, Number(options.idleTimeoutMs || 0));
     const maxOutputBytes = Math.max(1024, Number(options.maxOutputBytes || 256 * 1024));
     let child;
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let idleTimedOut = false;
     let settled = false;
     let timer = null;
+    let idleTimer = null;
+
+    const resetIdleTimer = () => {
+      if (!idleTimeoutMs || settled) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        child.kill('SIGKILL');
+      }, idleTimeoutMs);
+      idleTimer.unref?.();
+    };
 
     const appendOutput = (current, chunk) => `${current}${chunk.toString('utf8')}`.slice(-maxOutputBytes);
     const finish = (status, signal, error = null) => {
@@ -1032,8 +1045,9 @@ function runCapturedProcess(command, args, options = {}) {
       }
       settled = true;
       clearTimeout(timer);
+      clearTimeout(idleTimer);
       options.onChild?.(null);
-      resolve({ status, signal, stdout, stderr, error, timedOut, timeoutMs });
+      resolve({ status, signal, stdout, stderr, error, timedOut, idleTimedOut, timeoutMs, idleTimeoutMs });
     };
 
     try {
@@ -1044,6 +1058,7 @@ function runCapturedProcess(command, args, options = {}) {
         env: ffmpegEnvironment(options.env || process.env)
       });
       options.onChild?.(child);
+      resetIdleTimer();
       if (hasInput) {
         child.stdin?.on('error', () => {});
         child.stdin?.end(String(options.input));
@@ -1055,6 +1070,7 @@ function runCapturedProcess(command, args, options = {}) {
 
     child.stdout?.on('data', (chunk) => {
       stdout = appendOutput(stdout, chunk);
+      resetIdleTimer();
       options.onStdout?.(chunk.toString('utf8'));
     });
     child.stderr?.on('data', (chunk) => {
