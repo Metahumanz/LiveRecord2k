@@ -2083,7 +2083,7 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
       ? {
           ...videoInfo,
           avgFrameRate: String(exactVideo?.avg_frame_rate || ''),
-          rFrameRate: String(exactVideo?.r_frame_rate || ''),
+          rFrameRate: String(exactVideo?.r_frame_rate || videoInfo.rFrameRate || ''),
           timeBase: String(exactVideo?.time_base || ''),
           startTime: Number.isFinite(Number(exactVideo?.start_time)) ? Number(exactVideo.start_time) : undefined,
           fps: parseFrameRate(exactVideo?.avg_frame_rate) || parseFrameRate(exactVideo?.r_frame_rate) || videoInfo.fps
@@ -2574,6 +2574,7 @@ function parseFfmpegVideoInfo(text) {
   const pixelFormatMatch = line.match(/Video:\s*[^,]+,\s*([a-z0-9_]+)(?:\(([^)]*)\))?/i);
   const fpsMatch = line.match(/,\s*([0-9]+(?:\.[0-9]+)?)\s*fps/i);
   const fps = fpsMatch ? Number(fpsMatch[1]) : 0;
+  const tbrMatch = line.match(/,\s*([0-9]+(?:\.[0-9]+)?)\s*tbr\b/i);
   const pixelFormat = pixelFormatMatch?.[1] || '';
   const colorParts = String(pixelFormatMatch?.[2] || '').split('/').map((part) => part.trim());
   const bitDepthMatch = pixelFormat.match(/p0?(\d{2})(?:le|be)?$/i);
@@ -2590,7 +2591,8 @@ function parseFfmpegVideoInfo(text) {
     hdr: /(?:smpte2084|arib-std-b67|bt2020)/i.test(String(pixelFormatMatch?.[2] || '')),
     width: Number(sizeMatch[1]),
     height: Number(sizeMatch[2]),
-    fps: Number.isFinite(fps) && fps > 0 ? fps : undefined
+    fps: Number.isFinite(fps) && fps > 0 ? fps : undefined,
+    rFrameRate: tbrMatch ? `${tbrMatch[1]}/1` : ''
   };
 }
 

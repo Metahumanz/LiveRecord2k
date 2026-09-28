@@ -207,6 +207,18 @@ test('compatible nominal frame clocks do not transcode for dropped frames or con
   assert.equal(shouldTranscodeConcat([inputs[0], { videoInfo: { ...videoInfo, fps: 30, rFrameRate: '0/0' }, audioInfo }]), true);
 });
 
+test('Windows packaged FFmpeg uses tbr when ffprobe is absent and average fps varies', () => {
+  const lines = [
+    'Stream #0:0: Video: hevc (Main) (hvc1 / 0x31637668), yuv420p(tv, bt709), 2560x1440, 60.01 fps, 60 tbr, 16k tbn',
+    'Stream #0:0: Video: hevc (Main) (hvc1 / 0x31637668), yuv420p(tv, bt709), 2560x1440, 59.73 fps, 60 tbr, 16k tbn'
+  ];
+  const infos = lines.map(line => ({ videoInfo: parseFfmpegVideoInfo(line),
+    audioInfo: { codec: 'aac', sampleRate: 48000, channelLayout: 'stereo' } }));
+  assert.equal(infos[0].videoInfo.rFrameRate, '60/1');
+  assert.equal(infos[1].videoInfo.rFrameRate, '60/1');
+  assert.equal(shouldTranscodeConcat(infos), false);
+});
+
 test('merge normalization retains the source rational clock when the container average is just above 60', () => {
   const target = selectHighestResolutionVideoInfo([{ videoInfo: {
     width: 2560, height: 1440, fps: 60.001667, rFrameRate: '60/1'
