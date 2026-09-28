@@ -164,6 +164,46 @@ test('a validated merged recording can join later segments without suggesting it
     group.recordings.map(row => row.cleanPath)), [['merged.mp4', 'part-3.mp4']]);
 });
 
+test('nearby segments from different known live sessions stay in separate suggestions', () => {
+  const start = Date.parse('2026-09-26T20:00:00+08:00');
+  const recordings = [
+    { cleanPath: 'first.mp4', roomId: '883263', startedAt: start, durationSec: 600,
+      valid: true, liveSessionId: 'broadcast-a' },
+    { cleanPath: 'second.mp4', roomId: '883263', startedAt: start + 11 * 60_000, durationSec: 600,
+      valid: true, liveSessionId: 'broadcast-a' },
+    { cleanPath: 'new-live.mp4', roomId: '883263', startedAt: start + 22 * 60_000, durationSec: 600,
+      valid: true, liveSessionId: 'broadcast-b' },
+    { cleanPath: 'new-live-2.mp4', roomId: '883263', startedAt: start + 33 * 60_000, durationSec: 600,
+      valid: true, liveSessionId: 'broadcast-b' }
+  ];
+  assert.deepEqual(getSameLiveMergeSuggestions(recordings, rooms).map(group =>
+    group.recordings.map(row => row.cleanPath)), [['new-live.mp4', 'new-live-2.mp4'], ['first.mp4', 'second.mp4']]);
+});
+
+test('a missing session id between two known broadcasts cannot bridge them', () => {
+  const start = Date.parse('2026-09-26T20:00:00+08:00');
+  const recordings = [
+    { cleanPath: 'a.mp4', roomId: '883263', startedAt: start, durationSec: 600,
+      valid: true, liveSessionId: 'broadcast-a' },
+    { cleanPath: 'unknown.mp4', roomId: '883263', startedAt: start + 11 * 60_000, durationSec: 600, valid: true },
+    { cleanPath: 'b.mp4', roomId: '883263', startedAt: start + 22 * 60_000, durationSec: 600,
+      valid: true, liveSessionId: 'broadcast-b' }
+  ];
+  assert.deepEqual(getSameLiveMergeSuggestions(recordings, rooms).map(group =>
+    group.recordings.map(row => row.cleanPath)), [['a.mp4', 'unknown.mp4']]);
+});
+
+test('overlapping manual outputs with shared source content are not suggested for another merge', () => {
+  const start = Date.parse('2026-09-26T23:11:55+08:00');
+  const recordings = [
+    { cleanPath: 'first-manual.merged.mp4', roomId: '883263', startedAt: start, durationSec: 21.1,
+      valid: true, liveSessionId: 'broadcast-a', mergedFrom: ['same.clean.mp4', 'later.clean.mp4'] },
+    { cleanPath: 'second-manual.merged.mp4', roomId: '883263', startedAt: start, durationSec: 19.09,
+      valid: true, liveSessionId: 'broadcast-a', mergedFrom: ['same.clean.mp4', 'middle.clean.mp4'] }
+  ];
+  assert.deepEqual(getSameLiveMergeSuggestions(recordings, rooms), []);
+});
+
 test('one-click and manual paths require a separate explicit confirmation of sources and deletion', () => {
   const start = Date.parse('2026-09-12T20:00:00+08:00');
   const selected = [

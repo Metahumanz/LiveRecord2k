@@ -34,17 +34,24 @@ export function getSameLiveMergeSuggestions(recordings: RecordingState[], rooms:
     roomRecordings.sort((a, b) => a.startedAt - b.startedAt || a.cleanPath.localeCompare(b.cleanPath));
     let current: RecordingState[] = [];
     let gapsSec: number[] = [];
+    let currentSessionId = '';
     const flush = () => {
       if (current.length >= 2) suggestions.push({ room, recordings: current, gapsSec });
       current = [];
       gapsSec = [];
+      currentSessionId = '';
     };
     for (const recording of roomRecordings) {
       const previous = current[current.length - 1];
       const gapMs = previous ? recording.startedAt - previous.startedAt - Number(previous.durationSec) * 1000 : 0;
-      if (previous && (current.length >= 160 || gapMs < -MAX_SAME_LIVE_OVERLAP_MS || gapMs > MAX_SAME_LIVE_GAP_MS)) flush();
+      const differentSession = currentSessionId && recording.liveSessionId &&
+        currentSessionId !== recording.liveSessionId;
+      const overlappingMergedOutput = (previous?.mergedFrom?.length || recording.mergedFrom?.length) && gapMs < -2000;
+      if (previous && (differentSession || current.length >= 160 ||
+        overlappingMergedOutput || gapMs < -MAX_SAME_LIVE_OVERLAP_MS || gapMs > MAX_SAME_LIVE_GAP_MS)) flush();
       if (current.length) gapsSec.push(gapMs / 1000);
       current.push(recording);
+      currentSessionId ||= recording.liveSessionId || '';
     }
     flush();
   }
@@ -60,7 +67,7 @@ export function SameLiveMergeSuggestions({ suggestions, recordings, rooms, busy,
 }) {
   if (!suggestions.length) return null;
   return <div className="same-live-suggestions">
-    <div className="same-live-heading"><strong>疑似同场直播</strong><span>同房间、相邻录像间隔不超过 15 分钟</span></div>
+    <div className="same-live-heading"><strong>疑似同场直播</strong><span>同房间、已知会话不冲突、相邻间隔不超过 15 分钟</span></div>
     {suggestions.map(suggestion => {
       const paths = suggestion.recordings.map(recording => recording.cleanPath);
       const { reason } = getManualMergeSelection(recordings, paths, rooms);

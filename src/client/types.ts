@@ -36,6 +36,7 @@ export type RecordingState = {
   roomId?: string;
   roomTitle?: string;
   anchor?: string;
+  liveSessionId?: string;
   startedAt: number;
   cleanPath: string;
   capturePath?: string;
