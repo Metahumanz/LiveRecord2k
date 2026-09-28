@@ -175,6 +175,32 @@ test('merged recording metadata preserves cleanup lineage across a library refre
   }
 });
 
+test('merged metadata retains sources from sibling sessions within the same room', async () => {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cross-session-metadata-'));
+  const firstDir = path.join(outputDir, 'room-a', 'session-a');
+  const secondDir = path.join(outputDir, 'room-a', 'session-b');
+  const unrelatedDir = path.join(outputDir, 'room-b', 'session-c');
+  const sourceOne = path.join(firstDir, 'one.merged.mp4');
+  const sourceTwo = path.join(secondDir, 'two.merged.mp4');
+  const unrelated = path.join(unrelatedDir, 'other.merged.mp4');
+  const mergedPath = path.join(firstDir, 'combined.merged.mp4');
+  try {
+    await Promise.all([fsp.mkdir(firstDir, { recursive: true }), fsp.mkdir(secondDir, { recursive: true }),
+      fsp.mkdir(unrelatedDir, { recursive: true })]);
+    await Promise.all([sourceOne, sourceTwo, unrelated, mergedPath].map(writeRecordingFile));
+    const service = createService(outputDir);
+    await service.writeRecordingMetadata(service.normalizeRecording({ cleanPath: mergedPath,
+      segmentReason: 'merged', mergedFrom: [sourceOne, sourceTwo, unrelated] }));
+    const metadata = JSON.parse(await fsp.readFile(`${mergedPath}.metadata.json`, 'utf8'));
+    assert.deepEqual(metadata.mergedFrom.sort(), [path.basename(sourceOne), '../session-b/' + path.basename(sourceTwo)].sort());
+    const discovered = await discoverRecordingFiles(outputDir, { concurrency: 1 });
+    const restored = discovered.find(recording => recording.cleanPath === mergedPath);
+    assert.deepEqual(restored.mergedFrom.sort(), [sourceOne, sourceTwo].sort());
+  } finally {
+    await fsp.rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('manual cleanup processes persisted pending cleanup tasks without recording-library lineage', async () => {
   const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cleanup-pending-'));
   const sourcePath = path.join(outputDir, 'session-part.clean.mp4');

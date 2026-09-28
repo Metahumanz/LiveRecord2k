@@ -8821,15 +8821,29 @@ try {
               artifacts: segment => this.manualMergeArtifacts(segment) });
             this.recordings = this.recordings.filter(row => !segmentPathKeys.has(path.resolve(row.cleanPath).toLowerCase()));
             await this.saveStore();
+            progress.deletedSourceCount = segments.length;
+            progress.deletedArtifactCount = deleted;
             this.log('success', `手动合并成片及配套文件已保存，已删除所选源文件与配套文件 ${deleted} 项。`);
-          } catch (error) { if (isStopped()) throw error; this.log('warn', `合并成片已保留，源文件清理未完成：${error.message}`); }
+          } catch (error) {
+            if (isStopped()) throw error;
+            progress.cleanupError = error.message;
+            this.log('warn', `合并成片已保留，源文件清理未完成：${error.message}`);
+          }
           finally { for (const segment of segments) this.manualCleanupSourcePaths?.delete(path.resolve(segment.cleanPath)); }
-        } else this.log('warn', '合并配套文件或元数据未完整保存，已保留全部源文件。');
+        } else {
+          progress.cleanupError = '合并配套文件或元数据未完整保存';
+          this.log('warn', '合并配套文件或元数据未完整保存，已保留全部源文件。');
+        }
       }
       if (!manualOptions) await this.cleanupMergedSegmentFiles(room, segments, mergedRecording, { cleanupId, preserveSourceInputs: true });
       if (isStopped() && !progress.cleanupStarted) throw new Error('合并已取消，源分段保留。');
       if (room.mergeProgress?.id === progress.id) {
-        finishFfmpegJobProgress(room.mergeProgress, 'completed', '续录分段已合并');
+        const cleanupMessage = !manualOptions?.deleteSources
+          ? '续录分段已合并，源文件已保留'
+          : progress.cleanupError
+            ? `续录分段已合并，但源文件未删除：${progress.cleanupError}`
+            : `续录分段已合并，已删除所选 ${progress.deletedSourceCount || segments.length} 个源文件`;
+        finishFfmpegJobProgress(room.mergeProgress, 'completed', cleanupMessage);
       }
       this.log(
         'success',
@@ -8887,6 +8901,9 @@ try {
     const metadataPath = `${cleanPath}.metadata.json`;
     const temporaryPath = `${metadataPath}.${process.pid}.tmp`;
     const metadataDirectory = path.dirname(path.resolve(cleanPath));
+    const libraryRoot = path.resolve(this.settings.outputDir);
+    const sourceScope = isPathInsideDirectory(metadataDirectory, libraryRoot)
+      ? path.dirname(metadataDirectory) : metadataDirectory;
     const toMetadataRelativePath = (filePath) => {
       const value = String(filePath || '').trim();
       if (!value) return '';
@@ -8894,8 +8911,15 @@ try {
       if (!isPathInsideDirectory(resolved, metadataDirectory)) return '';
       return path.relative(metadataDirectory, resolved).split(path.sep).join('/');
     };
+    const toMergedSourceRelativePath = (filePath) => {
+      const value = String(filePath || '').trim();
+      if (!value) return '';
+      const resolved = path.resolve(value);
+      if (!isPathInsideDirectory(resolved, libraryRoot) || !isPathInsideDirectory(resolved, sourceScope)) return '';
+      return path.relative(metadataDirectory, resolved).split(path.sep).join('/');
+    };
     const mergedFrom = Array.isArray(recording.mergedFrom)
-      ? [...new Set(recording.mergedFrom.map(toMetadataRelativePath).filter(Boolean))]
+      ? [...new Set(recording.mergedFrom.map(toMergedSourceRelativePath).filter(Boolean))]
       : [];
     const payload = {
       schemaVersion: 2,

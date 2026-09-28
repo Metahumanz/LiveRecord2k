@@ -98,6 +98,26 @@ test('manual merge deletion validates all selected sources and protects output a
   assert.equal(await fs.readFile(unrelated, 'utf8'), 'other');
 });
 
+test('manual merge cleanup ignores directory metadata drift while keeping file fingerprints', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-manual-avatar-dir-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourceDir = path.join(root, 'session');
+  const avatarDir = path.join(sourceDir, 'avatars');
+  await fs.mkdir(avatarDir, { recursive: true });
+  const cleanPath = path.join(sourceDir, 'source.mp4');
+  const avatarPath = path.join(avatarDir, 'avatar.jpg');
+  const outputPath = path.join(root, 'merged.mp4');
+  await Promise.all([fs.writeFile(cleanPath, 'source'), fs.writeFile(avatarPath, 'avatar'), fs.writeFile(outputPath, 'merged')]);
+  const segments = [{ cleanPath }];
+  const artifacts = () => [cleanPath, avatarDir];
+  const expected = { [cleanPath]: await fs.stat(cleanPath) };
+  const artifactSnapshot = await snapshotManualMergeArtifacts(segments, artifacts);
+  const later = new Date(Date.now() + 10_000);
+  await fs.utimes(avatarDir, later, later);
+  assert.equal(await deleteManualMergeSources({ root, outputPath, segments, expected, artifacts, artifactSnapshot }), 2);
+  assert.equal(await fs.readFile(outputPath, 'utf8'), 'merged');
+});
+
 test('scene budget counts pixel identities, grows beyond 1 GiB and keeps fractional text phases distinct', () => {
   const object = { type: 'Text', frame: { x: 0.25, y: 0, width: 1000, height: 1000 }, props: { text: '中文🙂' }, style: { fill: '#fff' } };
   const repeated = { objects: Array.from({ length: 400 }, (_, i) => ({ ...object, id: String(i), start: i })) };

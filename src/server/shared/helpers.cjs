@@ -3068,8 +3068,18 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         const resolved = path.isAbsolute(value) ? path.resolve(value) : path.resolve(metadataDirectory, value);
         return isPathInsideDirectory(resolved, metadataDirectory) ? resolved : '';
       };
+      const resolveMergedSourcePath = (filePath) => {
+        const value = String(filePath || '').trim();
+        if (!value) return '';
+        const resolved = path.isAbsolute(value) ? path.resolve(value) : path.resolve(metadataDirectory, value);
+        const libraryRoot = path.resolve(outputDir);
+        const sourceScope = isPathInsideDirectory(metadataDirectory, libraryRoot)
+          ? path.dirname(metadataDirectory) : metadataDirectory;
+        return isPathInsideDirectory(resolved, libraryRoot) && isPathInsideDirectory(resolved, sourceScope)
+          ? resolved : '';
+      };
       const mergedFrom = Array.isArray(metadata?.mergedFrom)
-        ? [...new Set(metadata.mergedFrom.map(resolveMetadataRelativePath).filter(Boolean))]
+        ? [...new Set(metadata.mergedFrom.map(resolveMergedSourcePath).filter(Boolean))]
         : [];
       const metadataUsable =
         Number(metadata?.schemaVersion || 0) >= 1 &&
