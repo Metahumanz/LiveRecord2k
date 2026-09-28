@@ -12,7 +12,10 @@ compiled.paths = module.paths;
 compiled._compile(buildSync({ entryPoints: [path.join(__dirname, '../src/client/components/ManualMergeControls.tsx')],
   bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/jsx-runtime', 'lucide-react'], write: false
 }).outputFiles[0].text, filename);
-const { getManualMergeSelection, ManualMergeControls, ManualMergeProgress } = compiled.exports;
+const {
+  getManualMergeSelection, getSameLiveMergeSuggestions, ManualMergeControls, ManualMergeProgress,
+  MergeConfirmation, SameLiveMergeSuggestions
+} = compiled.exports;
 const rooms = [{ id: '883263', realRoomId: 883263, shortId: 123, recording: false }];
 const rows = [{ cleanPath: 'later', roomId: '883263', startedAt: 2, valid: true },
   { cleanPath: 'earlier', roomId: 883263, startedAt: 1, valid: true }];
@@ -100,6 +103,89 @@ test('same-room selection enables the actual rendered primary button and submits
 
 test('short IDs and real IDs identify the same configured room', () => {
   assert.equal(getManualMergeSelection([rows[0], { ...rows[1], roomId: '123' }], ['later', 'earlier'], rooms).reason, '');
+});
+
+test('same-live suggestions require adjacent completed source recordings in one room', () => {
+  const start = Date.parse('2026-09-12T20:00:00+08:00');
+  const source = (name, minute, durationSec = 600, extra = {}) => ({
+    cleanPath: name, roomId: '883263', startedAt: start + minute * 60_000,
+    durationSec, valid: true, ...extra
+  });
+  const recordings = [
+    source('part-2.mp4', 12), source('part-1.mp4', 0),
+    source('part-3.mp4', 37), // exactly 15 minutes after part 2 ends
+    source('next-live.mp4', 63), // 16 minutes later: separate broadcast
+    source('other-room.mp4', 46, 600, { roomId: '7953876' }),
+    source('unknown-duration.mp4', 48, 0),
+    source('incomplete.mp4', 49, 600, { containerStage: 'capturing' }),
+    source('merged.mp4', 0, 2220, { mergedFrom: ['part-1.mp4'] })
+  ];
+  const suggestions = getSameLiveMergeSuggestions(recordings, rooms);
+  assert.deepEqual(suggestions.map(group => group.recordings.map(row => row.cleanPath)), [
+    ['part-2.mp4', 'part-3.mp4']
+  ]);
+  assert.equal(suggestions[0].gapsSec[0], 900);
+  const html = renderToStaticMarkup(React.createElement(SameLiveMergeSuggestions, {
+    suggestions, recordings, rooms, busy: false, onChoose() {}
+  }));
+  assert.match(html, /疑似同场直播/);
+  assert.match(html, /一键合并/);
+  assert.match(html, /时间推测/);
+});
+
+test('overlapping duplicate ranges and a busy room are never silently submitted', () => {
+  const start = Date.parse('2026-09-12T20:00:00+08:00');
+  const recordings = [
+    { cleanPath: 'a.mp4', roomId: '883263', startedAt: start, durationSec: 3600, valid: true },
+    { cleanPath: 'b.mp4', roomId: '883263', startedAt: start + 5 * 60_000, durationSec: 600, valid: true },
+    { cleanPath: 'c.mp4', roomId: '883263', startedAt: start + 17 * 60_000, durationSec: 600, valid: true }
+  ];
+  const suggestions = getSameLiveMergeSuggestions(recordings, rooms);
+  assert.deepEqual(suggestions.map(group => group.recordings.map(row => row.cleanPath)), [['b.mp4', 'c.mp4']]);
+  const busyRooms = [{ ...rooms[0], recording: true }];
+  let chosen = 0;
+  const suggestion = SameLiveMergeSuggestions({ suggestions, recordings, rooms: busyRooms, busy: false,
+    onChoose() { chosen++; } });
+  const button = suggestion.props.children[1][0].props.children[1];
+  assert.equal(button.props.disabled, true);
+  assert.equal(chosen, 0);
+});
+
+test('a validated merged recording can join later segments without suggesting its original sources again', () => {
+  const start = Date.parse('2026-09-12T20:00:00+08:00');
+  const recordings = [
+    { cleanPath: 'part-1.mp4', roomId: '883263', startedAt: start, durationSec: 600, valid: true },
+    { cleanPath: 'part-2.mp4', roomId: '883263', startedAt: start + 12 * 60_000, durationSec: 600, valid: true },
+    { cleanPath: 'merged.mp4', roomId: '883263', startedAt: start, durationSec: 1320, valid: true,
+      mergedFrom: ['part-1.mp4', 'part-2.mp4'] },
+    { cleanPath: 'part-3.mp4', roomId: '883263', startedAt: start + 25 * 60_000, durationSec: 600, valid: true }
+  ];
+  assert.deepEqual(getSameLiveMergeSuggestions(recordings, rooms).map(group =>
+    group.recordings.map(row => row.cleanPath)), [['merged.mp4', 'part-3.mp4']]);
+});
+
+test('one-click and manual paths require a separate explicit confirmation of sources and deletion', () => {
+  const start = Date.parse('2026-09-12T20:00:00+08:00');
+  const selected = [
+    { cleanPath: 'one.mp4', startedAt: start, durationSec: 600 },
+    { cleanPath: 'two.mp4', startedAt: start + 12 * 60_000, durationSec: 600 }
+  ];
+  let submissions = 0;
+  const props = { selected, reason: '', deleteSources: false, busy: false,
+    onDeleteSourcesChange() {}, onCancel() {}, onConfirm() { submissions++; } };
+  const html = renderToStaticMarkup(React.createElement(MergeConfirmation, props));
+  assert.match(html, /确认合并 2 段录像/);
+  assert.match(html, /one\.mp4/);
+  assert.match(html, /two\.mp4/);
+  assert.match(html, /与上一段间隔 00:02:00/);
+  assert.doesNotMatch(html, /checked=""/);
+  assert.equal(submissions, 0);
+  const dialog = MergeConfirmation(props).props.children;
+  dialog.props.children[5].props.children[1].props.onClick();
+  assert.equal(submissions, 1);
+  const blocked = renderToStaticMarkup(React.createElement(MergeConfirmation, { ...props, reason: '该房间正在录制' }));
+  assert.match(blocked, /该房间正在录制/);
+  assert.match(blocked, /disabled=""/);
 });
 
 test('cross-room, missing ownership, active tasks and unfinished sources remain blocked with visible reasons', () => {

@@ -21,6 +21,138 @@
   margin: 0 0 12px;
 }
 
+.same-live-suggestions {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid rgba(121, 222, 213, 0.16);
+  border-radius: 8px;
+  background: rgba(121, 222, 213, 0.055);
+}
+
+.same-live-heading,
+.same-live-suggestion,
+.same-live-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.same-live-heading {
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+
+.same-live-heading strong,
+.same-live-summary strong {
+  color: #eef9f6;
+}
+
+.same-live-heading span,
+.same-live-summary span,
+.same-live-reason {
+  color: #aebfba;
+  font-size: 12px;
+}
+
+.same-live-suggestion {
+  flex-wrap: wrap;
+  padding: 10px;
+  border-radius: 7px;
+  background: rgba(8, 16, 19, 0.35);
+}
+
+.same-live-summary {
+  flex: 1 1 220px;
+  min-width: 0;
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.same-live-suggestion .wide-button {
+  min-height: 36px;
+}
+
+.same-live-suggestions .field-help {
+  margin: 0;
+}
+
+.merge-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 8, 12, 0.76);
+  backdrop-filter: blur(10px);
+}
+
+.merge-confirmation {
+  width: min(620px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: #121920;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+}
+
+.merge-confirmation h3 {
+  margin: 0 0 8px;
+  color: #eef9f6;
+}
+
+.merge-confirm-list {
+  display: grid;
+  gap: 7px;
+  max-height: min(45vh, 420px);
+  overflow: auto;
+  margin: 14px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.merge-confirm-list li {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 11px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.merge-confirm-list li span,
+.merge-confirm-list li small {
+  color: #aebfba;
+  font-size: 12px;
+}
+
+.merge-confirm-list li strong {
+  overflow-wrap: anywhere;
+  color: #eef9f6;
+  font-size: 13px;
+}
+
+.merge-confirm-delete {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.merge-confirm-delete input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  accent-color: #79ded5;
+}
+
+.merge-confirm-actions {
+  display: flex;
+  margin-top: 16px;
+}
+
 .recording-row-content {
   min-width: 0;
   display: grid;

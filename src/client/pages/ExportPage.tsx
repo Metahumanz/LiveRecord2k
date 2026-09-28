@@ -17,7 +17,10 @@ import {
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
-import { getManualMergeSelection, ManualMergeControls, ManualMergeProgress } from '../components/ManualMergeControls';
+import {
+  getManualMergeSelection, getSameLiveMergeSuggestions, ManualMergeControls, ManualMergeProgress,
+  MergeConfirmation, SameLiveMergeSuggestions
+} from '../components/ManualMergeControls';
 import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
 import {
   burnAvatarModeOptions,
@@ -69,7 +72,13 @@ export function ExportPage({
   const [selectingMerge, setSelectingMerge] = useState(false);
   const [mergeSubmitted, setMergeSubmitted] = useState(false);
   const [deleteMergeSources, setDeleteMergeSources] = useState(false);
+  const [pendingMergePaths, setPendingMergePaths] = useState<string[] | null>(null);
+  const mergeSubmissionRef = useRef(false);
   const { selected: mergeRecordings, reason: mergeReason } = getManualMergeSelection(recordings, mergeSelection, state.rooms);
+  const { selected: pendingMergeRecordings, reason: pendingMergeReason } = getManualMergeSelection(
+    recordings, pendingMergePaths || [], state.rooms
+  );
+  const sameLiveSuggestions = getSameLiveMergeSuggestions(recordings, state.rooms);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [decodedVideoSize, setDecodedVideoSize] = useState<{ width: number; height: number } | null>(null);
@@ -385,16 +394,37 @@ export function ExportPage({
             <span className="source-count">共 {recordings.length} 个，可用 {validRecordingCount} 个</span>
           </div>
 
+          <SameLiveMergeSuggestions suggestions={sameLiveSuggestions} recordings={recordings} rooms={state.rooms}
+            busy={busy.has('manual-merge')} onChoose={paths => {
+              setDeleteMergeSources(false);
+              setPendingMergePaths(paths);
+            }} />
+
           <ManualMergeControls selecting={selectingMerge} count={mergeRecordings.length} reason={mergeReason}
             deleteSources={deleteMergeSources} onDeleteSourcesChange={setDeleteMergeSources}
             busy={busy.has('manual-merge')}
             onToggle={() => { setSelectingMerge(!selectingMerge); setMergeSelection([]); }}
-            onMerge={async () => {
-              if (await run('manual-merge', () => recorder.mergeRecordings(mergeRecordings.map(recording => recording.cleanPath), deleteMergeSources))) {
-                setMergeSubmitted(true);
-                setMergeSelection([]); setSelectingMerge(false);
+            onMerge={() => setPendingMergePaths(mergeRecordings.map(recording => recording.cleanPath))} />
+
+          {pendingMergePaths ? <MergeConfirmation selected={pendingMergeRecordings} reason={pendingMergeReason}
+            deleteSources={deleteMergeSources} busy={busy.has('manual-merge')}
+            onDeleteSourcesChange={setDeleteMergeSources}
+            onCancel={() => { if (!mergeSubmissionRef.current) setPendingMergePaths(null); }}
+            onConfirm={async () => {
+              if (pendingMergeReason || mergeSubmissionRef.current) return;
+              mergeSubmissionRef.current = true;
+              const paths = pendingMergeRecordings.map(recording => recording.cleanPath);
+              try {
+                if (await run('manual-merge', () => recorder.mergeRecordings(paths, deleteMergeSources))) {
+                  setMergeSubmitted(true);
+                  setPendingMergePaths(null);
+                  setDeleteMergeSources(false);
+                  setMergeSelection([]); setSelectingMerge(false);
+                }
+              } finally {
+                mergeSubmissionRef.current = false;
               }
-            }} />
+            }} /> : null}
 
           {mergeSubmitted ? <p className="field-help manual-merge-hint" role="status">
             合并任务已提交，进度显示在下方，也可在“直播间”页面查看。合并完成后，成片会自动加入录像列表。
