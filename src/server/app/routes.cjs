@@ -133,6 +133,11 @@ async function handleApi(service, parsed, port, request, response, access) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/export/mux-recoveries') {
+    writeJson(response, 200, await service.listSceneMuxRecoveries());
+    return;
+  }
+
   if (request.method === 'GET' && pathname.startsWith('/api/preview/')) {
     await service.servePreview(parsed, request, response);
     return;
@@ -185,8 +190,9 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/rooms/auto-record': () => service.setAutoRecord(body.roomId, body.enabled),
     '/api/rooms/record/start': () => service.startRecording(body.roomId, false),
     '/api/rooms/record/stop': () => service.stopRecording(body.roomId),
-    '/api/rooms/merge/cancel': () => service.cancelMerge(body.roomId),
+    '/api/rooms/merge/cancel': () => service.cancelMerge(body.roomId, body.jobId),
     '/api/rooms/merge/retry': () => service.retryMerge(body.roomId),
+    '/api/recordings/merge': () => service.mergeSelectedRecordings(body),
     '/api/rooms/preview/start': () => service.startPreview(body.roomId),
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
     '/api/rooms/burn/cancel': () => service.cancelBurnDanmaku(body.roomId),
@@ -196,7 +202,8 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/export/subtitles': () => service.prepareSubtitleExport(body),
     '/api/export/scene-tracks': () => service.prepareSceneTracks(body),
     '/api/export/clip': () => service.exportClip(body),
-    '/api/export/cancel': () => service.cancelExportClip(),
+    '/api/export/mux-recover': () => service.queueSceneMuxRecovery(body.id),
+    '/api/export/cancel': () => service.cancelExportClip(body.jobId),
     '/api/recordings/scan': () => service.refreshRecordingLibrary(),
     '/api/recordings/cleanup-merged': () =>
       service.cleanupMergedSegmentResiduals({ confirm: Boolean(body.confirm), scanId: body.scanId }),

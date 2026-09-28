@@ -9,14 +9,18 @@ const path = require('node:path');
 // packaging tests during an ordinary development pass.
 const GROUPS = {
   integration: [
+    'optimization-regression.test.cjs',
     'recording-merge.test.cjs',
     'recording-stability.test.cjs',
+    'recording-stream-recovery.test.cjs',
+    'pipeline-lifecycle.test.cjs',
     'merge-retry.test.cjs',
     'recording-cleanup.test.cjs',
     'nonblocking.test.cjs',
     'file-stream-lifecycle.test.cjs',
     'burn-queue.test.cjs',
     'export-queue.test.cjs',
+    'scene-mux-recovery-integration.test.cjs',
     'preview-queue.test.cjs'
   ],
   package: [
@@ -25,6 +29,7 @@ const GROUPS = {
     'msix-package.test.cjs'
   ],
   hardware: [
+    'arm64-ffmpeg-text.test.cjs',
     'jetson-cuda-scene-conformance.test.cjs',
     'jetson-native-nvmm-pts.test.cjs',
     'desktop-cuda-scene-conformance.test.cjs'
@@ -35,18 +40,28 @@ const GROUPS = {
     'av-clock-regression.test.cjs',
     'avatar-capture.test.cjs',
     'client-code-splitting.test.cjs',
+    'manual-merge-ui.test.cjs',
+    'merge-sidecar-progress.test.cjs',
+    'recording-identity.test.cjs',
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
     'desktop-cuda-capability.test.cjs',
+    'desktop-burn-regression.test.cjs',
     'diagnostics.test.cjs',
     'gpu-scene-conformance.test.cjs',
     'gpu-scene-renderer.test.cjs',
     'jetson-native-bridge.test.cjs',
+    'jetson-native-output.test.cjs',
+    'scene-audio-mux.test.cjs',
+    'scene-mux-recovery.test.cjs',
+    'jetson-export-recovery.test.cjs',
     'jetson-self-test.test.cjs',
     'keyframe-preview.test.cjs',
     'preview-editor-contract.test.cjs',
     'maintenance-confirmation.test.cjs',
     'maintenance-service.test.cjs',
+    'media-publication.test.cjs',
+    'media-storage.test.cjs',
     'release-notes.test.cjs',
     'room-behavior.test.cjs',
     'room-monitor-scheduler.test.cjs',
@@ -54,6 +69,7 @@ const GROUPS = {
     'room-removal.test.cjs',
     'safety.test.cjs',
     'scene-graph.test.cjs',
+    'scene-cache-index.test.cjs',
     'scene-legacy-conformance.test.cjs',
     'settings-draft.test.cjs',
     'settings-service.test.cjs',

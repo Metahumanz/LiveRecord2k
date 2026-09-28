@@ -8,6 +8,8 @@ const tls = require('node:tls');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { validateRemoteUrl } = require('./security.cjs');
+const { ffmpegEnvironment } = require('../recording/fontconfig.cjs');
+const { scanFullMedia } = require('../recording/media-full-scan.cjs');
 
 let ffmpegStatic = null;
 try {
@@ -991,6 +993,7 @@ async function detectJetsonGstreamerDecoders(options = {}) {
 async function runFfmpegProbe(ffmpegPath, args, options = {}) {
   try {
     const result = await runCapturedProcess(ffmpegPath, args, {
+      onChild: options.onChild,
       timeoutMs: Number(options.timeoutMs || 8000),
       maxOutputBytes: Number(options.maxOutputBytes || 256 * 1024)
     });
@@ -1038,7 +1041,7 @@ function runCapturedProcess(command, args, options = {}) {
       child = spawn(command, args, {
         windowsHide: true,
         stdio: [hasInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-        env: options.env || process.env
+        env: ffmpegEnvironment(options.env || process.env)
       });
       options.onChild?.(child);
       if (hasInput) {
@@ -1541,6 +1544,7 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, {
       windowsHide: true,
+      env: ffmpegEnvironment(options.env || process.env),
       stdio: ['ignore', 'ignore', 'pipe']
     });
     options.onChild?.(child);
@@ -1677,6 +1681,13 @@ function setFfmpegJobPhase(progress, phase, options = {}) {
     progress.percent = 100;
   }
   progress.phase = phase;
+  // Remux/verification has a new media clock. Do not display its rate as
+  // live rendering speed (or carry the previous render rate into that phase).
+  if (phase !== 'render') {
+    progress.renderFps = null;
+    progress.realtimeFactor = null;
+    progress.stageFps = undefined;
+  }
   progress.phaseStartedAt = now;
   progress.phaseCurrentTimeSec = 0;
   progress.phasePercent = phase === 'verify' ? null : 0;
@@ -1691,6 +1702,7 @@ function setFfmpegJobPhase(progress, phase, options = {}) {
         ? Math.max(0, Number(progress.durationSec || 0))
         : 0;
   if (options.stageLabel !== undefined) progress.stageLabel = String(options.stageLabel || '');
+  if (progress.stageLabel) progress.message = progress.stageLabel;
   progress.updatedAt = now;
   resetFfmpegJobProgressRate(progress, phase);
   return true;
@@ -1996,7 +2008,7 @@ function resolveReliableDurationSec({
 }
 
 function parseRecordingStartedAtFromName(filePath) {
-  const name = path.basename(String(filePath || ''));
+  const name = String(filePath || '').split(/[\\/]/).at(-1);
   const matches = Array.from(name.matchAll(/_(\d{8})_(\d{6})(?=.*\.(?:clean|merged)\.(?:mp4|mkv)$)/gi));
   const match = matches.at(-1);
   if (!match) {
@@ -2013,6 +2025,22 @@ function parseRecordingStartedAtFromName(filePath) {
     Number(time.slice(4, 6))
   ).getTime();
   return Number.isFinite(startedAt) ? startedAt : 0;
+}
+
+function inferRecordingIdentity(recording = {}) {
+  const explicitRoomId = String(recording.roomId || '').trim();
+  const parts = String(recording.cleanPath || '').split(/[\\/]/);
+  const match = (parts.at(-1) || '').match(/^([1-9]\d*)_(.+)_\d{8}_\d{6}(?:\.[^.]+)*\.(?:clean|merged)\.(?:mp4|mkv)$/i);
+  const roomDirectory = (parts.at(-3) || '').match(/^([1-9]\d*)-(.+)$/);
+  // Only the recorder's numeric filename prefix establishes ownership. A
+  // display name or an unrelated parent directory must never combine rooms.
+  const inferred = match && (!roomDirectory || roomDirectory[1] === match[1]) ? match : null;
+  const session = inferred && (parts.at(-2) || '').match(/^\d{8}_\d{6}-(.+)$/);
+  return {
+    roomId: explicitRoomId || inferred?.[1] || '',
+    anchor: String(recording.anchor || inferred?.[2] || ''),
+    roomTitle: String(recording.roomTitle || session?.[1] || '')
+  };
 }
 
 function estimateRecordingDurationFromStats(filePath, stat) {
@@ -2036,6 +2064,7 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
     return { durationSec: 0, videoInfo: null, audioInfo: null };
   }
   const probe = await runFfmpegProbe(ffmpegPath, ['-hide_banner', '-i', filePath], {
+    onChild: options.onChild,
     timeoutMs: Number(options.timeoutMs || 8000)
   });
   if (!probe.ok && /超时/.test(probe.error || '')) {
@@ -2054,7 +2083,7 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
       ? {
           ...videoInfo,
           avgFrameRate: String(exactVideo?.avg_frame_rate || ''),
-          rFrameRate: String(exactVideo?.r_frame_rate || ''),
+          rFrameRate: String(exactVideo?.r_frame_rate || videoInfo.rFrameRate || ''),
           timeBase: String(exactVideo?.time_base || ''),
           startTime: Number.isFinite(Number(exactVideo?.start_time)) ? Number(exactVideo.start_time) : undefined,
           fps: parseFrameRate(exactVideo?.avg_frame_rate) || parseFrameRate(exactVideo?.r_frame_rate) || videoInfo.fps
@@ -2100,7 +2129,7 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
   const result = await runCapturedProcess(
     ffprobe,
     ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time', '-of', 'json', filePath],
-    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024 }
+    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024, onChild: options.onChild }
   );
   if (result.status !== 0 || result.timedOut || result.error) return null;
   const parsed = JSON.parse(String(result.stdout || '{}'));
@@ -2108,50 +2137,16 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
 }
 
 async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
-  const timeoutMs = Number(options.timeoutMs || 90000);
-  const scanStream = async (selector) => {
-    const result = await runCapturedProcess(
-      ffmpegPath,
-      [
-        '-hide_banner',
-        '-nostdin',
-        '-loglevel',
-        'error',
-        '-i',
-        filePath,
-        '-map',
-        selector,
-        '-c',
-        'copy',
-        '-f',
-        'null',
-        '-',
-        '-progress',
-        'pipe:1'
-      ],
-      { timeoutMs }
-    );
-    if (result.timedOut) {
-      throw new Error(`媒体时间轴扫描超时：${path.basename(filePath)}`);
-    }
-    if (result.status !== 0) {
-      throw new Error(`媒体时间轴扫描失败：${path.basename(filePath)}（${compactLogLine(result.stderr)}）`);
-    }
-    const values = Array.from(String(result.stdout || '').matchAll(/out_time_us=(-?\d+)/g))
-      .map((match) => Number(match[1]) / 1_000_000)
-      .filter(Number.isFinite);
-    return values.length ? Math.max(0, values.at(-1)) : 0;
-  };
-
-  const videoDurationSec = await scanStream('0:v:0');
-  const audioDurationSec = mediaInfo.audioInfo ? await scanStream('0:a:0') : 0;
+  const fullScan = options.fullScan || await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess);
+  const videoDurationSec = fullScan.video.dtsEnd;
+  const audioDurationSec = mediaInfo.audioInfo ? Number(fullScan.audio?.ptsEnd || 0) : 0;
   const measuredAvDeltaSec = mediaInfo.audioInfo ? audioDurationSec - videoDurationSec : 0;
   // Stream-copy progress reports video DTS, which can trail presentation time by several B-frames.
   // Discount that known positive-only reorder gap before deciding whether the streams really drift.
   const fps = Number(mediaInfo.videoInfo?.fps || 0);
   const videoReorderAllowanceSec = fps > 0 ? Math.min(0.15, 3 / fps) : 0.12;
   const avDeltaSec = measuredAvDeltaSec > 0 ? Math.max(0, measuredAvDeltaSec - videoReorderAllowanceSec) : measuredAvDeltaSec;
-  const videoPresentationDurationSec = videoDurationSec > 0 ? videoDurationSec + videoReorderAllowanceSec : 0;
+  const videoPresentationDurationSec = fullScan.video.ptsEnd;
   const containerDurationSec = Number(mediaInfo.durationSec || 0);
   const streamDurationSec = Math.max(videoDurationSec, audioDurationSec);
   return {
@@ -2200,6 +2195,7 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.onChild?.(null);
       if (error) {
         error.stderr = compactLogLine(stderrTail);
         reject(error);
@@ -2278,6 +2274,7 @@ async function scanMediaPacketTimeline(ffmpegPath, filePath, selector, options =
       finish(error);
       return;
     }
+    options.onChild?.(child);
     child.stderr.on('data', (chunk) => {
       const text = `${residual}${chunk.toString('utf8')}`;
       stderrTail = `${stderrTail}${text}`.slice(-16 * 1024);
@@ -2356,39 +2353,12 @@ async function probeMediaClipTimelineInfo(ffmpegPath, filePath, startTimeSec, du
 }
 
 async function scanMediaCopyWarnings(ffmpegPath, filePath, options = {}) {
-  const result = await runCapturedProcess(
-    ffmpegPath,
-    [
-      '-hide_banner',
-      '-nostdin',
-      '-loglevel',
-      'warning',
-      '-i',
-      filePath,
-      '-map',
-      '0:v?',
-      '-map',
-      '0:a?',
-      '-c',
-      'copy',
-      '-f',
-      'null',
-      '-'
-    ],
-    { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 120_000)), maxOutputBytes: 128 * 1024 }
-  );
-  if (result.timedOut) throw new Error(`媒体完整性扫描超时：${path.basename(filePath)}`);
-  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
-  return {
-    exitCode: result.status,
-    corruptPacketCount: (output.match(/(?:corrupt|invalid (?:data|nal)|error while decoding)/gi) || []).length,
-    nonMonotonicCount: (output.match(/(?:non[- ]monoton(?:ous|ically)|timestamp.*discontinuity)/gi) || []).length,
-    output: compactLogLine(output)
-  };
+  return (options.fullScan || await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess)).warnings;
 }
 
 async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
-  const timingInfo = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo, options);
+  const fullScan = await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess);
+  const timingInfo = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo, { ...options, fullScan });
   const packetSampleDurationSec = Math.max(1, Number(options.packetSampleDurationSec || 3));
   const [videoStart, videoEnd, audioStart, audioEnd, copyWarnings] = await Promise.all([
     scanMediaPacketTimeline(ffmpegPath, filePath, '0:v:0', { ...options, packetSampleDurationSec }),
@@ -2407,7 +2377,7 @@ async function probeMediaTimelineHealth(ffmpegPath, filePath, mediaInfo = {}, op
           packetSampleFromEnd: true
         })
       : Promise.resolve(null),
-    scanMediaCopyWarnings(ffmpegPath, filePath, options)
+    scanMediaCopyWarnings(ffmpegPath, filePath, { ...options, fullScan })
   ]);
   const video = {
     ...videoStart,
@@ -2604,6 +2574,7 @@ function parseFfmpegVideoInfo(text) {
   const pixelFormatMatch = line.match(/Video:\s*[^,]+,\s*([a-z0-9_]+)(?:\(([^)]*)\))?/i);
   const fpsMatch = line.match(/,\s*([0-9]+(?:\.[0-9]+)?)\s*fps/i);
   const fps = fpsMatch ? Number(fpsMatch[1]) : 0;
+  const tbrMatch = line.match(/,\s*([0-9]+(?:\.[0-9]+)?)\s*tbr\b/i);
   const pixelFormat = pixelFormatMatch?.[1] || '';
   const colorParts = String(pixelFormatMatch?.[2] || '').split('/').map((part) => part.trim());
   const bitDepthMatch = pixelFormat.match(/p0?(\d{2})(?:le|be)?$/i);
@@ -2620,7 +2591,8 @@ function parseFfmpegVideoInfo(text) {
     hdr: /(?:smpte2084|arib-std-b67|bt2020)/i.test(String(pixelFormatMatch?.[2] || '')),
     width: Number(sizeMatch[1]),
     height: Number(sizeMatch[2]),
-    fps: Number.isFinite(fps) && fps > 0 ? fps : undefined
+    fps: Number.isFinite(fps) && fps > 0 ? fps : undefined,
+    rFrameRate: tbrMatch ? `${tbrMatch[1]}/1` : ''
   };
 }
 
@@ -3120,10 +3092,8 @@ async function discoverRecordingFiles(outputDir, options = {}) {
       }
       recordings[index] = {
         id: `${cleanPath}:${Math.round(stat.mtimeMs)}`,
-        roomId: String(metadata?.roomId || ''),
-        roomTitle: String(metadata?.roomTitle || ''),
-        anchor: String(metadata?.anchor || ''),
-        startedAt: Number(metadata?.startedAt || stat.mtimeMs),
+        ...inferRecordingIdentity({ ...metadata, cleanPath }),
+        startedAt: Number(metadata?.startedAt || parseRecordingStartedAtFromName(cleanPath) || stat.mtimeMs),
         cleanPath,
         danmakuPath,
         avatarManifestPath:
@@ -4205,6 +4175,7 @@ module.exports = {
   parseFfmpegDuration,
   resolveReliableDurationSec,
   parseRecordingStartedAtFromName,
+  inferRecordingIdentity,
   estimateRecordingDurationFromStats,
   readDanmakuDurationSec,
   probeMediaFileInfo,

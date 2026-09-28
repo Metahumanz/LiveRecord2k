@@ -2,9 +2,11 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
 const test = require('node:test');
 
 const { LiveRecordService } = require('../src/server/app/service.cjs');
+const { StatePublisher } = require('../src/server/app/state-publisher.cjs');
 
 class FakeSseResponse extends EventEmitter {
   constructor() {
@@ -235,6 +237,77 @@ test('慢速 SSE 客户端在背压解除后获取新的完整状态', () => {
   assert.equal(service.clients.get(response)?.paused, false);
   assert.match(response.writes.join(''), /event: state/);
   assert.match(response.writes.join(''), /"liveStatus":1/);
+});
+
+test('oversized real HTTP state drains once, keeps API responsive, and sends later deltas', async (t) => {
+  let snapshots = 0;
+  let writes = 0;
+  let revision = 0;
+  const publisher = new StatePublisher({
+    getFullState: () => { snapshots++; return { revision, padding: 'x'.repeat(300000) }; },
+    getDeltaPayload: () => ({ revision })
+  });
+  const server = http.createServer({ highWaterMark: 65536 }, (request, response) => {
+    if (request.url === '/health') return response.end('ok');
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const write = response.write.bind(response);
+    response.write = (...args) => {
+      writes++;
+      // Bound the broken implementation too: its drain loop otherwise
+      // starves the test timeout just as it starves the production API.
+      if (writes > 6) { response.destroy(); return false; }
+      return write(...args);
+    };
+    publisher.addClient(response);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  let response;
+  const request = http.get(url + '/events');
+  t.after(() => { request.destroy(); response?.destroy(); server.closeAllConnections(); server.close(); });
+  response = await new Promise((resolve, reject) => { request.once('response', resolve); request.once('error', reject); });
+  response.on('error', () => {});
+  let data = '';
+  const events = [];
+  response.on('data', chunk => {
+    data += chunk;
+    let end;
+    while ((end = data.indexOf('\n\n')) >= 0) {
+      events.push(data.slice(0, end)); data = data.slice(end + 2);
+    }
+  });
+  const waitFor = async predicate => {
+    for (let i = 0; i < 100 && !predicate(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(predicate(), 'SSE event / drain did not complete');
+  };
+  await waitFor(() => events.length >= 1);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(snapshots, 1, 'drain must not resend an already queued snapshot');
+  assert.equal(writes, 1);
+  const health = await new Promise((resolve, reject) => {
+    const probe = http.get(url + '/health', res => { let body = ''; res.on('data', x => body += x); res.on('end', () => resolve(body)); });
+    probe.setTimeout(1000, () => probe.destroy(new Error('health timeout'))); probe.on('error', reject);
+  });
+  assert.equal(health, 'ok');
+  revision = 1; publisher.markDirty('system'); publisher.flush();
+  await waitFor(() => events.some(value => value.includes('event: system')));
+  assert.equal(snapshots, 1);
+  assert.match(events.at(-1), /"revision":1/);
+});
+
+test('skipped changes resync once even when the resync snapshot also causes backpressure', () => {
+  let revision = 0;
+  const publisher = new StatePublisher({ getFullState: () => ({ revision }) });
+  const response = new BackpressuredFakeSseResponse();
+  response.backpressured = true;
+  publisher.addClient(response);
+  revision = 1; publisher.markDirty('system'); publisher.flush();
+  response.emit('drain');
+  assert.equal(response.writes.length, 2);
+  assert.match(response.writes[1], /"revision":1/);
+  response.emit('drain');
+  assert.equal(response.writes.length, 2, 'resync drain must not create an endless snapshot loop');
+  assert.equal(publisher.clients.get(response).paused, false);
 });
 
 test('修改远程凭据会通知并关闭既有远程 SSE 客户端', async () => {

@@ -195,6 +195,37 @@ test('mixed segment specifications select the highest resolution and require tra
   );
 });
 
+test('compatible nominal frame clocks do not transcode for dropped frames or container rounding', () => {
+  const videoInfo = { codec: 'hevc', width: 1920, height: 1080, fps: 60.0001, rFrameRate: '60/1',
+    profile: 'Main', pixelFormat: 'yuv420p', bitDepth: 8 };
+  const audioInfo = { codec: 'aac', sampleRate: 48000, channelLayout: 'stereo' };
+  const inputs = [60.0001, 59.7322, 59.998].map(fps => ({ videoInfo: { ...videoInfo, fps }, audioInfo }));
+  assert.equal(shouldTranscodeConcat(inputs), false);
+  assert.equal(selectHighestResolutionVideoInfo(inputs).fps, 60);
+  assert.equal(shouldTranscodeConcat([inputs[0], { ...inputs[1], videoInfo: { ...videoInfo, rFrameRate: '30/1' } }]), true);
+  assert.equal(shouldTranscodeConcat([inputs[0], { ...inputs[1], audioInfo: { ...audioInfo, sampleRate: 44100 } }]), true);
+  assert.equal(shouldTranscodeConcat([inputs[0], { videoInfo: { ...videoInfo, fps: 30, rFrameRate: '0/0' }, audioInfo }]), true);
+});
+
+test('Windows packaged FFmpeg uses tbr when ffprobe is absent and average fps varies', () => {
+  const lines = [
+    'Stream #0:0: Video: hevc (Main) (hvc1 / 0x31637668), yuv420p(tv, bt709), 2560x1440, 60.01 fps, 60 tbr, 16k tbn',
+    'Stream #0:0: Video: hevc (Main) (hvc1 / 0x31637668), yuv420p(tv, bt709), 2560x1440, 59.73 fps, 60 tbr, 16k tbn'
+  ];
+  const infos = lines.map(line => ({ videoInfo: parseFfmpegVideoInfo(line),
+    audioInfo: { codec: 'aac', sampleRate: 48000, channelLayout: 'stereo' } }));
+  assert.equal(infos[0].videoInfo.rFrameRate, '60/1');
+  assert.equal(infos[1].videoInfo.rFrameRate, '60/1');
+  assert.equal(shouldTranscodeConcat(infos), false);
+});
+
+test('merge normalization retains the source rational clock when the container average is just above 60', () => {
+  const target = selectHighestResolutionVideoInfo([{ videoInfo: {
+    width: 2560, height: 1440, fps: 60.001667, rFrameRate: '60/1'
+  } }]);
+  assert.equal(target.fps, 60);
+});
+
 test('旧版 FFmpeg 兼容缩放不依赖 force_divisible_by，并保持偶数输出尺寸', async () => {
   const scaleFilter = createBoundedEvenScaleFilter(1280, 720);
   assert.equal(

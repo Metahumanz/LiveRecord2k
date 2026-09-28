@@ -132,15 +132,24 @@ export function UpdateProgress({ update }: { update: AppState['update'] }) {
 }
 
 export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
-  const phase = progress.phase || (progress.status === 'completed' ? 'verify' : 'render');
-  const phasePercentValue = typeof progress.phasePercent === 'number' && Number.isFinite(progress.phasePercent)
+  const isMerge = progress.kind === 'merge';
+  const stageProgress = isMerge ? progress.stageProgress : null;
+  // Older servers emitted media PTS while leaving phase=prepare. This also
+  // allows a UI update to describe an in-flight merge without restarting it.
+  const legacyMergeRender = isMerge && progress.status === 'running' && progress.phase === 'prepare' && Boolean(progress.workStartedAt) &&
+    /规范化分段|无损拼接/.test(progress.stageLabel || '');
+  const phase = legacyMergeRender ? /无损拼接/.test(progress.stageLabel || '') ? 'mux' : 'render'
+    : progress.phase || (progress.status === 'completed' ? 'verify' : 'render');
+  const phasePercentValue = legacyMergeRender && Number(progress.durationSec) > 0
+    ? Number(progress.phaseCurrentTimeSec || progress.currentTimeSec || 0) / Number(progress.durationSec) * 100
+    : typeof progress.phasePercent === 'number' && Number.isFinite(progress.phasePercent)
     ? progress.phasePercent
     : progress.percent;
   const hasPercent = typeof phasePercentValue === 'number' && Number.isFinite(phasePercentValue);
-  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent || (phase === 'verify' && progress.status === 'running');
+  const indeterminate = progress.status === 'queued' || progress.status === 'retrying' || !hasPercent || (phase === 'verify' && progress.status === 'running' && !stageProgress?.total);
   const percent = hasPercent ? clampNumber(phasePercentValue || 0, 0, 100) : 0;
   const phaseCurrentTime = Number(progress.phaseCurrentTimeSec ?? progress.currentTimeSec ?? 0);
-  const phaseDuration = Number(progress.phaseDurationSec ?? progress.durationSec ?? 0);
+  const phaseDuration = Number(legacyMergeRender ? progress.durationSec : progress.phaseDurationSec ?? progress.durationSec ?? 0);
   const etaSeconds = progress.phaseEstimatedRemainingSec ?? progress.estimatedRemainingSec;
   const hasEta =
     (progress.status === 'running' || progress.status === 'retrying') &&
@@ -159,13 +168,15 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   const decoderLabel = pipeline?.decoder || '';
   const sceneRendererLabel = pipeline?.sceneRenderer || '';
   const renderFps = Number(progress.renderFps);
-  const renderFpsLabel = Number.isFinite(renderFps) && renderFps > 0 ? `渲染 ${renderFps.toFixed(renderFps >= 10 ? 1 : 2)} fps` : '';
+  const renderFpsLabel = Number.isFinite(renderFps) && renderFps > 0 ? `${isMerge ? '处理' : '渲染'} ${renderFps.toFixed(renderFps >= 10 ? 1 : 2)} fps` : '';
   const realtimeFactor = Number(progress.realtimeFactor);
   const realtimeLabel = Number.isFinite(realtimeFactor) && realtimeFactor > 0 ? `${realtimeFactor.toFixed(2)}×实时` : '';
-  const runningPhaseLabel = phase === 'prepare'
+  const runningPhaseLabel = isMerge && phase === 'verify' && progress.stageLabel
+    ? `${progress.stageLabel.replace(/^正在/, '')}${stageProgress?.total ? ` ${Math.round(percent)}%` : ''}`
+    : phase === 'prepare'
     ? hasPercent ? `准备 ${Math.round(percent)}%` : '准备中'
     : phase === 'mux'
-      ? hasPercent ? `封装 ${Math.round(percent)}%` : '正在封装'
+      ? hasPercent ? `${isMerge ? '拼接' : '封装'} ${Math.round(percent)}%` : isMerge ? '正在拼接' : '正在封装'
       : phase === 'verify'
         ? '正在验证输出'
         : hasPercent
@@ -183,8 +194,19 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
           : progress.status === 'queued'
             ? '等待资源'
           : runningPhaseLabel;
-  const primaryMessage = progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
-  const phaseTimingLabel = phase === 'prepare'
+  const primaryMessage = legacyMergeRender ? progress.stageLabel || progress.message
+    : progress.message || (progress.outputPath ? filename(progress.outputPath) : '等待进度');
+  const phaseTimingLabel = stageProgress
+    ? stageProgress.unit === 'bytes'
+      ? `已读取 ${(stageProgress.completed / 1048576).toFixed(2)} / ${(stageProgress.total / 1048576).toFixed(2)} MB${stageProgress.eventCount != null ? ` · ${stageProgress.eventCount} 条弹幕` : ''}`
+      : stageProgress.unit === 'files'
+        ? `已复制 ${stageProgress.completed} / ${stageProgress.total} 个计划头像文件`
+        : `已处理 ${stageProgress.completed} / ${stageProgress.total} 条头像记录（重复头像跳过）`
+    : isMerge
+    ? phase === 'render' || phase === 'mux'
+      ? `整体已处理 ${formatCompactDuration(phaseCurrentTime)} / ${formatCompactDuration(phaseDuration)}`
+      : phase === 'verify' ? progress.stageLabel || '检查合并结果与音画时间轴' : '检查分段媒体信息与可用空间'
+    : phase === 'prepare'
     ? phaseDuration > 0
       ? `正在预渲染纹理 ${Math.max(0, Math.floor(phaseCurrentTime))}/${Math.max(0, Math.floor(phaseDuration))}`
       : '正在预渲染纹理'
@@ -226,7 +248,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
       }`
     : '';
   const backendDetails = [
-    pipeline ? (sceneRendererLabel || progress.avatarCompositeBackend || '') : '实际管线启动中',
+    pipeline ? (sceneRendererLabel || progress.avatarCompositeBackend || '') : isMerge ? '' : '实际管线启动中',
     avatarDiagnosticsLabel,
     progress.fallbackReason ? `回退：${progress.fallbackReason}` : '',
     decoderLabel,
@@ -236,7 +258,9 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
   return (
     <div className={`job-progress ${progress.status}`}>
       <div className="job-progress-heading">
-        <span>{progress.label}</span>
+        <span title={progress.outputPath}>{isMerge && (progress.sourceCount || progress.sourcePaths?.length)
+          ? `${progress.manual ? '手动合并' : '合并续录'} ${progress.sourceCount || progress.sourcePaths?.length} 段录像`
+          : progress.label}</span>
         <strong>{statusLabel}</strong>
       </div>
       <div className={indeterminate ? 'job-progress-track indeterminate' : 'job-progress-track'}>
@@ -244,6 +268,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
       </div>
       <div className="job-progress-details" title={fullProgressTitle || progress.outputPath || ''}>
         <span className="job-progress-message">{primaryMessage}</span>
+        {isMerge && progress.mergeReason ? <span className="job-progress-meta">{progress.mergeReason}</span> : null}
         {timingDetails.length ? <span className="job-progress-meta">{timingDetails.join(' · ')}</span> : null}
         {rateDetails.length ? <span className="job-progress-meta">{rateDetails.join(' · ')}</span> : null}
         {backendDetails.length ? <span className="job-progress-meta backend">{backendDetails.join(' · ')}</span> : null}

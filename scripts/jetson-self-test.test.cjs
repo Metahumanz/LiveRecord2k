@@ -57,7 +57,7 @@ test('Jetson end-to-end self-test always covers H.264/HEVC plans and both requir
   assert.match(implementation, /CPU 解码回退/);
   assert.doesNotMatch(implementation, /'-filters'/);
   const serviceImplementation = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'app', 'service.cjs'), 'utf8');
-  assert.match(serviceImplementation, /const chunkSeconds = nativeTimestampedAdmission \? Math\.max\(0\.001, Number\(duration\)/);
+  // Window sizing and early fallback are exercised by the recovery tests.
   assert.match(serviceImplementation, /sourceToSceneFrames/);
   assert.match(serviceImplementation, /sceneToEncodeFrames/);
   assert.match(serviceImplementation, /sourceToEncodeFrames/);

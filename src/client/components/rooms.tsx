@@ -272,18 +272,18 @@ export function RoomCard({
         ) : null}
 
         {room.mergeProgress ? <JobProgress progress={room.mergeProgress} /> : null}
-        {mergeActive ? (
+        {mergeActive && !room.mergeProgress?.cleanupStarted ? (
           <button
             className="wide-button danger fill"
             type="button"
             disabled={busy.has(`cancel-merge-${roomKey}`)}
-            onClick={() => run(`cancel-merge-${roomKey}`, () => recorder.cancelMerge(room.id))}
+            onClick={() => run(`cancel-merge-${roomKey}`, () => recorder.cancelMerge(room.id, room.mergeProgress?.id))}
           >
             <Square size={17} />
             {mergeRetrying ? '取消自动合并重试' : mergeQueued ? '取消排队合并' : '中断合并'}
           </button>
         ) : null}
-        {room.mergeProgress?.status === 'error' ? (
+        {room.mergeProgress?.status === 'error' || room.mergeProgress?.status === 'cancelled' ? (
           <button
             className="wide-button fill"
             type="button"

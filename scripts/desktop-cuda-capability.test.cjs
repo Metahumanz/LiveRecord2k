@@ -9,7 +9,7 @@ const {
 const {
   fingerprintEnvironment
 } = require('../src/server/danmaku/desktop-cuda-conformance.cjs');
-const { canUseDesktopCudaSceneProduction } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
+const { canUseDesktopCudaSceneProduction, CUDA_SCENE_CONFORMANCE_VERSION } = require('../src/server/danmaku/gpu-scene-conformance.cjs');
 
 const cudaFilters = new Set(['hwupload_cuda', 'overlay_cuda', 'scale_cuda']);
 const nvenc = [{ value: 'hevc_nvenc', kind: 'hardware' }];
@@ -56,8 +56,10 @@ test('desktop CUDA conformance cache is tied to the runtime fingerprint', () => 
   const capability = { available: true, backend: 'cuda-ffmpeg' };
   const environment = { platform: 'win32', arch: 'x64', ffmpegVersion: 'ffmpeg version 7', gpu: [{ name: 'RTX', driver: '1', pciBusId: '01:00.0' }] };
   const fingerprint = fingerprintEnvironment(environment);
+  assert.notEqual(fingerprint, fingerprintEnvironment({ ...environment, rendererRevision: 'before-alpha-fix' }));
   const report = {
-    version: 'ass-compat-v1', backend: 'cuda-ffmpeg', passed: true,
+    version: CUDA_SCENE_CONFORMANCE_VERSION, backend: 'cuda-ffmpeg', passed: true,
+    executedAt: Date.now(),
     environmentFingerprint: fingerprint,
     cases: [
       ...['h5-card', 'bubble', 'minimal'].flatMap((preset) => [0, 1.019].map((leadingVideoPaddingSec) => ({

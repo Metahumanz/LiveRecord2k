@@ -4,7 +4,9 @@
 // a complete, current visual run. A helper's advertised primitives are not
 // evidence that its pixels, alpha or timeline are compatible.
 
-const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v1';
+// v3 also restores MP4 edit-list running time before NVDEC. Older reports
+// cannot admit the new media clock without a fresh fixture run.
+const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v3';
 const CUDA_SCENE_CONFORMANCE_PRESETS = ['h5-card', 'bubble', 'minimal'];
 const CUDA_SCENE_CONFORMANCE_LEADS = [0, 1.019];
 const CUDA_SCENE_CONFORMANCE_COVERAGE = [
@@ -16,6 +18,7 @@ const CUDA_SCENE_CONFORMANCE_COVERAGE = [
 // and the production gate.
 const CUDA_SCENE_MAX_MEAN_ABS_RGB = 2;
 const CUDA_SCENE_MAX_CHANGED_RATIO = 0.02;
+const DESKTOP_CUDA_REPORT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function number(value, fallback = NaN) {
   const result = Number(value);
@@ -115,9 +118,14 @@ function canUseDesktopCudaSceneProduction(capability, conformance, options = {})
   }
   const validation = validateCudaSceneConformance(conformance);
   if (!validation.ok) return validation;
-  const expectedFingerprint = String(options.environmentFingerprint || '').trim();
-  if (expectedFingerprint && conformance.environmentFingerprint !== expectedFingerprint) {
+  const expectedFingerprint = String(options.environmentFingerprint || capability.environmentFingerprint || '').trim();
+  if (!expectedFingerprint || conformance.environmentFingerprint !== expectedFingerprint) {
     return { ok: false, reason: '桌面 CUDA Scene 自检环境已变化，需要重新执行视觉一致性门禁。' };
+  }
+  const timestamp = Number(conformance.executedAt);
+  const age = Number(options.now ?? Date.now()) - timestamp;
+  if (!Number.isFinite(timestamp) || timestamp <= 0 || !Number.isFinite(age) || age < -60_000 || age > DESKTOP_CUDA_REPORT_MAX_AGE_MS) {
+    return { ok: false, reason: '桌面 CUDA Scene 视觉一致性报告已过期，需要重新自检。' };
   }
   return { ok: true, reason: '' };
 }
@@ -129,6 +137,7 @@ module.exports = {
   CUDA_SCENE_CONFORMANCE_COVERAGE,
   CUDA_SCENE_MAX_MEAN_ABS_RGB,
   CUDA_SCENE_MAX_CHANGED_RATIO,
+  DESKTOP_CUDA_REPORT_MAX_AGE_MS,
   createCudaSceneConformanceUnavailable,
   validateCudaSceneConformance,
   canUseCudaSceneProduction,

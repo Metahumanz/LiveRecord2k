@@ -20,6 +20,7 @@ class StatePublisher {
       accessAuthenticated: Boolean(options.accessAuthenticated),
       accessRequired: Boolean(options.accessRequired),
       paused: false,
+      needsSnapshot: false,
       drainListener: null
     };
     this.clients.set(response, client);
@@ -107,8 +108,11 @@ class StatePublisher {
     if (!this.hasDirtyState()) return;
     const batch = this.takeDirtyState();
     for (const [response, client] of this.clients) {
-      if (client.paused) continue;
-      this.writeDeltaBatch(response, client, batch);
+      if (client.paused) {
+        client.needsSnapshot = true;
+        continue;
+      }
+      if (this.writeDeltaBatch(response, client, batch) === false) client.needsSnapshot = true;
     }
   }
 
@@ -144,10 +148,13 @@ class StatePublisher {
       if (this.clients.get(response) !== client) return;
       client.paused = false;
       client.drainListener = null;
-      // Deltas accumulated while the stream was blocked were deliberately
-      // skipped, so resume with a current full snapshot instead of replaying
-      // an arbitrary stale subset.
-      this.writeState(response, client);
+      // write(false) has already queued the event. A large snapshot alone
+      // must not cause another snapshot at every drain. Resync only when a
+      // batch was skipped or stopped while this client was backpressured.
+      if (client.needsSnapshot) {
+        client.needsSnapshot = false;
+        this.writeState(response, client);
+      }
     };
     client.drainListener = resume;
     if (typeof response.once === 'function') {
@@ -181,21 +188,22 @@ class StatePublisher {
     if (batch.roomsAll) {
       for (const roomId of this.getRoomIds()) {
         emittedRooms.add(String(roomId));
-        if (!this.writeRoom(response, client, roomId, false)) return;
+        if (!this.writeRoom(response, client, roomId, false)) return false;
       }
     }
     for (const [roomId, detail] of batch.rooms) {
       if (!detail.deleted && emittedRooms.has(roomId)) continue;
-      if (!this.writeRoom(response, client, roomId, detail.deleted)) return;
+      if (!this.writeRoom(response, client, roomId, detail.deleted)) return false;
     }
 
-    if (batch.recording && !this.writePayload(response, client, 'recording')) return;
-    if (batch.logClear && !this.writeEvent(response, 'log', { clear: true })) return;
-    if (batch.logEntries.length && !this.writeEvent(response, 'log', { entries: batch.logEntries })) return;
-    if (batch.logReplace && !this.writePayload(response, client, 'log')) return;
+    if (batch.recording && !this.writePayload(response, client, 'recording')) return false;
+    if (batch.logClear && !this.writeEvent(response, 'log', { clear: true })) return false;
+    if (batch.logEntries.length && !this.writeEvent(response, 'log', { entries: batch.logEntries })) return false;
+    if (batch.logReplace && !this.writePayload(response, client, 'log')) return false;
     for (const type of ['settings', 'mediaJob', 'diskSpace', 'system']) {
-      if (batch[type] && !this.writePayload(response, client, type)) return;
+      if (batch[type] && !this.writePayload(response, client, type)) return false;
     }
+    return true;
   }
 
   writeRoom(response, client, roomId, deleted) {

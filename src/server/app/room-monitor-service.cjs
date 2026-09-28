@@ -150,6 +150,7 @@ class RoomMonitorService {
     const previousLiveStatus = room.liveStatus;
     const previousLastError = room.lastError;
     room.liveStatus = Number(liveStatus || 0);
+    if (room.liveStatus !== 1) room.recordingManuallyStopped = false;
     room.lastCheckedAt = Date.now();
     room.lastError = undefined;
     const liveStatusChanged = previousLiveStatus !== room.liveStatus;

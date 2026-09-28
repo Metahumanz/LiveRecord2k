@@ -221,7 +221,7 @@ class MediaJobManager extends EventEmitter {
     for (const activeJob of preemptions) {
       activeJob.preemptRequested = true;
       try {
-        activeJob.cancel?.();
+        activeJob.cancel?.({ reason: 'recording-preemption', recordingId: recording.id });
       } catch {
         // Capture startup must not be blocked by a best-effort cancellation.
       }
@@ -241,7 +241,7 @@ class MediaJobManager extends EventEmitter {
     }
     const job = this.active.get(key) || this.external.get(key);
     if (!job) return false;
-    job.cancel?.();
+    job.cancel?.({ reason: 'user' });
     return true;
   }
 
@@ -293,7 +293,7 @@ class MediaJobManager extends EventEmitter {
     this.draining = true;
     const queued = this.queue.splice(0);
     for (const job of queued) job.reject(new Error('服务正在关闭，排队媒体任务已取消。'));
-    for (const job of [...this.active.values(), ...this.external.values()]) job.cancel?.();
+    for (const job of [...this.active.values(), ...this.external.values()]) job.cancel?.({ reason: 'shutdown' });
     this.emit('change');
   }
 }

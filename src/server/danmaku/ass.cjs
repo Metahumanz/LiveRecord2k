@@ -299,6 +299,7 @@ function normalizeDanmakuStyleLayout(values = {}) {
   const layout = {};
   for (const [key, [min, max]] of Object.entries(DANMAKU_STYLE_LAYOUT_LIMITS)) {
     if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    if (source[key] === null || source[key] === undefined || source[key] === '') continue;
     const value = Number(source[key]);
     if (!Number.isFinite(value)) continue;
     layout[key] = clamp(value, min, max);
@@ -676,7 +677,15 @@ function resolveAssRenderContext(events, options = {}) {
     Object.prototype.hasOwnProperty.call(options, 'stylePreset') || Object.prototype.hasOwnProperty.call(options, 'styleLayout')
       ? resolveDanmakuStyle(options.style, options.stylePreset, options.styleLayout)
       : normalizeDanmakuStyle(options.style);
-  const style = adaptDanmakuStyleToVideo(baseStyle, options.videoInfo);
+  let style = adaptDanmakuStyleToVideo(baseStyle, options.videoInfo);
+  if (visualPresetFromStyle(style) !== DEFAULT_DANMAKU_STYLE_PRESET) {
+    // Side cards and their avatar layer use the same selected display bounds
+    // as Scene Graph. Otherwise ASS anchors the stack near the bottom of the
+    // whole canvas while CUDA anchors it inside the selected quarter/half.
+    const bounds = getDanmakuLayoutMetrics(style, danmakuArea);
+    style = { ...style, danmakuAreaTop: bounds.top, danmakuAreaBottom: bounds.bottom,
+      superChatBottom: bounds.bottom };
+  }
   const sorted = prepareAssEvents(events, {
     overlayMode,
     startTime: options.startTime,

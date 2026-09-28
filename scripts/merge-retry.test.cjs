@@ -6,7 +6,8 @@ const test = require('node:test');
 const ffmpegPath = require('ffmpeg-static');
 
 const { LiveRecordService, getMergeSegmentTimingAssessment } = require('../src/server/app/service.cjs');
-const { createNormalizeSegmentArgs } = require('../src/server/recording/ffmpeg.cjs');
+const { AtomicJsonStore } = require('../src/server/app/atomic-store.cjs');
+const { createNormalizeSegmentArgs, createNormalizeEncodedVideoMuxArgs } = require('../src/server/recording/ffmpeg.cjs');
 const {
   createFfmpegJobProgress,
   discoverRecordingFiles,
@@ -50,6 +51,236 @@ function createMergeTestService() {
   service.getMergeRetryDelayMs = () => 1;
   return service;
 }
+
+test('cancelled groups and manual selection survive a real store reload without suppressing the next session', async t => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-cancel-persist-'));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
+  const files = [];
+  for (let i = 0; i < 4; i++) { const file = path.join(directory, `${i}.clean.mp4`); await fsp.writeFile(file, 'source'); files.push(file); }
+  app.recordings = files.map((cleanPath, i) => ({ cleanPath, roomId: room.id, startedAt: i < 2 ? i + 10 : i, valid: true,
+    mergeGroup: i < 2 ? 'first-session' : 'second-session', mergeSequence: i % 2 + 1, durationSec: 10, segmentTargetDurationSec: 600 }));
+  app.storePath = path.join(directory, 'settings.json'); app.stateStore = new AtomicJsonStore(app.storePath);
+  app.saveStore = LiveRecordService.prototype.saveStore;
+  room.mergeProgress = { kind: 'merge', id: 'first-job', mergeGroup: 'manual-first-session', status: 'retrying',
+    manual: true, sourcePaths: files.slice(0, 2), outputPath: path.join(directory, 'first.merged.mp4') };
+  await app.cancelMerge(room.id, 'first-job');
+  const restarted = createMergeTestService(); restarted.storePath = app.storePath; restarted.stateStore = new AtomicJsonStore(app.storePath);
+  await restarted.loadStore();
+  const restored = restarted.getRoom(room.id);
+  assert.equal(restored.mergeProgress.status, 'cancelled'); assert.deepEqual(restored.mergeProgress.sourcePaths, files.slice(0, 2));
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'manual-first-session')), true);
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'first-session')), false);
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'second-session')), false);
+  assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'second-session');
+  assert.equal(restarted.isCancelledMergeSelection(room.id, restarted.recordings.slice(0, 2)), true);
+  restarted.clearCancelledMergeSelection(room.id, files.slice(0, 2));
+  assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'first-session');
+});
+
+test('a retry in another group displays its own output path rather than the previous completed merge', () => {
+  const app = createMergeTestService(); const room = { id: '883263', mergeProgress: {
+    kind: 'merge', status: 'completed', mergeGroup: 'first-session', outputPath: 'first.merged.mp4' } };
+  app.getMergeRetryDelayMs = () => 60000;
+  app.scheduleMergeRetry(room, 'second-session', { cleanPath: 'second.clean.mp4', mergeOutputPath: 'second.merged.mp4' }, new Error('retry'));
+  assert.equal(room.mergeProgress.outputPath, 'second.merged.mp4'); assert.equal(room.mergeProgress.mergeGroup, 'second-session');
+  app.clearMergeRetryStatesForRoom(room.id);
+});
+
+test('service shutdown does not persist an interruption as a user cancellation', async () => {
+  const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
+  const progress = createFfmpegJobProgress({ kind: 'merge', durationSec: 60, roomId: room.id });
+  progress.mergeGroup = 'not-user-cancelled'; room.mergeProgress = progress;
+  const lease = await app.acquireMergeMediaLease(room, progress, { preferred: 'libx264', requiresTranscode: true });
+  app.draining = true; await app.mediaJobs.shutdown();
+  assert.equal(app.mergeCancelRequests.size, 0);
+  assert.equal(app.mergePreemptRequests.has(app.getMergeRetryKey(room.id, progress.mergeGroup)), true);
+  lease.release();
+});
+
+test('cancelling one live session does not suppress finalization of a later single-segment session', async () => {
+  const app = createMergeTestService();
+  const room = { id: '883263', mergeProgress: { kind: 'merge', id: 'old-job', mergeGroup: 'first-session', status: 'cancelled' } };
+  app.rooms.set(room.id, room);
+  app.mergeCancelRequests.add(app.getMergeRetryKey(room.id, 'first-session'));
+  const recording = { cleanPath: 'second-session.mp4', liveSessionId: 'second-session', eventCount: 0, valid: true };
+  app.mergeReconnectGroupIfNeeded = async (_room, group) => { assert.equal(group, 'second-session'); return recording; };
+  let finalized;
+  app.finalizeLiveDiagnostics = async (_room, output) => { finalized = output; };
+  assert.equal(await app.finalizeReconnectGroup(room, 'second-session', recording), recording);
+  assert.equal(finalized, recording);
+});
+
+test('cancelling the displayed retry leaves other live-session retries intact and rejects a stale button', async t => {
+  const app = createMergeTestService();
+  const room = { id: '883263' }; app.rooms.set(room.id, room);
+  app.getMergeRetryDelayMs = () => 40;
+  t.after(() => app.clearMergeRetryStatesForRoom(room.id));
+  const retried = [];
+  app.finalizeReconnectGroup = async (_room, group) => retried.push(group);
+  app.scheduleMergeRetry(room, 'second-session', {}, new Error('temporary failure'));
+  app.scheduleMergeRetry(room, 'first-session', {}, new Error('temporary failure'));
+  const job = room.mergeProgress.id;
+  await assert.rejects(app.cancelMerge(room.id, 'stale-job'), error => error.code === 'MERGE_TASK_CHANGED');
+  await app.cancelMerge(room.id, job);
+  assert.equal(app.mergeRetryStates.has(app.getMergeRetryKey(room.id, 'second-session')), true);
+  await waitFor(() => retried.length === 1);
+  assert.deepEqual(retried, ['second-session']);
+});
+
+test('same-room merge groups serialize and an older cancellation cannot stop a later group', async () => {
+  const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
+  let unblock; const gate = new Promise(resolve => { unblock = resolve; });
+  const started = [];
+  app.performMergeReconnectGroup = async (_room, group) => { started.push(group); if (group === 'first') await gate; return group; };
+  const first = app.mergeReconnectGroupIfNeededInternal(room, 'first', {});
+  const second = app.mergeReconnectGroupIfNeededInternal(room, 'second', {});
+  await waitFor(() => started.length === 1);
+  app.mergeCancelRequests.add(app.getMergeRetryKey(room.id, 'first'));
+  unblock();
+  assert.equal(await first, 'first'); assert.equal(await second, 'second');
+  assert.deepEqual(started, ['first', 'second']); assert.equal(app.mergeRoomTasks.size, 0);
+});
+
+test('recording preemption yields resources without marking a user cancellation and can retry the manual selection', async t => {
+  const app = createMergeTestService(); const room = { id: '883263' }; app.rooms.set(room.id, room);
+  const progress = createFfmpegJobProgress({ kind: 'merge', durationSec: 60, roomId: room.id });
+  progress.mergeGroup = 'manual-first'; progress.manual = true; room.mergeProgress = progress;
+  const lease = await app.acquireMergeMediaLease(room, progress, { preferred: 'libx264', requiresTranscode: true });
+  const releaseRecording = app.mediaJobs.registerExternal({ id: 'recording:883263:new-session', type: 'recording', resource: 'recording' });
+  t.after(() => { lease.release(); releaseRecording(); app.clearMergeRetryStatesForRoom(room.id); });
+  const key = app.getMergeRetryKey(room.id, progress.mergeGroup);
+  assert.equal(app.mergeCancelRequests.has(key), false); assert.equal(app.mergePreemptRequests.has(key), true);
+  await assert.rejects(app.runMergePreparationStage(room, progress, '检查', async () => {}), error => error.code === 'MERGE_PREEMPTED');
+  app.mergePreemptRequests.delete(key); lease.release();
+  const selected = { segments: [{ cleanPath: 'one' }, { cleanPath: 'two' }], outputPath: 'same-target.mp4' };
+  let retried;
+  app.mergeReconnectGroupIfNeededInternal = async (_room, group, _fallback, options) => { retried = { group, options }; };
+  const error = Object.assign(new Error('yield'), { code: 'MERGE_PREEMPTED' });
+  assert.equal(app.scheduleMergeRetry(room, 'manual-first', {}, error, { manualOptions: selected }), true);
+  assert.match(room.mergeProgress.message, /录制优先/);
+  await waitFor(() => retried);
+  assert.equal(retried.group, 'manual-first'); assert.equal(retried.options, selected);
+});
+
+test('Jetson merge rejects a mux that would overwrite its video input before launching FFmpeg', () => {
+  assert.throws(() => createNormalizeEncodedVideoMuxArgs({ encodedVideoPath: 'same.mkv', outputPath: './same.mkv' }), /同一路径/);
+});
+
+test('Jetson cross-resolution merge uses separate video and mux files on a local workspace', async t => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-jetson-mux-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const app = createMergeTestService();
+  app.ffmpegPath = ffmpegPath;
+  app.settings.outputDir = dir;
+  const room = { id: '883263', recording: false };
+  app.rooms.set(room.id, room);
+  app.getMergeEncoderPlan = () => ({ preferred: 'h264_nvv4l2', fallback: '', software: '' });
+  app.getLinuxRecordingRootMount = async () => ({ fsType: 'cifs', mountPoint: dir });
+  const progressSamples = [];
+  app.markRoomDirty = () => { if (room.mergeProgress) progressSamples.push({ ...room.mergeProgress }); };
+  const originals = [];
+  for (let i = 0; i < 2; i++) {
+    const cleanPath = path.join(dir, `883263_test_20260926_22275${i + 3}.clean.mp4`);
+    const generated = await runCapturedProcess(ffmpegPath, ['-y', '-f', 'lavfi', '-i', `testsrc2=size=${i ? '640x360' : '320x180'}:rate=30:duration=1`,
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1', '-c:v', 'libx264', '-c:a', 'aac', '-shortest', cleanPath], { timeoutMs: 20_000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    originals.push(cleanPath);
+    app.recordings.push({ cleanPath, roomId: room.id, startedAt: i + 1, durationSec: 1, valid: true });
+  }
+  let attempts = 0;
+  app.runJetsonGstreamerTranscode = async options => {
+    attempts++;
+    const mux = options.createMuxArgs();
+    const source = mux[mux.indexOf('-i', mux.indexOf('-i') + 1) + 1];
+    assert.notEqual(path.resolve(options.encodedVideoPath), path.resolve(mux.at(-1)));
+    assert.equal(path.basename(options.encodedVideoPath), `${String(attempts).padStart(3, '0')}.video.mkv`);
+    assert.ok(path.dirname(options.encodedVideoPath).includes('br2k-merge-publish-'));
+    const encoded = await runCapturedProcess(ffmpegPath, ['-y', '-i', source, '-an', '-vf', `scale=${options.width}:${options.height}`,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0', options.encodedVideoPath], { timeoutMs: 20_000 });
+    assert.equal(encoded.status, 0, encoded.stderr);
+    await runFfmpegJob(ffmpegPath, mux, options.onStderr, { onChild: options.onChild });
+  };
+  await app.mergeSelectedRecordings({ cleanPaths: originals });
+  const result = await [...app.mergeInFlightGroups.values()][0];
+  assert.equal(attempts, 2);
+  assert.ok(progressSamples.some(sample => sample.phase === 'render' && sample.phaseCurrentTimeSec > 0), 'normalization media PTS never reached the progress fields');
+  assert.ok(progressSamples.some(sample => sample.phase === 'mux' && sample.phaseCurrentTimeSec > 0), 'concat media PTS never reached the progress fields');
+  assert.equal((await probeMediaFileInfo(ffmpegPath, result.cleanPath)).videoInfo.width, 640);
+  for (const source of originals) assert.ok((await fsp.stat(source)).size);
+});
+
+test('manual selection merges complete segments chronologically and preserves source files and rows', async t => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-manual-merge-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const app = createMergeTestService();
+  app.ffmpegPath = ffmpegPath;
+  app.settings.outputDir = dir;
+  const room = { id: '883263', title: '今天的直播标题', recording: false };
+  app.rooms.set(room.id, room);
+  for (let index = 0; index < 2; index++) {
+    const cleanPath = path.join(dir, `883263_真栗_20260926_22275${index + 3}.clean.mp4`);
+    const result = await runCapturedProcess(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc2=size=320x180:rate=30:duration=1`,
+      '-f', 'lavfi', '-i', `sine=frequency=${440 + index * 220}:sample_rate=48000:duration=1`,
+      '-c:v', 'libx264', '-c:a', 'aac', '-shortest', cleanPath], { timeoutMs: 20_000 });
+    assert.equal(result.status, 0, result.stderr);
+    const danmakuPath = path.join(dir, `${index}.danmaku.jsonl`);
+    await fsp.writeFile(danmakuPath, JSON.stringify({ type: 'danmaku', time: 0.2, text: `分段${index}`, uid: index }) + '\n');
+    app.recordings.push({ cleanPath, danmakuPath, roomId: '', startedAt: index + 1,
+      roomTitle: index === 0 ? '录制时的原始标题' : '同场后来修改的标题',
+      durationSec: 1, segmentTargetDurationSec: 1, valid: true, eventCount: 1 });
+  }
+  const original = [...app.recordings];
+  app.mergeCancelRequests.add(app.getMergeRetryKey(room.id, 'previous-cancelled-session'));
+  await app.mergeSelectedRecordings({ cleanPaths: original.map(row => row.cleanPath).reverse() });
+  const task = [...app.mergeInFlightGroups.values()][0];
+  assert.ok(task);
+  const merged = await task;
+  assert.deepEqual(merged.mergedFrom, original.map(row => row.cleanPath));
+  assert.equal(merged.roomTitle, '录制时的原始标题');
+  assert.equal(room.title, '今天的直播标题');
+  assert.ok((await probeMediaFileInfo(ffmpegPath, merged.cleanPath)).videoInfo);
+  assert.equal(app.recordings.length, 3);
+  for (const row of original) assert.ok((await fsp.stat(row.cleanPath)).size > 0);
+  assert.equal(app.pendingSegmentCleanups.size, 0);
+  const rescanned = await discoverRecordingFiles(dir, { ffmpegPath });
+  assert.ok(rescanned.some(row => row.cleanPath === merged.cleanPath), 'manual output disappeared after refreshing the library');
+  assert.equal(rescanned.find(row => row.cleanPath === merged.cleanPath).roomTitle, '录制时的原始标题');
+  const events = (await fsp.readFile(merged.danmakuPath, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(events.length, 2);
+  assert.ok(events[1].time > events[0].time);
+});
+
+test('manual selection rejects duplicate, cross-room and unfinished inputs', async () => {
+  const app = createMergeTestService();
+  app.recordings = [{ cleanPath: 'one.mp4', roomId: 'one', valid: true },
+    { cleanPath: 'two.mp4', roomId: 'two', valid: true }];
+  await assert.rejects(app.mergeSelectedRecordings({ cleanPaths: ['one.mp4', 'one.mp4'] }), error => error.code === 'MERGE_SELECTION_INVALID');
+  await assert.rejects(app.mergeSelectedRecordings({ cleanPaths: ['one.mp4', 'two.mp4'] }), error => error.code === 'MERGE_ROOM_MISMATCH');
+  app.recordings[1].roomId = 'one';
+  app.recordings[1].containerStage = 'capturing';
+  await assert.rejects(app.mergeSelectedRecordings({ cleanPaths: ['one.mp4', 'two.mp4'] }), error => error.code === 'MERGE_SOURCE_INVALID');
+});
+
+test('manual retry clears cancellation and retries the displayed group rather than a newer group', async () => {
+  const app = createMergeTestService();
+  const room = { id: 'retry-display', recording: false, mergeProgress: { kind: 'merge', status: 'error', mergeGroup: 'old-group' } };
+  app.rooms.set(room.id, room);
+  app.mergeCancelRequests.add(app.getMergeRetryKey(room.id, 'old-group'));
+  app.getPendingMergeGroupForRoom = async (_room, preferred) => {
+    assert.equal(preferred, 'old-group');
+    return { mergeGroup: preferred, fallbackRecording: {} };
+  };
+  let called = false;
+  app.finalizeReconnectGroup = async (_room, group) => {
+    called = true;
+    assert.equal(group, 'old-group');
+    assert.equal(app.mergeCancelRequests.has(app.getMergeRetryKey(room.id, 'old-group')), false);
+  };
+  await app.retryMerge(room.id);
+  assert.equal(called, true);
+});
 
 test('merge watchdog terminates an FFmpeg process whose media timestamp stops progressing', async () => {
   let notified = false;
@@ -455,6 +686,10 @@ test('full-length recording segments are merge boundaries while adjacent incompl
     const pending = await service.getPendingMergeGroupForRoom(room);
     assert.equal(pending?.mergeGroup, 'boundary-group');
     assert.equal(pending?.fallbackRecording.cleanPath, paths[2]);
+    await fsp.writeFile(pending.fallbackRecording.mergeOutputPath, 'incomplete prior merge');
+    service.ffmpegPath = ffmpegPath;
+    assert.equal((await service.getPendingMergeGroupForRoom(room))?.mergeGroup, 'boundary-group',
+      'an existing invalid output must not hide preserved source segments from retry');
   } finally {
     await fsp.rm(outputDir, { recursive: true, force: true });
   }

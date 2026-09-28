@@ -3,6 +3,9 @@ build/
 dist/
 release/
 smoke-output/
+.tmp/desktop-burn-regression/
+.tmp/orin-ca15664/
+.tmp/performance-20260928/
 *.log
 *.tsbuildinfo
 .DS_Store

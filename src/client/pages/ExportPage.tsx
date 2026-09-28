@@ -11,12 +11,17 @@ import {
   Scissors,
   SkipBack,
   SkipForward,
+  SquareCheck,
   Square
 } from 'lucide-react';
 import { recorder } from '../recorderClient';
 import { JobProgress, PageHeader, PathLine } from '../components/common';
 import { DanmakuStylePreview } from '../components/DanmakuStylePreview';
-import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState } from '../types';
+import {
+  getManualMergeSelection, getSameLiveMergeSuggestions, ManualMergeControls, ManualMergeProgress,
+  MergeConfirmation, SameLiveMergeSuggestions
+} from '../components/ManualMergeControls';
+import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState, SceneMuxRecovery } from '../types';
 import {
   burnAvatarModeOptions,
   danmakuAreaOptions,
@@ -63,6 +68,17 @@ export function ExportPage({
   const canOpenServerPath = state.uiCapabilities?.openServerPath ?? !isLinux;
   const validRecordingCount = recordings.filter((recording) => recording.valid !== false).length;
   const selectedRecording = recordings.find((recording) => recording.cleanPath === draft.cleanPath);
+  const [mergeSelection, setMergeSelection] = useState<string[]>([]);
+  const [selectingMerge, setSelectingMerge] = useState(false);
+  const [mergeSubmitted, setMergeSubmitted] = useState(false);
+  const [deleteMergeSources, setDeleteMergeSources] = useState(false);
+  const [pendingMergePaths, setPendingMergePaths] = useState<string[] | null>(null);
+  const mergeSubmissionRef = useRef(false);
+  const { selected: mergeRecordings, reason: mergeReason } = getManualMergeSelection(recordings, mergeSelection, state.rooms);
+  const { selected: pendingMergeRecordings, reason: pendingMergeReason } = getManualMergeSelection(
+    recordings, pendingMergePaths || [], state.rooms
+  );
+  const sameLiveSuggestions = getSameLiveMergeSuggestions(recordings, state.rooms);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [decodedVideoSize, setDecodedVideoSize] = useState<{ width: number; height: number } | null>(null);
@@ -71,6 +87,8 @@ export function ExportPage({
   const [previewDeclined, setPreviewDeclined] = useState(false);
   const [previewStarting, setPreviewStarting] = useState(false);
   const [sceneTracksMessage, setSceneTracksMessage] = useState('');
+  const [muxRecoveries, setMuxRecoveries] = useState<SceneMuxRecovery[]>([]);
+  const [muxRecoveryError, setMuxRecoveryError] = useState('');
   const [pathPickerBusy, setPathPickerBusy] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -126,6 +144,16 @@ export function ExportPage({
   const playheadTime = canUseTimeline ? clampNumber(playbackTime, 0, timelineDuration) : 0;
   const playheadLeft = canUseTimeline ? clampNumber((playheadTime / timelineDuration) * 100, 0, 100) : 0;
   const exportQueue = state.exportQueue || [];
+  const exportStatus = state.exportProgress?.status;
+  useEffect(() => {
+    let active = true;
+    void recorder.listSceneMuxRecoveries().then(items => {
+      if (active) { setMuxRecoveries(items); setMuxRecoveryError(''); }
+    }).catch(error => {
+      if (active) setMuxRecoveryError(error instanceof Error ? error.message : '恢复任务读取失败。');
+    });
+    return () => { active = false; };
+  }, [exportStatus]);
   const hasExportBacklog = state.exportProgress?.status === 'running' || exportQueue.length > 0;
   const previewVideoInfo = decodedVideoSize || selectedRecording?.videoInfo || null;
   const previewWidth = Math.round(Number(previewVideoInfo?.width || 0));
@@ -378,6 +406,45 @@ export function ExportPage({
             <span className="source-count">共 {recordings.length} 个，可用 {validRecordingCount} 个</span>
           </div>
 
+          <SameLiveMergeSuggestions suggestions={sameLiveSuggestions} recordings={recordings} rooms={state.rooms}
+            busy={busy.has('manual-merge')} onChoose={paths => {
+              setDeleteMergeSources(false);
+              setPendingMergePaths(paths);
+            }} />
+
+          <ManualMergeControls selecting={selectingMerge} count={mergeRecordings.length} reason={mergeReason}
+            deleteSources={deleteMergeSources} onDeleteSourcesChange={setDeleteMergeSources}
+            busy={busy.has('manual-merge')}
+            onToggle={() => { setSelectingMerge(!selectingMerge); setMergeSelection([]); }}
+            onMerge={() => setPendingMergePaths(mergeRecordings.map(recording => recording.cleanPath))} />
+
+          {pendingMergePaths ? <MergeConfirmation selected={pendingMergeRecordings} reason={pendingMergeReason}
+            deleteSources={deleteMergeSources} busy={busy.has('manual-merge')}
+            onDeleteSourcesChange={setDeleteMergeSources}
+            onCancel={() => { if (!mergeSubmissionRef.current) setPendingMergePaths(null); }}
+            onConfirm={async () => {
+              if (pendingMergeReason || mergeSubmissionRef.current) return;
+              mergeSubmissionRef.current = true;
+              const paths = pendingMergeRecordings.map(recording => recording.cleanPath);
+              try {
+                if (await run('manual-merge', () => recorder.mergeRecordings(paths, deleteMergeSources))) {
+                  setMergeSubmitted(true);
+                  setPendingMergePaths(null);
+                  setDeleteMergeSources(false);
+                  setMergeSelection([]); setSelectingMerge(false);
+                }
+              } finally {
+                mergeSubmissionRef.current = false;
+              }
+            }} /> : null}
+
+          {mergeSubmitted ? <p className="field-help manual-merge-hint" role="status">
+            合并任务已提交，进度显示在下方，也可在“直播间”页面查看。合并完成后，成片会自动加入录像列表。
+          </p> : null}
+          <ManualMergeProgress rooms={state.rooms} busy={busy}
+            onCancel={(roomId, jobId) => { void run(`cancel-merge-${roomId}`, () => recorder.cancelMerge(roomId, jobId)); }}
+            onRetry={(roomId) => { void run(`retry-merge-${roomId}`, () => recorder.retryMerge(roomId)); }} />
+
           <div className="recording-list">
             {recordings.length === 0 ? (
               <div className="empty-state compact-empty export-empty">
@@ -391,21 +458,32 @@ export function ExportPage({
                   key={recording.id || recording.cleanPath}
                   className={[
                     'recording-row',
-                    recording.cleanPath === draft.cleanPath ? 'active' : '',
+                    selectingMerge ? 'merge-selectable' : '',
+                    (selectingMerge ? mergeSelection.includes(recording.cleanPath) : recording.cleanPath === draft.cleanPath) ? 'active' : '',
                     recording.valid === false ? 'invalid' : ''
                   ]
                     .filter(Boolean)
                     .join(' ')}
                   type="button"
-                  disabled={recording.valid === false}
                   title={recording.valid === false ? recording.validReason || '文件不可用' : recording.cleanPath}
-                  onClick={() => selectRecording(recording)}
+                  role={selectingMerge ? 'checkbox' : undefined}
+                  aria-checked={selectingMerge ? mergeSelection.includes(recording.cleanPath) : undefined}
+                  disabled={recording.valid === false || (selectingMerge && ['capturing', 'finalizing'].includes(recording.containerStage || ''))}
+                  onClick={() => selectingMerge
+                    ? setMergeSelection(current => current.includes(recording.cleanPath)
+                      ? current.filter(value => value !== recording.cleanPath) : [...current, recording.cleanPath])
+                    : selectRecording(recording)}
                 >
-                  <span>{recordingLabel(recording)}</span>
-                  <span className="recording-meta">
-                    {filename(recording.cleanPath)}
-                    {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
-                    {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
+                  {selectingMerge ? mergeSelection.includes(recording.cleanPath)
+                    ? <SquareCheck className="recording-selection-icon" size={18} />
+                    : <Square className="recording-selection-icon" size={18} /> : null}
+                  <span className="recording-row-content">
+                    <span>{recordingLabel(recording)}</span>
+                    <span className="recording-meta">
+                      {filename(recording.cleanPath)}
+                      {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
+                      {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
+                    </span>
                   </span>
                 </button>
               ))
@@ -791,6 +869,7 @@ export function ExportPage({
                 className="wide-button"
                 type="button"
                 disabled={busy.has('save-settings')}
+                title="保存当前导出类型（纯净片段或烧录片段）、烧录内容、弹幕显示区域、样式预设与调整参数、头像模式。下次选择录像时使用；烧录参数也用于自动烧录。不保存源文件、剪辑起止时间或本次输出目录。"
                 onClick={saveStyleAsDefault}
               >
                 设为默认
@@ -904,7 +983,7 @@ export function ExportPage({
               className="wide-button fill danger"
               type="button"
               disabled={busy.has('export-cancel')}
-              onClick={() => run('export-cancel', recorder.cancelExport)}
+              onClick={() => run('export-cancel', () => recorder.cancelExport(state.exportProgress?.id))}
             >
               <Square size={17} />
               中断当前导出
@@ -931,6 +1010,33 @@ export function ExportPage({
               </div>
             </div>
           ) : null}
+          {muxRecoveries.length > 0 ? (
+            <div className="export-queue">
+              <div className="export-queue-heading">
+                <RefreshCw size={17} />
+                <span>封装失败后恢复</span>
+                <strong>{muxRecoveries.length}</strong>
+              </div>
+              <p className="field-help">烧录视频已保留。重试只封装源音频并验收成片，不会重新渲染整段录像。</p>
+              <div className="export-queue-list">
+                {muxRecoveries.map(item => {
+                  const queued = exportQueue.some(job => job.recoveryId === item.id);
+                  return <div className="export-queue-row" key={item.id}>
+                    <span>{filename(item.outputPath || item.cleanPath || item.id)}</span>
+                    <small>{item.videoCount || 0} 段烧录视频 · {Math.round(item.durationSec || 0)} 秒</small>
+                    {item.outputPath ? <small title={item.outputPath}>输出：{item.outputPath}</small> : null}
+                    {item.unavailableReason ? <small>暂不可恢复：{item.unavailableReason}</small> :
+                      <button className="wide-button fill" type="button"
+                        disabled={queued || busy.has(`mux-recover-${item.id}`)}
+                        onClick={() => { void run(`mux-recover-${item.id}`, () => recorder.retrySceneMux(item.id)); }}>
+                        {queued ? '已加入导出队列' : '仅重试封装'}
+                      </button>}
+                  </div>;
+                })}
+              </div>
+            </div>
+          ) : null}
+          {muxRecoveryError ? <p className="field-help" role="alert">恢复任务读取失败：{muxRecoveryError}</p> : null}
         </section>
 
         <section className="inspector-card export-panel export-result-panel">

@@ -36,6 +36,7 @@ export type RecordingState = {
   roomId?: string;
   roomTitle?: string;
   anchor?: string;
+  liveSessionId?: string;
   startedAt: number;
   cleanPath: string;
   capturePath?: string;
@@ -136,6 +137,7 @@ export type AppSettings = {
   burnDanmakuStylePreset: DanmakuStylePreset;
   burnDanmakuStyleLayout: DanmakuStyleLayout;
   burnAvatarMode: BurnAvatarMode;
+  defaultExportMode: 'clean' | 'burn';
   burnCodec: string;
   burnCrf: number;
   notifyLiveStarted: boolean;
@@ -413,8 +415,17 @@ export type AvatarPreparationDiagnostics = {
 };
 
 export type FfmpegJobProgress = {
+  mergeGroup?: string;
+  manual?: boolean;
+  sourcePaths?: string[];
+  deleteSources?: boolean;
+  sourceCount?: number;
+  segmentIndex?: number;
+  mergeMode?: 'copy' | 'normalize';
+  mergeReason?: string;
   id: string;
   kind: 'burn' | 'export' | 'merge' | 'preview' | 'repair';
+  cleanupStarted?: boolean;
   status: 'queued' | 'running' | 'retrying' | 'completed' | 'error' | 'cancelled';
   label: string;
   outputPath?: string;
@@ -458,6 +469,7 @@ export type FfmpegJobProgress = {
   realtimeFactor?: number | null;
   stageLabel?: string;
   stageStartedAt?: number;
+  stageProgress?: { completed: number; total: number; unit: 'bytes' | 'items' | 'files'; eventCount?: number } | null;
   percent?: number | null;
   message?: string;
 };
@@ -479,11 +491,22 @@ export type ExportQueueItem = {
   id: string;
   label: string;
   mode: 'clean' | 'burn';
+  recoveryId?: string;
   cleanPath: string;
   outputPath?: string;
   startTime: string;
   endTime: string;
   createdAt: number;
+};
+
+export type SceneMuxRecovery = {
+  id: string;
+  createdAt?: string;
+  cleanPath?: string;
+  outputPath?: string;
+  durationSec?: number;
+  videoCount?: number;
+  unavailableReason: string;
 };
 
 export type BurnQueueItem = {
@@ -617,8 +640,9 @@ export type RecorderApi = {
   setAutoRecord: (roomId: string, enabled: boolean) => Promise<AppState>;
   startRecording: (roomId: string) => Promise<AppState>;
   stopRecording: (roomId: string) => Promise<AppState>;
-  cancelMerge: (roomId: string) => Promise<AppState>;
+  cancelMerge: (roomId: string, jobId?: string) => Promise<AppState>;
   retryMerge: (roomId: string) => Promise<AppState>;
+  mergeRecordings: (cleanPaths: string[], deleteSources?: boolean) => Promise<AppState>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
   startExportPreview: (request: { cleanPath: string }) => Promise<ExportPreviewResult>;
   cancelExportPreview: () => Promise<AppState>;
@@ -654,7 +678,9 @@ export type RecorderApi = {
     styleLayout?: DanmakuStyleLayout;
   }) => Promise<SceneGraph>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
-  cancelExport: () => Promise<AppState>;
+  listSceneMuxRecoveries: () => Promise<SceneMuxRecovery[]>;
+  retrySceneMux: (id: string) => Promise<{ ok: boolean; queued: boolean; queueId: string; outputPath: string }>;
+  cancelExport: (jobId?: string) => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
   scanMergedResiduals: () => Promise<CleanupScanResult>;
   applyMergedResidualCleanup: (scanId: string) => Promise<AppState>;

@@ -41,6 +41,7 @@ export const settingsExportKeys: Array<keyof AppSettings> = [
   'burnDanmakuStylePreset',
   'burnDanmakuStyleLayout',
   'burnAvatarMode',
+  'defaultExportMode',
   'burnCodec',
   'burnCrf',
   'notifyLiveStarted',

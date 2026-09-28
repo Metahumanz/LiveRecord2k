@@ -114,28 +114,33 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
   const report = { version: CUDA_SCENE_CONFORMANCE_VERSION, passed: false, executedAt: Date.now(), cases: [] };
   try {
     for (const preset of CUDA_SCENE_CONFORMANCE_PRESETS) {
-      const assPath = path.join(directory, `${preset}.ass`);
-      await fs.writeFile(assPath, createAss(EVENTS, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS }), 'utf8');
       const scene = buildSceneGraph(EVENTS, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, durationSec: DURATION });
       for (const leadingVideoPaddingSec of CUDA_SCENE_CONFORMANCE_LEADS) {
         const id = `${preset}-${String(leadingVideoPaddingSec).replace('.', '_')}`;
+        const assPath = path.join(directory, `${id}.ass`);
+        // This synthetic fixture prepends new video before the original
+        // events. Move ASS events onto that output clock, just as the CUDA
+        // request moves its textures. Production recording events already
+        // use the recording clock and must not receive this fixture offset.
+        const eventOffset = Math.ceil(leadingVideoPaddingSec * CANVAS.fps - 1e-7) / CANVAS.fps;
+        await fs.writeFile(assPath, createAss(EVENTS.map((event) => ({ ...event, time: event.time + eventOffset })),
+          { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS }), 'utf8');
         const caseResult = {
           preset, leadingVideoPaddingSec, passed: false,
           coverage: Object.fromEntries(CUDA_SCENE_CONFORMANCE_COVERAGE.map((key) => [key, true])),
           metrics: { meanAbsRgb: 0, changedRatio: 0 }, samples: []
         };
-        const totalDuration = DURATION + leadingVideoPaddingSec;
-        // FFmpeg's finite colour source is frame-count based. Match the
-        // helper's expected I420 count rather than ceil(5.019 * 60), which
-        // incorrectly requests a 302nd frame after a 61-frame lead-in.
-        const helperDuration = (Math.floor(DURATION * CANVAS.fps) + Math.floor(leadingVideoPaddingSec * CANVAS.fps)) / CANVAS.fps;
+        const totalDuration = DURATION + eventOffset;
+        // Both finite sources and the helper now use the same whole-frame
+        // lead, avoiding a one-frame phase difference at a fractional lead.
+        const helperDuration = totalDuration;
         const assScript = await writeSceneFilterScript(path.join(directory, `${id}.ass.filter`), scene, {
-          duration: DURATION, outputDuration: totalDuration, leadingVideoPaddingSec, fps: CANVAS.fps, target: 'jetson', legacyAssPath: assPath
+          duration: DURATION, outputDuration: totalDuration, leadingVideoPaddingSec: eventOffset, fps: CANVAS.fps, target: 'jetson', legacyAssPath: assPath
         });
         const baselinePath = path.join(directory, `${id}.ass.h265`);
         const cudaPath = path.join(directory, `${id}.cuda.h265`);
         const baselineRequest = helperRequest({ ...scene, objects: [] }, baselinePath, helperDuration);
-        const cudaRequest = helperRequest(scene, cudaPath, helperDuration, leadingVideoPaddingSec);
+        const cudaRequest = helperRequest(scene, cudaPath, helperDuration, eventOffset);
         const baselineRequestPath = path.join(directory, `${id}.ass.json`);
         const cudaRequestPath = path.join(directory, `${id}.cuda.json`);
         await Promise.all([
@@ -143,9 +148,9 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
           fs.writeFile(cudaRequestPath, JSON.stringify(cudaRequest))
         ]);
         const baselineLog = await pipeToHelper(ffmpeg, sourceArgs(0, assScript.filterScriptPath), helper, baselineRequestPath);
-        const cudaLog = await pipeToHelper(ffmpeg, sourceArgs(leadingVideoPaddingSec), helper, cudaRequestPath);
+        const cudaLog = await pipeToHelper(ffmpeg, sourceArgs(eventOffset), helper, cudaRequestPath);
         const allMetrics = [];
-        for (const sampleTime of SAMPLE_TIMES.map((time) => time + leadingVideoPaddingSec)) {
+        for (const sampleTime of SAMPLE_TIMES.map((time) => time + eventOffset)) {
           const [assPixels, cudaPixels] = await Promise.all([
             decodeFrame(ffmpeg, baselinePath, sampleTime, path.join(directory, `${id}-${sampleTime}-ass.rgb`)),
             decodeFrame(ffmpeg, cudaPath, sampleTime, path.join(directory, `${id}-${sampleTime}-cuda.rgb`))

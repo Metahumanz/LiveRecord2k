@@ -635,12 +635,15 @@ async function readSceneCacheEvents(cachePath) {
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
-      try {
-        const record = JSON.parse(line);
-        if (record && record.schema === SCENE_CACHE_SCHEMA && record.op === 'append' && record.event) events.push(record.event);
-      } catch {
-        // A partially written final line must not invalidate an otherwise
-        // useful capture cache.
+      // Older builds wrote a literal backslash-n delimiter. Recover caches
+      // without rewriting originals or splitting escaped newlines in text.
+      for (const fragment of line.split(/\\n(?=\{"schema":"bili-record2k\.scene-cache\/v1")/)) {
+        try {
+          const record = JSON.parse(fragment.replace(/\\n$/, ''));
+          if (record && record.schema === SCENE_CACHE_SCHEMA && record.op === 'append' && record.event) events.push(record.event);
+        } catch {
+          // Ignore a partially written final record.
+        }
       }
     }
   } catch (error) {
@@ -658,7 +661,7 @@ async function writeSceneGraph(scenePath, graph) {
   assertSceneGraph(graph);
   const temporary = target + '.' + process.pid + '.' + Date.now() + '.tmp';
   try {
-    await fsp.writeFile(temporary, JSON.stringify(graph, null, 2) + '\n', { encoding: 'utf8', mode: 0o660 });
+    await fsp.writeFile(temporary, JSON.stringify(graph) + '\n', { encoding: 'utf8', mode: 0o660 });
     // Windows cannot atomically replace an existing destination with rename.
     // The Scene Graph is a derived cache; raw JSONL and media remain untouched.
     await fsp.rm(target, { force: true });
@@ -802,14 +805,14 @@ function clipSceneGraph(graph, startTime, endTime, options) {
   // chunking into quadratic work and can itself delay the first frame.
   const output = Object.assign({}, graph, {
     canvas: clone(graph.canvas || {}),
-    assets: clone(graph.assets || []),
+    assets: [],
     metadata: Object.assign({}, graph.metadata || {}),
     timeline: { start: round(start - shift, 4), end: round(end - shift, 4) }
   });
   output.objects = graph.objects
     .filter((object) => number(object.end) >= start && number(object.start) <= end)
     .map((object) => {
-      const next = clone(object);
+      const next = clone({ ...object, animations: [] });
       const objectStart = Math.max(start, number(object.start));
       const objectEnd = Math.min(end, number(object.end));
       const state = evaluateSceneObject(object, objectStart);
@@ -817,12 +820,22 @@ function clipSceneGraph(graph, startTime, endTime, options) {
       next.end = round(objectEnd - shift, 4);
       next.frame.x = round(state.x);
       next.frame.y = round(state.y);
+      if (object.props?.textKeyframes?.length) {
+        const keyframes = object.props.textKeyframes.slice().sort((a, b) => Number(a.time) - Number(b.time));
+        for (const keyframe of keyframes) {
+          if (Number(keyframe.time) <= objectStart) next.props.text = String(keyframe.text || '');
+        }
+        next.props.textKeyframes = keyframes.filter((keyframe) => Number(keyframe.time) > objectStart && Number(keyframe.time) < objectEnd)
+          .map((keyframe) => ({ ...keyframe, time: round(Number(keyframe.time) - shift, 4) }));
+      }
       next.animations = (object.animations || [])
         .map((animation) => clipAnimation(animation, objectStart, objectEnd, shift))
         .filter(Boolean);
       return next;
     });
   output.metadata = Object.assign({}, output.metadata, { clippedFrom: { start, end, shift } });
+  const usedAssets = new Set(output.objects.map(object => object.props?.assetId).filter(Boolean));
+  output.assets = (graph.assets || []).filter(asset => usedAssets.has(asset.id)).map(clone);
   return output;
 }
 

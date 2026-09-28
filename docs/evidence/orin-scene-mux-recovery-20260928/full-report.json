@@ -1,0 +1,42 @@
+{
+  "sourcePath": "/mnt/zzzz/哔哩录播2K/883263-真栗/20260911_221804-播两秒/883263_真栗_20260911_221804.merged.mp4",
+  "burnedPath": "/mnt/zzzz/哔哩录播2K/883263_真栗_20260911_221804.merged.clip_0-7354_97.danmaku.mp4",
+  "testDir": "/mnt/zzzz/哔哩录播2K/.br2k-recovery-accept-zVnwc6",
+  "sceneDir": "/tmp/br2k-export-scene-accept-5GKafQ",
+  "mediaDir": "/mnt/zzzz/哔哩录播2K/.br2k-recovery-accept-zVnwc6/.br2k-export-media-LbByyq",
+  "targetPath": "/mnt/zzzz/哔哩录播2K/.br2k-recovery-accept-zVnwc6/883263_真栗_20260911_221804.merged.clip_0-7354_97.danmaku.mp4",
+  "durationSec": 7354.97,
+  "sourceBytes": 6071087204,
+  "burnedBytes": 8636992050,
+  "phaseTimes": {
+    "videoCopySec": 206.093,
+    "recoverySec": 232.653
+  },
+  "frameMatches": [
+    {
+      "second": 20,
+      "match": true
+    },
+    {
+      "second": 1838.7425,
+      "match": true
+    },
+    {
+      "second": 3677.485,
+      "match": true
+    },
+    {
+      "second": 5516.2275,
+      "match": true
+    },
+    {
+      "second": 7334.97,
+      "match": true
+    }
+  ],
+  "ok": true,
+  "chunkBytes": 8475019334,
+  "finalBytes": 8639355010,
+  "finalDurationSec": 7354.93,
+  "testOutputRemoved": true
+}

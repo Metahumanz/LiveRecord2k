@@ -48,8 +48,9 @@ export const recorder: RecorderApi = {
   setAutoRecord: (roomId, enabled) => api<AppState>('/api/rooms/auto-record', { roomId, enabled }),
   startRecording: (roomId) => api<AppState>('/api/rooms/record/start', { roomId }, { timeoutMs: 120000 }),
   stopRecording: (roomId) => api<AppState>('/api/rooms/record/stop', { roomId }),
-  cancelMerge: (roomId) => api<AppState>('/api/rooms/merge/cancel', { roomId }),
+  cancelMerge: (roomId, jobId) => api<AppState>('/api/rooms/merge/cancel', { roomId, jobId }),
   retryMerge: (roomId) => api<AppState>('/api/rooms/merge/retry', { roomId }),
+  mergeRecordings: (cleanPaths, deleteSources = false) => api<AppState>('/api/recordings/merge', { cleanPaths, deleteSources }),
   startPreview: (roomId) => api('/api/rooms/preview/start', { roomId }, { timeoutMs: 120000 }),
   startExportPreview: (request) => api('/api/export/preview/start', request, { timeoutMs: 0 }),
   cancelExportPreview: () => api<AppState>('/api/export/preview/cancel', {}),
@@ -69,7 +70,9 @@ export const recorder: RecorderApi = {
     return api<SceneGraph>('/api/scene?' + params.toString(), undefined, { timeoutMs: 60000 });
   },
   exportClip: (request) => api('/api/export/clip', request),
-  cancelExport: () => api<AppState>('/api/export/cancel', {}),
+  listSceneMuxRecoveries: () => api('/api/export/mux-recoveries'),
+  retrySceneMux: (id) => api('/api/export/mux-recover', { id }),
+  cancelExport: (jobId?: string) => api<AppState>('/api/export/cancel', { jobId }),
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}, { timeoutMs: 180000 }),
   scanMergedResiduals: () => api('/api/recordings/cleanup-merged', {}, { timeoutMs: 180000 }),
   applyMergedResidualCleanup: (scanId) =>

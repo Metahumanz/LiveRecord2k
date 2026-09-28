@@ -14,7 +14,13 @@ function migrateStore(input) {
     rooms: Array.isArray(source.rooms) ? source.rooms : [],
     recordings: Array.isArray(source.recordings) ? source.recordings : [],
     mediaJobs: Array.isArray(source.mediaJobs) ? source.mediaJobs : [],
-    segmentCleanups: Array.isArray(source.segmentCleanups) ? source.segmentCleanups : []
+    segmentCleanups: Array.isArray(source.segmentCleanups) ? source.segmentCleanups : [],
+    mergeCancelledGroups: Array.isArray(source.mergeCancelledGroups)
+      ? source.mergeCancelledGroups.filter(key => typeof key === 'string' && key.includes('\u0000')) : [],
+    mergeCancelledSelections: Array.isArray(source.mergeCancelledSelections) ? source.mergeCancelledSelections
+      : (Array.isArray(source.rooms) ? source.rooms : []).filter(room => room.cancelledMergeProgress?.manual)
+        .map(room => ({ roomId: room.id, mergeGroup: room.cancelledMergeProgress.mergeGroup,
+          sourcePaths: room.cancelledMergeProgress.sourcePaths }))
   };
   if (schemaVersion < 2 && migrated.settings.accessPassword && !migrated.settings.accessPasswordHash) {
     migrated.settings.legacyAccessPassword = String(migrated.settings.accessPassword);

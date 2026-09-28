@@ -10,10 +10,12 @@ function createCommittedJetsonNativeRuntimeError(processedMediaSeconds, cause) {
   const processed = Math.max(0, Number(processedMediaSeconds) || 0);
   const causeMessage = String(cause?.message || cause || '未知错误').replace(/\s+/g, ' ').trim();
   const runtimeError = new Error(
-    `CUDA/NVMM 已处理 ${processed.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${causeMessage.slice(0, 240)}`
+    `CUDA/NVMM 已处理 ${processed.toFixed(1)}s 后失败。为避免从头重复处理，已停止导出：${causeMessage.slice(-700)}`
   );
   runtimeError.code = 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT';
   runtimeError.processedMediaSeconds = processed;
+  runtimeError.cause = cause;
+  runtimeError.nativeFailure = cause?.nativeFailure;
   return runtimeError;
 }
 

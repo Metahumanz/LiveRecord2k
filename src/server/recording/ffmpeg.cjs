@@ -2,7 +2,8 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { readDanmakuEvents, getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
+const readline = require('node:readline');
+const { getDanmakuEventVideoTime } = require('../danmaku/ass.cjs');
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -938,7 +939,7 @@ function createBurnArgs({
   const avatarCompositeBackend = gpuAvatarComposite
     ? normalizeAvatarCompositeBackend(avatarOverlay?.gpuCompositeBackend) || 'cuda'
     : '';
-  const args = ['-hide_banner', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   const sceneCudaDevice = sceneCuda ? 'br2k_scene_cuda' : '';
   if (sceneCuda) {
     args.push('-init_hw_device', `cuda=${sceneCudaDevice}:0`, '-filter_hw_device', sceneCudaDevice);
@@ -2239,6 +2240,9 @@ function createNormalizeEncodedVideoMuxArgs({
   if (!encodedVideoPath || !outputPath) {
     throw new Error('Jetson 规范化分段缺少临时视频或输出路径。');
   }
+  if (path.resolve(encodedVideoPath) === path.resolve(outputPath)) {
+    throw new Error('Jetson 规范化视频中间文件与封装输出不能使用同一路径。');
+  }
   if (hasAudio && !inputPath) {
     throw new Error('Jetson 规范化分段缺少音频源路径。');
   }
@@ -2389,11 +2393,17 @@ function selectHighestResolutionVideoInfo(mediaInfos) {
     }
     return Number(candidate.height) > Number(best.height) ? candidate : best;
   });
+  const [rateNumerator, rateDenominator] = String(highestResolution.rFrameRate || '').split('/').map(Number);
+  const sourceRate = rateDenominator > 0 ? rateNumerator / rateDenominator : 0;
+  // Container averages such as 60.0017 are not a new encoder frame clock.
+  // Jetson treats >60 caps as unsupported and silently encodes at 30 instead.
+  const frameRate = sourceRate > 0 && sourceRate <= 240
+    ? sourceRate : highestResolution.fps;
   return {
     ...highestResolution,
     width: makeEvenDimension(highestResolution.width),
     height: makeEvenDimension(highestResolution.height),
-    fps: highestResolution.fps
+    fps: frameRate
   };
 }
 
@@ -2451,7 +2461,10 @@ function createConcatStreamSignature(mediaInfo) {
   return [
     videoCodec,
     `${Number(videoInfo.width) || 0}x${Number(videoInfo.height) || 0}`,
-    normalizeMergeFps(videoInfo.fps) || 'unknown-fps',
+    // Average FPS includes dropped frames and container rounding. Compare the
+    // declared frame clock instead; packet/timeline verification still decides
+    // whether otherwise compatible streams may be copied safely.
+    normalizeMergeFps(getDeclaredMergeFrameRate(videoInfo)) || 'unknown-fps',
     String(videoInfo.profile || '').toLowerCase(),
     String(videoInfo.pixelFormat || '').toLowerCase(),
     Number(videoInfo.bitDepth || 0),
@@ -2463,6 +2476,12 @@ function createConcatStreamSignature(mediaInfo) {
     Number(audioInfo?.sampleRate) || 0,
     String(audioInfo?.channelLayout || '')
   ].join('|');
+}
+
+function getDeclaredMergeFrameRate(videoInfo) {
+  const [numerator, denominator] = String(videoInfo?.rFrameRate || '').split('/').map(Number);
+  const rate = denominator > 0 ? numerator / denominator : 0;
+  return rate > 0 && rate <= 240 ? rate : videoInfo?.fps;
 }
 
 function normalizeCodecFamily(codec) {
@@ -2530,19 +2549,49 @@ function escapeConcatPath(filePath) {
   return String(filePath).replace(/\\/g, '/').replace(/'/g, "'\\''");
 }
 
-async function mergeDanmakuFiles(segments, outputPath) {
-  const lines = [];
+async function mergeDanmakuFiles(segments, outputPath, options = {}) {
+  const sizes = await Promise.all(segments.map(segment => segment.danmakuPath
+    ? fsp.stat(segment.danmakuPath).then(stat => stat.size).catch(error => {
+      if (error.code === 'ENOENT') return 0;
+      throw error;
+    }) : 0));
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  const output = await fsp.open(outputPath, 'w');
+  let completed = 0;
+  let eventCount = 0;
   let offset = 0;
-  for (let index = 0; index < segments.length; index += 1) {
-    const segment = segments[index];
-    const events = await readDanmakuEvents(segment.danmakuPath);
-    for (const event of events) {
-      const videoTime = Math.max(0, getDanmakuEventVideoTime(event) + offset);
-      lines.push(JSON.stringify({ ...event, videoTime, time: videoTime }));
+  try {
+    options.onProgress?.({ completed, total, unit: 'bytes', eventCount });
+    for (let index = 0; index < segments.length; index += 1) {
+      options.signal?.throwIfAborted();
+      const segment = segments[index];
+      if (segment.danmakuPath && sizes[index] > 0) {
+        const input = fs.createReadStream(segment.danmakuPath, { encoding: 'utf8', signal: options.signal });
+        const lines = readline.createInterface({ input, crlfDelay: Infinity });
+        let batch = [];
+        try {
+          for await (const line of lines) {
+            options.signal?.throwIfAborted();
+            let event;
+            try { event = JSON.parse(line); } catch { continue; }
+            const videoTime = Math.max(0, getDanmakuEventVideoTime(event) + offset);
+            batch.push(JSON.stringify({ ...event, videoTime, time: videoTime }));
+            eventCount += 1;
+            if (batch.length >= 256) {
+              await output.writeFile(`${batch.join('\n')}\n`, 'utf8');
+              batch = [];
+              options.onProgress?.({ completed: completed + Math.min(input.bytesRead, sizes[index]), total,
+                unit: 'bytes', eventCount });
+            }
+          }
+          if (batch.length) await output.writeFile(`${batch.join('\n')}\n`, 'utf8');
+        } finally { lines.close(); input.destroy(); }
+      }
+      completed += sizes[index];
+      options.onProgress?.({ completed, total, unit: 'bytes', eventCount });
+      offset += getSegmentDurationForMerge(segment, segments[index + 1]);
     }
-    offset += getSegmentDurationForMerge(segment, segments[index + 1]);
-  }
-  await fsp.writeFile(outputPath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+  } finally { await output.close(); }
 }
 
 function getSegmentDurationForMerge(segment, nextSegment) {

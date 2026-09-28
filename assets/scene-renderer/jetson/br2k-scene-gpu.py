@@ -10,6 +10,7 @@ requests, avatar/texture resources, and final audio muxing.
 
 import argparse
 import ctypes
+import hashlib
 import io
 import json
 import math
@@ -46,6 +47,7 @@ REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoc
 # nvivafilter is Jetson's supported CUDA callback bridge for NVMM allocated by
 # nvvidconv.  Do not insert the direct V4l2Memory-only test element here.
 CUDA_NVMM_REQUIRED_ELEMENTS = [
+    'capssetter',
     'appsrc', 'videotestsrc', 'concat', 'queue', 'nvvidconv', 'nvivafilter', 'nvv4l2h264enc', 'nvv4l2h265enc'
 ]
 # A test-only override lets the Orin visual gate exercise a freshly compiled
@@ -94,7 +96,13 @@ def ass_rgba(value):
     return (int(raw[6:8], 16), int(raw[4:6], 16), int(raw[2:4], 16), 255 - int(raw[0:2], 16))
 
 
+FONT_CACHE = {}
+
+
 def font_for(props, size):
+    key = (str(props.get('fontFamily') or 'Noto Sans CJK SC'), max(1, round(size)), number(props.get('fontWeight'), 400))
+    if key in FONT_CACHE:
+        return FONT_CACHE[key]
     family = str(props.get('fontFamily') or 'sans-serif').replace('\n', ' ').replace('\r', ' ').strip() or 'sans-serif'
     # Fontconfig resolves both the CJK face within a TTC and its weight.  PIL
     # otherwise silently loads face 0 (Japanese for NotoSansCJK) and regular
@@ -114,7 +122,11 @@ def font_for(props, size):
     for candidate, index in [(path, face_index), (fallback, 2), ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 0)]:
         try:
             if candidate and os.path.isfile(candidate):
-                return ImageFont.truetype(candidate, max(1, round(size)), index=index)
+                font = ImageFont.truetype(candidate, max(1, round(size)), index=index)
+                if len(FONT_CACHE) >= 16:
+                    FONT_CACHE.pop(next(iter(FONT_CACHE)))
+                FONT_CACHE[key] = font
+                return font
         except Exception:
             pass
     return ImageFont.load_default()
@@ -252,7 +264,7 @@ except Exception:
     LIBASS_TEXT = None
 
 
-def draw_texture(entry, work_dir):
+def rasterize_texture(entry):
     frame = entry.get('frame') or {}
     props = entry.get('props') or {}
     style = entry.get('style') or {}
@@ -264,7 +276,7 @@ def draw_texture(entry, work_dir):
     if kind == 'Text':
         font_size = max(1, number(props.get('fontSize'), 20))
         stroke = max(0, round(number(style.get('strokeWidth'), 0)))
-        if LIBASS_TEXT:
+        if LIBASS_TEXT and (entry.get('_legacyAssMetrics') or 'assText' in props):
             # The CUDA callback places Scene objects at rounded NV12 pixels,
             # while the ASS oracle rasterises at fractional \pos coordinates.
             # Preserve that residual phase inside the libass texture so glyph
@@ -274,7 +286,12 @@ def draw_texture(entry, work_dir):
             image = LIBASS_TEXT.render(props, style, width, height, phase_x, phase_y)
         else:
             font = font_for(props, font_size)
-            draw.multiline_text((0, 0), str(props.get('text') or ''), font=font,
+            text = str(props.get('text') or '')
+            # Scene uses CSS/FreeType pixel sizes. ASS uses Windows font
+            # height metrics, which shrank modern glyphs by roughly one third.
+            # drawtext's y=0 refers to the glyph top, not Pillow's ascender.
+            top = draw.multiline_textbbox((0, 0), text, font=font, spacing=0)[1]
+            draw.multiline_text((0, -top), text, font=font,
                                 fill=rgba(style.get('fill'), 1), stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
     elif kind == 'Avatar':
         vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
@@ -323,9 +340,35 @@ def draw_texture(entry, work_dir):
         shadow_image = Image.new('RGBA', image.size, rgba(shadow.get('color') or '#000000', 1))
         shadow_image.putalpha(alpha.point(lambda value: int(value * number(shadow.get('opacity'), 0))))
         image = Image.alpha_composite(shadow_image, image)
+    return image, width, height
+
+
+def draw_texture(entry, work_dir):
+    image, width, height = rasterize_texture(entry)
     target = os.path.join(work_dir, 'scene-' + str(entry.get('id') or 'object').replace('/', '_') + '.png')
     image.save(target, 'PNG')
     return target, width, height
+
+
+def texture_key(entry, asset_versions=None):
+    # Absolute position/time/animation are applied by CUDA. Text's fractional
+    # phase is baked by libass and must remain in the pixel identity.
+    frame = entry.get('frame') or {}
+    phase = [number(frame.get(axis)) - math.floor(number(frame.get(axis)) + 0.5)
+             for axis in ('x', 'y')] if entry.get('type') == 'Text' else []
+    asset = entry.get('asset') or {}
+    asset_path = str(asset.get('path') or '')
+    versions = asset_versions if asset_versions is not None else {}
+    if asset_path not in versions:
+        try:
+            stat = os.stat(asset_path)
+            versions[asset_path] = [asset_path, stat.st_size, stat.st_mtime_ns]
+        except OSError:
+            versions[asset_path] = [asset_path, 'missing']
+    asset_version = versions[asset_path]
+    value = [entry.get('type'), frame.get('width'), frame.get('height'), phase,
+             entry.get('props'), entry.get('style'), asset_version]
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
 
 
 def clamp(value, minimum, maximum):
@@ -370,6 +413,11 @@ def scene_state(entry, at, texture_width, texture_height):
     return state
 
 
+def scene_texture_entries(scene):
+    legacy_metrics = (scene.get('style') or {}).get('preset') in ('h5-card', 'bubble', 'minimal')
+    return [dict(entry, _legacyAssMetrics=legacy_metrics) for entry in scene.get('objects') or []]
+
+
 def prepare_cuda_timeline(request, work_dir):
     """Pre-render Scene assets once and emit GPU-friendly linear time spans.
 
@@ -379,10 +427,13 @@ def prepare_cuda_timeline(request, work_dir):
     """
     rows = []
     timeline_offset = max(0, number(request.get('timelineOffsetSec'), 0))
-    entries = sorted(request['scene'].get('objects') or [], key=lambda item: number(item.get('zIndex')))
+    entries = sorted(scene_texture_entries(request['scene']), key=lambda item: number(item.get('zIndex')))
     report_preparation = request.get('reportPreparation') is True
     preparation_started = GLib.get_monotonic_time() if report_preparation else 0
     last_reported = preparation_started
+    textures = {}
+    asset_versions = {}
+    texture_bytes = 0
     def report_preparation_progress(prepared, force=False):
         nonlocal last_reported
         if not report_preparation:
@@ -394,17 +445,29 @@ def prepare_cuda_timeline(request, work_dir):
             'objectsPrepared': prepared,
             'objectCount': len(entries),
             'timelineRows': len(rows),
+            'uniqueTextures': len(textures),
+            'textureBytes': texture_bytes,
             'wallSeconds': max(0.0, (now - preparation_started) / GLib.USEC_PER_SEC)
         }}, ensure_ascii=False), flush=True)
         last_reported = now
     report_preparation_progress(0, force=True)
     for entry_index, entry in enumerate(entries, start=1):
         style = entry.get('style') or {}
-        png, texture_width, texture_height = draw_texture(entry, work_dir)
-        raw_path = os.path.splitext(png)[0] + '.rgba'
-        Image.open(png).convert('RGBA').tobytes()
-        with open(raw_path, 'wb') as handle:
-            handle.write(Image.open(png).convert('RGBA').tobytes())
+        key = texture_key(entry, asset_versions)
+        cached = textures.get(key)
+        if cached is None:
+            image, texture_width, texture_height = rasterize_texture(entry)
+            raw_path = os.path.join(work_dir, 'texture-' + key + '.rgba')
+            data = image.tobytes()
+            reserve = max(2 * 1024 ** 3, len(data))
+            if shutil.disk_usage(work_dir).free < len(data) + reserve:
+                fail('Scene 纹理临时盘空间不足，已停止准备并保留源录像。')
+            with open(raw_path, 'wb') as handle:
+                handle.write(data)
+            texture_bytes += len(data)
+            textures[key] = (raw_path, texture_width, texture_height)
+        else:
+            raw_path, texture_width, texture_height = cached
         scene_start, scene_end = number(entry.get('start')), max(number(entry.get('start')) + 0.0001, number(entry.get('end')))
         points = {scene_start, scene_end}
         for animation in entry.get('animations') or []:
@@ -425,6 +488,8 @@ def prepare_cuda_timeline(request, work_dir):
     with open(manifest, 'w', encoding='utf-8') as handle:
         for row in rows:
             handle.write('\t'.join(str(item) for item in row) + '\n')
+    request['_textureStats'] = {'uniqueTextures': len(textures), 'objectCount': len(entries), 'textureBytes': texture_bytes,
+                                'timelineRows': len(rows), 'prepareWallSeconds': (GLib.get_monotonic_time() - preparation_started) / GLib.USEC_PER_SEC if preparation_started else None}
     return manifest
 
 
@@ -519,7 +584,7 @@ def create_pipeline(request, work_dir):
     if not upload.get_static_pad('src').link(base_pad) == Gst.PadLinkReturn.OK: fail('无法连接 base 到 GL mixer。')
     if not link_many(mixer, download, convert, raw_caps, nvvidconv, nv_caps, encode, parse, sink): fail('无法连接 GL → NVMM → nvv4l2 管线。')
 
-    for index, entry in enumerate(request['scene'].get('objects') or []):
+    for index, entry in enumerate(scene_texture_entries(request['scene'])):
         texture, texture_width, texture_height = draw_texture(entry, work_dir)
         source = make_element('filesrc', 'overlay-file-%d' % index)
         source.set_property('location', texture)
@@ -725,6 +790,45 @@ def decode_native(args):
         fail('原生 NVDEC 仅解出 %d/%d 帧。' % (written, required_frames))
 
 
+def resolve_native_scene_fps(caps_text, requested_fps):
+    """Unknown (0/1) decoder rates must not replace the valid Scene clock."""
+    match = __import__('re').search(r'framerate=\(fraction\)(\d+)/(\d+)', caps_text)
+    if match and int(match.group(1)) > 0 and int(match.group(2)) > 0:
+        numerator, denominator = int(match.group(1)), int(match.group(2))
+        return str(numerator) + '/' + str(denominator), numerator / denominator
+    return 'unavailable', requested_fps
+
+
+def probe_native_edit_list_lead(input_path):
+    """Read the demuxer's real empty edit, not an inferred A/V PTS delta."""
+    quoted = '"' + input_path.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    probe = Gst.parse_launch('filesrc location=%s ! qtdemux name=demux demux.video_0 ! fakesink name=sink sync=false' % quoted)
+    clock = {'lead': 0.0, 'complete': False}
+    def first_media(_pad, info):
+        if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
+            event = info.get_event()
+            if event and event.type == Gst.EventType.SEGMENT:
+                segment = event.parse_segment()
+                # qtdemux moves SEGMENT.base past a leading empty edit before
+                # its first picture. B-frame reorder timestamps alone do not.
+                clock['lead'] = max(0.0, segment.base / Gst.SECOND)
+        elif info.type & Gst.PadProbeType.BUFFER and not clock['complete']:
+            clock['complete'] = True
+            probe.get_bus().post(Gst.Message.new_application(probe, Gst.Structure.new_empty('br2k-edit-clock')))
+        return Gst.PadProbeReturn.OK
+    probe.get_by_name('sink').get_static_pad('sink').add_probe(
+        Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.BUFFER, first_media)
+    try:
+        if probe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            fail('无法探测原生 MP4 编辑列表。')
+        message = probe.get_bus().timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.APPLICATION | Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if not message or message.type == Gst.MessageType.ERROR or not clock['complete']:
+            fail('无法读取原生 MP4 首帧的编辑列表时间。')
+        return clock['lead']
+    finally:
+        probe.set_state(Gst.State.NULL)
+
+
 def render_native_nvmm(request):
     """Decode, composite and encode entirely in NVMM for one finite request."""
     check_request(request)
@@ -734,6 +838,10 @@ def render_native_nvmm(request):
     input_path = str(source.get('path') or '')
     if not os.path.isfile(input_path): fail('原生零拷贝输入不存在：' + input_path)
     width, height, fps = int(output['width']), int(output['height']), number(output.get('fps'), 30)
+    _, scene_fps = resolve_native_scene_fps('framerate=(fraction)' + str(source.get('sourceFrameRate') or ''), fps)
+    # A container average can be slightly above 60 even on a 60/1 source.
+    # Use the source clock for the black lead too; NVENC rejects >60 caps.
+    fps = scene_fps
     codec = str(source.get('codec') or '').lower()
     parser_factory = 'h265parse' if codec in ('hevc', 'h265') else 'h264parse'
     encoder = 'nvv4l2h265enc' if ('hevc' in str(output.get('codec') or '') or 'h265' in str(output.get('codec') or '')) else 'nvv4l2h264enc'
@@ -745,7 +853,8 @@ def render_native_nvmm(request):
     # Convert the already frame-aligned request value into a finite number of
     # black NVMM frames so the elementary H26x stream begins at PTS zero and
     # its first source frame begins at the same clock as the original audio.
-    leading_video_sec = min(duration, max(0, number(request.get('timelineOffsetSec'), 0)))
+    edit_list_lead_sec = max(0.0, probe_native_edit_list_lead(input_path) - start)
+    leading_video_sec = min(duration, max(edit_list_lead_sec, number(request.get('timelineOffsetSec'), 0)))
     leading_video_frames = max(0, int(round(leading_video_sec * fps)))
     # A video stream can only represent the lead in whole frames. Make CUDA's
     # texture timeline use that exact materialized duration too; otherwise a
@@ -754,15 +863,18 @@ def render_native_nvmm(request):
     materialized_lead_sec = leading_video_frames / fps if leading_video_frames else 0
     def launch_quote(value):
         return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
-    work_dir = tempfile.mkdtemp(prefix='br2k-native-nvmm-')
+    work_dir = tempfile.mkdtemp(prefix='br2k-native-nvmm-', dir=request.get('scratchDirectory') or None)
     pipeline = None
     try:
         timeline_request = dict(request)
-        timeline_request['timelineOffsetSec'] = materialized_lead_sec
+        timeline_request['output'] = dict(output, fps=fps)
+        # Captured Scene events already use the recording's media clock. A
+        # container empty edit is part of that clock, not an extra Scene delay.
+        timeline_request['timelineOffsetSec'] = max(0.0, materialized_lead_sec - edit_list_lead_sec)
         timeline_request['reportPreparation'] = True
         timeline = prepare_cuda_timeline(timeline_request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
-        os.environ['BR2K_CUDA_SCENE_FPS'] = str(fps)
+        os.environ['BR2K_CUDA_SCENE_FPS'] = str(scene_fps)
         # Let GStreamer's delayed-link machinery bind qtdemux.video_0 before
         # streaming begins. This is the same graph syntax that succeeds under
         # gst-launch; hand-written pad-added linkage could admit one frame and
@@ -782,11 +894,14 @@ def render_native_nvmm(request):
             # nvivafilter currently assigns an incorrect synthetic clock to
             # its output on some JetPack releases.  The pad probe below
             # restores NVDEC's PTS before this muxer sees each frame.
-            output_sink = 'matroskamux name=output-mux ! ' + output_sink
+            # Sequential Matroska avoids seek/backpatch writes on CIFS and lets
+            # us compare the exact mux output bytes with the completed file.
+            output_sink = 'matroskamux name=output-mux streamable=true ! ' + output_sink
         encoder_branch = (
             'nvivafilter name=cuda-scene cuda-process=true customer-lib-name=%s ! %s ! '
+            'capssetter caps="video/x-raw,framerate=%s" ! '
             '%s name=encode bitrate=%d ! %s name=parse ! %s'
-        ) % (launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps, encoder,
+        ) % (launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps, fps_caps(fps), encoder,
              max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, output_sink)
         if leading_video_frames:
             # concat adjusts the source branch's segment base after the finite
@@ -817,57 +932,57 @@ def render_native_nvmm(request):
         encode = pipeline.get_by_name('encode')
         if not decoder or not composite or not encode:
             fail('原生 NVMM 管线缺少必需元件。')
-        # For a non-zero chunk, hold the first Scene buffer long enough for
+        # qtdemux expresses MP4 edit-list gaps in SEGMENT.base/time. Its
+        # compressed PTS can start at 33ms although the actual picture starts
+        # at 1.029s. Materialize running time BEFORE NVDEC creates NVMM
+        # timestamp metadata; rewriting decoded buffers later cannot change
+        # that metadata. Forward a zero-based segment to avoid applying the
+        # edit offset again at matroskamux.
+        input_clock = {'segment': None, 'forwarding': False}
+        def restore_demux_media_clock(pad, info):
+            if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
+                event = info.get_event()
+                if event and event.type == Gst.EventType.SEGMENT and not input_clock['forwarding']:
+                    segment = event.parse_segment()
+                    input_clock['segment'] = segment.copy()
+                    normalized = segment.copy()
+                    normalized.start = 0
+                    normalized.stop = Gst.CLOCK_TIME_NONE
+                    normalized.base = 0
+                    normalized.time = 0
+                    normalized.offset = 0
+                    input_clock['forwarding'] = True
+                    try:
+                        pad.push_event(Gst.Event.new_segment(normalized))
+                    finally:
+                        input_clock['forwarding'] = False
+                    return Gst.PadProbeReturn.DROP
+            elif info.type & Gst.PadProbeType.BUFFER and input_clock['segment']:
+                buffer = info.get_buffer()
+                for field in ['pts', 'dts']:
+                    timestamp = getattr(buffer, field)
+                    if timestamp != Gst.CLOCK_TIME_NONE:
+                        clock = input_clock['segment'].to_running_time(Gst.Format.TIME, timestamp)
+                        if clock != Gst.CLOCK_TIME_NONE:
+                            setattr(buffer, field, clock)
+            return Gst.PadProbeReturn.OK
+        pipeline.get_by_name('parser').get_static_pad('src').add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.BUFFER, restore_demux_media_clock)
+        # For a non-zero chunk, hold the first decoded buffer long enough for
         # qtdemux to become seekable. Seeking the fully running NVENC graph
         # races the encoder; seeking while PAUSED never prerolls nvivafilter
-        # on JetPack. A downstream block gives the demux a real segment while
+        # on JetPack. A decoder block gives the demux a real segment while
         # preventing pre-seek media from reaching the output.
         startup_gate = {'reached': False}
-        startup_pad = composite.get_static_pad('src')
+        startup_pad = decoder.get_static_pad('src')
         startup_probe = None
         needs_segment_seek = start > 0.0001
         if needs_segment_seek:
             def hold_first_scene_buffer(_pad, _info):
                 startup_gate['reached'] = True
-                native_nvmm_trace('startup scene buffer held for seek')
+                native_nvmm_trace('startup decoded buffer held for seek')
                 return Gst.PadProbeReturn.OK
-            startup_probe = startup_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, hold_first_scene_buffer)
-        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            fail('无法启动原生 NVMM 管线。')
-        native_nvmm_trace('pipeline PLAYING')
-        # A wall-clock timer cuts a fast NVMM pipeline short.  JetPack's
-        # nvivafilter does not accept a pipeline-wide stop segment on every
-        # release, so seek the media start and use the CUDA Scene output PTS
-        # to inject EOS at the requested end instead.
-        if needs_segment_seek:
-            deadline = GLib.get_monotonic_time() + 5 * GLib.USEC_PER_SEC
-            while not startup_gate['reached'] and GLib.get_monotonic_time() < deadline:
-                message = pipeline.get_bus().timed_pop_filtered(10 * Gst.MSECOND, Gst.MessageType.ERROR)
-                if message:
-                    error, debug = message.parse_error()
-                    fail('原生 NVMM 分段定位预热失败：' + str(error) + ('；' + str(debug) if debug else ''))
-            if not startup_gate['reached']:
-                fail('原生 NVMM 分段定位预热超时。')
-            # nvivafilter is a transform, not a seekable demuxer. Seeking the
-            # whole pipeline therefore returns false on JetPack even though
-            # qtdemux can seek the MP4 perfectly well. Target qtdemux itself
-            # and carry both segment bounds in the media clock; EOS below is
-            # only a defensive stop, never a wall-clock timer.
-            demux = pipeline.get_by_name('demux')
-            seek_target = demux if demux else pipeline
-            segment_stop = int((start + duration) * Gst.SECOND)
-            seek_ok = seek_target.seek(
-                1.0,
-                Gst.Format.TIME,
-                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
-                Gst.SeekType.SET,
-                int(start * Gst.SECOND),
-                Gst.SeekType.SET,
-                segment_stop
-            )
-            if not seek_ok:
-                fail('原生 NVMM qtdemux 无法定位到分段起点。')
-            startup_pad.remove_probe(startup_probe)
+            startup_probe = startup_pad.add_probe(Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, hold_first_scene_buffer)
         counters = {'decode': 0, 'scene': 0, 'encode': 0}
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
@@ -924,7 +1039,7 @@ def render_native_nvmm(request):
             if buffer_duration is None:
                 buffer_duration = max(1, int(Gst.SECOND / max(1.0, fps)))
             media_end_pts = int(buffer.pts) + int(buffer_duration)
-            media_seconds = max(0.0, min(duration, (media_end_pts - scene_media_first_pts['value']) / Gst.SECOND))
+            media_seconds = max(0.0, min(duration, (media_end_pts - scene_first_pts['value']) / Gst.SECOND))
             # A fast Orin can finish a finite source range in a few seconds. Keep
             # the UI responsive without emitting one JSON line per frame.
             if media_seconds <= progress_report['last_media'] + 0.01 or wall_now - progress_report['last_wall_us'] < 250000:
@@ -957,26 +1072,28 @@ def render_native_nvmm(request):
                 # rate rather than the lossy decimal displayed by FFmpeg.
                 caps = _pad.get_current_caps()
                 caps_text = caps.to_string() if caps else ''
-                match = __import__('re').search(r'framerate=\(fraction\)(\d+)/(\d+)', caps_text)
-                if match and int(match.group(2)) > 0:
-                    numerator, denominator = int(match.group(1)), int(match.group(2))
-                    negotiated_fps['value'] = str(numerator) + '/' + str(denominator)
-                    # nvivafilter's customer-library ABI exposes no buffer
-                    # PTS, so the CUDA renderer derives its media clock from
-                    # frame index / BR2K_CUDA_SCENE_FPS.  The customer library
-                    # consumes a numeric value (not a GStreamer fraction):
+                source_rate, scene_rate = resolve_native_scene_fps(caps_text, scene_fps)
+                if source_rate != 'unavailable':
+                    negotiated_fps['value'] = source_rate
+                    # Keep a numeric fallback for the raw-I420 compatibility
+                    # path; native NVMM drawing uses the ordered PTS queue.
+                    # The customer library consumes a numeric value:
                     # writing "60000/1001" previously made strtod() see
                     # 60000 fps, freezing all normal-time overlays near t=0.
                     # Preserve the source rational rate as a precise decimal
                     # for the renderer, while retaining the rational form in
                     # diagnostics.
-                    os.environ['BR2K_CUDA_SCENE_FPS'] = format(numerator / denominator, '.12g')
+                    os.environ['BR2K_CUDA_SCENE_FPS'] = format(scene_rate, '.12g')
                     native_nvmm_trace('negotiated source fps=' + negotiated_fps['value'] + ' (' + os.environ['BR2K_CUDA_SCENE_FPS'] + ')')
                 elif caps_text:
                     # Avoid re-querying once per decoded frame on unusual
-                    # streams whose negotiated caps omit framerate.
+                    # streams whose negotiated caps omit framerate or use
+                    # 0/1 for an unknown rate. Zero must never replace the
+                    # request's valid rate: CUDA clamps it to 1 fps, consumes
+                    # the entire overlay timeline in seconds, then emits
+                    # an otherwise successful video without danmaku.
                     negotiated_fps['value'] = 'unavailable'
-                    native_nvmm_trace('decoder caps omit framerate: ' + caps_text)
+                    native_nvmm_trace('decoder caps have no positive framerate; retaining source/request fps=' + str(scene_fps) + ': ' + caps_text)
             if counters[key] == 0:
                 native_nvmm_trace('first ' + key + ' buffer pts=' + str(buffer.pts))
             if key == 'decode' and buffer.pts != Gst.CLOCK_TIME_NONE:
@@ -1026,11 +1143,6 @@ def render_native_nvmm(request):
                     scene_first_pts['value'] = buffer.pts
                 if not is_lead_scene_frame and scene_media_first_pts['value'] is None:
                     scene_media_first_pts['value'] = buffer.pts
-                scene_clock['first'] = scene_clock['first'] if scene_clock['first'] is not None else buffer.pts
-                scene_clock['last'] = buffer.pts
-                scene_clock['last_duration'] = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE and buffer.duration > 0 else None
-                emit_progress(buffer)
-                scene_previous_pts['value'] = buffer.pts
                 target_pts = scene_first_pts['value'] + int(duration * Gst.SECOND)
                 # NVDEC can negotiate a stream rate that differs slightly
                 # from the container average (for example a 60/1 PTS clock
@@ -1038,13 +1150,18 @@ def render_native_nvmm(request):
                 # that timestamp is authoritative; a frame-count cutoff here
                 # would terminate a finite range early. Keep the count
                 # only as a defensive fallback for buffers without PTS.
-                reached_pts_budget = leading_video_frames <= 0 and buffer.pts >= target_pts
+                reached_pts_budget = buffer.pts >= target_pts
                 if reached_pts_budget:
                     if not eos_at_target['sent']:
                         eos_at_target['sent'] = True
                         native_nvmm_trace('send EOS at scene pts=' + str(buffer.pts))
                         pipeline.send_event(Gst.Event.new_eos())
                     return Gst.PadProbeReturn.DROP
+                scene_clock['first'] = scene_clock['first'] if scene_clock['first'] is not None else buffer.pts
+                scene_clock['last'] = buffer.pts
+                scene_clock['last_duration'] = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE and buffer.duration > 0 else None
+                emit_progress(buffer)
+                scene_previous_pts['value'] = buffer.pts
                 if source_pts_for_scene is not None:
                     decoded_clock['restored'] += 1
                     delta = abs(int(buffer.pts) - source_pts_for_scene)
@@ -1110,26 +1227,122 @@ def render_native_nvmm(request):
                     end += buffer.duration
                 encoded_pts['end'] = max(encoded_pts['end'] or end, end)
             return Gst.PadProbeReturn.OK
+        clock_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
+        clock_library.br2k_scene_enable_pts_clock.argtypes = []
+        clock_library.br2k_scene_enable_pts_clock.restype = None
+        clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
+        clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
+        clock_library.br2k_scene_enable_pts_clock()
+        drawing_clock = {'first': None}
+        def supply_drawing_time(_pad, info):
+            buffer = info.get_buffer()
+            if not buffer:
+                return Gst.PadProbeReturn.OK
+            if buffer.pts == Gst.CLOCK_TIME_NONE:
+                with open(timeline + '.error', 'w', encoding='utf-8') as marker:
+                    marker.write('CUDA Scene 输入帧没有有效 PTS，拒绝按帧数猜测弹幕时间。')
+                return Gst.PadProbeReturn.DROP
+            if drawing_clock['first'] is None:
+                drawing_clock['first'] = int(buffer.pts)
+            seconds = (int(buffer.pts) - drawing_clock['first']) / Gst.SECOND
+            if not clock_library.br2k_scene_push_frame_time(seconds):
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+        composite.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, supply_drawing_time)
         for name, element in [('decode', decoder), ('scene', composite), ('encode', encode)]:
             element.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, count_buffer, name)
+        output_digest = hashlib.sha256()
+        output_bytes = {'count': 0}
+        def audit_output(_pad, info):
+            if info.type & Gst.PadProbeType.BUFFER:
+                buffer = info.get_buffer()
+                data = buffer.extract_dup(0, buffer.get_size())
+                output_digest.update(data)
+                output_bytes['count'] += len(data)
+            return Gst.PadProbeReturn.OK
+        pipeline.get_by_name('output').get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, audit_output)
         bus = pipeline.get_bus()
+        cache_stats = {}
         try:
             if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-                fail('无法运行原生 NVMM 管线。')
+                fail('无法启动原生 NVMM 管线。')
+            native_nvmm_trace('pipeline PLAYING')
+            # A wall-clock timer cuts a fast NVMM pipeline short.  JetPack's
+            # nvivafilter does not accept a pipeline-wide stop segment on every
+            # release, so seek the media start and use the CUDA Scene output PTS
+            # to inject EOS at the requested end instead.
+            if needs_segment_seek:
+                deadline = GLib.get_monotonic_time() + 5 * GLib.USEC_PER_SEC
+                while not startup_gate['reached'] and GLib.get_monotonic_time() < deadline:
+                    message = pipeline.get_bus().timed_pop_filtered(10 * Gst.MSECOND, Gst.MessageType.ERROR)
+                    if message:
+                        error, debug = message.parse_error()
+                        fail('原生 NVMM 分段定位预热失败：' + str(error) + ('；' + str(debug) if debug else ''))
+                if not startup_gate['reached']:
+                    fail('原生 NVMM 分段定位预热超时。')
+                # nvivafilter is a transform, not a seekable demuxer. Seeking the
+                # whole pipeline therefore returns false on JetPack even though
+                # qtdemux can seek the MP4 perfectly well. Target qtdemux itself
+                # and carry both segment bounds in the media clock; EOS below is
+                # only a defensive stop, never a wall-clock timer.
+                demux = pipeline.get_by_name('demux')
+                seek_target = demux if demux else pipeline
+                segment_stop = int((start + duration) * Gst.SECOND)
+                seek_ok = seek_target.seek(
+                    1.0,
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
+                    Gst.SeekType.SET,
+                    int(start * Gst.SECOND),
+                    Gst.SeekType.SET,
+                    segment_stop
+                )
+                if not seek_ok:
+                    fail('原生 NVMM qtdemux 无法定位到分段起点。')
+                startup_pad.remove_probe(startup_probe)
             native_nvmm_trace('waiting for EOS')
             while True:
                 # Only the tiny bundled admission samples have a no-progress
                 # deadline. Production chunks are terminated by Scene PTS,
                 # never by wall clock, so a heavily loaded yet valid export is
                 # not cut short.
-                wait_time = 6 * Gst.SECOND if request.get('selfTest') else Gst.CLOCK_TIME_NONE
+                wait_time = 250 * Gst.MSECOND
                 message = bus.timed_pop_filtered(wait_time, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                failure_marker = timeline + '.error'
+                if os.path.isfile(failure_marker):
+                    with open(failure_marker, encoding='utf-8') as failure_file:
+                        fail('CUDA Scene 合成失败：' + failure_file.read(4096))
                 if message is None:
-                    fail('原生 NVMM 自检在 6 秒内未完成媒体 EOS。')
+                    if request.get('selfTest') and GLib.get_monotonic_time() - wall_started > 6 * GLib.USEC_PER_SEC:
+                        fail('原生 NVMM 自检在 6 秒内未完成媒体 EOS。')
+                    continue
                 if message.type == Gst.MessageType.EOS: break
                 error, debug = message.parse_error(); fail('原生 NVMM：' + str(error) + ('；' + str(debug) if debug else ''))
+            try:
+                cache_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
+                cache_library.br2k_scene_cache_peak_bytes.restype = ctypes.c_ulonglong
+                cache_library.br2k_scene_texture_upload_count.restype = ctypes.c_ulonglong
+                cache_stats = {'peakBytes': cache_library.br2k_scene_cache_peak_bytes(),
+                               'uploads': cache_library.br2k_scene_texture_upload_count(), 'limitBytes': 512 * 1024 ** 2}
+            except (OSError, AttributeError):
+                pass
         finally:
             pipeline.set_state(Gst.State.NULL)
+        if output_container == 'mkv':
+            actual_digest = hashlib.sha256()
+            actual_bytes = 0
+            with open(output['path'], 'rb') as completed_file:
+                os.fsync(completed_file.fileno())
+                if hasattr(os, 'posix_fadvise'):
+                    os.posix_fadvise(completed_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                while True:
+                    data = completed_file.read(1024 * 1024)
+                    if not data:
+                        break
+                    actual_digest.update(data)
+                    actual_bytes += len(data)
+            if actual_bytes != output_bytes['count'] or actual_digest.digest() != output_digest.digest():
+                fail('共享盘输出字节与编码封装输出不一致（写入或回读损坏），已拒绝发布；请检查 SMB 存储链路。')
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
         media_clock = 'frame-fallback'
@@ -1204,13 +1417,18 @@ def render_native_nvmm(request):
                 native_nvmm_trace('scene→encode samples=' + json.dumps(trace_encode_pairs, ensure_ascii=False))
             if trace_pts and source_encode_samples:
                 native_nvmm_trace('source→encode samples=' + json.dumps(source_encode_samples, ensure_ascii=False))
-            fail('NVMM CUDA Scene PTS 映射未覆盖完整媒体时间：解码=%d，source→Scene=%d/%d（偏差=%d），Scene→编码=%d/%d（偏差=%d），source→编码=%d/%d（偏差=%d），未匹配=%d，编码=%d/%d。' % (
+            fail('NVMM CUDA Scene PTS 映射未覆盖完整媒体时间：解码=%d，source→Scene=%d/%d（偏差=%d），Scene→编码=%d/%d（偏差=%d），source→编码=%d/%d（偏差=%d），未匹配=%d，编码=%d/%d；Scene/编码覆盖=%.3f/%.3fs，请求=%.3fs。' % (
                 decoded_clock['frames'], pts_audit['sourceToSceneFrames'], expected_restored,
                 pts_audit['sourceToSceneMismatches'], pts_audit['sceneToEncodeFrames'], counters['scene'],
                 pts_audit['sceneToEncodeMismatches'], source_encode_frames, counters['encode'],
-                source_encode_mismatches, decoded_clock['unmatched'], counters['encode'], minimum_frames))
+                source_encode_mismatches, decoded_clock['unmatched'], counters['encode'], minimum_frames,
+                scene_coverage_ns / Gst.SECOND, encode_coverage_ns / Gst.SECOND, duration))
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'mediaClock': media_clock, 'wallSeconds': wall_seconds,
+            'drawingClock': 'input-pts-fifo',
+            'textures': timeline_request.get('_textureStats'),
+            'textureCache': cache_stats,
+            'outputStorageVerified': output_container == 'mkv',
             'decode': counters['decode'] / wall_seconds, 'scene': counters['scene'] / wall_seconds,
             'encode': total, 'total': total, 'pipelineFps': total,
             'ptsBridge': {
