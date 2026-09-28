@@ -12492,7 +12492,9 @@ try {
                 });
                 break;
               } catch (error) {
-                if (!nativeTimestampedChunk || !error?.nativeFailure?.idleTimedOut || attempt > 0 || isCancelled?.()) throw error;
+                if (!nativeTimestampedChunk ||
+                    !(error?.nativeFailure?.idleTimedOut || error?.nativeFailure?.timedOut) ||
+                    attempt > 0 || isCancelled?.()) throw error;
                 this.log('warn', `${label} 分段 ${index + 1} 的 NVMM 解码链路无进展，重新初始化并仅重试本分段一次。`);
                 onStage?.(`正在重新初始化 NVMM 并重试分段 ${index + 1}`);
                 await new Promise(resolve => setTimeout(resolve, 1000));
@@ -12505,7 +12507,9 @@ try {
           } catch (error) {
             const damagedSourceWindow = /NVMM CUDA Scene PTS 映射未覆盖完整媒体时间/.test(
               `${error?.message || ''} ${error?.nativeFailure?.stderrTail || ''}`);
-            if (nativeTimestampedChunk && (error?.nativeFailure?.idleTimedOut || damagedSourceWindow) && !isCancelled?.()) {
+            if (nativeTimestampedChunk &&
+                (error?.nativeFailure?.idleTimedOut || error?.nativeFailure?.timedOut || damagedSourceWindow) &&
+                !isCancelled?.()) {
               nativeRepairUntil = Math.max(nativeRepairUntil, completed + chunkDuration);
               if (chunkDuration > 20.001) {
                 this.log('warn', `${label} 分段 ${index + 1} 的 Jetson NVDEC 连续停滞，改为最长 20 秒的局部修复窗口；已完成的前序分段不重跑。`);
@@ -12768,9 +12772,12 @@ try {
               onPreparing?.(parsed.nativeNvmmPreparing);
             }
           };
+          const nativeTimeoutMs = Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000));
+          const effectiveIdleTimeoutMs = Math.max(1000, Number(nativeIdleTimeoutMs) ||
+            ((nativeDecode.duration || duration) <= 20.001 ? 30_000 : JETSON_NATIVE_SCENE_IDLE_TIMEOUT_MS));
           const runNativeHelper = () => runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
-            timeoutMs: Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000)), maxOutputBytes: 64 * 1024,
-            idleTimeoutMs: Math.max(1000, Number(nativeIdleTimeoutMs) || JETSON_NATIVE_SCENE_IDLE_TIMEOUT_MS),
+            timeoutMs: nativeTimeoutMs, maxOutputBytes: 64 * 1024,
+            idleTimeoutMs: effectiveIdleTimeoutMs,
             onChild,
             env: { ...process.env, TMPDIR: sceneTemporaryDir || path.dirname(encodedVideoPath) },
             onStdout: (chunk) => {
@@ -12806,8 +12813,10 @@ try {
           if (nativeStdoutRemainder) consumeNativeReportLine(nativeStdoutRemainder);
           if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut || nativeResult.idleTimedOut) {
             const timeoutReason = nativeResult.idleTimedOut
-              ? `原生 NVMM 连续 ${Math.round((Number(nativeIdleTimeoutMs) || JETSON_NATIVE_SCENE_IDLE_TIMEOUT_MS) / 1000)} 秒没有输出进展，已终止停滞的分段；已处理媒体 ${nativeAttemptMediaSeconds.toFixed(1)} 秒。`
-              : '';
+              ? `原生 NVMM 连续 ${Math.round(effectiveIdleTimeoutMs / 1000)} 秒没有输出进展，已终止停滞的分段；已处理媒体 ${nativeAttemptMediaSeconds.toFixed(1)} 秒。`
+              : nativeResult.timedOut
+                ? `原生 NVMM 分段超过 ${Math.round(nativeTimeoutMs / 1000)} 秒运行时限，已终止；已处理媒体 ${nativeAttemptMediaSeconds.toFixed(1)} 秒。`
+                : '';
             const nativeDiagnostic = redactSensitive(String(timeoutReason || nativeResult.stderr || nativeResult.stdout || nativeResult.error?.message || '原生 NVMM CUDA Scene 失败。')).replace(/\s+/g, ' ').trim().slice(-900);
             onStderr?.(`原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
             this.log('warn', `${label}：原生 NVMM CUDA Scene helper 失败：${nativeDiagnostic}`);
@@ -13149,7 +13158,11 @@ try {
           return true;
         };
         const onStderr = (line) => {
-          if (this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
+          // A chunk's FFmpeg clock starts at zero. The chunk coordinator
+          // translates it to the full recording clock below; applying the
+          // raw line here would briefly move the WebUI progress backward.
+          if ((!useChunkedJetsonScene || progress.phase === 'mux') &&
+              this.exportProgress?.id === progress.id && updateFfmpegJobProgress(this.exportProgress, line)) {
             this.emitState('mediaJob');
           }
           for (const entry of String(line).split(/\r?\n/).filter(Boolean)) {
@@ -13243,6 +13256,7 @@ try {
         throwIfExportCancelled();
         if (isJetsonGstreamerCodec(burnCodec)) {
           if (useChunkedJetsonScene) {
+            let reportedMediaHighWaterSec = Math.max(0, Number(progress.currentTimeSec) || 0);
             await this.runChunkedJetsonSceneGraphExport({
               graph, cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, codec: burnCodec, crf: burnCrf,
               finalOutputPath: outputPath, sharedOutput,
@@ -13260,7 +13274,8 @@ try {
                 // A late native helper report can arrive at a chunk boundary
                 // after the completed-chunk marker. Never let it move the
                 // displayed media clock backward or reset the whole-job ETA.
-                const monotonicValue = Math.max(Number(this.exportProgress.currentTimeSec || 0), Number(value) || 0);
+                reportedMediaHighWaterSec = Math.max(reportedMediaHighWaterSec, Number(value) || 0);
+                const monotonicValue = reportedMediaHighWaterSec;
                 if (updateFfmpegJobProgress(this.exportProgress, `out_time_us=${Math.round(monotonicValue * 1_000_000)}`)) this.emitState('mediaJob');
               },
               onPreparing: onScenePreparing,

@@ -141,7 +141,10 @@ test('repeated NVDEC stall narrows the range and CPU-decodes only the failing 20
     nativeCalls.push(window);
     if (window[1] > 20 || window[0] === 20) {
       opts.onProgress(8);
-      throw Object.assign(new Error('NVDEC 停滞'), { nativeFailure: { idleTimedOut: true } });
+      // A short bad-source window can hit its absolute process limit before
+      // the longer idle watchdog; it must use the same local repair path.
+      throw Object.assign(new Error('NVDEC 停滞'), { nativeFailure: window[1] > 20
+        ? { idleTimedOut: true } : { timedOut: true, idleTimedOut: false } });
     }
     if (window[0] === 40) {
       opts.onProgress(16);
