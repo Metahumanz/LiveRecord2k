@@ -334,6 +334,27 @@ test('timeline audit detects A/V drift before a segment is copied into a merge',
   }
 });
 
+test('low-fps B-frame video uses presentation time for A/V merge validation', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-low-fps-timeline-'));
+  const filePath = path.join(tempDir, 'five-fps.mp4');
+  try {
+    const generated = await runCapturedProcess(ffmpegPath, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=5:duration=4',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=4',
+      '-c:v', 'libx264', '-bf', '3', '-pix_fmt', 'yuv420p', '-c:a', 'aac', filePath
+    ], { timeoutMs: 20_000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    const mediaInfo = await probeMediaFileInfo(ffmpegPath, filePath);
+    const timing = await probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo);
+    assert.ok(timing.videoPresentationDurationSec - timing.videoDurationSec >= 0.2, JSON.stringify(timing));
+    assert.ok(Math.abs(timing.avDeltaSec) <= 0.08, JSON.stringify(timing));
+    assert.equal(timing.timingSafeForCopy, true, JSON.stringify(timing));
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('video probing retains the 10-bit HDR profile used by safe merge selection', () => {
   const videoInfo = parseFfmpegVideoInfo(
     'Stream #0:0: Video: hevc (Main 10), p010le(tv, bt2020nc/bt2020/smpte2084), 3840x2160, 60 fps'

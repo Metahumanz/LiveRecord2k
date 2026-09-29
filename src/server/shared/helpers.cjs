@@ -2171,14 +2171,14 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
 async function probeMediaTimelineInfo(ffmpegPath, filePath, mediaInfo = {}, options = {}) {
   const fullScan = options.fullScan || await scanFullMedia(ffmpegPath, filePath, options, runCapturedProcess);
   const videoDurationSec = fullScan.video.dtsEnd;
-  const audioDurationSec = mediaInfo.audioInfo ? Number(fullScan.audio?.ptsEnd || 0) : 0;
-  const measuredAvDeltaSec = mediaInfo.audioInfo ? audioDurationSec - videoDurationSec : 0;
-  // Stream-copy progress reports video DTS, which can trail presentation time by several B-frames.
-  // Discount that known positive-only reorder gap before deciding whether the streams really drift.
-  const fps = Number(mediaInfo.videoInfo?.fps || 0);
-  const videoReorderAllowanceSec = fps > 0 ? Math.min(0.15, 3 / fps) : 0.12;
-  const avDeltaSec = measuredAvDeltaSec > 0 ? Math.max(0, measuredAvDeltaSec - videoReorderAllowanceSec) : measuredAvDeltaSec;
   const videoPresentationDurationSec = fullScan.video.ptsEnd;
+  const audioDurationSec = mediaInfo.audioInfo ? Number(fullScan.audio?.ptsEnd || 0) : 0;
+  // DTS can end several frames before the last presented B-frame, especially
+  // for low-fps live streams. Compare presentation endpoints directly rather
+  // than guessing a fixed reordering allowance from the nominal frame rate.
+  const videoReorderAllowanceSec = Math.max(0, videoPresentationDurationSec - videoDurationSec);
+  const measuredAvDeltaSec = mediaInfo.audioInfo ? audioDurationSec - videoPresentationDurationSec : 0;
+  const avDeltaSec = measuredAvDeltaSec;
   const containerDurationSec = Number(mediaInfo.durationSec || 0);
   const streamDurationSec = Math.max(videoDurationSec, audioDurationSec);
   return {

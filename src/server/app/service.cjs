@@ -7422,7 +7422,8 @@ try {
       this.removingRoomIds.has(room?.id) ||
       this.mergeCancelRequests.has(this.getMergeRetryKey(room.id, groupId)) ||
       isFfmpegMemoryPressureError(error) ||
-      error?.code === 'MERGE_SEGMENT_UNDECODABLE'
+      error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
+      error?.code === 'MERGE_AV_TIMELINE_UNSAFE'
     ) {
       if (room?.id && groupId) this.clearMergeRetryState(room.id, groupId);
       return false;

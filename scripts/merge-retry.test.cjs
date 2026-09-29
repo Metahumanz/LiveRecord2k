@@ -78,6 +78,14 @@ test('cancelled groups and manual selection survive a real store reload without 
   assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'first-session');
 });
 
+test('deterministic A/V timeline failure does not re-encode the whole group again', () => {
+  const app = createMergeTestService();
+  const room = { id: '883263', mergeProgress: { kind: 'merge', mergeGroup: 'session', status: 'error' } };
+  const error = Object.assign(new Error('合并后音画时长不一致'), { code: 'MERGE_AV_TIMELINE_UNSAFE' });
+  assert.equal(app.scheduleMergeRetry(room, 'session', {}, error), false);
+  assert.equal(app.mergeRetryStates.size, 0);
+});
+
 test('a retry in another group displays its own output path rather than the previous completed merge', () => {
   const app = createMergeTestService(); const room = { id: '883263', mergeProgress: {
     kind: 'merge', status: 'completed', mergeGroup: 'first-session', outputPath: 'first.merged.mp4' } };
