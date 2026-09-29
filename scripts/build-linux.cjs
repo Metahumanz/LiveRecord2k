@@ -131,7 +131,7 @@ async function writeDebianMetadata(debRoot, { version, debArch }) {
     'Priority: optional',
     `Architecture: ${debArch}`,
     'Maintainer: Metahumanz',
-    'Depends: ffmpeg, ca-certificates, openssl, passwd, util-linux, tar, fontconfig, fonts-noto-cjk, libass9, gstreamer1.0-tools, gstreamer1.0-plugins-base',
+    'Depends: ffmpeg, ca-certificates, openssl, libgnutls30, passwd, util-linux, tar, fontconfig, fonts-noto-cjk, libass9, gstreamer1.0-tools, gstreamer1.0-plugins-base',
     'Homepage: https://github.com/Metahumanz/LiveRecord2k',
     'Description: Bilibili live recording service with a WebUI',
     ' Records live streams and danmaku, and can render danmaku into exported video.',
@@ -164,6 +164,14 @@ async function copyBundledArm64SceneGraphFfmpeg(binDir, arch) {
     }
     await fsp.copyFile(source, path.join(binDir, targetName));
     await fsp.chmod(path.join(binDir, targetName), 0o755);
+  }
+  const protocolProbe = spawnSync(path.join(binDir, 'ffmpeg-full'), ['-hide_banner', '-protocols'], {
+    encoding: 'utf8',
+    timeout: 8_000
+  });
+  const inputProtocols = String(protocolProbe.stdout || '').split(/\r?\nOutput:/)[0];
+  if (protocolProbe.status !== 0 || !/^\s+https\s*$/m.test(inputProtocols)) {
+    throw new Error('ARM64 打包 FFmpeg 缺少 HTTPS 输入协议，无法录制直播流。');
   }
 }
 
