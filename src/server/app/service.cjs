@@ -8376,6 +8376,7 @@ try {
                 normalizeTempDir,
                 `${String(index + 1).padStart(3, '0')}.video.mkv`
               );
+              let jetsonStagePhase = 'render';
               await runMergeFfmpeg(null, {
                 ...normalizeOptions,
                 run: (onStderr, onChild) =>
@@ -8410,8 +8411,31 @@ try {
                         hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
                         timelineAlignment
                       }),
-                    onStderr,
+                    onStderr: (line) => {
+                      // Audio muxing starts its own FFmpeg clock at zero. It
+                      // must not rewind the completed video segment's overall
+                      // merge percentage or ETA.
+                      if (jetsonStagePhase === 'mux' && Number.isFinite(parseFfmpegProgressTime(line)) &&
+                          !/error|failed|invalid/i.test(line)) return;
+                      onStderr(line);
+                    },
                     onChild,
+                    onPhase: (phase) => {
+                      jetsonStagePhase = phase;
+                      if (phase !== 'mux' || room.mergeProgress?.id !== progress.id) return;
+                      const completedSec = Math.min(mergeDurationSec, progressOffsetSec + sourceDurationSec);
+                      room.mergeProgress.currentTimeSec = Math.max(Number(room.mergeProgress.currentTimeSec || 0), completedSec);
+                      room.mergeProgress.phaseCurrentTimeSec = room.mergeProgress.currentTimeSec;
+                      room.mergeProgress.percent = mergeDurationSec > 0
+                        ? Math.max(Number(room.mergeProgress.percent || 0), Math.min(99.3, room.mergeProgress.currentTimeSec / mergeDurationSec * 100))
+                        : null;
+                      room.mergeProgress.stageLabel = `正在封装规范化分段 ${index + 1}/${segments.length} 的音频`;
+                      room.mergeProgress.message = room.mergeProgress.stageLabel;
+                      room.mergeProgress.etaState = 'estimating';
+                      room.mergeProgress.estimatedRemainingSec = null;
+                      room.mergeProgress.updatedAt = Date.now();
+                      this.markRoomDirty(room.id);
+                    },
                     onFallback: () => {
                       this.setProgressDecoder(room.mergeProgress, {
                         value: 'software',

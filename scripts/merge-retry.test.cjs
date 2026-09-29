@@ -207,6 +207,12 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
     const encoded = await runCapturedProcess(ffmpegPath, ['-y', '-i', source, '-an', '-vf', `scale=${options.width}:${options.height}`,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0', options.encodedVideoPath], { timeoutMs: 20_000 });
     assert.equal(encoded.status, 0, encoded.stderr);
+    options.onPhase?.('render');
+    options.onStderr?.('out_time_us=900000');
+    const renderPercent = Number(room.mergeProgress?.percent || 0);
+    options.onPhase?.('mux');
+    options.onStderr?.('out_time_us=100000');
+    assert.ok(Number(room.mergeProgress?.percent || 0) >= renderPercent, 'audio mux progress must not rewind the merged video progress');
     await runFfmpegJob(ffmpegPath, mux, options.onStderr, { onChild: options.onChild });
   };
   await app.mergeSelectedRecordings({ cleanPaths: originals });
