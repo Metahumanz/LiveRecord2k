@@ -2215,7 +2215,10 @@ function createNormalizeRawVideoArgs({
     `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
     `${createBoundedEvenScaleFilter(width, height)},` +
     `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p` +
-    `${videoPaddingFilter}${videoTailFilter}[vout]`;
+    // rawvideoparse already assigns a fixed frame clock. Regularize damaged
+    // source PTS before the tail trim, otherwise FFmpeg can discard two valid
+    // low-fps tail frames while the audio is padded to the requested duration.
+    `${videoPaddingFilter},fps=${formatGstreamerFramerate(targetVideoInfo?.fps)}${videoTailFilter}[vout]`;
   args.push(
     '-filter_complex',
     filter,

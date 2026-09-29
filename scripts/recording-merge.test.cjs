@@ -380,7 +380,7 @@ test('normalization holds a missing low-fps tail frame to the audio boundary', a
     assert.ok(Math.abs(timeline.videoPresentationDurationSec - 4) <= 0.05, JSON.stringify(timeline));
     assert.equal(timeline.timingSafeForCopy, true, JSON.stringify(timeline));
     const rawArgs = createNormalizeRawVideoArgs({ inputPath: sourcePath, durationSec: 4, targetVideoInfo: mediaInfo.videoInfo });
-    assert.match(rawArgs[rawArgs.indexOf('-filter_complex') + 1], /tpad=stop_mode=clone:stop_duration=1,trim=duration=4/);
+    assert.match(rawArgs[rawArgs.indexOf('-filter_complex') + 1], /fps=5\/1,tpad=stop_mode=clone:stop_duration=1,trim=duration=4/);
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
