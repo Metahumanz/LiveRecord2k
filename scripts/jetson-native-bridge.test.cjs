@@ -63,7 +63,7 @@ test('Jetson export contract validates the intermediate MKV and retries empty na
   assert.match(serviceSource, /Jetson nvv4l2decoder 未产生有效帧，已切换 CPU 解码/);
 });
 
-test('Jetson native admission preflights a real source and never restarts a committed long run', () => {
+test('Jetson native admission preflights a real source and never restarts the whole committed export', () => {
   const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'app', 'service.cjs'), 'utf8');
   assert.match(serviceSource, /probeJetsonNativeSceneForSource/);
   assert.match(serviceSource, /native-preflight\.json/);
@@ -94,7 +94,7 @@ test('Jetson native admission preflights a real source and never restarts a comm
   const nativeFallbackGuardRegion = serviceSource.slice(nativeFallbackGuardStart, nativeFallbackCpuRunStart + 30);
   assert.match(nativeFallbackGuardRegion, /if \(committedNativeNvmmRun\) throw error/);
   assert.ok(nativeFallbackGuardRegion.indexOf('if (committedNativeNvmmRun) throw error') < nativeFallbackGuardRegion.indexOf("await run('software')"));
-  assert.match(serviceSource, /正式导出使用连续NVMM链路/);
+  assert.match(serviceSource, /正式导出使用分段NVMM链路/);
   assert.match(serviceSource, /本次导出从开始即使用兼容链/);
 });
 

@@ -8,7 +8,12 @@ async function snapshotManualMergeArtifacts(segments, artifacts) {
     const stat = await fs.lstat(target).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     if (!stat) return;
     if (stat.isSymbolicLink()) throw new Error('源配套文件包含符号链接，不能自动清理。');
-    result[path.resolve(target)] = [stat.size, stat.mtimeMs, stat.isDirectory()];
+    // Directory size/mtime is not a source-content fingerprint. CIFS may
+    // change either while copying the merged output into a sibling path.
+    // The recursive entry list and each file fingerprint remain protected.
+    result[path.resolve(target)] = stat.isDirectory()
+      ? [0, 0, true]
+      : [stat.size, stat.mtimeMs, false];
     if (stat.isDirectory()) for (const entry of await fs.readdir(target)) await visit(path.join(target, entry));
   };
   for (const target of new Set(segments.flatMap(artifacts))) await visit(target);
@@ -41,8 +46,11 @@ async function deleteManualMergeSources({ root, outputPath, segments, expected, 
   if (artifactSnapshot) {
     const current = await snapshotManualMergeArtifacts(segments, artifacts);
     const keys = Object.keys(current).sort(), originalKeys = Object.keys(artifactSnapshot).sort();
-    if (JSON.stringify(keys) !== JSON.stringify(originalKeys) || keys.some(key => JSON.stringify(current[key]) !== JSON.stringify(artifactSnapshot[key]))) {
-      throw new Error('源配套文件在合并期间发生变化，源文件保留。');
+    const changed = keys.find(key => !Object.hasOwn(artifactSnapshot, key) ||
+      JSON.stringify(current[key]) !== JSON.stringify(artifactSnapshot[key])) ||
+      originalKeys.find(key => !Object.hasOwn(current, key));
+    if (changed) {
+      throw new Error(`源配套文件在合并期间发生变化，源文件保留：${path.basename(changed)}。`);
     }
   }
   if (segments.some(segment => isBusy(segment.cleanPath))) throw new Error('源录像开始被其它任务使用，源文件保留。');

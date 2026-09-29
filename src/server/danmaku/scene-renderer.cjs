@@ -427,6 +427,10 @@ function createSceneFilterScript(scene, options) {
   // round-trip through RGBA before libass: that shifts antialiasing and makes
   // two otherwise identical ASS renders differ.
   if (legacyAssPath) {
+    const repairInput = source.repairMissingFrames === true
+      ? 'fps=fps=' + ff(fps) + ':round=near,tpad=stop_mode=clone:stop_duration=' + ff(outputDuration) +
+        ',trim=duration=' + ff(outputDuration) + ',setpts=PTS-STARTPTS,'
+      : '';
     if (leadingVideoPaddingSec > 0.0005) {
       const lead = ff(leadingVideoPaddingSec);
       // libass reads the recording clock, but concat adds the black lead
@@ -437,7 +441,7 @@ function createSceneFilterScript(scene, options) {
         script: [
           'color=c=black:s=' + canvasWidth + 'x' + canvasHeight + ':r=' + ff(fps) + ':d=' + lead +
             ',format=yuv420p,setpts=PTS-STARTPTS[scene_legacy_lead]',
-          "[0:v]settb=AVTB,setpts=PTS-STARTPTS+" + lead + "/TB,ass=filename='" + quoteFilter(legacyAssPath) +
+          "[0:v]settb=AVTB,setpts=PTS-STARTPTS+" + lead + "/TB," + repairInput + "ass=filename='" + quoteFilter(legacyAssPath) +
             "',setpts=PTS-STARTPTS[scene_legacy_source]",
           '[scene_legacy_lead][scene_legacy_source]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
             ',setpts=PTS-STARTPTS,format=yuv420p[vout]'
@@ -447,7 +451,7 @@ function createSceneFilterScript(scene, options) {
     }
     return {
       plan,
-      script: "[0:v]ass=filename='" + quoteFilter(legacyAssPath) + "'[vout]\n",
+      script: "[0:v]" + repairInput + "ass=filename='" + quoteFilter(legacyAssPath) + "'[vout]\n",
       renderer: 'libass-legacy-compatibility'
     };
   }
@@ -462,7 +466,10 @@ function createSceneFilterScript(scene, options) {
   // converting every 1440p frame to RGBA and back merely to draw a few glyphs.
   const softwareFormat = source.directText === true && plan.objects.every(canDrawTextDirectly)
     ? ',format=yuv420p' : ',format=rgba';
-  const frameClock = source.normalizeFrameClock === true && !cudaTarget ? ',fps=fps=' + ff(fps) + ':round=near' : '';
+  const frameClock = source.repairMissingFrames === true && !cudaTarget
+    ? ',fps=fps=' + ff(fps) + ':round=near,tpad=stop_mode=clone:stop_duration=' + ff(outputDuration) +
+      ',trim=duration=' + ff(outputDuration) + ',setpts=PTS-STARTPTS'
+    : source.normalizeFrameClock === true && !cudaTarget ? ',fps=fps=' + ff(fps) + ':round=near' : '';
   const filters = leadingVideoPaddingSec > 0.0005
     ? [
         '[0:v]settb=AVTB,setpts=PTS-STARTPTS' + (cudaTarget ? uploadBase : softwareFormat) + '[scene_source_0]',

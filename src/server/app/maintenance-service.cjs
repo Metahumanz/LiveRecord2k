@@ -337,12 +337,16 @@ class MaintenanceService {
         knownMergedRecordings.set(key, recording);
       }
     };
-    const resolveMetadataPath = (metadataPath, value) => {
+    const resolveMetadataPath = (metadataPath, value, allowSiblingSession = false) => {
       const rawPath = String(value || '').trim();
       if (!rawPath) return '';
       const metadataDirectory = path.dirname(metadataPath);
       const resolvedPath = path.resolve(metadataDirectory, rawPath);
-      return isPathInsideDirectory(resolvedPath, metadataDirectory) ? resolvedPath : '';
+      const libraryRoot = path.resolve(owner.settings.outputDir);
+      const sourceScope = allowSiblingSession && isPathInsideDirectory(metadataDirectory, libraryRoot)
+        ? path.dirname(metadataDirectory) : metadataDirectory;
+      return isPathInsideDirectory(resolvedPath, libraryRoot) && isPathInsideDirectory(resolvedPath, sourceScope)
+        ? resolvedPath : '';
     };
 
     for (const cleanup of owner.pendingSegmentCleanups.values()) {
@@ -384,7 +388,7 @@ class MaintenanceService {
       if (!(await this.isExistingFile(entry.mediaPath))) continue;
       const metadata = entry.metadata;
       const mergedFrom = Array.isArray(metadata.mergedFrom)
-        ? metadata.mergedFrom.map((sourcePath) => resolveMetadataPath(entry.metadataPath, sourcePath)).filter(Boolean)
+        ? metadata.mergedFrom.map((sourcePath) => resolveMetadataPath(entry.metadataPath, sourcePath, true)).filter(Boolean)
         : [];
       const recording = owner.normalizeRecording({
         cleanPath: entry.mediaPath,
