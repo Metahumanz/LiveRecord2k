@@ -8523,6 +8523,15 @@ try {
           if (!normalizedInfo.videoInfo) {
             throw new Error(`规范化分段后没有检测到视频流：${path.basename(segments[index].cleanPath)}`);
           }
+          if (index === segments.length - 1) {
+            const tailTiming = await this.runMergePreparationStage(
+              room,
+              progress,
+              '正在检查末段规范化后的音画尾部',
+              () => probeMediaTimelineInfo(this.ffmpegPath, normalizedPath, normalizedInfo, { ...mergeProbeOptions, timeoutMs: 120000 })
+            );
+            this.log('info', `${roomLabel(room)} 末段规范化尾部：视频 PTS ${tailTiming.videoPresentationDurationSec.toFixed(3)}s，音频 ${tailTiming.audioDurationSec.toFixed(3)}s，差 ${tailTiming.avDeltaSec.toFixed(3)}s。`);
+          }
           normalizedPaths.push(normalizedPath);
           // The concat demuxer must advance by the normalized presentation
           // length, not by trailing H.26x DTS. The quick container probe is
@@ -8636,7 +8645,7 @@ try {
         );
         this.log(
           Math.abs(mergedTimingInfo.avDeltaSec) > 0.08 ? 'warn' : 'success',
-          `${roomLabel(room)} 合并后时轴检查：视频 ${mergedTimingInfo.videoDurationSec.toFixed(
+          `${roomLabel(room)} 合并后时轴检查：视频 PTS ${mergedTimingInfo.videoPresentationDurationSec.toFixed(
             3
           )}s，音频 ${mergedTimingInfo.audioDurationSec.toFixed(3)}s，音频${mergedTimingInfo.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
             mergedTimingInfo.avDeltaSec

@@ -13,6 +13,7 @@ const {
   createAvatarOverlayChunkFilterScript,
   createConcatCopyArgs,
   createNormalizeSegmentArgs,
+  createNormalizeRawVideoArgs,
   createConcatTranscodeArgs,
   createPreviewHlsArgs,
   createBoundedEvenScaleFilter,
@@ -350,6 +351,36 @@ test('low-fps B-frame video uses presentation time for A/V merge validation', as
     assert.ok(timing.videoPresentationDurationSec - timing.videoDurationSec >= 0.2, JSON.stringify(timing));
     assert.ok(Math.abs(timing.avDeltaSec) <= 0.08, JSON.stringify(timing));
     assert.equal(timing.timingSafeForCopy, true, JSON.stringify(timing));
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('normalization holds a missing low-fps tail frame to the audio boundary', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-low-fps-tail-'));
+  const sourcePath = path.join(tempDir, 'source.mp4');
+  const outputPath = path.join(tempDir, 'normalized.mkv');
+  try {
+    const generated = await runCapturedProcess(ffmpegPath, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=5:duration=3.6',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=4',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', sourcePath
+    ], { timeoutMs: 20_000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    const mediaInfo = await probeMediaFileInfo(ffmpegPath, sourcePath);
+    const args = createNormalizeSegmentArgs({
+      inputPath: sourcePath, outputPath, container: 'mkv', durationSec: 4,
+      hasAudio: true, targetVideoInfo: mediaInfo.videoInfo, videoCodec: 'libx264'
+    });
+    const normalized = await runCapturedProcess(ffmpegPath, args, { timeoutMs: 20_000 });
+    assert.equal(normalized.status, 0, normalized.stderr);
+    const outputInfo = await probeMediaFileInfo(ffmpegPath, outputPath);
+    const timeline = await probeMediaTimelineInfo(ffmpegPath, outputPath, outputInfo);
+    assert.ok(Math.abs(timeline.videoPresentationDurationSec - 4) <= 0.05, JSON.stringify(timeline));
+    assert.equal(timeline.timingSafeForCopy, true, JSON.stringify(timeline));
+    const rawArgs = createNormalizeRawVideoArgs({ inputPath: sourcePath, durationSec: 4, targetVideoInfo: mediaInfo.videoInfo });
+    assert.match(rawArgs[rawArgs.indexOf('-filter_complex') + 1], /tpad=stop_mode=clone:stop_duration=1,trim=duration=4/);
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
