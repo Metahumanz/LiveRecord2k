@@ -1014,6 +1014,22 @@ async function runFfmpegProbe(ffmpegPath, args, options = {}) {
   }
 }
 
+function parseFfmpegInputProtocols(output) {
+  const lines = String(output || '').split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === 'Input:');
+  const end = lines.findIndex((line, index) => index > start && line.trim() === 'Output:');
+  if (start < 0 || end < 0) return new Set();
+  return new Set(lines.slice(start + 1, end).map((line) => line.trim()).filter((line) => /^[a-z0-9+.-]+$/i.test(line)));
+}
+
+async function probeMediaFirstVideoPacket(ffmpegPath, filePath, options = {}) {
+  const result = await runCapturedProcess(ffmpegPath, [
+    '-hide_banner', '-nostdin', '-loglevel', 'verbose', '-debug_ts',
+    '-i', filePath, '-t', '3', '-map', '0:v:0', '-c', 'copy', '-f', 'null', '-'
+  ], { timeoutMs: Number(options.timeoutMs || 8000), maxOutputBytes: 128 * 1024 });
+  return result.status === 0 && !result.timedOut && /\bmuxer\s+<-\s+type:video\s+pkt_pts:/i.test(result.stderr || '');
+}
+
 function runCapturedProcess(command, args, options = {}) {
   return new Promise((resolve) => {
     const timeoutMs = Math.max(0, Number(options.timeoutMs || 0));
@@ -4153,6 +4169,8 @@ module.exports = {
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,
+  parseFfmpegInputProtocols,
+  probeMediaFirstVideoPacket,
   parseFfmpegEncoderNames,
   parseFfmpegHwaccels,
   parseFfmpegFilterNames,

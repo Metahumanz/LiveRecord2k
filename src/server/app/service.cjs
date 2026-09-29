@@ -132,6 +132,8 @@ const {
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,
+  parseFfmpegInputProtocols,
+  probeMediaFirstVideoPacket,
   parseFfmpegEncoderNames,
   parseFfmpegHwaccels,
   detectVideoAdapters,
@@ -1197,6 +1199,7 @@ class LiveRecordService {
     this.managedLinuxUpdateRequestPromise = null;
     this.updateService = new UpdateService(this);
     this.ffmpegPath = findFfmpegPath();
+    this.ffmpegInputProtocols = null;
     this.ffmpegCapabilities = {
       burnCodecs: BURN_CODEC_CANDIDATES.filter((codec) => codec.kind === 'software'),
       unavailableBurnCodecs: [],
@@ -1316,6 +1319,18 @@ class LiveRecordService {
     if (ffmpegSelection.path !== this.ffmpegPath) {
       this.ffmpegPath = ffmpegSelection.path;
       this.log('warn', ffmpegSelection.fallbackReason);
+    }
+    const protocolProbe = await runFfmpegProbe(this.ffmpegPath, ['-hide_banner', '-protocols'], {
+      timeoutMs: 8000,
+      maxOutputBytes: 64 * 1024
+    });
+    this.ffmpegInputProtocols = protocolProbe.ok
+      ? parseFfmpegInputProtocols(protocolProbe.output)
+      : null;
+    if (this.ffmpegInputProtocols && !this.ffmpegInputProtocols.has('https')) {
+      this.log('error', `当前 FFmpeg 缺少 HTTPS 输入协议，无法录制 HTTPS 直播流：${this.ffmpegPath}。请安装包含 GnuTLS/HTTPS 的 FFmpeg。`);
+    } else if (!protocolProbe.ok) {
+      this.log('warn', `无法确认 FFmpeg 输入协议：${protocolProbe.error || '协议探测失败'}`);
     }
     [this.ffmpegCapabilities, this.startupEnabled] = await Promise.all([
       detectFfmpegCapabilities(this.ffmpegPath, {
@@ -5208,6 +5223,13 @@ try {
         }
       }
       streamResolved = Boolean(stream?.url);
+      if (this.ffmpegInputProtocols && /^https:\/\//i.test(String(stream?.url || '')) && !this.ffmpegInputProtocols.has('https')) {
+        throw businessError(
+          'FFMPEG_HTTPS_UNAVAILABLE',
+          '当前 FFmpeg 不支持 HTTPS 输入，无法开始录制；请安装包含 GnuTLS/HTTPS 的 FFmpeg。',
+          503
+        );
+      }
       const streamResolvedAt = Date.now();
       if (startCancelled()) return this.getState();
       if (refreshedIdentity) {
@@ -6556,6 +6578,18 @@ try {
       if (fileSize > Number(session.lastMediaSize || 0) + MIN_MEDIA_GROWTH_BYTES) {
         session.lastMediaSize = fileSize;
         session.lastMediaGrowthAt = now;
+      }
+      // Stream-copy progress reports out_time but may omit frame entirely.
+      // Confirm an actual video packet before marking the recording active.
+      if (session.mediaClock && session.videoInfo && !session.firstVideoAt &&
+          fileSize >= MIN_PLAYABLE_BYTES && now - Number(session.firstVideoProbeAt || 0) >= 15_000) {
+        session.firstVideoProbeAt = now;
+        const hasVideoPacket = await probeMediaFirstVideoPacket(this.ffmpegPath,
+          session.capturePath || session.cleanPath, { timeoutMs: 8_000 }).catch(() => false);
+        if (hasVideoPacket && !session.finished && !session.stopping) {
+          session.firstVideoAt = session.firstMediaProgressAt || now;
+          this.maybeEnterRecordingState(room, session);
+        }
       }
 
       if (!session.mediaClock && now - Number(session.ffmpegSpawnAt || session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS) {
