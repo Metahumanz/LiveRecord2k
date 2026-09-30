@@ -38,9 +38,10 @@ jobs:
         run: npm ci
 
       - name: Prepare complete Linux FFmpeg and Chinese fonts for media fixtures
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fontconfig fonts-noto-cjk
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg fontconfig fonts-noto-cjk
           ffmpeg -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]drawtext[[:space:]]'
           ffmpeg -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]ass[[:space:]]'
           # Media fixtures resolve ffmpeg-static directly. Use the complete
@@ -184,6 +185,14 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Prepare bundled ARM64 FFmpeg runtime dependencies
+        if: matrix.arch == 'arm64'
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ffmpeg libass9 libgnutls30 fontconfig fonts-noto-cjk
+          ldd assets/ffmpeg/linux-arm64/ffmpeg
 
       - name: Build Linux packages
         run: npm run build:linux
