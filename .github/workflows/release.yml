@@ -37,6 +37,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Prepare complete Linux FFmpeg and Chinese fonts for media fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fontconfig fonts-noto-cjk
+          ffmpeg -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]drawtext[[:space:]]'
+          ffmpeg -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]ass[[:space:]]'
+          # Media fixtures resolve ffmpeg-static directly. Use the complete
+          # distribution binary that the Linux runtime also probes.
+          install -m 755 /usr/bin/ffmpeg node_modules/ffmpeg-static/ffmpeg
+
       - name: Run regression tests
         timeout-minutes: 5
         run: npm test
