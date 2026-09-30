@@ -2115,11 +2115,17 @@ function createNormalizeSegmentArgs({
             : ''
         }`
       : '';
+  // Hardware and software decoders may return the last low-fps frame before
+  // the requested clip boundary. Match the audio's bounded target duration by
+  // holding that final frame, never by stretching or shortening audio.
+  const videoTailFilter = normalizedDuration > 0
+    ? `,tpad=stop_mode=clone:stop_duration=1,trim=duration=${formatFfmpegSeconds(normalizedDuration)},setpts=PTS-STARTPTS`
+    : '';
   const filters = [
     `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
       `${createBoundedEvenScaleFilter(width, height)},` +
       `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=${pixelFormat}` +
-      `${videoPaddingFilter}[vout]`
+      `${videoPaddingFilter}${videoTailFilter}[vout]`
   ];
   if (hasAudio) {
     const audioPaddingFilter = leadingAudioPaddingMs > 0 ? `adelay=${leadingAudioPaddingMs}:all=1,` : '';
@@ -2202,11 +2208,17 @@ function createNormalizeRawVideoArgs({
             : ''
         }`
       : '';
+  const videoTailFilter = normalizedDuration > 0
+    ? `,tpad=stop_mode=clone:stop_duration=1,trim=duration=${formatFfmpegSeconds(normalizedDuration)},setpts=PTS-STARTPTS`
+    : '';
   const filter =
     `[0:v:0]${videoDurationFilter}settb=AVTB,setpts=PTS-STARTPTS,` +
     `${createBoundedEvenScaleFilter(width, height)},` +
     `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p` +
-    `${videoPaddingFilter}[vout]`;
+    // rawvideoparse already assigns a fixed frame clock. Regularize damaged
+    // source PTS before the tail trim, otherwise FFmpeg can discard two valid
+    // low-fps tail frames while the audio is padded to the requested duration.
+    `${videoPaddingFilter},fps=${formatGstreamerFramerate(targetVideoInfo?.fps)}${videoTailFilter}[vout]`;
   args.push(
     '-filter_complex',
     filter,

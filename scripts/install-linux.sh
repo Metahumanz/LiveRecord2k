@@ -150,21 +150,21 @@ if command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
   # Ubuntu 20.04 / 22.04 / 24.04 all provide this common GStreamer base. The
   # NVIDIA nvv4l2 plugin itself remains supplied by the installed JetPack/L4T
   # stack, so do not attempt to install a mismatched nvidia-l4t package here.
-  apt-get install -y ca-certificates curl jq openssl python3 ffmpeg fonts-noto-cjk gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+  apt-get install -y ca-certificates curl jq openssl libgnutls30 python3 ffmpeg fonts-noto-cjk gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y ca-certificates curl jq openssl python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
+  dnf install -y ca-certificates curl jq openssl gnutls python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
   dnf install -y google-noto-sans-cjk-fonts || dnf install -y google-noto-cjk-fonts || \
     fail '当前软件源缺少 Noto Sans CJK 字体，请先启用相应字体软件源。'
   command -v ffmpeg >/dev/null 2>&1 || dnf install -y ffmpeg || fail '当前软件源没有 FFmpeg，请先为发行版启用 FFmpeg 软件源。'
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y ca-certificates curl jq openssl python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
+  yum install -y ca-certificates curl jq openssl gnutls python3 tar shadow-utils util-linux fontconfig gstreamer1 gstreamer1-plugins-base
   yum install -y google-noto-sans-cjk-fonts || yum install -y google-noto-cjk-fonts || \
     fail '当前软件源缺少 Noto Sans CJK 字体，请先启用相应字体软件源。'
   command -v ffmpeg >/dev/null 2>&1 || yum install -y ffmpeg || fail '当前软件源没有 FFmpeg，请先为发行版启用 FFmpeg 软件源。'
 elif command -v zypper >/dev/null 2>&1; then
-  zypper --non-interactive install ca-certificates curl jq openssl python3 tar shadow ffmpeg noto-sans-cjk-fonts gstreamer gstreamer-plugins-base
+  zypper --non-interactive install ca-certificates curl jq openssl gnutls python3 tar shadow ffmpeg noto-sans-cjk-fonts gstreamer gstreamer-plugins-base
 elif command -v pacman >/dev/null 2>&1; then
-  pacman -Sy --noconfirm ca-certificates curl jq openssl python tar shadow ffmpeg noto-fonts-cjk gstreamer gst-plugins-base
+  pacman -Sy --noconfirm ca-certificates curl jq openssl gnutls python tar shadow ffmpeg noto-fonts-cjk gstreamer gst-plugins-base
 else
   fail '不支持当前包管理器；请使用 Debian/Ubuntu、Fedora/RHEL、openSUSE 或 Arch Linux。'
 fi

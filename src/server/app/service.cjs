@@ -132,6 +132,8 @@ const {
   detectFfmpegCapabilities,
   runCapturedProcess,
   runFfmpegProbe,
+  parseFfmpegInputProtocols,
+  probeMediaFirstVideoPacket,
   parseFfmpegEncoderNames,
   parseFfmpegHwaccels,
   detectVideoAdapters,
@@ -940,6 +942,31 @@ function canCopyWholeSourceAudio(mediaInfo, startTime, duration, timelineAlignme
   );
 }
 
+function assessSceneExportTimeline(timing, durationSec, fps) {
+  const target = Number(durationSec);
+  const frameRate = Number(fps);
+  const frameDurationSec = frameRate > 0 ? 1 / frameRate : 0;
+  const videoEnd = Number(timing?.videoPresentationDurationSec);
+  const audioEnd = Number(timing?.audioDurationSec);
+  if (!Number.isFinite(target) || !(target > 0) || !Number.isFinite(videoEnd)) {
+    return { ok: false, frameBoundaryToleranceApplied: false };
+  }
+  if (Math.abs(videoEnd - target) > Math.max(0.25, 3 * frameDurationSec)) {
+    return { ok: false, frameBoundaryToleranceApplied: false };
+  }
+  if (timing?.timingSafeForCopy) return { ok: true, frameBoundaryToleranceApplied: false };
+  // A low-fps final frame can end just before the requested cut while an AAC
+  // packet ends just after it. Admit only that bounded tail shape, not a
+  // general A/V drift or a missing video interval elsewhere in the clip.
+  const frameBoundaryToleranceApplied = frameDurationSec > 0.08 &&
+    Number.isFinite(audioEnd) &&
+    videoEnd >= target - frameDurationSec - 0.01 && videoEnd <= target + 0.03 &&
+    audioEnd >= target - 0.05 && audioEnd <= target + 0.05 &&
+    audioEnd >= videoEnd &&
+    audioEnd - videoEnd <= Math.min(0.25, frameDurationSec + 0.05);
+  return { ok: frameBoundaryToleranceApplied, frameBoundaryToleranceApplied };
+}
+
 // Deciding whether copy-concat is safe must use timing as well as codec,
 // resolution and frame rate. A source can have identical stream specs while
 // only its own audio starts late, then appear to recover at the next segment.
@@ -1197,6 +1224,7 @@ class LiveRecordService {
     this.managedLinuxUpdateRequestPromise = null;
     this.updateService = new UpdateService(this);
     this.ffmpegPath = findFfmpegPath();
+    this.ffmpegInputProtocols = null;
     this.ffmpegCapabilities = {
       burnCodecs: BURN_CODEC_CANDIDATES.filter((codec) => codec.kind === 'software'),
       unavailableBurnCodecs: [],
@@ -1316,6 +1344,18 @@ class LiveRecordService {
     if (ffmpegSelection.path !== this.ffmpegPath) {
       this.ffmpegPath = ffmpegSelection.path;
       this.log('warn', ffmpegSelection.fallbackReason);
+    }
+    const protocolProbe = await runFfmpegProbe(this.ffmpegPath, ['-hide_banner', '-protocols'], {
+      timeoutMs: 8000,
+      maxOutputBytes: 64 * 1024
+    });
+    this.ffmpegInputProtocols = protocolProbe.ok
+      ? parseFfmpegInputProtocols(protocolProbe.output)
+      : null;
+    if (this.ffmpegInputProtocols && !this.ffmpegInputProtocols.has('https')) {
+      this.log('error', `当前 FFmpeg 缺少 HTTPS 输入协议，无法录制 HTTPS 直播流：${this.ffmpegPath}。请安装包含 GnuTLS/HTTPS 的 FFmpeg。`);
+    } else if (!protocolProbe.ok) {
+      this.log('warn', `无法确认 FFmpeg 输入协议：${protocolProbe.error || '协议探测失败'}`);
     }
     [this.ffmpegCapabilities, this.startupEnabled] = await Promise.all([
       detectFfmpegCapabilities(this.ffmpegPath, {
@@ -5208,6 +5248,13 @@ try {
         }
       }
       streamResolved = Boolean(stream?.url);
+      if (this.ffmpegInputProtocols && /^https:\/\//i.test(String(stream?.url || '')) && !this.ffmpegInputProtocols.has('https')) {
+        throw businessError(
+          'FFMPEG_HTTPS_UNAVAILABLE',
+          '当前 FFmpeg 不支持 HTTPS 输入，无法开始录制；请安装包含 GnuTLS/HTTPS 的 FFmpeg。',
+          503
+        );
+      }
       const streamResolvedAt = Date.now();
       if (startCancelled()) return this.getState();
       if (refreshedIdentity) {
@@ -6557,6 +6604,18 @@ try {
         session.lastMediaSize = fileSize;
         session.lastMediaGrowthAt = now;
       }
+      // Stream-copy progress reports out_time but may omit frame entirely.
+      // Confirm an actual video packet before marking the recording active.
+      if (session.mediaClock && session.videoInfo && !session.firstVideoAt &&
+          fileSize >= MIN_PLAYABLE_BYTES && now - Number(session.firstVideoProbeAt || 0) >= 15_000) {
+        session.firstVideoProbeAt = now;
+        const hasVideoPacket = await probeMediaFirstVideoPacket(this.ffmpegPath,
+          session.capturePath || session.cleanPath, { timeoutMs: 8_000 }).catch(() => false);
+        if (hasVideoPacket && !session.finished && !session.stopping) {
+          session.firstVideoAt = session.firstMediaProgressAt || now;
+          this.maybeEnterRecordingState(room, session);
+        }
+      }
 
       if (!session.mediaClock && now - Number(session.ffmpegSpawnAt || session.startedAt || now) >= NO_MEDIA_TIMEOUT_MS) {
         session.noMediaDetected = true;
@@ -7388,7 +7447,8 @@ try {
       this.removingRoomIds.has(room?.id) ||
       this.mergeCancelRequests.has(this.getMergeRetryKey(room.id, groupId)) ||
       isFfmpegMemoryPressureError(error) ||
-      error?.code === 'MERGE_SEGMENT_UNDECODABLE'
+      error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
+      error?.code === 'MERGE_AV_TIMELINE_UNSAFE'
     ) {
       if (room?.id && groupId) this.clearMergeRetryState(room.id, groupId);
       return false;
@@ -8341,6 +8401,7 @@ try {
                 normalizeTempDir,
                 `${String(index + 1).padStart(3, '0')}.video.mkv`
               );
+              let jetsonStagePhase = 'render';
               await runMergeFfmpeg(null, {
                 ...normalizeOptions,
                 run: (onStderr, onChild) =>
@@ -8375,8 +8436,31 @@ try {
                         hasAudio: Boolean(segmentMediaInfos[index].audioInfo),
                         timelineAlignment
                       }),
-                    onStderr,
+                    onStderr: (line) => {
+                      // Audio muxing starts its own FFmpeg clock at zero. It
+                      // must not rewind the completed video segment's overall
+                      // merge percentage or ETA.
+                      if (jetsonStagePhase === 'mux' && Number.isFinite(parseFfmpegProgressTime(line)) &&
+                          !/error|failed|invalid/i.test(line)) return;
+                      onStderr(line);
+                    },
                     onChild,
+                    onPhase: (phase) => {
+                      jetsonStagePhase = phase;
+                      if (phase !== 'mux' || room.mergeProgress?.id !== progress.id) return;
+                      const completedSec = Math.min(mergeDurationSec, progressOffsetSec + sourceDurationSec);
+                      room.mergeProgress.currentTimeSec = Math.max(Number(room.mergeProgress.currentTimeSec || 0), completedSec);
+                      room.mergeProgress.phaseCurrentTimeSec = room.mergeProgress.currentTimeSec;
+                      room.mergeProgress.percent = mergeDurationSec > 0
+                        ? Math.max(Number(room.mergeProgress.percent || 0), Math.min(99.3, room.mergeProgress.currentTimeSec / mergeDurationSec * 100))
+                        : null;
+                      room.mergeProgress.stageLabel = `正在封装规范化分段 ${index + 1}/${segments.length} 的音频`;
+                      room.mergeProgress.message = room.mergeProgress.stageLabel;
+                      room.mergeProgress.etaState = 'estimating';
+                      room.mergeProgress.estimatedRemainingSec = null;
+                      room.mergeProgress.updatedAt = Date.now();
+                      this.markRoomDirty(room.id);
+                    },
                     onFallback: () => {
                       this.setProgressDecoder(room.mergeProgress, {
                         value: 'software',
@@ -8487,6 +8571,15 @@ try {
           );
           if (!normalizedInfo.videoInfo) {
             throw new Error(`规范化分段后没有检测到视频流：${path.basename(segments[index].cleanPath)}`);
+          }
+          if (index === segments.length - 1) {
+            const tailTiming = await this.runMergePreparationStage(
+              room,
+              progress,
+              '正在检查末段规范化后的音画尾部',
+              () => probeMediaTimelineInfo(this.ffmpegPath, normalizedPath, normalizedInfo, { ...mergeProbeOptions, timeoutMs: 120000 })
+            );
+            this.log('info', `${roomLabel(room)} 末段规范化尾部：视频 PTS ${tailTiming.videoPresentationDurationSec.toFixed(3)}s，音频 ${tailTiming.audioDurationSec.toFixed(3)}s，差 ${tailTiming.avDeltaSec.toFixed(3)}s。`);
           }
           normalizedPaths.push(normalizedPath);
           // The concat demuxer must advance by the normalized presentation
@@ -8601,7 +8694,7 @@ try {
         );
         this.log(
           Math.abs(mergedTimingInfo.avDeltaSec) > 0.08 ? 'warn' : 'success',
-          `${roomLabel(room)} 合并后时轴检查：视频 ${mergedTimingInfo.videoDurationSec.toFixed(
+          `${roomLabel(room)} 合并后时轴检查：视频 PTS ${mergedTimingInfo.videoPresentationDurationSec.toFixed(
             3
           )}s，音频 ${mergedTimingInfo.audioDurationSec.toFixed(3)}s，音频${mergedTimingInfo.avDeltaSec >= 0 ? '长' : '短'} ${Math.abs(
             mergedTimingInfo.avDeltaSec
@@ -13445,8 +13538,12 @@ try {
       const outputTiming = await probeMediaTimelineInfo(this.ffmpegPath, temporaryOutputPath, exportedMediaInfo, {
         onChild: child => { this.exportProcess = child; if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 }); }
       });
-      if (!outputTiming.timingSafeForCopy || Math.abs(outputTiming.videoPresentationDurationSec - duration) > Math.max(0.25, 3 / fps)) {
-        throw new Error(`Scene 成片时间轴验收失败：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s，音画差 ${outputTiming.avDeltaSec.toFixed(3)}s。`);
+      const outputAssessment = assessSceneExportTimeline(outputTiming, duration, fps);
+      if (!outputAssessment.ok) {
+        throw new Error(`Scene 成片时间轴验收失败：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s，音频 ${Number(outputTiming.audioDurationSec || 0).toFixed(3)}s，音画差 ${outputTiming.avDeltaSec.toFixed(3)}s。`);
+      }
+      if (outputAssessment.frameBoundaryToleranceApplied) {
+        this.log('info', `Scene 成片低帧率尾部验收通过：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，音频 ${outputTiming.audioDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s；尾差 ${Math.round(outputTiming.avDeltaSec * 1000)}ms 在一帧与 AAC 包边界内。`);
       }
       diagnosticContext.finalTextVerification = await this.verifyFinalSceneTextOutput({
         graph, events: sceneResult.events,
@@ -14712,6 +14809,7 @@ module.exports = {
   createCommittedJetsonNativeRuntimeError,
   isFfmpegMemoryPressureError,
   getBurnTimelineAlignment,
+  assessSceneExportTimeline,
   getMergeSegmentTimingAssessment,
   getMonitorPollDelayMs,
   createUiCapabilities,

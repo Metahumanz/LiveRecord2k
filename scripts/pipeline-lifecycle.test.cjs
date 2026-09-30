@@ -6,7 +6,7 @@ const path = require('node:path');
 const ffmpeg = require('ffmpeg-static');
 const {BufferedJsonlWriter} = require('../src/server/recording/jsonl-writer.cjs');
 const {LiveRecordService} = require('../src/server/app/service.cjs');
-const {runCapturedProcess} = require('../src/server/shared/helpers.cjs');
+const {runCapturedProcess,parseFfmpegInputProtocols,probeMediaFirstVideoPacket} = require('../src/server/shared/helpers.cjs');
 
 function app() {
   const service = new LiveRecordService();
@@ -98,6 +98,28 @@ test('initial capture refreshes stale title alongside stream selection, while me
     await assert.rejects(service.startRecording('1'),/test capture boundary/);
     assert.equal(room.title,failMetadata?'old title':'new title');
   }
+});
+
+test('HTTPS stream is rejected before creating a recording when selected FFmpeg lacks TLS', async () => {
+  const service=app();const room=service.rooms.get('1');
+  service.ffmpegInputProtocols=new Set(['file','http','pipe']);
+  service.resolvePlayStream=async()=>({url:'https://example.test/live.flv'});
+  service.ensureRecordingOutputRootReady=async()=>{throw new Error('must not create a zero-byte recording');};
+  await assert.rejects(service.startRecording('1'),error=>error.code==='FFMPEG_HTTPS_UNAVAILABLE');
+  assert.match(room.lastError,/不支持 HTTPS/);
+  assert.equal(service.recordingSessions.size,0);
+  assert.equal(service.recordingStartLocks.size,0);
+});
+
+test('FFmpeg protocol probe reads input HTTPS separately from output protocols', () => {
+  const protocols=parseFfmpegInputProtocols('Supported file protocols:\nInput:\n  file\n  http\n  https\nOutput:\n  file\n  http\n');
+  assert.equal(protocols.has('https'),true);
+  assert.equal(parseFfmpegInputProtocols('Input:\n  file\nOutput:\n  https\n').has('https'),false);
+});
+
+test('stream-copy recording confirms a real video packet without relying on FFmpeg frame progress', async () => {
+  const source=path.join(__dirname,'..','assets','jetson-self-test','h264-sample.mp4');
+  assert.equal(await probeMediaFirstVideoPacket(ffmpeg,source,{timeoutMs:8000}),true);
 });
 
 test('failed MP4 publish restores existing output and retains the source capture', async () => {
