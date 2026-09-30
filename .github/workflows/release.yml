@@ -38,13 +38,16 @@ jobs:
         run: npm ci
 
       - name: Run regression tests
-        # Keep release validation focused on the two fixtures that exercise
-        # the real-avatar layer lifecycle fixed in this release.
         timeout-minutes: 5
-        run: >-
-          node --test --test-concurrency=1 --test-force-exit
-          --test-name-pattern='photo avatars are composed through a separate transparent side layer and keep an MP4-compatible output|multiple recorded avatars remain visible in separate chunked time windows'
-          scripts/recording-merge.test.cjs
+        run: npm test
+
+      - name: Run recording, merge and export integration tests
+        timeout-minutes: 5
+        run: npm run test:integration
+
+      - name: Validate packaging and update contracts
+        timeout-minutes: 5
+        run: npm run test:package
 
       - name: Type-check and build frontend
         run: |
