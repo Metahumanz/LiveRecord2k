@@ -23,9 +23,18 @@ helpersModule.exports = {
   probeMediaTimelineInfo: async () => ({ videoPresentationDurationSec: timelineDuration, videoDurationSec: timelineDuration }),
   runCapturedProcess: (...args) => capturedRun(...args)
 };
-const { LiveRecordService } = require('../src/server/app/service.cjs');
+const { LiveRecordService, assessSceneExportTimeline } = require('../src/server/app/service.cjs');
 helpersModule.exports = helpers;
 verifierModule.exports = verifier;
+
+test('low-fps Scene export accepts only a one-frame final boundary difference', () => {
+  const target = 4925.28;
+  const observed = { videoPresentationDurationSec: 4925.21, audioDurationSec: 4925.294, avDeltaSec: 0.084, timingSafeForCopy: false };
+  assert.deepEqual(assessSceneExportTimeline(observed, target, 5), { ok: true, frameBoundaryToleranceApplied: true });
+  assert.equal(assessSceneExportTimeline({ ...observed, audioDurationSec: target + 0.3 }, target, 5).ok, false);
+  assert.equal(assessSceneExportTimeline({ ...observed, videoPresentationDurationSec: target - 0.3 }, target, 5).ok, false);
+  assert.equal(assessSceneExportTimeline(observed, target, 60).ok, false);
+});
 
 function service() {
   const value = new LiveRecordService();

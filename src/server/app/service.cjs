@@ -942,6 +942,31 @@ function canCopyWholeSourceAudio(mediaInfo, startTime, duration, timelineAlignme
   );
 }
 
+function assessSceneExportTimeline(timing, durationSec, fps) {
+  const target = Number(durationSec);
+  const frameRate = Number(fps);
+  const frameDurationSec = frameRate > 0 ? 1 / frameRate : 0;
+  const videoEnd = Number(timing?.videoPresentationDurationSec);
+  const audioEnd = Number(timing?.audioDurationSec);
+  if (!Number.isFinite(target) || !(target > 0) || !Number.isFinite(videoEnd)) {
+    return { ok: false, frameBoundaryToleranceApplied: false };
+  }
+  if (Math.abs(videoEnd - target) > Math.max(0.25, 3 * frameDurationSec)) {
+    return { ok: false, frameBoundaryToleranceApplied: false };
+  }
+  if (timing?.timingSafeForCopy) return { ok: true, frameBoundaryToleranceApplied: false };
+  // A low-fps final frame can end just before the requested cut while an AAC
+  // packet ends just after it. Admit only that bounded tail shape, not a
+  // general A/V drift or a missing video interval elsewhere in the clip.
+  const frameBoundaryToleranceApplied = frameDurationSec > 0.08 &&
+    Number.isFinite(audioEnd) &&
+    videoEnd >= target - frameDurationSec - 0.01 && videoEnd <= target + 0.03 &&
+    audioEnd >= target - 0.05 && audioEnd <= target + 0.05 &&
+    audioEnd >= videoEnd &&
+    audioEnd - videoEnd <= Math.min(0.25, frameDurationSec + 0.05);
+  return { ok: frameBoundaryToleranceApplied, frameBoundaryToleranceApplied };
+}
+
 // Deciding whether copy-concat is safe must use timing as well as codec,
 // resolution and frame rate. A source can have identical stream specs while
 // only its own audio starts late, then appear to recover at the next segment.
@@ -13513,8 +13538,12 @@ try {
       const outputTiming = await probeMediaTimelineInfo(this.ffmpegPath, temporaryOutputPath, exportedMediaInfo, {
         onChild: child => { this.exportProcess = child; if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 }); }
       });
-      if (!outputTiming.timingSafeForCopy || Math.abs(outputTiming.videoPresentationDurationSec - duration) > Math.max(0.25, 3 / fps)) {
-        throw new Error(`Scene 成片时间轴验收失败：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s，音画差 ${outputTiming.avDeltaSec.toFixed(3)}s。`);
+      const outputAssessment = assessSceneExportTimeline(outputTiming, duration, fps);
+      if (!outputAssessment.ok) {
+        throw new Error(`Scene 成片时间轴验收失败：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s，音频 ${Number(outputTiming.audioDurationSec || 0).toFixed(3)}s，音画差 ${outputTiming.avDeltaSec.toFixed(3)}s。`);
+      }
+      if (outputAssessment.frameBoundaryToleranceApplied) {
+        this.log('info', `Scene 成片低帧率尾部验收通过：视频 ${outputTiming.videoPresentationDurationSec.toFixed(3)}s，音频 ${outputTiming.audioDurationSec.toFixed(3)}s，目标 ${duration.toFixed(3)}s；尾差 ${Math.round(outputTiming.avDeltaSec * 1000)}ms 在一帧与 AAC 包边界内。`);
       }
       diagnosticContext.finalTextVerification = await this.verifyFinalSceneTextOutput({
         graph, events: sceneResult.events,
@@ -14780,6 +14809,7 @@ module.exports = {
   createCommittedJetsonNativeRuntimeError,
   isFfmpegMemoryPressureError,
   getBurnTimelineAlignment,
+  assessSceneExportTimeline,
   getMergeSegmentTimingAssessment,
   getMonitorPollDelayMs,
   createUiCapabilities,
