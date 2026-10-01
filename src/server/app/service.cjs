@@ -12272,9 +12272,18 @@ try {
         }
       }
       if (result.status !== 0 || result.error || result.timedOut) {
+        const processFailure = {
+          exitCode: result.status ?? null,
+          signal: result.signal || '',
+          timedOut: Boolean(result.timedOut),
+          error: redactSensitive(result.error?.message || '')
+        };
+        const detail = redactSensitive(String(result.stderr || result.stdout || result.error?.message ||
+          '真实源 CUDA Scene helper 失败。')).replace(/\s+/g, ' ').trim().slice(-900);
         return {
           ok: false,
-          reason: redactSensitive(String(result.stderr || result.stdout || result.error?.message || '真实源 CUDA Scene helper 失败。')).replace(/\s+/g, ' ').trim().slice(-900),
+          reason: `CUDA Scene helper 退出码 ${processFailure.exitCode ?? '-'}，信号 ${processFailure.signal || '-'}，超时 ${processFailure.timedOut}：${detail}`,
+          processFailure,
           metrics,
           durationSec: probeDuration
         };
