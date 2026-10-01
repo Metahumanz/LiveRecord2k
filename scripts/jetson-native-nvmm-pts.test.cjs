@@ -62,20 +62,23 @@ print('unknown and rational decoder rates passed')
   assert.match(result.stdout, /decoder rates passed/);
 });
 
-function run(command, args) {
+function run(command, args, { timeoutMs = 60000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
     const stdoutChunks = [];
     let stderr = '';
     child.stdout.on('data', (chunk) => { stdoutChunks.push(chunk); });
     child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-16000); });
-    child.on('error', reject);
+    child.on('error', error => { clearTimeout(timer); reject(error); });
     child.on('close', (code) => {
+      clearTimeout(timer);
       const stdoutBuffer = Buffer.concat(stdoutChunks);
       const stdout = stdoutBuffer.toString('utf8');
       code === 0
         ? resolve({ stdout, stdoutBuffer, stderr })
-        : reject(new Error(`${path.basename(command)} exited ${code}: ${stderr || stdout}`));
+        : reject(new Error(`${path.basename(command)} ${timedOut ? 'timed out' : `exited ${code}`}: ${stderr || stdout}`));
     });
   });
 }
@@ -155,12 +158,17 @@ test('native MP4 edit-list gap preserves the original picture time and finite EO
     seekRequest.scene.duration = 0.8;
     seekRequest.selfTest = true;
     await fs.writeFile(request, JSON.stringify(seekRequest));
-    const seekResult = await run(helper, ['--native-scene-request', request]);
-    const seekMetrics = JSON.parse(seekResult.stdout.split(/\r?\n/).find(line => line.includes('"nativeNvmmMetrics"'))).nativeNvmmMetrics;
-    assert.equal(seekMetrics.ptsBridge.ok, true);
-    assert.equal(seekMetrics.ptsBridge.leadingFrames, 0, '非零剪辑不能重复插入源文件空编辑');
-    assert.ok(seekMetrics.ptsBridge.encodeCoverageSec >= 0.75 && seekMetrics.ptsBridge.encodeCoverageSec <= 0.85);
-    assert.ok(await rgbMean(ffmpeg, seekRequest.output.path, 0.2) > 200, '非零剪辑应立即显示所选源画面');
+    // The old BLOCK probe raced a FLUSH seek and could deadlock only on
+    // some starts. Repeat startup and check that draining warmup frames
+    // preserves the first requested picture and the complete PTS interval.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const seekResult = await run(helper, ['--native-scene-request', request], { timeoutMs: 15000 });
+      const seekMetrics = JSON.parse(seekResult.stdout.split(/\r?\n/).find(line => line.includes('"nativeNvmmMetrics"'))).nativeNvmmMetrics;
+      assert.equal(seekMetrics.ptsBridge.ok, true);
+      assert.equal(seekMetrics.ptsBridge.leadingFrames, 0, '非零剪辑不能重复插入源文件空编辑');
+      assert.ok(seekMetrics.ptsBridge.encodeCoverageSec >= 0.75 && seekMetrics.ptsBridge.encodeCoverageSec <= 0.85);
+      assert.ok(await rgbMean(ffmpeg, seekRequest.output.path, 0) > 200, '定位后的首帧应立即显示所选源画面');
+    }
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
