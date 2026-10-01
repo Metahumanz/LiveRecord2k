@@ -1365,11 +1365,18 @@ function createBurnAudioMuxArgs({
   if (includeAudio) {
     const audioPaddingMs = Math.max(0, Math.round((Number(leadingAudioPaddingSec) || 0) * 1000));
     if (copyAudio && audioPaddingMs <= 0) {
-      args.push('-map', '1:a?', '-c:a', 'copy', '-shortest');
+      args.push('-map', '1:a?', '-c:a', 'copy');
+      if (!hasDuration) args.push('-shortest');
     } else {
       const audioFilters = ['aresample=48000', 'asetpts=PTS-STARTPTS'];
       if (audioPaddingMs > 0) audioFilters.push(`adelay=${audioPaddingMs}:all=1`);
-      if (hasDuration) audioFilters.push(`atrim=duration=${formatFfmpegSeconds(duration)}`);
+      // A live stream may finish its audio packets before its final video
+      // frames. The requested clip clock owns the mux endpoint; never let
+      // -shortest discard already-rendered frames to match that audio tail.
+      // Bound padding by timestamp rather than decoded sample count: live
+      // AAC timestamps can contain small gaps or overlaps at the stream end.
+      if (hasDuration) audioFilters.push('apad',
+        `atrim=duration=${formatFfmpegSeconds(duration)}`);
       audioFilters.push('asetpts=PTS-STARTPTS');
       args.push(
         '-map',
@@ -1381,9 +1388,11 @@ function createBurnAudioMuxArgs({
         '-b:a',
         '160k',
         '-ac',
-        '2',
-        '-shortest'
+        '2'
       );
+      // With finite padded audio, the rendered video's EOF owns the tail.
+      // This also prevents silence from extending past a partial final frame.
+      args.push('-shortest');
     }
   } else {
     args.push('-an');
