@@ -133,6 +133,11 @@ async function handleApi(service, parsed, port, request, response, access) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/export/results') {
+    writeJson(response, 200, await service.listExportedClips());
+    return;
+  }
+
   if (request.method === 'GET' && pathname === '/api/export/mux-recoveries') {
     writeJson(response, 200, await service.listSceneMuxRecoveries());
     return;

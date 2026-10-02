@@ -209,6 +209,16 @@ export type LoginState = {
   expiresAt?: number;
 };
 
+export type ExportedClip = {
+  outputPath: string;
+  cleanPath: string;
+  mode: 'clean' | 'burn';
+  startTime: number;
+  endTime: number;
+  fileSize: number;
+  modifiedAt: number;
+};
+
 export type ExportResult = {
   ok: boolean;
   mode: 'clean' | 'burn' | 'subtitles';
@@ -679,6 +689,7 @@ export type RecorderApi = {
   }) => Promise<SceneGraph>;
   exportClip: (request: ExportClipRequest) => Promise<ExportResult>;
   listSceneMuxRecoveries: () => Promise<SceneMuxRecovery[]>;
+  listExportedClips: () => Promise<ExportedClip[]>;
   retrySceneMux: (id: string) => Promise<{ ok: boolean; queued: boolean; queueId: string; outputPath: string }>;
   cancelExport: (jobId?: string) => Promise<AppState>;
   scanRecordings: () => Promise<AppState>;
