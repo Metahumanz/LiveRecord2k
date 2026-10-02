@@ -71,6 +71,7 @@ export const recorder: RecorderApi = {
   },
   exportClip: (request) => api('/api/export/clip', request),
   listSceneMuxRecoveries: () => api('/api/export/mux-recoveries'),
+  listExportedClips: () => api('/api/export/results'),
   retrySceneMux: (id) => api('/api/export/mux-recover', { id }),
   cancelExport: (jobId?: string) => api<AppState>('/api/export/cancel', { jobId }),
   scanRecordings: () => api<AppState>('/api/recordings/scan', {}, { timeoutMs: 180000 }),

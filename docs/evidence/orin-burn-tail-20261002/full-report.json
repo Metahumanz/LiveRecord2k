@@ -1,0 +1,100 @@
+{
+  "generatedAt": "2026-10-01T16:09:21.488Z",
+  "source": "7953876_宴宁ccccc_20261001_212131.clean.mp4",
+  "output": "7953876_宴宁ccccc_20261001_212131.clip_0-2332_5.danmaku.mp4",
+  "targetDurationSec": 2332.5,
+  "outputBytes": 4311428010,
+  "videoInfo": {
+    "codec": "hevc (hvc1 / 0x31637668)",
+    "profile": "hvc1 / 0x31637668",
+    "pixelFormat": "yuv420p",
+    "bitDepth": 8,
+    "colorSpace": "",
+    "colorPrimaries": "",
+    "colorTransfer": "",
+    "hdr": false,
+    "width": 1080,
+    "height": 1920,
+    "fps": 24.98156437035894,
+    "rFrameRate": "25/1",
+    "avgFrameRate": "1456700/58311",
+    "timeBase": "1/16000",
+    "startTime": 0.021
+  },
+  "audioInfo": {
+    "codec": "aac (mp4a / 0x6134706D)",
+    "sampleRate": 48000,
+    "channelLayout": "stereo",
+    "timeBase": "1/48000",
+    "startTime": 0
+  },
+  "timing": {
+    "containerDurationSec": 2332.46,
+    "videoDurationSec": 2332.44,
+    "videoPresentationDurationSec": 2332.44,
+    "audioDurationSec": 2332.4418541666664,
+    "avDeltaSec": 0.001854166666362289,
+    "measuredAvDeltaSec": 0.001854166666362289,
+    "videoReorderAllowanceSec": 0,
+    "containerDeltaSec": 0.01814583333361952,
+    "timingSafeForCopy": true
+  },
+  "logs": [
+    {
+      "time": 1790870269019,
+      "message": "Jetson Scene Graph 烧录真实源预检通过：10.00s，134.6fps，PTS bridge通过；正式导出使用分段NVMM链路。"
+    },
+    {
+      "time": 1790870272167,
+      "message": "Jetson Scene Graph 烧录 分段 1：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "time": 1790870585440,
+      "message": "Jetson Scene Graph 烧录 分段 1：原生 NVMM 已生成 4 帧黑帧前导。"
+    },
+    {
+      "time": 1790870585440,
+      "message": "Jetson Scene Graph 烧录 分段 1 性能：decode 153.33fps / scene 153.27fps / encode 153.27fps / total 153.27fps"
+    },
+    {
+      "time": 1790870585443,
+      "message": "Jetson Scene Graph 烧录 分段 1：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "time": 1790870588105,
+      "message": "Jetson Scene Graph 烧录 分段 1 PTS 映射：source→Scene 44969 帧（最大 0.000ms），Scene→编码 44973 帧（最大 0.000ms），source→编码 44969 帧（最大 0.000ms）；封装诊断 1800.037s / 1800.000s。"
+    },
+    {
+      "time": 1790870589362,
+      "message": "Jetson Scene Graph 烧录 分段 2：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "time": 1790870691374,
+      "message": "Jetson Scene Graph 烧录 分段 2 性能：decode 142.14fps / scene 142.13fps / encode 142.13fps / total 142.13fps"
+    },
+    {
+      "time": 1790870691379,
+      "message": "Jetson Scene Graph 烧录 分段 2：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "time": 1790870692261,
+      "message": "Jetson Scene Graph 烧录 分段 2 PTS 映射：source→Scene 13385 帧（最大 0.000ms），Scene→编码 13385 帧（最大 0.000ms），source→编码 13385 帧（最大 0.000ms）；封装诊断 532.440s / 532.500s。"
+    },
+    {
+      "id": "1790870892779-7bb06261514ab8",
+      "time": 1790870892779,
+      "level": "success",
+      "message": "Scene Graph 片段已导出：7953876_宴宁ccccc_20261001_212131.clip_0-2332_5.danmaku.mp4"
+    }
+  ],
+  "startedAt": 1790870251933,
+  "completedAt": 1790870892779,
+  "elapsedSec": 640.846,
+  "acceptance": {
+    "formalServicePublished": true,
+    "distributedTextSamplesPassed": 5,
+    "nativeHardwareTestsPassed": 5,
+    "realSourceRepeatedSeekRunsPassed": 10,
+    "muxVideoTailRetained": true
+  }
+}

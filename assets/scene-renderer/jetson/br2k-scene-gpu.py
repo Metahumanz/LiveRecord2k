@@ -939,12 +939,15 @@ def render_native_nvmm(request):
         # that metadata. Forward a zero-based segment to avoid applying the
         # edit offset again at matroskamux.
         input_clock = {'segment': None, 'forwarding': False}
+        startup_gate = {'reached': False, 'seeking': False, 'located': False}
         def restore_demux_media_clock(pad, info):
             if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
                 event = info.get_event()
                 if event and event.type == Gst.EventType.SEGMENT and not input_clock['forwarding']:
                     segment = event.parse_segment()
                     input_clock['segment'] = segment.copy()
+                    if startup_gate['seeking']:
+                        startup_gate['located'] = True
                     normalized = segment.copy()
                     normalized.start = 0
                     normalized.stop = Gst.CLOCK_TIME_NONE
@@ -968,21 +971,23 @@ def render_native_nvmm(request):
             return Gst.PadProbeReturn.OK
         pipeline.get_by_name('parser').get_static_pad('src').add_probe(
             Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.BUFFER, restore_demux_media_clock)
-        # For a non-zero chunk, hold the first decoded buffer long enough for
-        # qtdemux to become seekable. Seeking the fully running NVENC graph
-        # races the encoder; seeking while PAUSED never prerolls nvivafilter
-        # on JetPack. A decoder block gives the demux a real segment while
-        # preventing pre-seek media from reaching the output.
-        startup_gate = {'reached': False}
+        # Decode warmup makes qtdemux seekable, but blocking NVDEC's output
+        # exhausts its capture buffers. The demux then waits inside NVDEC
+        # while holding the lock that its FLUSH seek needs: neither can move.
+        # Drain and discard warmup buffers instead, before the PTS/count
+        # probes. Admit the very first buffer of the new seek segment even
+        # if it arrives before the synchronous seek call returns.
         startup_pad = decoder.get_static_pad('src')
-        startup_probe = None
         needs_segment_seek = start > 0.0001
         if needs_segment_seek:
-            def hold_first_scene_buffer(_pad, _info):
-                startup_gate['reached'] = True
-                native_nvmm_trace('startup decoded buffer held for seek')
-                return Gst.PadProbeReturn.OK
-            startup_probe = startup_pad.add_probe(Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, hold_first_scene_buffer)
+            def discard_warmup_scene_buffer(_pad, _info):
+                if startup_gate['located']:
+                    return Gst.PadProbeReturn.REMOVE
+                if not startup_gate['reached']:
+                    startup_gate['reached'] = True
+                    native_nvmm_trace('startup decoded buffer drained for seek')
+                return Gst.PadProbeReturn.DROP
+            startup_pad.add_probe(Gst.PadProbeType.BUFFER, discard_warmup_scene_buffer)
         counters = {'decode': 0, 'scene': 0, 'encode': 0}
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
@@ -1288,6 +1293,7 @@ def render_native_nvmm(request):
                 demux = pipeline.get_by_name('demux')
                 seek_target = demux if demux else pipeline
                 segment_stop = int((start + duration) * Gst.SECOND)
+                startup_gate['seeking'] = True
                 seek_ok = seek_target.seek(
                     1.0,
                     Gst.Format.TIME,
@@ -1299,7 +1305,6 @@ def render_native_nvmm(request):
                 )
                 if not seek_ok:
                     fail('原生 NVMM qtdemux 无法定位到分段起点。')
-                startup_pad.remove_probe(startup_probe)
             native_nvmm_trace('waiting for EOS')
             while True:
                 # Only the tiny bundled admission samples have a no-progress

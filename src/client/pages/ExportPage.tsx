@@ -4,6 +4,7 @@ import type Hls from 'hls.js';
 import {
   CheckCircle2,
   CircleAlert,
+  Download,
   FileCode2,
   FileVideo,
   FolderOpen,
@@ -21,7 +22,7 @@ import {
   getManualMergeSelection, getSameLiveMergeSuggestions, ManualMergeControls, ManualMergeProgress,
   MergeConfirmation, SameLiveMergeSuggestions
 } from '../components/ManualMergeControls';
-import type { AppSettings, AppState, ExportDraft, ExportResult, RecordingState, SceneMuxRecovery } from '../types';
+import type { AppSettings, AppState, ExportDraft, ExportResult, ExportedClip, RecordingState, SceneMuxRecovery } from '../types';
 import {
   burnAvatarModeOptions,
   danmakuAreaOptions,
@@ -89,6 +90,9 @@ export function ExportPage({
   const [sceneTracksMessage, setSceneTracksMessage] = useState('');
   const [muxRecoveries, setMuxRecoveries] = useState<SceneMuxRecovery[]>([]);
   const [muxRecoveryError, setMuxRecoveryError] = useState('');
+  const [exportedClips, setExportedClips] = useState<ExportedClip[]>([]);
+  const [exportedClipsError, setExportedClipsError] = useState('');
+  const [exportedClipsRevision, setExportedClipsRevision] = useState(0);
   const [pathPickerBusy, setPathPickerBusy] = useState(false);
   const [timelineDrag, setTimelineDrag] = useState<'start' | 'playhead' | 'end' | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -145,6 +149,18 @@ export function ExportPage({
   const playheadLeft = canUseTimeline ? clampNumber((playheadTime / timelineDuration) * 100, 0, 100) : 0;
   const exportQueue = state.exportQueue || [];
   const exportStatus = state.exportProgress?.status;
+  useEffect(() => {
+    let active = true;
+    void recorder.listExportedClips().then(items => {
+      if (active) { setExportedClips(items); setExportedClipsError(''); }
+    }).catch(error => {
+      if (active) setExportedClipsError(error instanceof Error ? error.message : '成片列表读取失败。');
+    });
+    return () => { active = false; };
+  }, [exportStatus, state.recordings, exportedClipsRevision]);
+  const visibleExportedClips = selectedRecording
+    ? exportedClips.filter(item => item.cleanPath === selectedRecording.cleanPath)
+    : exportedClips;
   useEffect(() => {
     let active = true;
     void recorder.listSceneMuxRecoveries().then(items => {
@@ -1045,6 +1061,30 @@ export function ExportPage({
               <CheckCircle2 size={18} />
               <span>结果</span>
             </div>
+          </div>
+          <div className="export-queue">
+            <div className="export-queue-heading">
+              <FileVideo size={17} />
+              <span>{selectedRecording ? '这条录像已导出的片段' : '已导出片段'}</span>
+              <strong>{visibleExportedClips.length}</strong>
+              <button type="button" className="icon-button" aria-label="刷新已导出片段"
+                onClick={() => setExportedClipsRevision(value => value + 1)}><RefreshCw size={17} /></button>
+            </div>
+            {exportedClipsError ? <p className="field-help" role="alert">{exportedClipsError}</p> : null}
+            <div className="export-queue-list">
+              {visibleExportedClips.map(item => <div className="export-queue-row" key={item.outputPath}>
+                <strong>{filename(item.outputPath)}</strong>
+                <small>{item.mode === 'burn' ? '烧录片段' : '纯净片段'} · {formatTimelineTime(item.startTime)} – {formatTimelineTime(item.endTime)} · {formatFileSize(item.fileSize)}</small>
+                <PathLine label="保存位置" value={item.outputPath} />
+                <div className="export-file-actions">
+                  <a className="wide-button fill" href={mediaUrl(item.outputPath, item.modifiedAt)} target="_blank" rel="noopener noreferrer"><FileVideo size={17} />查看成片</a>
+                  <a className="wide-button fill" href={mediaUrl(item.outputPath, item.modifiedAt)} download={filename(item.outputPath)}><Download size={17} />下载成片</a>
+                  {canOpenServerPath ? <button type="button" className="wide-button fill"
+                    onClick={() => run('open-export-dir', () => recorder.openPathDir(item.outputPath))}><FolderOpen size={17} />打开所在目录</button> : null}
+                </div>
+              </div>)}
+            </div>
+            {!exportedClipsError && !visibleExportedClips.length ? <p className="field-help">暂未找到已导出的片段。完成后会显示在这里，刷新页面也会保留。</p> : null}
           </div>
           {result ? (
             <div className="result-lines">

@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const { discoverExportedClips } = require('../recording/exported-clips.cjs');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const {
@@ -11907,6 +11908,10 @@ try {
     return { item, recording, mode, outputPath };
   }
 
+  async listExportedClips() {
+    return discoverExportedClips(this.settings.outputDir, this.recordings);
+  }
+
   async exportClip(options = {}) {
     const { item, recording, mode, outputPath } = await this.createExportQueueItem(options);
     this.assertExportSourcePath(recording.cleanPath);
@@ -12140,7 +12145,7 @@ try {
       await atomicReplaceFile(attemptPath, recovery.finalOutputPath, { isCancelled: () => this.exportCancelRequested });
       completed = true;
       finishFfmpegJobProgress(progress, 'completed', '已复用烧录视频完成音视频封装');
-      this.log('success', `仅封装恢复完成：${path.basename(recovery.finalOutputPath)}。`);
+      this.log('success', `仅封装恢复完成：${recovery.finalOutputPath}`);
       this.emitState('mediaJob');
       // Cleanup follows publication, never a failed or cancelled attempt.
       await Promise.all([...recovery.chunkPaths, recovery.concatPath, recovery.outputPath,
@@ -12272,9 +12277,18 @@ try {
         }
       }
       if (result.status !== 0 || result.error || result.timedOut) {
+        const processFailure = {
+          exitCode: result.status ?? null,
+          signal: result.signal || '',
+          timedOut: Boolean(result.timedOut),
+          error: redactSensitive(result.error?.message || '')
+        };
+        const detail = redactSensitive(String(result.stderr || result.stdout || result.error?.message ||
+          '真实源 CUDA Scene helper 失败。')).replace(/\s+/g, ' ').trim().slice(-900);
         return {
           ok: false,
-          reason: redactSensitive(String(result.stderr || result.stdout || result.error?.message || '真实源 CUDA Scene helper 失败。')).replace(/\s+/g, ' ').trim().slice(-900),
+          reason: `CUDA Scene helper 退出码 ${processFailure.exitCode ?? '-'}，信号 ${processFailure.signal || '-'}，超时 ${processFailure.timedOut}：${detail}`,
+          processFailure,
           metrics,
           durationSec: probeDuration
         };
@@ -13569,7 +13583,7 @@ try {
         finishFfmpegJobProgress(this.exportProgress, 'completed', 'Scene Graph 片段已导出');
         this.emitState('mediaJob');
       }
-      this.log('success', 'Scene Graph 片段已导出：' + path.basename(outputPath));
+      this.log('success', 'Scene Graph 片段已导出：' + outputPath);
       return {
         ok: true,
         mode: 'burn',
@@ -14089,7 +14103,7 @@ try {
         finishFfmpegJobProgress(this.exportProgress, 'completed', '片段已导出');
         this.emitState('mediaJob');
       }
-      this.log('success', `片段已导出：${path.basename(outputPath)}`);
+      this.log('success', `片段已导出：${outputPath}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       cancelled = this.exportCancelRequested;

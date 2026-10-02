@@ -12,6 +12,24 @@
   align-self: start;
 }
 
+.export-file-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.export-file-actions .wide-button {
+  width: auto;
+  flex: 1 1 120px;
+  text-decoration: none;
+}
+
+.export-queue-row > strong {
+  overflow-wrap: anywhere;
+  color: #edf4f1;
+  font-size: 13px;
+}
+
 .manual-merge-actions {
   display: flex;
   margin-bottom: 12px;

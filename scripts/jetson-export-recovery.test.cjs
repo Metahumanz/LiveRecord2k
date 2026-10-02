@@ -77,6 +77,19 @@ test('captured native helper stops after stdout progress stalls', async () => {
   assert.match(result.stdout, /progress/);
 });
 
+test('native preflight retains a fatal signal even when stderr contains only normal driver chatter', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-preflight-signal-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const app = service();
+  app.probeJetsonNativeSceneForSource = LiveRecordService.prototype.probeJetsonNativeSceneForSource;
+  capturedRun = async () => ({ status: null, signal: 'SIGSEGV', stderr: 'NvMMLiteOpen : Block : BlockType = 8' });
+  const result = await app.probeJetsonNativeSceneForSource(options(dir));
+  assert.equal(result.ok, false);
+  assert.equal(result.processFailure.signal, 'SIGSEGV');
+  assert.equal(result.processFailure.exitCode, null);
+  assert.match(result.reason, /SIGSEGV/);
+});
+
 test('early native failure rebuilds bounded CPU windows and preserves hardware decode', async t => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-recovery-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
