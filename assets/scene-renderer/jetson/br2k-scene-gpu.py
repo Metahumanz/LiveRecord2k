@@ -937,19 +937,20 @@ def render_native_nvmm(request):
             fail('原生 NVMM 管线缺少必需元件。')
         # qtdemux expresses MP4 edit-list gaps in SEGMENT.base/time. Its
         # compressed PTS can start at 33ms although the actual picture starts
-        # at 1.029s. Materialize running time BEFORE NVDEC creates NVMM
+        # at 1.029s. Materialize media time BEFORE NVDEC creates NVMM
         # timestamp metadata; rewriting decoded buffers later cannot change
         # that metadata. Forward a zero-based segment to avoid applying the
         # edit offset again at matroskamux.
         input_clock = {'segment': None, 'forwarding': False}
-        startup_gate = {'reached': False, 'seeking': False, 'located': False}
+        startup_gate = {'reached': False, 'seeking': False, 'located': False, 'seek_seqnum': None}
         def restore_demux_media_clock(pad, info):
             if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
                 event = info.get_event()
                 if event and event.type == Gst.EventType.SEGMENT and not input_clock['forwarding']:
                     segment = event.parse_segment()
+                    native_nvmm_trace('parser segment seq=%s seek=%s start=%s time=%s base=%s' % (event.get_seqnum(), startup_gate['seek_seqnum'], segment.start, segment.time, segment.base))
                     input_clock['segment'] = segment.copy()
-                    if startup_gate['seeking']:
+                    if startup_gate['seeking'] and event.get_seqnum() == startup_gate['seek_seqnum']:
                         startup_gate['located'] = True
                     normalized = segment.copy()
                     normalized.start = 0
@@ -959,7 +960,9 @@ def render_native_nvmm(request):
                     normalized.offset = 0
                     input_clock['forwarding'] = True
                     try:
-                        pad.push_event(Gst.Event.new_segment(normalized))
+                        replacement = Gst.Event.new_segment(normalized)
+                        replacement.set_seqnum(event.get_seqnum())
+                        pad.push_event(replacement)
                     finally:
                         input_clock['forwarding'] = False
                     return Gst.PadProbeReturn.DROP
@@ -968,7 +971,11 @@ def render_native_nvmm(request):
                 for field in ['pts', 'dts']:
                     timestamp = getattr(buffer, field)
                     if timestamp != Gst.CLOCK_TIME_NONE:
-                        clock = input_clock['segment'].to_running_time(Gst.Format.TIME, timestamp)
+                        # Keep one absolute media clock across FLUSH seeks.
+                        # Running time re-bases post-seek packets while NVDEC
+                        # may retain the original clock in its surface metadata,
+                        # mixing seconds near zero with hours near the target.
+                        clock = input_clock['segment'].to_stream_time(Gst.Format.TIME, timestamp)
                         if clock != Gst.CLOCK_TIME_NONE:
                             setattr(buffer, field, clock)
             return Gst.PadProbeReturn.OK
@@ -982,9 +989,18 @@ def render_native_nvmm(request):
         # if it arrives before the synchronous seek call returns.
         startup_pad = decoder.get_static_pad('src')
         needs_segment_seek = start > 0.0001
+        # Some Jetson encoder MP4s mark non-IDR I pictures as sync samples.
+        # Seeking to the nearest such picture leaves NVDEC without reference
+        # state until the next IDR. Decode a bounded preroll in NVMM, then
+        # discard it before Scene/counters; never shift the requested interval.
+        seek_preroll_sec = min(start, 8.0) if needs_segment_seek else 0.0
         if needs_segment_seek:
             def discard_warmup_scene_buffer(_pad, _info):
                 if startup_gate['located']:
+                    buffer = _info.get_buffer()
+                    if buffer and buffer.pts != Gst.CLOCK_TIME_NONE and buffer.pts < int(start * Gst.SECOND):
+                        return Gst.PadProbeReturn.DROP
+                    native_nvmm_trace('first post-seek surface pts=' + str(_info.get_buffer().pts))
                     return Gst.PadProbeReturn.REMOVE
                 if not startup_gate['reached']:
                     startup_gate['reached'] = True
@@ -995,7 +1011,7 @@ def render_native_nvmm(request):
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
-        scene_first_pts = {'value': None}
+        scene_first_pts = {'value': int(start * Gst.SECOND) if needs_segment_seek else None}
         # Audit CUDA output against the ordered NVDEC frame sequence. JetPack
         # keeps the actual timestamp in NVMM metadata through nvivafilter and
         # NVENC; assigning a replacement Gst.Buffer.pts at the Scene pad does
@@ -1245,7 +1261,7 @@ def render_native_nvmm(request):
             clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
             clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
             clock_library.br2k_scene_enable_pts_clock()
-        drawing_clock = {'first': None}
+        drawing_clock = {'first': int(start * Gst.SECOND) if needs_segment_seek else None}
         def supply_drawing_time(_pad, info):
             buffer = info.get_buffer()
             if not buffer:
@@ -1302,15 +1318,17 @@ def render_native_nvmm(request):
                 seek_target = demux if demux else pipeline
                 segment_stop = int((start + duration) * Gst.SECOND)
                 startup_gate['seeking'] = True
-                seek_ok = seek_target.seek(
+                seek_event = Gst.Event.new_seek(
                     1.0,
                     Gst.Format.TIME,
                     Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
                     Gst.SeekType.SET,
-                    int(start * Gst.SECOND),
+                    int((start - seek_preroll_sec) * Gst.SECOND),
                     Gst.SeekType.SET,
                     segment_stop
                 )
+                startup_gate['seek_seqnum'] = seek_event.get_seqnum()
+                seek_ok = seek_target.send_event(seek_event)
                 if not seek_ok:
                     fail('原生 NVMM qtdemux 无法定位到分段起点。')
             native_nvmm_trace('waiting for EOS')
@@ -1441,6 +1459,7 @@ def render_native_nvmm(request):
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'mediaClock': media_clock, 'wallSeconds': wall_seconds,
             'drawingClock': 'input-pts-fifo' if has_scene_objects else 'none',
+            'seekPrerollSec': seek_preroll_sec,
             'textures': timeline_request.get('_textureStats'),
             'textureCache': cache_stats,
             'outputStorageVerified': output_container == 'mkv',
