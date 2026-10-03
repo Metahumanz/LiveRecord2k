@@ -90,6 +90,7 @@ const {
   runJetsonNativeDecodeCudaSceneJob,
   createClipCopyArgs,
   createConcatCopyArgs,
+  estimateMp4IndexReserveBytes,
   createNormalizeSegmentArgs,
   createNormalizeRawVideoArgs,
   createNormalizeEncodedVideoMuxArgs,
@@ -804,6 +805,7 @@ function getCleanupArtifactType(filePath, stat) {
 }
 
 function isFfmpegMemoryPressureError(error) {
+  if (error?.ffmpegNoProgress || ['BR2K_MEDIA_CANCELLED', 'FFMPEG_DECODE_STALL'].includes(error?.code)) return false;
   const signal = String(error?.ffmpegSignal || '').toUpperCase();
   // Linux's OOM killer reports SIGKILL.  Windows may instead expose the
   // STATUS_NO_MEMORY process status (signed or unsigned), or FFmpeg may exit
@@ -8146,6 +8148,9 @@ try {
       // up front so a low-disk failure cannot leave a half-written merge behind.
       const boundedTranscodeTemporaryBytes = Math.max(sourceBytes, normalizedBytesEstimate) * 2;
       const estimatedTemporaryBytes = requiresTranscode ? boundedTranscodeTemporaryBytes : sourceBytes;
+      const moovReserveBytes = container === 'mp4' ? estimateMp4IndexReserveBytes(mergeDurationSec, targetVideoInfo.fps || 60) : 0;
+      const finalizationTimeoutMs = Math.max(15 * 60_000, Math.min(2 * 60 * 60_000,
+        Math.ceil(Math.max(sourceBytes, normalizedBytesEstimate) / (5 * 1024 * 1024)) * 1000));
       const needsPublishWorkspace = isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)));
       const prepareMergeWorkspace = async (estimatedBytes) => {
         await assertDiskSpace(outputPath, { estimatedBytes });
@@ -8185,6 +8190,7 @@ try {
         }`
       );
       this.emitState(['room', 'mediaJob']);
+      if (moovReserveBytes) this.log('info', `${roomLabel(room)} MP4 合并预留 ${formatBytes(moovReserveBytes)} 前置索引，避免收尾搬移整片媒体。`);
       if (mergePublishDirectory) await fsp.mkdir(mergePublishDirectory, { recursive: true });
       await fsp.rm(tmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
@@ -8201,8 +8207,19 @@ try {
           now: stageStartedAt, force: true, stageLabel,
           phaseDurationSec: options.etaDurationSec || mergeDurationSec
         });
+        if (options.streamCopy) {
+          // Copying packets has no decoder or frame renderer. Do not carry
+          // the previous NVDEC/NVENC metrics into this different pipeline.
+          progress.stageFps = undefined;
+          progress.decoder = '';
+          progress.decoderKind = '';
+          progress.decoderLabel = '';
+          progress.avatarCompositeBackend = '';
+          progress.activePipeline = { decoder: '', sceneRenderer: '', encoder: '无损复用（不重编码）' };
+        }
         let child = null;
         let sawMediaProgress = false;
+        let finalizationStarted = false;
         let lastMediaProgressSec = Number.NEGATIVE_INFINITY;
         let lastMediaProgressAt = stageStartedAt;
         let repeatedDecodeErrorCount = 0;
@@ -8264,6 +8281,7 @@ try {
         try {
           try {
             const onStderr = (line) => {
+              if (finalizationStarted) return;
               stageLabel = String(options.getStageLabel?.() || options.stageLabel || '合并处理');
               const now = Date.now();
               const processedSec = parseFfmpegProgressTime(line);
@@ -8319,8 +8337,8 @@ try {
               child = nextChild;
               if (nextChild) {
                 this.mergeProcesses.set(room.id, nextChild);
-                progress.activePipeline = progress.phase === 'mux'
-                  ? { decoder: '', sceneRenderer: '', encoder: '无损拼接（不重编码）' }
+                progress.activePipeline = options.streamCopy || progress.phase === 'mux'
+                  ? { decoder: '', sceneRenderer: '', encoder: options.streamCopy ? '无损复用（不重编码）' : '无损拼接（不重编码）' }
                   : { decoder: progress.decoderLabel || '', sceneRenderer: progress.avatarCompositeBackend || '', encoder: progress.encoderBackend || '' };
               }
               if (nextChild && isStopped()) requestFfmpegStop(nextChild, { graceful: false, timeoutMs: 1500 });
@@ -8332,8 +8350,24 @@ try {
                 onChild,
                 progressStallTimeoutMs: MERGE_PROGRESS_STALL_TIMEOUT_MS,
                 progressValueFromText: parseFfmpegProgressTime,
+                finalizationTimeoutMs,
+                onFinalizationStart: () => {
+                  finalizationStarted = true;
+                  stageLabel = '正在前置 MP4 索引（无需重新编码）';
+                  if (room.mergeProgress?.id !== progress.id) return;
+                  sawMediaProgress = true;
+                  room.mergeProgress.stageLabel = stageLabel;
+                  room.mergeProgress.message = stageLabel;
+                  room.mergeProgress.estimatedRemainingSec = null;
+                  room.mergeProgress.phaseEstimatedRemainingSec = null;
+                  room.mergeProgress.etaState = 'estimating';
+                  room.mergeProgress.updatedAt = Date.now();
+                  this.markRoomDirty(room.id);
+                },
                 onNoProgress: (watchdogError) => {
-                  const message = `${stageLabel}连续 ${Math.ceil(
+                  const message = watchdogError.code === 'FFMPEG_FINALIZATION_TIMEOUT'
+                    ? `${stageLabel}超过 ${Math.ceil(watchdogError.ffmpegStallTimeoutMs / 1000)} 秒，已终止；所有源分段均已保留。`
+                    : `${stageLabel}连续 ${Math.ceil(
                     MERGE_PROGRESS_STALL_TIMEOUT_MS / 1000
                   )} 秒没有媒体进度，已终止；源分段会保留并自动重试。`;
                   watchdogError.message = message;
@@ -8397,6 +8431,7 @@ try {
               '-i', segments[index].cleanPath, '-map', '0:v:0', '-map', '0:a:0',
               '-c', 'copy', '-avoid_negative_ts', 'disabled', '-f', 'matroska', copiedPath],
               { progressOffsetSec, segmentDurationSec: sourceDurationSec,
+                streamCopy: true,
                 stageLabel: `无损复用分段 ${index + 1}/${segments.length}` });
             normalizedPaths.push(copiedPath);
             normalizedDurations.push(Number(segmentMediaInfos[index].durationSec) || sourceDurationSec);
@@ -8684,7 +8719,8 @@ try {
             concatPath,
             outputPath: tmpPath,
             container,
-            streamCodec: targetVideoInfo.codec
+            streamCodec: targetVideoInfo.codec,
+            moovReserveBytes
           }),
           { stageLabel: '无损拼接已规范化分段' }
         );
@@ -8732,6 +8768,7 @@ try {
             isStopped() ||
             isFfmpegMemoryPressureError(error) ||
             error?.code === 'FFMPEG_NO_PROGRESS' ||
+            error?.code === 'FFMPEG_FINALIZATION_TIMEOUT' ||
             error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
             error?.code === 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT' ||
             error?.code === 'MERGE_PREEMPTED'
@@ -8753,12 +8790,13 @@ try {
         await writeConcatFile(concatPath, segments.map((segment) => segment.cleanPath));
         try {
           await runMergeFfmpeg(
-            createConcatCopyArgs({ concatPath, outputPath: tmpPath, container, streamCodec: targetVideoInfo.codec }),
+            createConcatCopyArgs({ concatPath, outputPath: tmpPath, container, streamCodec: targetVideoInfo.codec, moovReserveBytes }),
             { stageLabel: '无损拼接续录分段' }
           );
         } catch (error) {
           this.mergeProcesses.delete(room.id);
           if (isStopped()) throw error;
+          if (error?.ffmpegNoProgress) throw error;
           if (targetVideoInfo.hdr) {
             throw new Error(`HDR 无损 copy 合并失败；为避免丢失 HDR metadata，不会自动转码：${error.message}`);
           }

@@ -1590,6 +1590,8 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     let stalledError = null;
     let lastProgressValue = Number.NEGATIVE_INFINITY;
     let lastProgressAt = Date.now();
+    let finalizingAt = 0;
+    const finalizationTimeoutMs = Math.max(progressStallTimeoutMs, Number(options.finalizationTimeoutMs) || 15 * 60_000);
     let stallTimer = null;
 
     const finish = (callback, value) => {
@@ -1602,13 +1604,16 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     const triggerProgressStall = () => {
       if (settled || stalledError || !progressValueFromText || child.exitCode !== null || child.signalCode) return;
       const elapsedMs = Date.now() - lastProgressAt;
-      if (elapsedMs < progressStallTimeoutMs) return;
+      const timeoutMs = finalizingAt ? finalizationTimeoutMs : progressStallTimeoutMs;
+      if (elapsedMs < timeoutMs) return;
       stalledError = new Error(
-        `FFmpeg 已连续 ${Math.ceil(progressStallTimeoutMs / 1000)} 秒没有输出媒体进度，已终止该处理进程。`
+        finalizingAt
+          ? `FFmpeg MP4 索引前置超过 ${Math.ceil(timeoutMs / 1000)} 秒，已终止该处理进程。`
+          : `FFmpeg 已连续 ${Math.ceil(timeoutMs / 1000)} 秒没有输出媒体进度，已终止该处理进程。`
       );
-      stalledError.code = 'FFMPEG_NO_PROGRESS';
+      stalledError.code = finalizingAt ? 'FFMPEG_FINALIZATION_TIMEOUT' : 'FFMPEG_NO_PROGRESS';
       stalledError.ffmpegNoProgress = true;
-      stalledError.ffmpegStallTimeoutMs = progressStallTimeoutMs;
+      stalledError.ffmpegStallTimeoutMs = timeoutMs;
       stalledError.ffmpegLastProgressValue = Number.isFinite(lastProgressValue) ? lastProgressValue : null;
       stalledError.ffmpegStderr = compactLogLine(stderr);
       try {
@@ -1626,6 +1631,11 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString('utf8');
       stderr = `${stderr}${text}`.slice(-8000);
+      if (!finalizingAt && /Starting second pass:\s*moving the moov atom/i.test(stderr)) {
+        finalizingAt = Date.now();
+        lastProgressAt = finalizingAt;
+        options.onFinalizationStart?.();
+      }
       if (progressValueFromText) {
         try {
           const progressValue = Number(progressValueFromText(text));

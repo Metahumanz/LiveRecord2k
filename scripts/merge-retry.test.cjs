@@ -412,6 +412,21 @@ test('merge watchdog terminates an FFmpeg process whose media timestamp stops pr
   assert.ok(Date.now() - startedAt < 5000);
 });
 
+test('faststart finalization survives the media watchdog but retains a bounded timeout', async () => {
+  let finalized = 0;
+  const run = (tail, finalizationTimeoutMs) => runFfmpegJob(process.execPath, ['-e',
+    "process.stderr.write('time=00:00:10.000\\nStarting second pass: moving the moov'); setTimeout(() => process.stderr.write(' atom to the beginning of the file\\n'), 30); " + tail], () => {}, {
+      progressStallTimeoutMs: 200,
+      finalizationTimeoutMs,
+      progressValueFromText: parseFfmpegProgressTime,
+      onFinalizationStart: () => finalized++
+    });
+  await run('setTimeout(() => process.exit(0), 800)', 1500);
+  await assert.rejects(run('setInterval(() => {}, 100)', 600), error =>
+    error.code === 'FFMPEG_FINALIZATION_TIMEOUT' && error.ffmpegNoProgress && error.ffmpegStallTimeoutMs === 600);
+  assert.equal(finalized, 2);
+});
+
 test('a source PTS boundary offset is advisory when measured A/V duration remains in sync', () => {
   const delayedAudio = getMergeSegmentTimingAssessment(
     {

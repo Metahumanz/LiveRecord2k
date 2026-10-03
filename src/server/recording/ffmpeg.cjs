@@ -1989,13 +1989,28 @@ function createSceneAssRemuxArgs({ cleanPath, assPath, outputPath, title = 'Bili
   ];
 }
 
-function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec }) {
+function estimateMp4IndexReserveBytes(durationSec, fps = 60) {
+  const duration = Number(durationSec);
+  const frameRate = Number(fps);
+  if (!(duration > 0) || !Number.isFinite(duration) || !(frameRate > 0) || !Number.isFinite(frameRate)) return 0;
+  // Conservative packet-table budget for video and 48 kHz AAC. Reserving the
+  // front index avoids faststart rewriting an entire long file on SMB.
+  const mib = 1024 * 1024;
+  const bytes = Math.ceil((duration * (frameRate + 48000 / 1024) * 80 + 2 * mib) / mib) * mib;
+  return bytes <= 512 * mib ? bytes : 0;
+}
+
+function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec, moovReserveBytes = 0 }) {
   const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
   if (container === 'mp4') {
     if (isHevcCodec(streamCodec)) {
       args.push('-tag:v', 'hvc1');
     }
-    args.push('-movflags', '+faststart');
+    if (Number.isSafeInteger(moovReserveBytes) && moovReserveBytes > 0 && moovReserveBytes <= 2147483647) {
+      args.push('-moov_size', String(moovReserveBytes));
+    } else {
+      args.push('-movflags', '+faststart');
+    }
   }
   args.push(outputPath);
   return args;
@@ -2682,6 +2697,7 @@ module.exports = {
   createClipCopyArgs,
   createSceneAssRemuxArgs,
   createConcatCopyArgs,
+  estimateMp4IndexReserveBytes,
   createNormalizeSegmentArgs,
   createNormalizeRawVideoArgs,
   createNormalizeEncodedVideoMuxArgs,
