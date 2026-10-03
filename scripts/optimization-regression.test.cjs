@@ -10,7 +10,7 @@ const { estimateSceneScratchBytes } = require('../src/server/recording/scene-res
 const { createMediaLogAggregator } = require('../src/server/shared/media-log-aggregator.cjs');
 const { runBounded } = require('../src/server/shared/bounded-work.cjs');
 const { probeMediaTimelineInfo, probeMediaTimelineHealth, runCapturedProcess } = require('../src/server/shared/helpers.cjs');
-const { buildSceneGraphJob } = require('../src/server/danmaku/scene-build-job.cjs');
+const { buildSceneGraphJob, sceneWorkerHeapMb } = require('../src/server/danmaku/scene-build-job.cjs');
 const { buildSceneGraph, clipSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
 const { scanFullMedia } = require('../src/server/recording/media-full-scan.cjs');
 const { writeGraph, readGraphLines } = require('../src/server/danmaku/scene-graph-io.cjs');
@@ -184,6 +184,15 @@ test('one-pass packet scan retains real A/V duration and cache invalidates when 
   await create(3);
   const changed = await probeMediaTimelineInfo(ffmpeg, source, info);
   assert(changed.videoPresentationDurationSec > 2.95);
+});
+
+test('long Scene worker heap scales with event demand and stays within host/container memory', () => {
+  const gib = 1024 ** 3;
+  assert.equal(sceneWorkerHeapMb(300, { totalBytes: 64 * gib, availableBytes: 48 * gib }), 1024);
+  assert.equal(sceneWorkerHeapMb(15653, { totalBytes: 64 * gib, availableBytes: 48 * gib }), 4608);
+  assert.equal(sceneWorkerHeapMb(15653, { totalBytes: 4 * gib, availableBytes: 3 * gib }), 1024);
+  assert.equal(sceneWorkerHeapMb(15653, { totalBytes: 64 * gib, availableBytes: gib }), 512);
+  assert.equal(sceneWorkerHeapMb(100000, { totalBytes: 128 * gib, availableBytes: 96 * gib }), 8192);
 });
 
 test('background Scene layout and cached clip retain pre-clip active cards and exact visual objects', async () => {

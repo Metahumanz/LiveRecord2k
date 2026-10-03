@@ -17,6 +17,6 @@ async function runSceneWorker() {
   if (Number.isFinite(request.clipStart) && Number.isFinite(request.clipEnd)) {
     graph = clipSceneGraph(graph, request.clipStart, request.clipEnd, { shiftTime: false });
   }
-  await writeGraph(request.outputPath, graph);
+  await writeGraph(request.outputPath, graph, request.resultFormat === 'jsonl');
 }
 module.exports = { runSceneWorker };
