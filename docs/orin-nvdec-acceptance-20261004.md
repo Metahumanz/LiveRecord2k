@@ -73,3 +73,23 @@
 - 完成后生产服务无录制、合并、导出或队列任务。
 
 原始验收 JSON 保存在本机 `build/orin-merge-20261004/formal-acceptance.json` 与 `formal-frame-acceptance.json`，以及 Orin `/tmp/br2k-nvdec-regression-20261004/`；均为诊断数据，不是媒体中间文件。
+
+## 合并长片烧录：非 IDR 定位与布局内存修复
+
+对已合并长片继续烧录时，补查了约 2140 秒处规范化段与复用段的交界。直接对原合并文件的硬解能跨过 Baseline/High SPS 变化；不能将截样文件无帧直接归因于不同 profile。
+
+截样首个标记为 key frame 的包实际为 H.264 `nal_unit_type=1`、`slice_type=2`，是非 IDR I 帧。NVDEC 从该同步点开始解码会等待后续 IDR，旧定位路径还把 seek 后的 running time 与原始媒体时间混用。原 20 秒请求首帧错到 2141.191 秒，覆盖仅 18.820 秒，PTS 门禁正确拒绝了该输出。
+
+原生 helper 改用 stream time 保留绝对媒体时钟，通过 seek 事件序号确认新定位段，在 NVMM 中预解码最多 8 秒并在 Scene、绘制时钟和计数之前丢弃起点前帧。绘制与停止时间锚定用户指定起点。相同交界请求修复后首帧 2140.003 秒，1139 帧、覆盖 20.008 秒，三个 PTS 映射偏差均为 0；保留源时间轴空洞，不按目标帧率强造帧。
+
+Orin 原生 PTS 设备回归 6 项全部通过，新增非 IDR 同步点测试重复定位三次，每次准确输出 120 帧，实际中文文字仅在指定的 0.25–0.75 秒显示；其余涵盖时间轴空洞、分数帧率、edit-list 前导与非零起点重复定位、黑帧和音画起点。
+
+正式整片首次烧录在 Scene 布局阶段失败，原因是 worker 固定 `--max-old-space-size=1024` 耗尽 V8 堆，尚未启动正式媒体渲染。改为按事件量及宿主/容器可用内存设置有限堆预算（上限 8 GiB，且不超过有效总内存四分之一或可用内存二分之一）；本次 15653 条事件分配 4608 MiB。worker 结果通过逐行 JSONL 传递，避免父进程额外读取完整 JSON 字符串。低内存机器仍受资源上限约束，未取消限制。
+
+- 部署 helper SHA-256：`b343be5bcc00cf95797d33cb58ccab4f073314e235d3d0c7fbbee43d7897c555`，备份 `br2k-scene-gpu.bak-20261004-before-burn-seek`。
+- 部署后端 SHA-256：`aed8a214201238612d292c7df7705816a15e5643b4ba0f2e627670592e555571`，备份 `server.bundle.cjs.bak-20261004-before-scene-worker-heap`。
+- 本机 quick、integration 全组通过；布局缓存与剪辑测试保留对象的精确视觉数据。
+- 同一长片正式重试队列 ID：`7a6a92e3-a6c1-4b53-8a2a-e903b920fe6e`，进度 ID `export-1791064528368-02rkfm`。
+- 完成 503818 个 Scene 对象布局；10 秒真实中文弹幕画面/PTS 预检通过，84.2 fps。正式分段 NVDEC → CUDA Scene → NVENC 已开始，无 CPU 解码回退；此记录尚不代表完整长片输出验收通过。
+- 使用已保存的 `h5-card`、`quarter`、`danmaku-gift`、高质量头像、`panelLeft=0`、`superChatBottom=524`、`hevc_nvv4l2`、CRF 24。输出明确指定保存目录 `/mnt/zzzz/哔哩录播2K`，不改变默认导出模式设置。
+- 目标文件：`883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4`；原录像与弹幕保留。工作媒体位于输出盘专属 `.br2k-export-media-5TVLCw`，因本机临时盘不足以同时保存整片中间媒体与成片；任务运行期间不能清理该目录。
