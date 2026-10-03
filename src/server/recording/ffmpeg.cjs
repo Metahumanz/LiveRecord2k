@@ -1212,7 +1212,7 @@ function createBurnRawSceneFromPipeArgs({
   ];
 }
 
-function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, outputPath, preview = false, converter = 'nvvidconv', container = '' }) {
+function createJetsonGstreamerEncodeArgs({ codec, width, height, rawWidth = width, rawHeight = height, fps, quality, outputPath, preview = false, converter = 'nvvidconv', container = '' }) {
   const encoder = getJetsonGstreamerEncoder(codec);
   const outputWidth = makeEvenDimension(width);
   const outputHeight = makeEvenDimension(height);
@@ -1234,14 +1234,14 @@ function createJetsonGstreamerEncodeArgs({ codec, width, height, fps, quality, o
     'blocksize=1048576',
     '!',
     'rawvideoparse',
-    `width=${outputWidth}`,
-    `height=${outputHeight}`,
+    `width=${makeEvenDimension(rawWidth)}`,
+    `height=${makeEvenDimension(rawHeight)}`,
     'format=i420',
     `framerate=${formatGstreamerFramerate(fps)}`,
     '!',
     normalizedConverter,
     '!',
-    'video/x-raw(memory:NVMM),format=NV12',
+    `video/x-raw(memory:NVMM),format=NV12,width=${outputWidth},height=${outputHeight}`,
     '!',
     encoder,
     `bitrate=${getJetsonGstreamerBitrate(quality, codec, { preview })}`,

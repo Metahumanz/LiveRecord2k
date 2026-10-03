@@ -42,6 +42,7 @@ const GROUPS = {
     'client-code-splitting.test.cjs',
     'manual-merge-ui.test.cjs',
     'merge-sidecar-progress.test.cjs',
+    'merge-normalization.test.cjs',
     'recording-identity.test.cjs',
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
