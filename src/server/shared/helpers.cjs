@@ -2117,6 +2117,11 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
           avgFrameRate: String(exactVideo?.avg_frame_rate || ''),
           rFrameRate: String(exactVideo?.r_frame_rate || videoInfo.rFrameRate || ''),
           timeBase: String(exactVideo?.time_base || ''),
+          sampleAspectRatio: String(exactVideo?.sample_aspect_ratio || ''),
+          colorRange: String(exactVideo?.color_range || ''),
+          colorSpace: exactVideo?.color_space && exactVideo.color_space !== 'unknown' ? exactVideo.color_space : videoInfo.colorSpace,
+          colorPrimaries: exactVideo?.color_primaries && exactVideo.color_primaries !== 'unknown' ? exactVideo.color_primaries : videoInfo.colorPrimaries,
+          colorTransfer: exactVideo?.color_transfer && exactVideo.color_transfer !== 'unknown' ? exactVideo.color_transfer : videoInfo.colorTransfer,
           startTime: Number.isFinite(Number(exactVideo?.start_time)) ? Number(exactVideo.start_time) : undefined,
           fps: parseFrameRate(exactVideo?.avg_frame_rate) || parseFrameRate(exactVideo?.r_frame_rate) || videoInfo.fps
         }
@@ -2160,7 +2165,7 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
   if (!ffprobe) return null;
   const result = await runCapturedProcess(
     ffprobe,
-    ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time', '-of', 'json', filePath],
+    ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time,sample_aspect_ratio,color_range,color_space,color_primaries,color_transfer', '-of', 'json', filePath],
     { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024, onChild: options.onChild }
   );
   if (result.status !== 0 || result.timedOut || result.error) return null;

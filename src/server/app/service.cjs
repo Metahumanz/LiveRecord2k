@@ -3,7 +3,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const { discoverExportedClips } = require('../recording/exported-clips.cjs');
-const { canReuseMergeSegment, canScaleMergeOnGpu } = require('../recording/merge-normalization.cjs');
+const { canReuseMergeSegment, canScaleMergeOnGpu, canNormalizeNativeNvmm, createJetsonNvdecCanonicalInputArgs } = require('../recording/merge-normalization.cjs');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const {
@@ -8194,9 +8194,9 @@ try {
         if (isStopped()) throw new Error('合并已取消');
         const progressOffsetSec = Math.max(0, Number(options.progressOffsetSec || 0));
         const trackProgress = options.trackProgress !== false;
-        const stageLabel = String(options.stageLabel || '合并处理');
+        let stageLabel = String(options.stageLabel || '合并处理');
         const segmentDurationSec = Math.max(0, Number(options.segmentDurationSec || 0));
-        const stageStartedAt = Date.now();
+        let stageStartedAt = Date.now();
         setFfmpegJobPhase(progress, options.phase || (options.segmentDurationSec ? 'render' : 'mux'), {
           now: stageStartedAt, force: true, stageLabel,
           phaseDurationSec: options.etaDurationSec || mergeDurationSec
@@ -8227,6 +8227,8 @@ try {
           requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 });
         };
         const updateWaitingForMedia = () => {
+          if (options.isPreparing?.()) { stageStartedAt = Date.now(); lastMediaProgressAt = stageStartedAt; return; }
+          stageLabel = String(options.getStageLabel?.() || options.stageLabel || '合并处理');
           if (sawMediaProgress || room.mergeProgress?.id !== progress.id) return;
           const now = Date.now();
           const elapsedMs = Math.max(0, now - stageStartedAt);
@@ -8262,6 +8264,7 @@ try {
         try {
           try {
             const onStderr = (line) => {
+              stageLabel = String(options.getStageLabel?.() || options.stageLabel || '合并处理');
               const now = Date.now();
               const processedSec = parseFfmpegProgressTime(line);
               if (Number.isFinite(processedSec) && processedSec > lastMediaProgressSec + 0.0001) {
@@ -8318,7 +8321,7 @@ try {
                 this.mergeProcesses.set(room.id, nextChild);
                 progress.activePipeline = progress.phase === 'mux'
                   ? { decoder: '', sceneRenderer: '', encoder: '无损拼接（不重编码）' }
-                  : { decoder: progress.decoderLabel || '', sceneRenderer: '', encoder: progress.encoderBackend || '' };
+                  : { decoder: progress.decoderLabel || '', sceneRenderer: progress.avatarCompositeBackend || '', encoder: progress.encoderBackend || '' };
               }
               if (nextChild && isStopped()) requestFfmpegStop(nextChild, { graceful: false, timeoutMs: 1500 });
             };
@@ -8417,9 +8420,7 @@ try {
             );
           }
           const detectedDecoder = this.getHardwareDecoder(segmentMediaInfos[index]?.videoInfo, videoCodec);
-          const preferredDecoder = isJetsonGstreamerCodec(videoCodec)
-            ? { ...detectedDecoder, value: 'software', label: 'CPU 解码、NVMM 缩放与硬编', kind: 'software' }
-            : detectedDecoder;
+          const preferredDecoder = detectedDecoder;
           const runNormalizeAttempt = async ({
             stageLabel = isJetsonGstreamerCodec(videoCodec) && canScaleMergeOnGpu(segmentMediaInfos[index].videoInfo, targetVideoInfo)
               ? `${baseStageLabel}（CPU 解码、NVMM 缩放与硬编）` : baseStageLabel,
@@ -8461,6 +8462,8 @@ try {
               let jetsonStagePhase = 'render';
               await runMergeFfmpeg(null, {
                 ...normalizeOptions,
+                isPreparing: () => jetsonStagePhase === 'prepare',
+                getStageLabel: () => normalizeOptions.stageLabel,
                 run: (onStderr, onChild) =>
                   this.runMergeJetsonNormalize({
                     cleanPath: segments[index].cleanPath,
@@ -8471,10 +8474,15 @@ try {
                     timelineAlignment,
                     isCancelled: isStopped,
                     onProgress: (sec) => onStderr(`out_time_us=${Math.round(sec * 1000000)}`),
+                    onStageMetrics: (metrics) => {
+                      if (room.mergeProgress?.id !== progress.id) return;
+                      if (setFfmpegJobStageFps(progress, metrics)) this.markRoomDirty(room.id);
+                      if (metrics?.final) this.log('info', `${roomLabel(room)} ${baseStageLabel} 原生性能：${Number(metrics.pipelineFps || metrics.total || 0).toFixed(2)}fps；${Number(metrics.frames || 0)}帧，媒体 ${Number(metrics.mediaSeconds || 0).toFixed(3)}秒。`);
+                    },
                     onPipeline: (pipeline) => {
-                      this.setProgressDecoder(progress, pipeline.decoder);
-                      progress.activePipeline = pipeline;
-                      progress.stageLabel = `${baseStageLabel}（${pipeline.decoder.kind === 'hardware' ? 'NVMM 硬解与硬编' : 'CPU 解码与硬编'}）`;
+                      this.setProgressPipeline(progress, pipeline);
+                      normalizeOptions.stageLabel = `${baseStageLabel}（${pipeline.decoder.kind === 'hardware' ? 'NVDEC 硬解、NVMM 缩放与硬编' : 'CPU 解码、NVMM 缩放与硬编'}）`;
+                      progress.stageLabel = normalizeOptions.stageLabel;
                       this.markRoomDirty(room.id);
                     },
                     codec: videoCodec,
@@ -8518,6 +8526,11 @@ try {
                     onChild,
                     onPhase: (phase) => {
                       jetsonStagePhase = phase;
+                      if (phase === 'prepare' || phase === 'render') {
+                        setFfmpegJobPhase(progress, phase, { force: true, phaseDurationSec: normalizeOptions.etaDurationSec,
+                          stageLabel: phase === 'prepare' ? `${baseStageLabel}：正在准备兼容码流并验收硬解` : normalizeOptions.stageLabel });
+                        this.markRoomDirty(room.id);
+                      }
                       if (phase !== 'mux' || room.mergeProgress?.id !== progress.id) return;
                       const completedSec = Math.min(mergeDurationSec, progressOffsetSec + sourceDurationSec);
                       room.mergeProgress.currentTimeSec = Math.max(Number(room.mergeProgress.currentTimeSec || 0), completedSec);
@@ -8720,6 +8733,7 @@ try {
             isFfmpegMemoryPressureError(error) ||
             error?.code === 'FFMPEG_NO_PROGRESS' ||
             error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
+            error?.code === 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT' ||
             error?.code === 'MERGE_PREEMPTED'
           ) {
             throw error;
@@ -10403,19 +10417,107 @@ try {
   // bridge raw I420 to nvv4l2{h264,h265}enc, and immediately matroska-mux the
   // video-only intermediate so its PTS survives the final audio mux.
   async runMergeJetsonNormalize(options) {
-    if (!canScaleMergeOnGpu(options.sourceVideo, options.targetVideo)) {
-      return this.runJetsonGstreamerTranscode(options);
-    }
-    // Keep the validated FFmpeg timeline repair and CPU decode. Transfer
-    // source-sized frames; nvvidconv performs scaling before hardware encode.
-    // Native NVDEC stalled on the actual reconnect sources during acceptance.
-    return this.runJetsonGstreamerTranscode({
+    const compatibilityRun = () => this.runJetsonGstreamerTranscode(!canScaleMergeOnGpu(options.sourceVideo, options.targetVideo)
+      ? { ...options, decoder: 'software' } : {
       ...options, decoder: 'software',
       rawWidth: options.sourceVideo.width, rawHeight: options.sourceVideo.height,
       createRawArgs: decoder => options.createRawArgs(decoder, {
         ...options.targetVideo, width: options.sourceVideo.width, height: options.sourceVideo.height }),
       onPipeline: pipeline => options.onPipeline?.({ ...pipeline, sceneRenderer: 'NVMM 硬件缩放' })
     });
+    const renderer = this.ffmpegCapabilities?.sceneGpuRenderer;
+    if (!canNormalizeNativeNvmm(renderer, options.sourceVideo, options.targetVideo, options.recoverySeekSec) ||
+        !/\.mp4$/i.test(options.cleanPath || '')) {
+      this.log('info', `${options.label}：源规格、帧率或解码恢复要求不满足原生 NVDEC 准入，使用兼容解码。`);
+      return compatibilityRun();
+    }
+    // The compressed compatibility input is bounded to one segment. Keep its
+    // seek/backpatch MP4 writes on the local filesystem; large encoded media
+    // can still use the output volume's sequential Matroska workspace.
+    let canonicalDirectory = '';
+    let canonicalPath = '';
+    let temporaryDir = '';
+    let inputPath = options.cleanPath;
+    const throwIfCancelled = () => {
+      if (!options.isCancelled?.()) return;
+      const error = new Error('合并已取消。'); error.code = 'BR2K_MEDIA_CANCELLED'; throw error;
+    };
+    options.onPhase?.('prepare');
+    try {
+      // NVIDIA's native runtime also inherits TMPDIR. Never give it a deep
+      // shared-drive recording path; keep requests/runtime scratch local and
+      // use the shared volume only for sequential encoded Matroska media.
+      temporaryDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-nvdec-job-'));
+      const graph = buildSceneGraph([], { videoInfo: options.targetVideo });
+      graph.timeline.end = options.duration;
+      const sourceCodec = /hevc|h265/i.test(options.sourceVideo.codec) ? 'hevc' : 'h264';
+      let preflight;
+      try {
+        throwIfCancelled();
+        if (/h264|avc/i.test(options.sourceVideo.codec)) {
+          canonicalDirectory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-nvdec-input-'));
+          canonicalPath = path.join(canonicalDirectory, 'input.mp4');
+          await assertDiskSpace(canonicalPath, { estimatedBytes: await getFileSize(options.cleanPath) });
+          const args = createJetsonNvdecCanonicalInputArgs(options.cleanPath, canonicalPath, options.sourceVideo, options.duration);
+          // Filler NALs on reconnect sources can be malformed. Remove only
+          // filler before CBS rewrites SPS color fields; never rewrite VCL or
+          // timing. FFmpeg can exit 0 after a BSF error and silently drop frames.
+          const result = await runCapturedProcess(this.ffmpegPath, args, {
+            timeoutMs: Math.max(60_000, Math.ceil(options.duration * 1000)), maxOutputBytes: 128 * 1024,
+            onChild: options.onChild
+          });
+          throwIfCancelled();
+          if (result.status !== 0 || result.error || result.timedOut || String(result.stderr || '').trim()) {
+            throw new Error(`NVDEC 兼容码流准备失败：${compactLogLine(result.stderr || result.error?.message || `退出码 ${result.status}`)}`);
+          }
+          inputPath = canonicalPath;
+        }
+        preflight = await this.probeJetsonNativeSceneForSource({
+          graph, cleanPath: inputPath, codec: options.codec, sourceCodec,
+          sourceFrameRate: options.sourceVideo.rFrameRate, fps: options.fps, width: options.width, height: options.height,
+          // Sparse recordings can contain a long PTS hole inside the first
+          // 30 seconds. Inspect a bounded larger range rather than rejecting
+          // preserved source timing as a decoder failure.
+          startTime: 0, duration: options.duration,
+          sampleDurationSec: Number(options.sourceVideo.fps) > 0 && Number(options.sourceVideo.fps) < options.fps * 0.95 ? 120 : 30,
+          temporaryDir,
+          decoder: 'gstreamer-nvv4l2', onChild: options.onChild, isCancelled: options.isCancelled,
+          label: options.label
+        });
+        throwIfCancelled();
+        if (!preflight.ok) throw new Error(preflight.reason);
+      } catch (error) {
+        throwIfCancelled();
+        if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
+        this.log('warn', `${options.label}：原生 NVDEC 预检未通过，本段使用兼容解码：${compactLogLine(error.message)}`);
+        options.onPhase?.('render');
+        return await compatibilityRun();
+      }
+      this.log('info', `${options.label}：NVDEC 真实源预检通过（${preflight.durationSec.toFixed(1)}秒，${Number(preflight.metrics?.pipelineFps || 0).toFixed(1)}fps），正式使用 NVDEC → NVMM 缩放 → NVENC。`);
+      let processedMediaSeconds = 0;
+      try {
+        return await this.runJetsonCudaSceneGraphTranscode({
+          ...options, graph, cleanPath: inputPath, sceneTemporaryDir: temporaryDir,
+          decoder: 'gstreamer-nvv4l2', nativeTimestampedOutput: true,
+          timelineOffsetSec: Math.max(0, Number(options.timelineAlignment?.videoPaddingSec) || 0),
+          bitrate: getJetsonGstreamerBitrate(options.quality, options.codec),
+          nativeDecode: { decoderPath: renderer.helper, cleanPath: inputPath, sourceCodec,
+            sourceFrameRate: options.sourceVideo.rFrameRate, startTime: 0, duration: options.duration },
+          onProgress: sec => { processedMediaSeconds = Math.max(processedMediaSeconds, sec); options.onProgress?.(sec); },
+          onPipeline: pipeline => options.onPipeline?.({ ...pipeline, sceneRenderer: 'NVMM 硬件缩放' })
+        });
+      } catch (error) {
+        // After admission, never quietly re-run this whole segment on CPU.
+        // Returning a fatal error also prevents the outer encoder retry from
+        // restarting all previously completed segments.
+        throwIfCancelled();
+        if (error?.code === 'BR2K_MEDIA_CANCELLED') throw error;
+        throw createCommittedJetsonNativeRuntimeError(processedMediaSeconds, error);
+      }
+    } finally {
+      if (canonicalDirectory) await fsp.rm(canonicalDirectory, { recursive: true, force: true }).catch(() => {});
+      if (temporaryDir) await fsp.rm(temporaryDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   async runJetsonGstreamerTranscode({
@@ -12305,9 +12407,10 @@ try {
     onStage,
     onChild,
     isCancelled,
-    textVerification = null
+    textVerification = null,
+    sampleDurationSec = 5
   } = {}) {
-    const sample = textVerification ? selectSceneSample(graph, duration) : { start: 0, duration: 5 };
+    const sample = textVerification ? selectSceneSample(graph, duration) : { start: 0, duration: Math.max(1, Number(sampleDurationSec) || 5) };
     const probeDuration = Math.min(sample.duration, Math.max(0.001, Number(duration) || 0.001));
     const probeStart = Math.max(0, Number(startTime) || 0) + sample.start;
     const requestPath = path.join(temporaryDir, 'native-preflight.json');
@@ -12357,6 +12460,7 @@ try {
       };
       const result = await runCapturedProcess(renderer.helper, ['--native-scene-request', requestPath], {
         timeoutMs: Math.max(30_000, Math.ceil(probeDuration * 10_000)),
+        idleTimeoutMs: 30_000,
         maxOutputBytes: 256 * 1024,
         onChild,
         env: { ...process.env, TMPDIR: temporaryDir },
@@ -12904,6 +13008,7 @@ try {
     onFallback,
     isCancelled,
     nativeIdleTimeoutMs = JETSON_NATIVE_SCENE_IDLE_TIMEOUT_MS,
+    bitrate = 0,
     label = 'Jetson CUDA Scene Graph 烧录'
   } = {}) {
     const renderer = this.ffmpegCapabilities?.sceneGpuRenderer;
@@ -12933,6 +13038,7 @@ try {
         : ''
     });
     request.scratchDirectory = sceneTemporaryDir || path.dirname(requestPath);
+    if (Number(bitrate) > 0) request.output.bitrate = Math.round(Number(bitrate));
     if (nativeDecode) {
       request.input.startTime = Math.max(0, Number(nativeDecode.startTime) || 0);
       request.input.codec = String(nativeDecode.sourceCodec || '').toLowerCase();

@@ -10,6 +10,7 @@ requests, avatar/texture resources, and final audio muxing.
 
 import argparse
 import ctypes
+import gc
 import hashlib
 import io
 import json
@@ -835,6 +836,7 @@ def render_native_nvmm(request):
     if request.get('backend') != 'cuda-gstreamer': fail('原生零拷贝仅支持 cuda-gstreamer。')
     source = request.get('input') or {}
     output = request.get('output') or {}
+    has_scene_objects = bool(scene_texture_entries(request['scene']))
     input_path = str(source.get('path') or '')
     if not os.path.isfile(input_path): fail('原生零拷贝输入不存在：' + input_path)
     width, height, fps = int(output['width']), int(output['height']), number(output.get('fps'), 30)
@@ -898,10 +900,11 @@ def render_native_nvmm(request):
             # us compare the exact mux output bytes with the completed file.
             output_sink = 'matroskamux name=output-mux streamable=true ! ' + output_sink
         encoder_branch = (
-            'nvivafilter name=cuda-scene cuda-process=true customer-lib-name=%s ! %s ! '
+            '%s ! %s ! '
             'capssetter caps="video/x-raw,framerate=%s" ! '
             '%s name=encode bitrate=%d ! %s name=parse ! %s'
-        ) % (launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps, fps_caps(fps), encoder,
+        ) % (('nvivafilter name=cuda-scene cuda-process=true customer-lib-name=' + launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY))
+             if has_scene_objects else 'identity name=cuda-scene', caps, fps_caps(fps), encoder,
              max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, output_sink)
         if leading_video_frames:
             # concat adjusts the source branch's segment base after the finite
@@ -1232,12 +1235,16 @@ def render_native_nvmm(request):
                     end += buffer.duration
                 encoded_pts['end'] = max(encoded_pts['end'] or end, end)
             return Gst.PadProbeReturn.OK
-        clock_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
-        clock_library.br2k_scene_enable_pts_clock.argtypes = []
-        clock_library.br2k_scene_enable_pts_clock.restype = None
-        clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
-        clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
-        clock_library.br2k_scene_enable_pts_clock()
+        # A clean merge has no overlays. Keep frames in NVMM and use VIC for
+        # scaling, without loading the CUDA/ASS renderer or queuing unused
+        # drawing clocks. The same source→output PTS audit still applies.
+        if has_scene_objects:
+            clock_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
+            clock_library.br2k_scene_enable_pts_clock.argtypes = []
+            clock_library.br2k_scene_enable_pts_clock.restype = None
+            clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
+            clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
+            clock_library.br2k_scene_enable_pts_clock()
         drawing_clock = {'first': None}
         def supply_drawing_time(_pad, info):
             buffer = info.get_buffer()
@@ -1253,7 +1260,8 @@ def render_native_nvmm(request):
             if not clock_library.br2k_scene_push_frame_time(seconds):
                 return Gst.PadProbeReturn.DROP
             return Gst.PadProbeReturn.OK
-        composite.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, supply_drawing_time)
+        if has_scene_objects:
+            composite.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, supply_drawing_time)
         for name, element in [('decode', decoder), ('scene', composite), ('encode', encode)]:
             element.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, count_buffer, name)
         output_digest = hashlib.sha256()
@@ -1324,6 +1332,8 @@ def render_native_nvmm(request):
                 if message.type == Gst.MessageType.EOS: break
                 error, debug = message.parse_error(); fail('原生 NVMM：' + str(error) + ('；' + str(debug) if debug else ''))
             try:
+                if not has_scene_objects:
+                    raise OSError('No Scene textures in a clean merge')
                 cache_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
                 cache_library.br2k_scene_cache_peak_bytes.restype = ctypes.c_ulonglong
                 cache_library.br2k_scene_texture_upload_count.restype = ctypes.c_ulonglong
@@ -1430,7 +1440,7 @@ def render_native_nvmm(request):
                 scene_coverage_ns / Gst.SECOND, encode_coverage_ns / Gst.SECOND, duration))
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'mediaClock': media_clock, 'wallSeconds': wall_seconds,
-            'drawingClock': 'input-pts-fifo',
+            'drawingClock': 'input-pts-fifo' if has_scene_objects else 'none',
             'textures': timeline_request.get('_textureStats'),
             'textureCache': cache_stats,
             'outputStorageVerified': output_container == 'mkv',
@@ -1464,6 +1474,8 @@ def render_native_nvmm(request):
     finally:
         if pipeline:
             pipeline.set_state(Gst.State.NULL)
+            pipeline.get_state(5 * Gst.SECOND)
+            pipeline = None
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -1584,7 +1596,13 @@ def main():
 
 if __name__ == '__main__':
     try:
-        sys.exit(main())
+        exit_code = main()
     except Exception as error:
         print('GPU Scene renderer failed: ' + str(error), file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
+    # Release GI callback cycles and stop GStreamer's task pool before Python
+    # unloads NVIDIA libraries. Otherwise a VIC task can still execute code
+    # inside libnvvic after libnvbufsurftransform's exit handler dlcloses it.
+    gc.collect()
+    Gst.deinit()
+    sys.exit(exit_code)
