@@ -86,6 +86,17 @@ test('deterministic A/V timeline failure does not re-encode the whole group agai
   assert.equal(app.mergeRetryStates.size, 0);
 });
 
+test('disk space failures retain their reason and do not repeatedly retry an unchanged merge', () => {
+  for (const code of ['BR2K_DISK_SPACE_INSUFFICIENT', 'ENOSPC']) {
+    const app = createMergeTestService();
+    const room = { id: '883263', mergeProgress: { kind: 'merge', mergeGroup: 'session', status: 'error', message: '空间不足，源分段保留' } };
+    const error = Object.assign(new Error('空间不足'), { code });
+    assert.equal(app.scheduleMergeRetry(room, 'session', {}, error), false);
+    assert.equal(app.mergeRetryStates.size, 0);
+    assert.equal(room.mergeProgress.message, '空间不足，源分段保留');
+  }
+});
+
 test('a retry in another group displays its own output path rather than the previous completed merge', () => {
   const app = createMergeTestService(); const room = { id: '883263', mergeProgress: {
     kind: 'merge', status: 'completed', mergeGroup: 'first-session', outputPath: 'first.merged.mp4' } };
@@ -175,7 +186,7 @@ test('Jetson merge rejects a mux that would overwrite its video input before lau
   assert.throws(() => createNormalizeEncodedVideoMuxArgs({ encodedVideoPath: 'same.mkv', outputPath: './same.mkv' }), /同一路径/);
 });
 
-test('Jetson cross-resolution merge uses separate video and mux files on a local workspace', async t => {
+for (const destinationStaging of [false, true]) test(`Jetson cross-resolution merge uses separate video and mux files on ${destinationStaging ? 'the output disk when local space is insufficient' : 'a local workspace'}`, async t => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-jetson-mux-'));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   const app = createMergeTestService();
@@ -185,6 +196,16 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
   app.rooms.set(room.id, room);
   app.getMergeEncoderPlan = () => ({ preferred: 'h264_nvv4l2', fallback: '', software: '' });
   app.getLinuxRecordingRootMount = async () => ({ fsType: 'cifs', mountPoint: dir });
+  if (destinationStaging) {
+    const originalStat = fsp.stat.bind(fsp);
+    t.mock.method(fsp, 'statfs', async name => ({ bavail: (String(name).startsWith(dir) ? 100 : 2) * 1024 ** 3 / 4096,
+      bsize: 4096, blocks: 100 * 1024 ** 3 / 4096 }));
+    t.mock.method(fsp, 'stat', async name => {
+      const result = await originalStat(name);
+      result.dev = String(name).startsWith(dir) ? 2 : 1;
+      return result;
+    });
+  }
   const progressSamples = [];
   app.markRoomDirty = () => { if (room.mergeProgress) progressSamples.push({ ...room.mergeProgress }); };
   const originals = [];
@@ -197,13 +218,16 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
     app.recordings.push({ cleanPath, roomId: room.id, startedAt: i + 1, durationSec: 1, valid: true });
   }
   let attempts = 0;
+  let mediaWorkspace;
   app.runJetsonGstreamerTranscode = async options => {
     attempts++;
     const mux = options.createMuxArgs();
     const source = mux[mux.indexOf('-i', mux.indexOf('-i') + 1) + 1];
     assert.notEqual(path.resolve(options.encodedVideoPath), path.resolve(mux.at(-1)));
     assert.equal(path.basename(options.encodedVideoPath), `${String(attempts).padStart(3, '0')}.video.mkv`);
-    assert.ok(path.dirname(options.encodedVideoPath).includes('br2k-merge-publish-'));
+    mediaWorkspace = path.dirname(path.dirname(options.encodedVideoPath));
+    assert.ok(mediaWorkspace.includes(destinationStaging ? '.br2k-merge-media-' : 'br2k-merge-publish-'));
+    if (destinationStaging) assert.equal(path.dirname(mediaWorkspace), dir);
     const encoded = await runCapturedProcess(ffmpegPath, ['-y', '-i', source, '-an', '-vf', `scale=${options.width}:${options.height}`,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0', options.encodedVideoPath], { timeoutMs: 20_000 });
     assert.equal(encoded.status, 0, encoded.stderr);
@@ -222,6 +246,7 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
   assert.ok(progressSamples.some(sample => sample.phase === 'mux' && sample.phaseCurrentTimeSec > 0), 'concat media PTS never reached the progress fields');
   assert.equal((await probeMediaFileInfo(ffmpegPath, result.cleanPath)).videoInfo.width, 640);
   for (const source of originals) assert.ok((await fsp.stat(source)).size);
+  await assert.rejects(fsp.stat(mediaWorkspace), { code: 'ENOENT' });
 });
 
 test('manual selection merges complete segments chronologically and preserves source files and rows', async t => {

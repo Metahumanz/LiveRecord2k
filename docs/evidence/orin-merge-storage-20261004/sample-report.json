@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "inputs": [
+    {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261003_200838-真栗提到了你/883263_真栗_20261003_201740.clean.mp4",
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261003_200838-真栗提到了你/883263_真栗_20261003_201024.clean.mp4",
+      "width": 3840,
+      "height": 2160
+    }
+  ],
+  "output": {
+    "codec": "h264 (avc1 / 0x31637661)",
+    "profile": "avc1 / 0x31637661",
+    "pixelFormat": "yuv420p",
+    "bitDepth": 8,
+    "colorSpace": "",
+    "colorPrimaries": "",
+    "colorTransfer": "",
+    "hdr": false,
+    "width": 3840,
+    "height": 2160,
+    "fps": 59.84345586049737,
+    "rFrameRate": "60/1",
+    "avgFrameRate": "604000/10093",
+    "timeBase": "1/16000",
+    "startTime": 0.021
+  },
+  "timing": {
+    "containerDurationSec": 10.14,
+    "videoDurationSec": 10.114625,
+    "videoPresentationDurationSec": 10.114625,
+    "audioDurationSec": 10.137,
+    "avDeltaSec": 0.022375000000000256,
+    "measuredAvDeltaSec": 0.022375000000000256,
+    "videoReorderAllowanceSec": 0,
+    "containerDeltaSec": 0.0030000000000001137,
+    "timingSafeForCopy": true
+  },
+  "events": 2,
+  "sourceRetained": true,
+  "workspaceCleaned": true
+}

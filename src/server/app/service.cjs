@@ -253,7 +253,7 @@ const {
   validateRemoteUrl,
   redactSensitive
 } = require('../shared/security.cjs');
-const { atomicReplaceFile, assertDiskSpace, selectSceneMediaWorkspace } = require('../recording/media-safety.cjs');
+const { atomicReplaceFile, assertDiskSpace, selectSceneMediaWorkspace, selectMergeMediaWorkspace } = require('../recording/media-safety.cjs');
 const { deleteManualMergeSources, snapshotManualMergeArtifacts } = require('../recording/manual-merge-cleanup.cjs');
 const { createMediaLogAggregator } = require('../shared/media-log-aggregator.cjs');
 const { estimateSceneScratchBytes } = require('../recording/scene-resources.cjs');
@@ -7449,6 +7449,8 @@ try {
       this.mergeCancelRequests.has(this.getMergeRetryKey(room.id, groupId)) ||
       isFfmpegMemoryPressureError(error) ||
       error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
+      error?.code === 'BR2K_DISK_SPACE_INSUFFICIENT' ||
+      error?.code === 'ENOSPC' ||
       error?.code === 'MERGE_AV_TIMELINE_UNSAFE'
     ) {
       if (room?.id && groupId) this.clearMergeRetryState(room.id, groupId);
@@ -7949,7 +7951,7 @@ try {
     let tmpPath = replaceExtension(outputPath, `.tmp.${container}`);
     let concatPath = replaceExtension(outputPath, '.concat.txt');
     let preserveMergedOutput = false;
-    let localPublishDirectory = '';
+    let mergePublishDirectory = '';
     const danmakuPath = deriveSiblingPath(outputPath, 'danmaku', 'jsonl');
     const avatarManifestPath = deriveAvatarManifestPath(outputPath);
     const sceneCachePath = deriveSceneCachePath(outputPath);
@@ -8141,16 +8143,33 @@ try {
       // up front so a low-disk failure cannot leave a half-written merge behind.
       const boundedTranscodeTemporaryBytes = Math.max(sourceBytes, normalizedBytesEstimate) * 2;
       const estimatedTemporaryBytes = requiresTranscode ? boundedTranscodeTemporaryBytes : sourceBytes;
+      const needsPublishWorkspace = isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)));
+      const prepareMergeWorkspace = async (estimatedBytes) => {
+        await assertDiskSpace(outputPath, { estimatedBytes });
+        if (!needsPublishWorkspace) return;
+        if (mergePublishDirectory) {
+          try {
+            await assertDiskSpace(mergePublishDirectory, { estimatedBytes });
+            return;
+          } catch (error) {
+            if (error.code !== 'BR2K_DISK_SPACE_INSUFFICIENT') throw error;
+          }
+        }
+        // Copy concat can later require normalization. Re-plan its larger peak
+        // on the actual media filesystem before generating any intermediates.
+        const storage = await selectMergeMediaWorkspace(outputPath, { estimatedBytes });
+        if (mergePublishDirectory) {
+          await fsp.rm(mergePublishDirectory, { recursive: true, force: true });
+        }
+        mergePublishDirectory = storage.mediaDirectory;
+        tmpPath = path.join(mergePublishDirectory, `completed.${container}`);
+        concatPath = path.join(mergePublishDirectory, 'concat.txt');
+        normalizeTempDir = path.join(mergePublishDirectory, 'segments');
+        this.log('info', `${roomLabel(room)} ${storage.localSpaceError ? '本机临时盘不足，合并中间文件改存输出盘' : '合并中间文件使用本机临时盘'}：${mergePublishDirectory}，预留 ${formatBytes(estimatedBytes)}；验收后发布，源分段保留至成功。`);
+      };
       await this.runMergePreparationStage(room, progress, '正在检查本次合并的磁盘空间', () =>
-        assertDiskSpace(outputPath, { estimatedBytes: estimatedTemporaryBytes })
+        prepareMergeWorkspace(estimatedTemporaryBytes)
       );
-      if (isNonPosixRecordingMount(await this.getLinuxRecordingRootMount(path.dirname(outputPath)))) {
-        await assertDiskSpace(os.tmpdir(), { estimatedBytes: estimatedTemporaryBytes });
-        localPublishDirectory = path.join(os.tmpdir(), `br2k-merge-publish-${crypto.randomUUID()}`);
-        tmpPath = path.join(localPublishDirectory, `completed.${container}`);
-        concatPath = path.join(localPublishDirectory, 'concat.txt');
-        normalizeTempDir = path.join(localPublishDirectory, 'segments');
-      }
       if (isStopped()) throw new Error('合并已停止');
       mergeLease = await this.acquireMergeMediaLease(room, progress, mergeEncoderPlan);
 
@@ -8163,7 +8182,7 @@ try {
         }`
       );
       this.emitState(['room', 'mediaJob']);
-      if (localPublishDirectory) await fsp.mkdir(localPublishDirectory);
+      if (mergePublishDirectory) await fsp.mkdir(mergePublishDirectory, { recursive: true });
       await fsp.rm(tmpPath, { force: true });
       await fsp.rm(danmakuTmpPath, { force: true });
       await fsp.rm(cssTmpPath, { force: true });
@@ -8615,8 +8634,7 @@ try {
         // A healthy-looking copy merge can still fail because of malformed
         // timestamps.  Its fallback uses the same bounded workspace, so make
         // the larger disk reservation immediately before starting it too.
-        await assertDiskSpace(outputPath, { estimatedBytes: boundedTranscodeTemporaryBytes });
-        if (localPublishDirectory) await assertDiskSpace(os.tmpdir(), { estimatedBytes: boundedTranscodeTemporaryBytes });
+        await prepareMergeWorkspace(boundedTranscodeTemporaryBytes);
         try {
           await runBoundedTranscode(mergeEncoderPlan.preferred);
         } catch (error) {
@@ -8776,9 +8794,9 @@ try {
         if (isStopped()) throw new Error('合并已停止');
         await atomicReplaceFile(tmpPath, outputPath, { isCancelled: () => isStopped() });
       } catch (error) {
-        if (localPublishDirectory && !isStopped()) {
+        if (mergePublishDirectory && !isStopped()) {
           preserveMergedOutput = true;
-          this.log('error', `合并成片发布失败，已验证的本地成片保留在 ${tmpPath}：${error.message}`);
+          this.log('error', `合并成片发布失败，已验证的临时成片保留在 ${tmpPath}：${error.message}`);
         }
         throw error;
       }
@@ -8986,7 +9004,7 @@ try {
       await fsp.rm(danmakuTmpPath, { force: true }).catch(() => {});
       await fsp.rm(cssTmpPath, { force: true }).catch(() => {});
       await fsp.rm(normalizeTempDir, { recursive: true, force: true }).catch(() => {});
-      if (localPublishDirectory && !preserveMergedOutput) await fsp.rm(localPublishDirectory, { recursive: true, force: true }).catch(() => {});
+      if (mergePublishDirectory && !preserveMergedOutput) await fsp.rm(mergePublishDirectory, { recursive: true, force: true }).catch(() => {});
     }
   }
 
