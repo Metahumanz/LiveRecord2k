@@ -5,6 +5,7 @@ const os = require('node:os');
 const { discoverExportedClips } = require('../recording/exported-clips.cjs');
 const { canReuseMergeSegment, canScaleMergeOnGpu, canNormalizeNativeNvmm, createJetsonNvdecCanonicalInputArgs } = require('../recording/merge-normalization.cjs');
 const crypto = require('node:crypto');
+const { emojiAssetId } = require('../danmaku/emoji.cjs');
 const { spawn } = require('node:child_process');
 const {
   selectDesktopScenePath, selectSceneSample, selectDistributedSceneSamples, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
@@ -4656,6 +4657,9 @@ try {
     });
     return Object.assign({}, result.graph, {
       assets: result.graph.assets.map((asset) => {
+        if (asset.type === 'emoji' && asset.key?.startsWith('unicode:')) {
+          return { id: asset.id, type: asset.type, src: 'data:image/png;base64,' + fs.readFileSync(asset.path).toString('base64') };
+        }
         const params = new URLSearchParams({
           cleanPath: recording.cleanPath,
           assetId: String(asset.id || '')
@@ -4691,7 +4695,8 @@ try {
           : candidate.avatarUrl
             ? 'url:' + candidate.avatarUrl
             : '';
-        return key && stableId('avatar', key) === assetId;
+        return key && (stableId('avatar', key) === assetId ||
+          (candidate.avatarUrl && emojiAssetId('remote:' + candidate.avatarUrl) === assetId));
       });
       const filePath = String(entry?.filePath || '');
       if (!filePath || !isPathInsideDirectory(path.resolve(filePath), path.resolve(avatarDirectory)) || !(await isExistingFile(filePath))) {
@@ -6007,6 +6012,15 @@ try {
     this.pumpAvatarCaptureQueue(session);
   }
 
+  queueRecordingEmojiCapture(session, event) {
+    const capture = this.ensureAvatarCaptureState(session);
+    if (!capture) return;
+    for (const emote of event.emoticons || []) {
+      if (capture.knownKeys.size >= 2048 && !capture.knownKeys.has(emote.url)) { capture.truncated = true; break; }
+      this.queueRecordingAvatarCapture(session, { uid: 0, avatarUrl: emote.url });
+    }
+  }
+
   async captureAvatarSnapshot(session, request) {
     const capture = this.ensureAvatarCaptureState(session);
     if (!capture) return;
@@ -6173,7 +6187,8 @@ try {
       overlayMode: options.overlayMode || this.settings.burnOverlayMode,
       danmakuArea: options.danmakuArea || this.settings.burnDanmakuArea,
       videoInfo: options.videoInfo || recording?.videoInfo || null,
-      avatarAssets: options.avatarAssets || null
+      avatarAssets: options.avatarAssets || null,
+      emojiAssets: options.emojiAssets || options.avatarAssets || null
     };
   }
 
@@ -6210,7 +6225,9 @@ try {
       // normalized event list as the graph.  Do not re-read JSONL later: a
       // recording may still receive a final buffered event while an export is
       // being prepared.
-      events,
+      events: events.map(event => event.emoticons?.length ? { ...event, _emojiAssets: Object.fromEntries(
+        event.emoticons.filter(emote => avatarAssets[emote.url]?.filePath).map(emote => [emote.url, avatarAssets[emote.url]])
+      ) } : event),
       eventCount: events.length,
       scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath)
     };
@@ -6229,6 +6246,7 @@ try {
       shiftTime: options.shiftTime === true
     });
     const body = createAss(prepared, {
+      renderEmojiImages: true,
       stylePreset,
       styleLayout: options.styleLayout || this.settings.burnDanmakuStyleLayout,
       overlayMode: options.overlayMode || this.settings.burnOverlayMode,
@@ -6468,6 +6486,10 @@ try {
           return;
         }
         this.queueRecordingAvatarCapture(session, event);
+        // Custom Bilibili emoji share the bounded image capture queue and the
+        // recording's existing sidecar/merge/cleanup lifecycle. UID 0 keeps
+        // them independent of audience avatar lookups.
+        this.queueRecordingEmojiCapture(session, event);
         const writeDroppedBefore = Number(session.danmakuDropCounts?.writeDropped || 0);
         const written = session.eventStream.write(`${JSON.stringify(event)}\n`);
         if (!written) {
@@ -12585,7 +12607,7 @@ try {
         const reference = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-reference.filter'), probeGraph,
           { duration: probeDuration, fps, target: 'software', legacyAssPath: assPath });
         const clean = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-clean.filter'),
-          { ...probeGraph, objects: probeGraph.objects.filter(object => object.type !== 'Text') },
+          { ...probeGraph, objects: probeGraph.objects.filter(object => !['Text', 'Image'].includes(object.type)) },
           { duration: probeDuration, fps, target: 'software', legacyAssPath: textless });
         const at = Math.round(sample.time * fps) / fps;
         pixels = await verifySceneOutputFrame({
@@ -13310,7 +13332,7 @@ try {
       const reference = await writeSceneFilterScript(path.join(directory, prefix + '.filter'), sampleGraph,
         { duration: sample.duration, fps, target: 'software', legacyAssPath: ass });
       const clean = await writeSceneFilterScript(path.join(directory, prefix + '-clean.filter'),
-        { ...sampleGraph, objects: sampleGraph.objects.filter(object => object.type !== 'Text') },
+        { ...sampleGraph, objects: sampleGraph.objects.filter(object => !['Text', 'Image'].includes(object.type)) },
         { duration: sample.duration, fps, target: 'software', legacyAssPath: noText });
       const at = Math.round(sample.time * fps) / fps;
       try {

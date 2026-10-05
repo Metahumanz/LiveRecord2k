@@ -47,6 +47,7 @@ const GROUPS = {
     'recording-identity.test.cjs',
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
+    'danmaku-emoji.test.cjs',
     'desktop-cuda-capability.test.cjs',
     'desktop-burn-regression.test.cjs',
     'diagnostics.test.cjs',

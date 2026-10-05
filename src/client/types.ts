@@ -243,7 +243,7 @@ export type SceneAnimation = {
 
 export type SceneObject = {
   id: string;
-  type: 'Text' | 'Avatar' | 'Rect' | 'Card' | 'SuperChat' | 'Gift';
+  type: 'Text' | 'Image' | 'Avatar' | 'Rect' | 'Card' | 'SuperChat' | 'Gift';
   start: number;
   end: number;
   zIndex: number;

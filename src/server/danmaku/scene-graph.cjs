@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const readline = require('node:readline');
 const crypto = require('node:crypto');
+const { graphemes, unicodeAsset, emojiAssetId } = require('./emoji.cjs');
 const {
   LayoutEngine,
   MESSAGE_ANIMATION_SEC,
@@ -27,13 +28,14 @@ const {
   sideInteractionPrice,
   truncateTextToWidth,
   estimateTextWidth,
+  glyphWidthFactor,
   roundedRectPath
 } = require('./ass.cjs');
 
 const SCENE_GRAPH_SCHEMA = 'bili-record2k.scene/v1';
 const SCENE_GRAPH_VERSION = 1;
 const SCENE_CACHE_SCHEMA = 'bili-record2k.scene-cache/v1';
-const SCENE_OBJECT_TYPES = new Set(['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift']);
+const SCENE_OBJECT_TYPES = new Set(['Text', 'Image', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift']);
 const SCENE_ANIMATION_TYPES = new Set(['Move', 'Fade', 'Scale']);
 
 function stableId(prefix, source) {
@@ -382,7 +384,7 @@ function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAs
     legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, '&H250D1416&', metrics.radius, 16);
     legacyShape(graph, prefix + '-dot', segment, metrics.gap, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
     legacyText(graph, prefix + '-user', segment, textX, metrics.paddingY, username, metrics.fontSize, '&H00FFFFFF&', 23, 700);
-    legacyText(graph, prefix + '-detail', segment, textX + estimateTextWidth(username, metrics.fontSize), metrics.paddingY, ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23);
+    legacyText(graph, prefix + '-detail', segment, metrics.detailLines ? metrics.bodyX : textX + estimateTextWidth(username, metrics.fontSize), metrics.detailLines ? metrics.paddingY + metrics.fontSize : metrics.paddingY, metrics.detailLines ? metrics.detailLines.join('\\N') : ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23);
     if (price) {
       const priceWidth = Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize);
       const priceX = metrics.width - priceWidth;
@@ -396,7 +398,7 @@ function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAs
   const price = sideInteractionPrice(event);
   const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
   const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
-  const detail = truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
+  const detail = metrics.detailLines ? metrics.detailLines.join('\\N') : truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
   const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
   legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, palette.background, metrics.radius, 16);
   addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
@@ -541,7 +543,9 @@ function addMessageNode(graph, entry, layout, avatarAssets) {
     : base.y + topPadding + fontSize * 1.15;
   const detailSize = isSuperChat && !layout.sideStream ? fontSize : metaFontSize;
   const detailColor = isSuperChat && !layout.sideStream ? '#ffffff' : palette.detail;
-  textObject(graph, sharedEntry, eventId + '-detail', eventId, detail, textX, detailY, frame(0, 0, Math.max(1, base.width - contentX - gap), Math.max(detailSize * 1.3, base.height - (detailY - base.y))), {
+  const bodyX = isSuperChat && !layout.sideStream ? base.x + number(metrics.inset) : textX;
+  const bodyWidth = isSuperChat && !layout.sideStream ? number(metrics.textWidth) : Math.max(1, base.width - contentX - gap);
+  textObject(graph, sharedEntry, eventId + '-detail', eventId, detail, bodyX, detailY, frame(0, 0, bodyWidth, Math.max(detailSize * 1.3, base.height - (detailY - base.y))), {
     fontFamily: layout.style.fontFamily,
     fontSize: detailSize,
     fontWeight: 400,
@@ -555,6 +559,59 @@ function addMessageNode(graph, entry, layout, avatarAssets) {
         : detail
     }))
   });
+}
+
+function addEmojiNodes(graph, begin, tokens, legacy) {
+  const hasEmoji = text => graphemes(text).some(c => tokens[c] || unicodeAsset(c));
+  const originals = graph.objects.splice(begin).flatMap(object => {
+    const keys = object.props?.textKeyframes;
+    if (object.type !== 'Text' || !keys?.length || ![object.props.text, ...keys.map(k => k.text)].some(hasEmoji)) return [object];
+    // Splitting rich text must retain aggregated gift-count updates. Give
+    // each version its own bounded interval while preserving absolute motion.
+    const versions = [{ time: object.start, text: object.props.text }, ...keys]
+      .filter(k => Number(k.time) >= object.start && Number(k.time) < object.end)
+      .sort((a, b) => Number(a.time) - Number(b.time));
+    return versions.flatMap((version, index) => {
+      const end = Number(versions[index + 1]?.time ?? object.end);
+      if (end <= Number(version.time)) return [];
+      const props = { ...object.props, text: version.text };
+      delete props.textKeyframes;
+      return [{ ...object, id: object.id + '-version-' + index, start: Number(version.time), end, props }];
+    });
+  });
+  for (const object of originals) {
+    if (object.type !== 'Text' || !hasEmoji(object.props.text)) {
+      graph.objects.push(object); continue;
+    }
+    const size = Number(object.props.fontSize);
+    const advanceSize = legacy ? size / 1.22 : size;
+    const lineHeight = Number(object.props.lineHeight) || size * 1.2;
+    let x = 0, y = 0, run = '', runX = 0, index = 0;
+    const translated = (dx, dy) => (object.animations || []).map(a => a.type === 'Move' ? {
+      ...a, from: { x: a.from.x + dx, y: a.from.y + dy }, to: { x: a.to.x + dx, y: a.to.y + dy }
+    } : a);
+    const flush = () => {
+      if (!run) return;
+      const props = { ...object.props, text: run, emojiText: true };
+      delete props.assText; delete props.textKeyframes;
+      graph.objects.push({ ...object, id: object.id + '-run-' + index++, frame: frame(object.frame.x + runX, object.frame.y + y, Math.max(size, object.frame.width - runX), lineHeight * 1.3), props,
+        animations: translated(runX, y) });
+      run = '';
+    };
+    for (const glyph of graphemes(object.props.text)) {
+      if (glyph === '\n') { flush(); x = 0; y += lineHeight; continue; }
+      const asset = tokens[glyph] || unicodeAsset(glyph);
+      if (!asset) { if (!run) runX = x; run += glyph; x += glyphWidthFactor(glyph) * advanceSize; continue; }
+      flush();
+      const id = emojiAssetId(asset.key);
+      if (!graph.assets.some(a => a.id === id)) graph.assets.push({ id, type: 'emoji', path: asset.filePath, url: asset.url || '', key: asset.key });
+      graph.objects.push({ ...object, id: object.id + '-emoji-' + index++, type: 'Image',
+        frame: frame(object.frame.x + x, object.frame.y + y, advanceSize, advanceSize),
+        props: { assetId: id, role: 'emoji', alt: asset.text }, style: { opacity: object.style.opacity ?? 1, clip: object.style.clip }, animations: translated(x, y) });
+      x += advanceSize;
+    }
+    flush();
+  }
 }
 
 function buildSceneGraph(events, options) {
@@ -598,9 +655,11 @@ function buildSceneGraph(events, options) {
     )
   };
   for (const entry of layout.entries) {
+    const begin = graph.objects.length;
     if (entry.kind === 'rolling') addRollingNode(graph, entry, layout.style);
     else if (entry.kind === 'legacy-side') addLegacySideEntry(graph, entry, layout.style, source.avatarAssets, legacySideClip);
     else addMessageNode(graph, entry, layout, source.avatarAssets);
+    addEmojiNodes(graph, begin, entry.event?.emojiTokens || {}, entry.kind === 'legacy-side');
   }
   graph.timeline.end = round(graph.objects.reduce((maximum, object) => Math.max(maximum, number(object.end)), 0), 4);
   return graph;

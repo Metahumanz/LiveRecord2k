@@ -6,6 +6,7 @@ const {
   sourceIdFromCommand
 } = require('./dedupe.cjs');
 const DANMAKU_STYLE_PRESETS = require('../../shared/danmaku-style-presets.json');
+const { graphemes, parseEmoticons, maskEmojiText, isEmptyGuardToast } = require('./emoji.cjs');
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
@@ -131,6 +132,7 @@ function normalizeDanmakuEvent(command, timing) {
     if (!text.trim()) return null;
     const uid = Number(info[2]?.[0] || 0);
     const avatarUrl = eventAvatarUrl(data, info[2] || {});
+    const emoticons = parseEmoticons(command, text);
     return {
       ...normalizeSourceMeta(command, commandData(command), normalizedTiming),
       type: 'danmaku',
@@ -138,6 +140,7 @@ function normalizeDanmakuEvent(command, timing) {
       text,
       user: String(info[2]?.[1] || ''),
       color: Number(info[0]?.[3] || 0xffffff),
+      ...(emoticons.length ? { emoticons } : {}),
       ...(avatarUrl ? { avatarUrl } : {})
     };
   }
@@ -183,21 +186,27 @@ function normalizeDanmakuEvent(command, timing) {
 
   if (type === 'GUARD_BUY' || type === 'USER_TOAST_MSG' || type === 'USER_TOAST_MSG_V2') {
     const data = commandData(command);
+    const identity = data.uinfo?.base || data.user_info || data.user_show_info || {};
+    const uid = Number(data.uid || data.uinfo?.uid || identity.uid || 0);
+    const user = String(data.username || data.uname || identity.uname || identity.name || '');
+    // An empty notification is not a purchase; defaults used to turn this
+    // into a second anonymous card after the real GUARD_BUY.
+    if (!uid && !user.trim() && !Number(data.guard_level) && !Number(data.price)) return null;
     const count = Number(data.num || 1);
     const unitPrice = Number(data.price || 0) / 1000;
     const avatarUrl = eventAvatarUrl(data);
     return {
       ...normalizeSourceMeta(command, data, normalizedTiming),
       type: 'guard',
-      uid: Number(data.uid || 0),
-      user: String(data.username || data.uname || data.user_show_info?.uname || ''),
+      uid,
+      user,
       giftName: String(data.gift_name || data.role_name || guardName(data.guard_level)),
       count,
       guardLevel: Number(data.guard_level || 0),
       unitPrice,
       totalPrice: unitPrice * count,
       price: unitPrice,
-      ...(avatarUrl ? { avatarUrl } : {})
+      ...(avatarUrl || normalizeAvatarUrl(identity.face) ? { avatarUrl: avatarUrl || normalizeAvatarUrl(identity.face) } : {})
     };
   }
 
@@ -611,6 +620,7 @@ function prepareAssEvents(events, options = {}) {
   const hasEnd = Number.isFinite(endTime);
   return [...events]
     .filter((event) => {
+      if (isEmptyGuardToast(event)) return false;
       if (overlayMode === 'danmaku' && event.type !== 'danmaku') {
         return false;
       }
@@ -698,6 +708,7 @@ function resolveAssRenderContext(events, options = {}) {
 }
 
 function createAss(events, options = {}) {
+  if (options.renderEmojiImages) events = events.map(event => maskEmojiText(event, event._emojiAssets || options.emojiAssets));
   const { overlayMode, danmakuArea, style, sorted } = resolveAssRenderContext(events, options);
   const lines = [
     '[Script Info]',
@@ -1413,9 +1424,13 @@ function getSideInteractionCardMetrics(style, event = {}) {
   const metaFontSize = Math.max(12, Math.floor(fontSize * 0.66));
   const contentX = padding + avatarSize + avatarGap;
   const priceReserve = Math.max(fontSize * 3.8, 78);
+  const bodyWidth = Math.max(1, width - contentX - padding);
+  const detailLines = event.type === 'superchat' ? wrapTextToWidthLines(event.text, bodyWidth, metaFontSize / 1.22, 64) : null;
+  const bodyHeight = detailLines ? fontSize + detailLines.length * metaFontSize * 1.13 + padding * 2 : 0;
   return {
+    detailLines,
     width,
-    height: avatarSize + padding * 2,
+    height: Math.max(avatarSize + padding * 2, bodyHeight),
     radius: getCardRadius(style, fontSize, width, avatarSize + padding * 2),
     padding,
     avatarSize,
@@ -1435,9 +1450,15 @@ function getMinimalSideInteractionMetrics(style, event = {}) {
   const gap = Math.max(5, Math.round(fontSize * 0.35));
   const paddingY = Math.max(4, Math.round(fontSize * 0.32));
   const priceReserve = Math.max(60, fontSize * 4);
+  const bodyX = dotSize + gap * 2;
+  const bodyWidth = Math.max(1, width - bodyX - gap);
+  const multiline = event.type === 'superchat' && (String(event.text || '').includes('\n') || estimateTextWidth(event.text, fontSize / 1.22) > Math.max(1, bodyWidth - priceReserve - estimateTextWidth(event.user || '观众', fontSize)));
+  const detailLines = multiline ? wrapTextToWidthLines(event.text, bodyWidth, fontSize / 1.22, 64) : null;
   return {
+    detailLines,
+    bodyX,
     width,
-    height: Math.max(dotSize, fontSize) + paddingY * 2,
+    height: Math.max(dotSize, fontSize) + paddingY * 2 + (detailLines ? detailLines.length * fontSize * 1.13 : 0),
     radius: 3,
     dotSize,
     gap,
@@ -1745,7 +1766,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
   const price = sideInteractionPrice(event);
   const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
   const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
-  const detail = truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
+  const detail = metrics.detailLines ? metrics.detailLines.join('\\N') : truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
   const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
   const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
   const priceWidth = price ? Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2) : 0;
@@ -1852,8 +1873,10 @@ function renderMinimalSideInteractionCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap * 2, metrics.paddingY)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c&H00FFFFFF&\\b1}${assEscape(username)}{\\b0} · ${assEscape(detail)}`
+      )}\\1c&H00FFFFFF&\\b1}${assEscape(username)}{\\b0}${metrics.detailLines ? '' : ' · ' + assEscape(detail)}`
     ),
+    ...(metrics.detailLines ? [dialogue(8, segment.start, segment.end, 'BoxText',
+      `{${textTag}${segmentPositionTag(segment, metrics.bodyX, metrics.paddingY + metrics.fontSize)}\\fs${assNumber(metrics.fontSize)}\\1c&H00FFFFFF&\\b0}${assEscape(metrics.detailLines.join('\\N'))}`)] : []),
     ...(price
       ? [
           drawRoundedRect(
@@ -2044,7 +2067,7 @@ function renderGiftCardSegment(event, style, segment, clip) {
   ];
 }
 
-function getMessageCardMetrics(style, text, maxLines = MESSAGE_CARD.maxBodyLines) {
+function getMessageCardMetrics(style, text, maxLines = 64) {
   const fontSize = Math.max(12, Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize);
   const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
   const radius = getCardRadius(style, fontSize, width, fontSize * 2.5);
@@ -2461,13 +2484,15 @@ function chooseLaneWithoutOverlap(lanes, start, duration) {
 }
 
 function estimateTextWidth(text, fontSize) {
-  const length = Array.from(String(text || '')).reduce((sum, char) => {
+  const length = graphemes(text).reduce((sum, char) => {
     return sum + glyphWidthFactor(char);
   }, 0);
   return Math.ceil(length * fontSize);
 }
 
 function glyphWidthFactor(char) {
+  if (char === '\u3000') return 1;
+  if (char.length > 1 && /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(char)) return 1;
   const codePoint = String(char || '').codePointAt(0) || 0;
   if (
     (codePoint >= 0x0300 && codePoint <= 0x036f) ||
@@ -2496,7 +2521,7 @@ function glyphWidthFactor(char) {
 }
 
 function truncateText(text, max) {
-  const chars = Array.from(String(text || ''));
+  const chars = graphemes(text);
   if (chars.length <= max) {
     return text || '';
   }
@@ -2509,7 +2534,7 @@ function truncateTextToWidth(text, maxWidth, fontSize) {
   if (estimateTextWidth(original, fontSize) <= safeWidth) {
     return original;
   }
-  const chars = Array.from(original.replace(/…+$/u, ''));
+  const chars = graphemes(original.replace(/…+$/u, ''));
   let output = '';
   for (const char of chars) {
     const next = `${output}${char}`;
@@ -2522,7 +2547,7 @@ function truncateTextToWidth(text, maxWidth, fontSize) {
 }
 
 function wrapText(text, maxCharsPerLine, maxLines) {
-  const chars = Array.from(String(text || ''));
+  const chars = graphemes(text);
   const lines = [];
   for (let index = 0; index < chars.length && lines.length < maxLines; index += maxCharsPerLine) {
     lines.push(chars.slice(index, index + maxCharsPerLine).join(''));
@@ -2540,7 +2565,7 @@ function wrapTextToWidth(text, maxWidth, fontSize, maxLines) {
 }
 
 function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
-  const chars = Array.from(String(text || ''));
+  const chars = graphemes(text);
   const safeWidth = Math.max(20, Number(maxWidth) || 20);
   const safeMaxLines = Math.max(1, Math.floor(Number(maxLines) || 1));
   const lines = [];
@@ -2549,7 +2574,7 @@ function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
   let index = 0;
   for (; index < chars.length; index += 1) {
     const char = chars[index];
-    if (char === '\n' || char === '\r') {
+    if (char === '\n' || char === '\r' || char === '\r\n') {
       if (char === '\r' && chars[index + 1] === '\n') {
         index += 1;
       }
@@ -2642,6 +2667,7 @@ module.exports = {
   chooseLane,
   chooseLaneWithoutOverlap,
   estimateTextWidth,
+  glyphWidthFactor,
   truncateText,
   truncateTextToWidth,
   wrapText,

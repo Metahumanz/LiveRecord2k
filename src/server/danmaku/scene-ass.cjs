@@ -218,6 +218,11 @@ function compileSceneToAss(graph, options) {
         lines.push(renderText(object, segment));
         continue;
       }
+      if (object.type === 'Image') {
+        degradation.add('emoji-raster');
+        lines.push(renderText({ ...object, props: { text: object.props.alt || '表情', fontSize: object.frame.height } }, segment));
+        continue;
+      }
       if (object.type === 'Avatar') {
         if (object.props && object.props.assetId) degradation.add('avatar-raster');
         lines.push(renderShape(object, segment, ellipsePath(object.frame.width, object.frame.height), degradation));

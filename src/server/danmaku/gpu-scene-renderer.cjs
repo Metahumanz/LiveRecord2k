@@ -140,7 +140,7 @@ function parseGpuSceneRendererProbe(value, expectedBackend = '') {
     return { ok: false, reason: `GPU Scene helper 后端不匹配：期望 ${expectedBackend}，实际 ${backend}。` };
   }
   const capabilities = new Set(Array.isArray(probe.capabilities) ? probe.capabilities.map(String) : []);
-  const required = ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale'];
+  const required = ['Text', 'Image', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale'];
   const missing = required.filter((capability) => !capabilities.has(capability));
   if (missing.length) return { ok: false, reason: 'GPU Scene helper 缺少能力：' + missing.join('、') + '。' };
   return {

@@ -4,9 +4,9 @@
 // a complete, current visual run. A helper's advertised primitives are not
 // evidence that its pixels, alpha or timeline are compatible.
 
-// v3 also restores MP4 edit-list running time before NVDEC. Older reports
-// cannot admit the new media clock without a fresh fixture run.
-const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v3';
+// v4 adds wrapped superchat bodies and emoji image primitives. Older reports
+// cannot authorize a renderer/layout that has not passed the new fixtures.
+const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v4';
 const CUDA_SCENE_CONFORMANCE_PRESETS = ['h5-card', 'bubble', 'minimal'];
 const CUDA_SCENE_CONFORMANCE_LEADS = [0, 1.019];
 const CUDA_SCENE_CONFORMANCE_COVERAGE = [

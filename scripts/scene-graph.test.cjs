@@ -76,7 +76,7 @@ function run(command, args) {
 
 test('Scene Graph is the canonical layout for Web, ASS, CUDA and Jetson targets', async () => {
   const events = [
-    { type: 'danmaku', time: 0.5, uid: 11, user: '滚动用户', text: '滚动弹幕', color: 0xffffff },
+    { type: 'danmaku', time: 0.5, uid: 11, user: '滚动用户', text: '滚动弹幕😀', color: 0xffffff },
     { type: 'superchat', time: 1, uid: 12, user: '醒目留言', text: 'Scene Graph 统一排版', price: 30, avatarUrl: 'https://example.invalid/a.png' },
     { type: 'gift', time: 2, uid: 13, user: '礼物用户', giftName: '小心心', count: 2, price: 0.1, avatarUrl: 'https://example.invalid/b.png' }
   ];

@@ -43,7 +43,7 @@ except Exception as error:  # pragma: no cover - executed on the Jetson only
     sys.exit(2)
 
 PROTOCOL = 'bili-record2k.gpu-scene-render/v1'
-CAPABILITIES = ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale']
+CAPABILITIES = ['Text', 'Image', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale']
 REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoconvert', 'nvvidconv', 'nvv4l2h264enc', 'nvv4l2h265enc']
 # nvivafilter is Jetson's supported CUDA callback bridge for NVMM allocated by
 # nvvidconv.  Do not insert the direct V4l2Memory-only test element here.
@@ -294,6 +294,12 @@ def rasterize_texture(entry):
             top = draw.multiline_textbbox((0, 0), text, font=font, spacing=0)[1]
             draw.multiline_text((0, -top), text, font=font,
                                 fill=rgba(style.get('fill'), 1), stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
+    elif kind == 'Image':
+        source = str((entry.get('asset') or {}).get('path') or '')
+        # Static bitmap texture: preserve transparency and the whole image.
+        with Image.open(source) as bitmap:
+            bitmap.seek(0)
+            image = bitmap.convert('RGBA').resize((width, height), Image.Resampling.LANCZOS)
     elif kind == 'Avatar':
         vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
         drawings = props.get('assDrawings') if isinstance(props.get('assDrawings'), list) else None
@@ -481,7 +487,16 @@ def prepare_cuda_timeline(request, work_dir):
             clip = style.get('clip') if isinstance(style.get('clip'), dict) else {}
             clip_width = number(clip.get('width'), -1)
             clip_height = number(clip.get('height'), -1)
-            rows.append([left + timeline_offset, right + timeline_offset, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
+            row_start, row_end = left + timeline_offset, right + timeline_offset
+            if entry.get('_legacyAssMetrics'):
+                # The compatibility oracle's assTime() floors to centiseconds.
+                # A fractional video lead otherwise shifts a moving, wrapped
+                # card by several pixels relative to that same ASS geometry.
+                row_start = math.floor(row_start * 100 + 1e-7) / 100
+                row_end = math.floor(row_end * 100 + 1e-7) / 100
+                if row_end <= row_start:
+                    continue
+            rows.append([row_start, row_end, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
                          final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height,
                          number(clip.get('x'), 0), number(clip.get('y'), 0), clip_width, clip_height])
         report_preparation_progress(entry_index, force=entry_index == len(entries))

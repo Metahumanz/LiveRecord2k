@@ -155,6 +155,11 @@ function SceneNode({
       </div>
     );
   }
+  if (object.type === 'Image') {
+    const asset = assets.get(stringValue(props.assetId));
+    return <img key={object.id} src={asset?.src || asset?.url} alt={stringValue(props.alt)} draggable={false}
+      style={{ ...base, objectFit: 'contain', border: 0 }} />;
+  }
   if (object.type === 'Avatar') {
     const asset = assets.get(stringValue(props.assetId));
     const borderWidth = numberValue(style.borderWidth);
