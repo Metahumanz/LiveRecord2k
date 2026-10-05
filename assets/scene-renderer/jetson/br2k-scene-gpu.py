@@ -719,7 +719,16 @@ def decode_native(args):
     input_path = str(args.input or '')
     if not os.path.isfile(input_path): fail('原生解码输入不存在：' + input_path)
     width, height = int(args.width), int(args.height)
-    fps = max(1.0, number(args.fps, 30))
+    # Node passes rational GStreamer caps (for example 5/1 or 60000/1001).
+    # float() rejected those strings and silently used 30, over-producing
+    # decoded frames and provoking a pipe close at every finite render end.
+    try:
+        fps = float(Fraction(str(args.fps)))
+    except (ValueError, ZeroDivisionError):
+        fail('原生 NVDEC 缺少有效帧率：' + str(args.fps))
+    if not math.isfinite(fps) or fps <= 0:
+        fail('原生 NVDEC 缺少有效帧率：' + str(args.fps))
+    fps = max(1.0, fps)
     start = max(0.0, number(args.start, 0))
     duration = max(0.001, number(args.duration, 0))
     parser_factory = 'h265parse' if str(args.codec).lower() == 'hevc' else 'h264parse'
@@ -919,10 +928,10 @@ def render_native_nvmm(request):
                 # Re-basing it after the black source would add that gap a
                 # second time and final mux would trim the lead away.
                 'concat name=timeline_lead adjust-base=false ! queue ! %s '
-                'videotestsrc name=black-lead pattern=black num-buffers=%d ! '
+                'videotestsrc name=black-lead pattern=black num-buffers=%d timestamp-offset=%d ! '
                 'video/x-raw,format=I420,width=%d,height=%d,framerate=%s ! nvvidconv ! %s ! queue ! timeline_lead. '
                 '%s ! queue ! timeline_lead.'
-            ) % (encoder_branch, leading_video_frames, width, height, fps_caps(fps), caps, source_branch)
+            ) % (encoder_branch, leading_video_frames, int(start * Gst.SECOND), width, height, fps_caps(fps), caps, source_branch)
         else:
             launch = source_branch + ' ! ' + encoder_branch
         native_nvmm_trace('pipeline=' + launch)
@@ -988,7 +997,12 @@ def render_native_nvmm(request):
         # probes. Admit the very first buffer of the new seek segment even
         # if it arrives before the synchronous seek call returns.
         startup_pad = decoder.get_static_pad('src')
-        needs_segment_seek = start > 0.0001
+        # A clip beginning inside the MP4 empty edit has no source pictures
+        # to seek past. Seeking here flushes concat's already-running black
+        # branch; its zero-based buffers also preceded the requested clock
+        # and reached CUDA as negative drawing times. Decode from the start
+        # while the finite black branch fills the requested leading interval.
+        needs_segment_seek = start > 0.0001 and not leading_video_frames
         # Some Jetson encoder MP4s mark non-IDR I pictures as sync samples.
         # Seeking to the nearest such picture leaves NVDEC without reference
         # state until the next IDR. Decode a bounded preroll in NVMM, then
@@ -1011,7 +1025,7 @@ def render_native_nvmm(request):
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
-        scene_first_pts = {'value': int(start * Gst.SECOND) if needs_segment_seek else None}
+        scene_first_pts = {'value': int(start * Gst.SECOND) if start > 0.0001 else None}
         # Audit CUDA output against the ordered NVDEC frame sequence. JetPack
         # keeps the actual timestamp in NVMM metadata through nvivafilter and
         # NVENC; assigning a replacement Gst.Buffer.pts at the Scene pad does
@@ -1261,7 +1275,7 @@ def render_native_nvmm(request):
             clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
             clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
             clock_library.br2k_scene_enable_pts_clock()
-        drawing_clock = {'first': int(start * Gst.SECOND) if needs_segment_seek else None}
+        drawing_clock = {'first': int(start * Gst.SECOND) if start > 0.0001 else None}
         def supply_drawing_time(_pad, info):
             buffer = info.get_buffer()
             if not buffer:

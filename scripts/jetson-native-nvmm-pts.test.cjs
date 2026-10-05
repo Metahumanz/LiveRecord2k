@@ -183,6 +183,46 @@ test('native MP4 edit-list gap preserves the original picture time and finite EO
   }
 });
 
+test('low-rate HEVC clips starting inside an empty edit preserve black lead and Chinese glyph timing', async t => {
+  if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('需要 Orin NVDEC/CUDA/NVENC 实机');
+  const helper = process.env.BR2K_JETSON_NVMM_HELPER || '/usr/lib/bili-record-2k/bin/br2k-scene-gpu';
+  const ffmpeg = process.env.BR2K_JETSON_NVMM_FFMPEG || '/usr/lib/bili-record-2k/bin/ffmpeg-full';
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-low-rate-edit-'));
+  try {
+    const raw = path.join(directory, 'raw.mp4'), source = path.join(directory, 'source.mp4');
+    await run('gst-launch-1.0', ['-q', 'videotestsrc', 'pattern=white', 'num-buffers=30', '!',
+      `video/x-raw,format=I420,width=${WIDTH},height=${HEIGHT},framerate=5/1`, '!', 'nvvidconv', '!',
+      'video/x-raw(memory:NVMM),format=NV12', '!', 'nvv4l2h265enc', '!', 'h265parse', '!', 'mp4mux', '!',
+      'filesink', `location=${raw}`]);
+    await run(ffmpeg, ['-v', 'error', '-y', '-copyts', '-itsoffset', '1.991', '-i', raw, '-c:v', 'copy', '-an', source]);
+    for (const start of [0.5, 1]) {
+      const output = path.join(directory, `clip-${start}.mkv`), request = path.join(directory, 'request.json');
+      await fs.writeFile(request, JSON.stringify({
+        protocol: 'bili-record2k.gpu-scene-render/v1', backend: 'cuda-gstreamer',
+        input: { path: source, codec: 'hevc', sourceFrameRate: '5/1', startTime: start, duration: 3 },
+        output: { path: output, container: 'mkv', codec: 'hevc_nvv4l2', width: WIDTH, height: HEIGHT, fps: 4.99, bitrate: 1000000 },
+        scene: { canvas: { width: WIDTH, height: HEIGHT, fps: 5 }, duration: 3, objects: [{
+          id: 'text-in-empty-edit', type: 'Text', start: 0.2, end: 0.6,
+          frame: { x: 10, y: 10, width: 300, height: 60 },
+          props: { text: '黑帧时间验收', fontSize: 28, fontFamily: 'Noto Sans CJK SC' }, style: { fill: '#ffffff' }
+        }] }
+      }));
+      const result = await run(helper, ['--native-scene-request', request]);
+      const metrics = JSON.parse(result.stdout.split(/\r?\n/).find(line => line.includes('"nativeNvmmMetrics"'))).nativeNvmmMetrics;
+      assert.equal(metrics.ptsBridge.ok, true);
+      assert.equal(metrics.seekPrerollSec, 0);
+      assert.ok(metrics.ptsBridge.leadingFrames > 0);
+      const frame = await run(ffmpeg, ['-v', 'error', '-i', output, '-ss', '0.4', '-frames:v', '1', '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1']);
+      assert.equal(frame.stdoutBuffer.length, WIDTH * HEIGHT * 3);
+      let white = 0;
+      for (let i = 0; i < frame.stdoutBuffer.length; i += 3) if (Math.min(...frame.stdoutBuffer.subarray(i, i + 3)) > 180) white++;
+      assert.ok(white > 20 && white < WIDTH * HEIGHT / 3, `黑帧中的中文必须在所选剪辑时钟显示，实际白色像素=${white}`);
+      assert.ok(await rgbMean(ffmpeg, output, 0.8) < 12, '文字结束后仍处于空编辑的画面应恢复黑色');
+      assert.doesNotMatch(result.stderr, /invalid or overflowing|before segment event/);
+    }
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
 test('native NVMM CUDA Scene materializes a black lead and keeps muxed A/V at PTS zero', async (t) => {
   if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('仅在 AGX Orin 上显式执行 NVMM 前导 PTS 回归');
   const helper = process.env.BR2K_JETSON_NVMM_HELPER || '/usr/lib/bili-record-2k/bin/br2k-scene-gpu';
