@@ -1,0 +1,85 @@
+{
+  "checkedAt": "2026-10-04T11:38:39.612263+08:00",
+  "outputPath": "/mnt/zzzz/哔哩录播2K/883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4",
+  "outputInfo": {
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "hevc",
+        "codec_type": "video",
+        "width": 3840,
+        "height": 2160,
+        "r_frame_rate": "60/1",
+        "avg_frame_rate": "410749000/6872941",
+        "start_time": "0.021000",
+        "duration": "13745.882000"
+      },
+      {
+        "codec_name": "aac",
+        "codec_type": "audio",
+        "r_frame_rate": "0/0",
+        "avg_frame_rate": "0/0",
+        "start_time": "0.000000",
+        "duration": "13745.890333"
+      }
+    ],
+    "format": {
+      "duration": "13745.903000",
+      "size": "25711251293"
+    }
+  },
+  "presentationEnds": {
+    "1": 13745.890333000001,
+    "0": 13745.903625
+  },
+  "success": [
+    {
+      "id": "1791074321981-7ff1fb052b95c",
+      "time": 1791074321981,
+      "level": "success",
+      "message": "Scene Graph 片段已导出：/mnt/zzzz/哔哩录播2K/883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4"
+    }
+  ],
+  "problems": [],
+  "sourceExists": true,
+  "danmakuExists": true,
+  "activeExport": null,
+  "activeQueue": [],
+  "activeJobs": [],
+  "segmentReports": [
+    "Jetson Scene Graph 烧录真实源预检通过：10.00s，84.2fps，PTS bridge通过；正式导出使用分段NVMM链路。",
+    "Jetson Scene Graph 烧录 分段 1：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 1：原生 NVMM 已生成 1 帧黑帧前导。",
+    "Jetson Scene Graph 烧录 分段 1 性能：decode 110.27fps / scene 110.24fps / encode 110.24fps / total 110.24fps",
+    "Jetson Scene Graph 烧录 分段 1：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 1 PTS 映射：source→Scene 104924 帧（最大 0.000ms），Scene→编码 104925 帧（最大 0.000ms），source→编码 104924 帧（最大 0.000ms）；封装诊断 1800.001s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 2：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 2 性能：decode 102.39fps / scene 102.39fps / encode 102.39fps / total 102.39fps",
+    "Jetson Scene Graph 烧录 分段 2：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 2 PTS 映射：source→Scene 107936 帧（最大 0.000ms），Scene→编码 107936 帧（最大 0.000ms），source→编码 107936 帧（最大 0.000ms）；封装诊断 1800.008s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 3：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 3 性能：decode 100.59fps / scene 100.59fps / encode 100.59fps / total 100.59fps",
+    "Jetson Scene Graph 烧录 分段 3：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 3 PTS 映射：source→Scene 108000 帧（最大 0.000ms），Scene→编码 108000 帧（最大 0.000ms），source→编码 108000 帧（最大 0.000ms）；封装诊断 1800.000s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 4：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 4 性能：decode 101.49fps / scene 101.49fps / encode 101.49fps / total 101.49fps",
+    "Jetson Scene Graph 烧录 分段 4：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 4 PTS 映射：source→Scene 108001 帧（最大 0.000ms），Scene→编码 108001 帧（最大 0.000ms），source→编码 108001 帧（最大 0.000ms）；封装诊断 1800.005s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 5：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 5 性能：decode 94.44fps / scene 94.44fps / encode 94.44fps / total 94.44fps",
+    "Jetson Scene Graph 烧录 分段 5：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 5 PTS 映射：source→Scene 108002 帧（最大 0.000ms），Scene→编码 108002 帧（最大 0.000ms），source→编码 108002 帧（最大 0.000ms）；封装诊断 1800.011s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 6：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 6 性能：decode 101.87fps / scene 101.84fps / encode 101.84fps / total 101.84fps",
+    "Jetson Scene Graph 烧录 分段 6：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 6 PTS 映射：source→Scene 108000 帧（最大 0.000ms），Scene→编码 108000 帧（最大 0.000ms），source→编码 108000 帧（最大 0.000ms）；封装诊断 1800.002s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 7：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 7 性能：decode 101.29fps / scene 101.26fps / encode 101.26fps / total 101.26fps",
+    "Jetson Scene Graph 烧录 分段 7：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 7 PTS 映射：source→Scene 107881 帧（最大 0.000ms），Scene→编码 107881 帧（最大 0.000ms），source→编码 107881 帧（最大 0.000ms）；封装诊断 1799.999s / 1800.000s。",
+    "Jetson Scene Graph 烧录 分段 8：将在子进程实际启动后报告 CUDA Scene 运行链路。",
+    "Jetson Scene Graph 烧录 分段 8 性能：decode 100.94fps / scene 100.94fps / encode 100.94fps / total 100.94fps",
+    "Jetson Scene Graph 烧录 分段 8：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。",
+    "Jetson Scene Graph 烧录 分段 8 PTS 映射：source→Scene 68753 帧（最大 0.000ms），Scene→编码 68753 帧（最大 0.000ms），source→编码 68753 帧（最大 0.000ms）；封装诊断 1145.882s / 1145.890s。"
+  ]
+}
