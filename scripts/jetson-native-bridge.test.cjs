@@ -55,6 +55,54 @@ test('Jetson native bridge tolerates decoder teardown after real frames', async 
   assert.equal(final.sceneFrames, 1);
 });
 
+test('finite native rendering drains the encoder after closing decoder stdin', { timeout: 10000 }, async () => {
+  const directory = await fs.promises.mkdtemp(path.join(require('node:os').tmpdir(), 'br2k-bridge-drain-'));
+  const marker = path.join(directory, 'encoder-flushed');
+  try {
+    await runJetsonNativeDecodeSceneEncodeJob({
+      decoderPath: node,
+      decoderArgs: ['-e', "const fs=require('fs'); const b=Buffer.alloc(65536); for(let i=0;i<4096;i++)fs.writeSync(3,b);"],
+      ffmpegPath: node,
+      ffmpegArgs: ['-e', "process.stdin.once('data',()=>process.stdout.end(Buffer.from('1234'),()=>process.exit(0)));"],
+      gstreamerPath: node,
+      encoderArgs: ['-e', "let n=0;process.stdin.on('data',b=>n+=b.length);process.stdin.on('end',()=>setTimeout(()=>{require('fs').writeFileSync(process.argv[1],String(n));process.exit(0)},150));", marker],
+      frameSize: 4,
+      timeoutMs: 5000
+    });
+    assert.equal(await fs.promises.readFile(marker, 'utf8'), '4', '编码器必须收到全部已渲染帧并完成封装收尾');
+  } finally { await fs.promises.rm(directory, { recursive: true, force: true }); }
+});
+
+test('native bridge reports the original renderer failure rather than killed encoder noise', { timeout: 10000 }, async () => {
+  await assert.rejects(runJetsonNativeDecodeSceneEncodeJob({
+    decoderPath: node, decoderArgs: ['-e', "require('fs').writeSync(3,Buffer.alloc(65536));setInterval(()=>{},1000);"],
+    ffmpegPath: node, ffmpegArgs: ['-e', "process.stdin.once('data',()=>process.stdout.write('1234',()=>setTimeout(()=>{process.stderr.write('actual renderer error');process.exit(23)},100)));"],
+    gstreamerPath: node, encoderArgs: ['-e', "process.stderr.write('unrelated Argus warning');process.stdin.resume();setInterval(()=>{},1000);"],
+    frameSize: 4, timeoutMs: 5000
+  }), error => {
+    assert.equal(error.primaryProcess, 'ffmpeg');
+    assert.equal(error.exitCode, 23);
+    assert.match(error.message, /actual renderer error/);
+    return true;
+  });
+});
+
+test('native bridge keeps encoder drain cancellable after the renderer exits', { timeout: 10000 }, async () => {
+  let activeHandles = 0;
+  await assert.rejects(runJetsonNativeDecodeSceneEncodeJob({
+    decoderPath: node, decoderArgs: ['-e', "require('fs').writeSync(3,Buffer.alloc(65536));setInterval(()=>{},1000);"],
+    ffmpegPath: node, ffmpegArgs: ['-e', "process.stdin.once('data',()=>process.stdout.end('1234',()=>process.exit(0)));"],
+    gstreamerPath: node, encoderArgs: ['-e', "process.stdin.resume();setInterval(()=>{},1000);"],
+    frameSize: 4, timeoutMs: 5000,
+    onChild: child => { if (child && ++activeHandles === 2) child.kill('SIGKILL'); }
+  }), error => {
+    assert.equal(activeHandles, 2, '渲染结束后必须把取消句柄移交给仍在封装的编码器');
+    assert.equal(error.primaryProcess, 'gstreamer');
+    assert.ok(error.signal);
+    return true;
+  });
+});
+
 test('Jetson export contract validates the intermediate MKV and retries empty native decode', () => {
   const serviceSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'app', 'service.cjs'), 'utf8');
   assert.match(serviceSource, /BR2K_JETSON_NATIVE_DECODE_EMPTY/);
