@@ -1590,6 +1590,8 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     let stalledError = null;
     let lastProgressValue = Number.NEGATIVE_INFINITY;
     let lastProgressAt = Date.now();
+    let finalizingAt = 0;
+    const finalizationTimeoutMs = Math.max(progressStallTimeoutMs, Number(options.finalizationTimeoutMs) || 15 * 60_000);
     let stallTimer = null;
 
     const finish = (callback, value) => {
@@ -1602,13 +1604,16 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     const triggerProgressStall = () => {
       if (settled || stalledError || !progressValueFromText || child.exitCode !== null || child.signalCode) return;
       const elapsedMs = Date.now() - lastProgressAt;
-      if (elapsedMs < progressStallTimeoutMs) return;
+      const timeoutMs = finalizingAt ? finalizationTimeoutMs : progressStallTimeoutMs;
+      if (elapsedMs < timeoutMs) return;
       stalledError = new Error(
-        `FFmpeg 已连续 ${Math.ceil(progressStallTimeoutMs / 1000)} 秒没有输出媒体进度，已终止该处理进程。`
+        finalizingAt
+          ? `FFmpeg MP4 索引前置超过 ${Math.ceil(timeoutMs / 1000)} 秒，已终止该处理进程。`
+          : `FFmpeg 已连续 ${Math.ceil(timeoutMs / 1000)} 秒没有输出媒体进度，已终止该处理进程。`
       );
-      stalledError.code = 'FFMPEG_NO_PROGRESS';
+      stalledError.code = finalizingAt ? 'FFMPEG_FINALIZATION_TIMEOUT' : 'FFMPEG_NO_PROGRESS';
       stalledError.ffmpegNoProgress = true;
-      stalledError.ffmpegStallTimeoutMs = progressStallTimeoutMs;
+      stalledError.ffmpegStallTimeoutMs = timeoutMs;
       stalledError.ffmpegLastProgressValue = Number.isFinite(lastProgressValue) ? lastProgressValue : null;
       stalledError.ffmpegStderr = compactLogLine(stderr);
       try {
@@ -1626,6 +1631,11 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString('utf8');
       stderr = `${stderr}${text}`.slice(-8000);
+      if (!finalizingAt && /Starting second pass:\s*moving the moov atom/i.test(stderr)) {
+        finalizingAt = Date.now();
+        lastProgressAt = finalizingAt;
+        options.onFinalizationStart?.();
+      }
       if (progressValueFromText) {
         try {
           const progressValue = Number(progressValueFromText(text));
@@ -2117,6 +2127,11 @@ async function probeMediaFileInfo(ffmpegPath, filePath, options = {}) {
           avgFrameRate: String(exactVideo?.avg_frame_rate || ''),
           rFrameRate: String(exactVideo?.r_frame_rate || videoInfo.rFrameRate || ''),
           timeBase: String(exactVideo?.time_base || ''),
+          sampleAspectRatio: String(exactVideo?.sample_aspect_ratio || ''),
+          colorRange: String(exactVideo?.color_range || ''),
+          colorSpace: exactVideo?.color_space && exactVideo.color_space !== 'unknown' ? exactVideo.color_space : videoInfo.colorSpace,
+          colorPrimaries: exactVideo?.color_primaries && exactVideo.color_primaries !== 'unknown' ? exactVideo.color_primaries : videoInfo.colorPrimaries,
+          colorTransfer: exactVideo?.color_transfer && exactVideo.color_transfer !== 'unknown' ? exactVideo.color_transfer : videoInfo.colorTransfer,
           startTime: Number.isFinite(Number(exactVideo?.start_time)) ? Number(exactVideo.start_time) : undefined,
           fps: parseFrameRate(exactVideo?.avg_frame_rate) || parseFrameRate(exactVideo?.r_frame_rate) || videoInfo.fps
         }
@@ -2160,7 +2175,7 @@ async function probeExactStreamTiming(ffmpegPath, filePath, options = {}) {
   if (!ffprobe) return null;
   const result = await runCapturedProcess(
     ffprobe,
-    ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time', '-of', 'json', filePath],
+    ['-v', 'error', '-show_entries', 'stream=index,codec_type,avg_frame_rate,r_frame_rate,time_base,start_time,sample_aspect_ratio,color_range,color_space,color_primaries,color_transfer', '-of', 'json', filePath],
     { timeoutMs: Math.max(5_000, Number(options.timeoutMs || 8_000)), maxOutputBytes: 128 * 1024, onChild: options.onChild }
   );
   if (result.status !== 0 || result.timedOut || result.error) return null;

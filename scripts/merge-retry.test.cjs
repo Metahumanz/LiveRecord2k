@@ -86,6 +86,45 @@ test('deterministic A/V timeline failure does not re-encode the whole group agai
   assert.equal(app.mergeRetryStates.size, 0);
 });
 
+test('automatic cancellation survives restart and explicit retry releases only the selected session', async t => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-auto-cancel-retry-'));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const app = createMergeTestService(), room = { id: '883263', recording: false };
+  app.rooms.set(room.id, room);
+  app.storePath = path.join(directory, 'settings.json'); app.stateStore = new AtomicJsonStore(app.storePath);
+  app.saveStore = LiveRecordService.prototype.saveStore;
+  const files = [0, 1].map(i => path.join(directory, `segment${i}.clean.mp4`));
+  await Promise.all(files.map(file => fsp.writeFile(file, 'source')));
+  app.recordings = files.map((cleanPath, index) => ({ cleanPath, roomId: room.id, valid: true,
+    mergeGroup: 'cancelled-session', mergeSequence: index + 1, startedAt: index + 1,
+    mergeOutputPath: path.join(directory, 'merged.mp4'), durationSec: 10, segmentTargetDurationSec: 600 }));
+  room.mergeProgress = { kind: 'merge', id: 'auto-job', status: 'retrying', mergeGroup: 'cancelled-session' };
+  await app.cancelMerge(room.id, 'auto-job');
+  const restarted = createMergeTestService(); restarted.storePath = app.storePath; restarted.stateStore = new AtomicJsonStore(app.storePath);
+  await restarted.loadStore();
+  assert.equal(restarted.getRoom(room.id).mergeProgress.status, 'cancelled');
+  assert.equal(await restarted.getPendingMergeGroupForRoom(restarted.getRoom(room.id)), null);
+  const otherKey = restarted.getMergeRetryKey(room.id, 'another-session'); restarted.mergeCancelRequests.add(otherKey);
+  let retriedGroup;
+  restarted.finalizeReconnectGroup = async (_room, group) => { retriedGroup = group; };
+  await restarted.retryMerge(room.id, 'cancelled-session');
+  assert.equal(retriedGroup, 'cancelled-session');
+  assert.equal(restarted.mergeCancelRequests.has(restarted.getMergeRetryKey(room.id, 'cancelled-session')), false);
+  assert.equal(restarted.mergeCancelRequests.has(otherKey), true);
+  assert.equal(restarted.getRoom(room.id).cancelledMergeProgress, undefined);
+});
+
+test('disk space failures retain their reason and do not repeatedly retry an unchanged merge', () => {
+  for (const code of ['BR2K_DISK_SPACE_INSUFFICIENT', 'ENOSPC']) {
+    const app = createMergeTestService();
+    const room = { id: '883263', mergeProgress: { kind: 'merge', mergeGroup: 'session', status: 'error', message: '空间不足，源分段保留' } };
+    const error = Object.assign(new Error('空间不足'), { code });
+    assert.equal(app.scheduleMergeRetry(room, 'session', {}, error), false);
+    assert.equal(app.mergeRetryStates.size, 0);
+    assert.equal(room.mergeProgress.message, '空间不足，源分段保留');
+  }
+});
+
 test('a retry in another group displays its own output path rather than the previous completed merge', () => {
   const app = createMergeTestService(); const room = { id: '883263', mergeProgress: {
     kind: 'merge', status: 'completed', mergeGroup: 'first-session', outputPath: 'first.merged.mp4' } };
@@ -175,7 +214,7 @@ test('Jetson merge rejects a mux that would overwrite its video input before lau
   assert.throws(() => createNormalizeEncodedVideoMuxArgs({ encodedVideoPath: 'same.mkv', outputPath: './same.mkv' }), /同一路径/);
 });
 
-test('Jetson cross-resolution merge uses separate video and mux files on a local workspace', async t => {
+for (const destinationStaging of [false, true]) test(`Jetson cross-resolution merge uses separate video and mux files on ${destinationStaging ? 'the output disk when local space is insufficient' : 'a local workspace'}`, async t => {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-jetson-mux-'));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   const app = createMergeTestService();
@@ -185,6 +224,16 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
   app.rooms.set(room.id, room);
   app.getMergeEncoderPlan = () => ({ preferred: 'h264_nvv4l2', fallback: '', software: '' });
   app.getLinuxRecordingRootMount = async () => ({ fsType: 'cifs', mountPoint: dir });
+  if (destinationStaging) {
+    const originalStat = fsp.stat.bind(fsp);
+    t.mock.method(fsp, 'statfs', async name => ({ bavail: (String(name).startsWith(dir) ? 100 : 2) * 1024 ** 3 / 4096,
+      bsize: 4096, blocks: 100 * 1024 ** 3 / 4096 }));
+    t.mock.method(fsp, 'stat', async name => {
+      const result = await originalStat(name);
+      result.dev = String(name).startsWith(dir) ? 2 : 1;
+      return result;
+    });
+  }
   const progressSamples = [];
   app.markRoomDirty = () => { if (room.mergeProgress) progressSamples.push({ ...room.mergeProgress }); };
   const originals = [];
@@ -197,13 +246,16 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
     app.recordings.push({ cleanPath, roomId: room.id, startedAt: i + 1, durationSec: 1, valid: true });
   }
   let attempts = 0;
+  let mediaWorkspace;
   app.runJetsonGstreamerTranscode = async options => {
     attempts++;
     const mux = options.createMuxArgs();
     const source = mux[mux.indexOf('-i', mux.indexOf('-i') + 1) + 1];
     assert.notEqual(path.resolve(options.encodedVideoPath), path.resolve(mux.at(-1)));
     assert.equal(path.basename(options.encodedVideoPath), `${String(attempts).padStart(3, '0')}.video.mkv`);
-    assert.ok(path.dirname(options.encodedVideoPath).includes('br2k-merge-publish-'));
+    mediaWorkspace = path.dirname(path.dirname(options.encodedVideoPath));
+    assert.ok(mediaWorkspace.includes(destinationStaging ? '.br2k-merge-media-' : 'br2k-merge-publish-'));
+    if (destinationStaging) assert.equal(path.dirname(mediaWorkspace), dir);
     const encoded = await runCapturedProcess(ffmpegPath, ['-y', '-i', source, '-an', '-vf', `scale=${options.width}:${options.height}`,
       '-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0', options.encodedVideoPath], { timeoutMs: 20_000 });
     assert.equal(encoded.status, 0, encoded.stderr);
@@ -222,6 +274,7 @@ test('Jetson cross-resolution merge uses separate video and mux files on a local
   assert.ok(progressSamples.some(sample => sample.phase === 'mux' && sample.phaseCurrentTimeSec > 0), 'concat media PTS never reached the progress fields');
   assert.equal((await probeMediaFileInfo(ffmpegPath, result.cleanPath)).videoInfo.width, 640);
   for (const source of originals) assert.ok((await fsp.stat(source)).size);
+  await assert.rejects(fsp.stat(mediaWorkspace), { code: 'ENOENT' });
 });
 
 test('manual selection merges complete segments chronologically and preserves source files and rows', async t => {
@@ -264,6 +317,44 @@ test('manual selection merges complete segments chronologically and preserves so
   const events = (await fsp.readFile(merged.danmakuPath, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(events.length, 2);
   assert.ok(events[1].time > events[0].time);
+});
+
+test('mixed merge transcodes only incompatible segments and validates original-to-encoded boundaries', async t => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-selective-merge-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const app = createMergeTestService(); app.ffmpegPath = ffmpegPath; app.settings.outputDir = dir;
+  app.getMergeEncoderPlan = () => ({ preferred: 'libx264', fallback: '' });
+  const room = { id: '883263', recording: false }; app.rooms.set(room.id, room);
+  const messages = []; app.log = (_level, message) => messages.push(message);
+  let sawReducedEtaHorizon = false;
+  app.markRoomDirty = () => {
+    const progress = room.mergeProgress;
+    if (progress?.phase === 'render' && progress.stageLabel?.includes('规范化') &&
+        progress.phaseDurationSec < progress.durationSec) sawReducedEtaHorizon = true;
+  };
+  for (let i = 0; i < 3; i++) {
+    const cleanPath = path.join(dir, `883263_selective_20261004_00000${i}.clean.mp4`);
+    const generated = await runCapturedProcess(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc2=size=${i === 1 ? '320x180' : '640x360'}:rate=30:duration=1`,
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=1',
+      '-c:v', 'libx264', '-bf', '0', '-c:a', 'aac', '-ac', '2', '-shortest', cleanPath], { timeoutMs: 20000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    const media = await probeMediaFileInfo(ffmpegPath, cleanPath);
+    const timing = await probeMediaTimelineInfo(ffmpegPath, cleanPath, media);
+    app.recordings.push({ cleanPath, roomId: room.id, startedAt: i + 1, durationSec: media.durationSec,
+      valid: true, timelineHealth: { ...timing, avStartDeltaSec: 0, avEndDeltaSec: timing.avDeltaSec } });
+  }
+  const sourcePaths = app.recordings.map(r => r.cleanPath);
+  await app.mergeSelectedRecordings({ cleanPaths: sourcePaths, deleteSources: false });
+  const merged = await [...app.mergeInFlightGroups.values()][0];
+  assert(merged?.cleanPath);
+  assert.equal(messages.filter(m => m.includes('复用源视频及音频')).length, 2, messages.join('\n'));
+  assert(sawReducedEtaHorizon, '规范化 ETA 不应把无需重编码的分段计为渲染工作量');
+  const media = await probeMediaFileInfo(ffmpegPath, merged.cleanPath);
+  const timing = await probeMediaTimelineInfo(ffmpegPath, merged.cleanPath, media);
+  assert(timing.timingSafeForCopy, JSON.stringify(timing));
+  assert.equal(media.videoInfo.width, 640);
+  for (const file of sourcePaths) assert((await fsp.stat(file)).size > 0);
 });
 
 test('manual selection rejects duplicate, cross-room and unfinished inputs', async () => {
@@ -319,6 +410,21 @@ test('merge watchdog terminates an FFmpeg process whose media timestamp stops pr
   );
   assert.equal(notified, true);
   assert.ok(Date.now() - startedAt < 5000);
+});
+
+test('faststart finalization survives the media watchdog but retains a bounded timeout', async () => {
+  let finalized = 0;
+  const run = (tail, finalizationTimeoutMs) => runFfmpegJob(process.execPath, ['-e',
+    "process.stderr.write('time=00:00:10.000\\nStarting second pass: moving the moov'); setTimeout(() => process.stderr.write(' atom to the beginning of the file\\n'), 30); " + tail], () => {}, {
+      progressStallTimeoutMs: 200,
+      finalizationTimeoutMs,
+      progressValueFromText: parseFfmpegProgressTime,
+      onFinalizationStart: () => finalized++
+    });
+  await run('setTimeout(() => process.exit(0), 800)', 1500);
+  await assert.rejects(run('setInterval(() => {}, 100)', 600), error =>
+    error.code === 'FFMPEG_FINALIZATION_TIMEOUT' && error.ffmpegNoProgress && error.ffmpegStallTimeoutMs === 600);
+  assert.equal(finalized, 2);
 });
 
 test('a source PTS boundary offset is advisory when measured A/V duration remains in sync', () => {

@@ -3,7 +3,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const test = require('node:test');
-const { assertDiskSpace, selectSceneMediaWorkspace, atomicReplaceFile } = require('../src/server/recording/media-safety.cjs');
+const { assertDiskSpace, selectSceneMediaWorkspace, selectMergeMediaWorkspace, atomicReplaceFile } = require('../src/server/recording/media-safety.cjs');
 const GiB = 1024 ** 3;
 
 async function volumes(t, localFree = 30 * GiB, remoteFree = 1000 * GiB, sameVolume = false) {
@@ -44,6 +44,31 @@ test('short export retains local intermediates when sufficient space is availabl
   const workspace = await selectSceneMediaWorkspace(output, cache, { mediaPeakBytes: GiB,
     outputBytes: GiB / 2, scratchBytes: GiB, allowDestinationMedia: true });
   assert.deepEqual(workspace, { mediaDirectory: cache, separateMediaDirectory: false });
+});
+
+test('cross-spec merge uses output disk when its 35.77 GiB peak exceeds the local 32.83 GiB', async t => {
+  const { cache, destination, output } = await volumes(t, 32.83 * GiB, 1600 * GiB);
+  const workspace = await selectMergeMediaWorkspace(output, { estimatedBytes: 35.77 * GiB, localDirectory: cache });
+  assert.equal(path.dirname(workspace.mediaDirectory), destination);
+  assert.match(path.basename(workspace.mediaDirectory), /^\.br2k-merge-media-/);
+  assert.match(workspace.localSpaceError, /32.83 GiB.*35.77 GiB.*37.77 GiB/);
+  const temporary = path.join(workspace.mediaDirectory, 'completed.mp4');
+  await fs.writeFile(temporary, 'validated merge');
+  await atomicReplaceFile(temporary, output);
+  assert.equal(await fs.readFile(output, 'utf8'), 'validated merge');
+});
+
+test('merge retains a local publish workspace when both disks have enough space', async t => {
+  const { cache, output } = await volumes(t, 60 * GiB);
+  const workspace = await selectMergeMediaWorkspace(output, { estimatedBytes: 35.77 * GiB, localDirectory: cache });
+  assert.equal(path.dirname(workspace.mediaDirectory), cache);
+  assert.equal(workspace.localSpaceError, '');
+});
+
+test('merge cannot bypass protection by staging on the same or an insufficient output filesystem', async t => {
+  const { cache, output } = await volumes(t, 32.83 * GiB, 36 * GiB);
+  await assert.rejects(selectMergeMediaWorkspace(output, { estimatedBytes: 35.77 * GiB, localDirectory: cache }),
+    { code: 'BR2K_DISK_SPACE_INSUFFICIENT' });
 });
 
 test('moving within the same volume cannot bypass the disk protection', async t => {

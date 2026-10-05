@@ -28,6 +28,15 @@ const LEAD_SECONDS = 1.019;
 const WIDTH = 320;
 const HEIGHT = 180;
 
+test('native seek preserves every picture and Chinese overlay after a non-IDR sync sample', async t => {
+  if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('需要 Orin NVDEC/NVMM/NVENC 实机');
+  const result = await run('/usr/bin/python3', [path.join(__dirname, 'jetson-native-seek-regression.py')]);
+  const report = JSON.parse(result.stdout.trim());
+  assert.equal(report.ok, true);
+  assert.equal(report.nonIdrSyncSample, true);
+  assert.equal(report.reports.length, 3);
+});
+
 test('native Scene drawing follows actual PTS across a two-second source gap', async (t) => {
   if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('需要 Orin 原生 NVDEC/CUDA/NVENC 链路');
   const result = await run('/usr/bin/python3', [path.join(__dirname, 'jetson-scene-pts-gap.py')]);

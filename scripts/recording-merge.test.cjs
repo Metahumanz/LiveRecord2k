@@ -12,6 +12,7 @@ const {
   createAvatarOverlayFilterScript,
   createAvatarOverlayChunkFilterScript,
   createConcatCopyArgs,
+  estimateMp4IndexReserveBytes,
   createNormalizeSegmentArgs,
   createNormalizeRawVideoArgs,
   createConcatTranscodeArgs,
@@ -83,6 +84,20 @@ test('merge memory-pressure detection covers Linux signals and Windows allocatio
   assert.equal(isFfmpegMemoryPressureError({ ffmpegExitCode: -1073741801 }), true);
   assert.equal(isFfmpegMemoryPressureError({ ffmpegStderr: 'Cannot allocate memory while opening encoder' }), true);
   assert.equal(isFfmpegMemoryPressureError({ message: 'Unknown encoder h264_not_real' }), false);
+  assert.equal(isFfmpegMemoryPressureError({ ffmpegSignal: 'SIGKILL', ffmpegNoProgress: true }), false);
+  assert.equal(isFfmpegMemoryPressureError({ ffmpegSignal: 'SIGKILL', code: 'BR2K_MEDIA_CANCELLED' }), false);
+});
+
+test('long MP4 concat reserves a bounded front index without a full faststart rewrite', () => {
+  const reserve = estimateMp4IndexReserveBytes(13740, 60);
+  assert(reserve > 100 * 1024 * 1024 && reserve < 128 * 1024 * 1024);
+  const args = createConcatCopyArgs({ concatPath: 'input.txt', outputPath: 'out.mp4', container: 'mp4', streamCodec: 'hevc', moovReserveBytes: reserve });
+  assert.equal(args[args.indexOf('-moov_size') + 1], String(reserve));
+  assert(!args.includes('+faststart'));
+  assert(args.includes('hvc1'));
+  assert.equal(estimateMp4IndexReserveBytes(Infinity, 60), 0);
+  assert.equal(estimateMp4IndexReserveBytes(1e9, 60), 0);
+  assert(!createConcatCopyArgs({ concatPath: 'input.txt', outputPath: 'out.mkv', container: 'mkv', moovReserveBytes: reserve }).includes('-moov_size'));
 });
 
 test('mixed segment specifications select the highest resolution and require transcoding', () => {

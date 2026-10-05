@@ -4,6 +4,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
+const os = require('node:os');
 const { pipeline } = require('node:stream/promises');
 const { Transform, Writable } = require('node:stream');
 
@@ -107,9 +108,24 @@ async function selectSceneMediaWorkspace(outputPath, sceneDirectory, options = {
     if (local.dev === remote.dev) throw error;
     await assertDiskSpace(sceneDirectory, { estimatedBytes: scratchBytes });
     await assertDiskSpace(outputPath, { estimatedBytes: mediaPeakBytes });
-    const mediaDirectory = await fsp.mkdtemp(path.join(destination, '.br2k-export-media-'));
+    const mediaDirectory = await fsp.mkdtemp(path.join(destination, options.directoryPrefix || '.br2k-export-media-'));
     return { mediaDirectory, separateMediaDirectory: true, localSpaceError: error.message };
   }
+}
+
+async function selectMergeMediaWorkspace(outputPath, options = {}) {
+  const localDirectory = options.localDirectory || os.tmpdir();
+  const storage = await selectSceneMediaWorkspace(outputPath, localDirectory, {
+    mediaPeakBytes: options.estimatedBytes,
+    outputBytes: options.estimatedBytes,
+    allowDestinationMedia: true,
+    directoryPrefix: '.br2k-merge-media-'
+  });
+  return {
+    mediaDirectory: storage.separateMediaDirectory ? storage.mediaDirectory
+      : await fsp.mkdtemp(path.join(localDirectory, 'br2k-merge-publish-')),
+    localSpaceError: storage.localSpaceError || ''
+  };
 }
 
 module.exports = {
@@ -118,5 +134,6 @@ module.exports = {
   atomicReplaceFile,
   getDiskAvailability,
   assertDiskSpace,
-  selectSceneMediaWorkspace
+  selectSceneMediaWorkspace,
+  selectMergeMediaWorkspace
 };

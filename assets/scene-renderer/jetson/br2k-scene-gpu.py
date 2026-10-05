@@ -10,6 +10,7 @@ requests, avatar/texture resources, and final audio muxing.
 
 import argparse
 import ctypes
+import gc
 import hashlib
 import io
 import json
@@ -835,6 +836,7 @@ def render_native_nvmm(request):
     if request.get('backend') != 'cuda-gstreamer': fail('原生零拷贝仅支持 cuda-gstreamer。')
     source = request.get('input') or {}
     output = request.get('output') or {}
+    has_scene_objects = bool(scene_texture_entries(request['scene']))
     input_path = str(source.get('path') or '')
     if not os.path.isfile(input_path): fail('原生零拷贝输入不存在：' + input_path)
     width, height, fps = int(output['width']), int(output['height']), number(output.get('fps'), 30)
@@ -898,10 +900,11 @@ def render_native_nvmm(request):
             # us compare the exact mux output bytes with the completed file.
             output_sink = 'matroskamux name=output-mux streamable=true ! ' + output_sink
         encoder_branch = (
-            'nvivafilter name=cuda-scene cuda-process=true customer-lib-name=%s ! %s ! '
+            '%s ! %s ! '
             'capssetter caps="video/x-raw,framerate=%s" ! '
             '%s name=encode bitrate=%d ! %s name=parse ! %s'
-        ) % (launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY), caps, fps_caps(fps), encoder,
+        ) % (('nvivafilter name=cuda-scene cuda-process=true customer-lib-name=' + launch_quote(CUDA_SCENE_CUSTOMER_LIBRARY))
+             if has_scene_objects else 'identity name=cuda-scene', caps, fps_caps(fps), encoder,
              max(1000000, int(number(output.get('bitrate'), 15000000))), parser_out, output_sink)
         if leading_video_frames:
             # concat adjusts the source branch's segment base after the finite
@@ -934,19 +937,20 @@ def render_native_nvmm(request):
             fail('原生 NVMM 管线缺少必需元件。')
         # qtdemux expresses MP4 edit-list gaps in SEGMENT.base/time. Its
         # compressed PTS can start at 33ms although the actual picture starts
-        # at 1.029s. Materialize running time BEFORE NVDEC creates NVMM
+        # at 1.029s. Materialize media time BEFORE NVDEC creates NVMM
         # timestamp metadata; rewriting decoded buffers later cannot change
         # that metadata. Forward a zero-based segment to avoid applying the
         # edit offset again at matroskamux.
         input_clock = {'segment': None, 'forwarding': False}
-        startup_gate = {'reached': False, 'seeking': False, 'located': False}
+        startup_gate = {'reached': False, 'seeking': False, 'located': False, 'seek_seqnum': None}
         def restore_demux_media_clock(pad, info):
             if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
                 event = info.get_event()
                 if event and event.type == Gst.EventType.SEGMENT and not input_clock['forwarding']:
                     segment = event.parse_segment()
+                    native_nvmm_trace('parser segment seq=%s seek=%s start=%s time=%s base=%s' % (event.get_seqnum(), startup_gate['seek_seqnum'], segment.start, segment.time, segment.base))
                     input_clock['segment'] = segment.copy()
-                    if startup_gate['seeking']:
+                    if startup_gate['seeking'] and event.get_seqnum() == startup_gate['seek_seqnum']:
                         startup_gate['located'] = True
                     normalized = segment.copy()
                     normalized.start = 0
@@ -956,7 +960,9 @@ def render_native_nvmm(request):
                     normalized.offset = 0
                     input_clock['forwarding'] = True
                     try:
-                        pad.push_event(Gst.Event.new_segment(normalized))
+                        replacement = Gst.Event.new_segment(normalized)
+                        replacement.set_seqnum(event.get_seqnum())
+                        pad.push_event(replacement)
                     finally:
                         input_clock['forwarding'] = False
                     return Gst.PadProbeReturn.DROP
@@ -965,7 +971,11 @@ def render_native_nvmm(request):
                 for field in ['pts', 'dts']:
                     timestamp = getattr(buffer, field)
                     if timestamp != Gst.CLOCK_TIME_NONE:
-                        clock = input_clock['segment'].to_running_time(Gst.Format.TIME, timestamp)
+                        # Keep one absolute media clock across FLUSH seeks.
+                        # Running time re-bases post-seek packets while NVDEC
+                        # may retain the original clock in its surface metadata,
+                        # mixing seconds near zero with hours near the target.
+                        clock = input_clock['segment'].to_stream_time(Gst.Format.TIME, timestamp)
                         if clock != Gst.CLOCK_TIME_NONE:
                             setattr(buffer, field, clock)
             return Gst.PadProbeReturn.OK
@@ -979,9 +989,18 @@ def render_native_nvmm(request):
         # if it arrives before the synchronous seek call returns.
         startup_pad = decoder.get_static_pad('src')
         needs_segment_seek = start > 0.0001
+        # Some Jetson encoder MP4s mark non-IDR I pictures as sync samples.
+        # Seeking to the nearest such picture leaves NVDEC without reference
+        # state until the next IDR. Decode a bounded preroll in NVMM, then
+        # discard it before Scene/counters; never shift the requested interval.
+        seek_preroll_sec = min(start, 8.0) if needs_segment_seek else 0.0
         if needs_segment_seek:
             def discard_warmup_scene_buffer(_pad, _info):
                 if startup_gate['located']:
+                    buffer = _info.get_buffer()
+                    if buffer and buffer.pts != Gst.CLOCK_TIME_NONE and buffer.pts < int(start * Gst.SECOND):
+                        return Gst.PadProbeReturn.DROP
+                    native_nvmm_trace('first post-seek surface pts=' + str(_info.get_buffer().pts))
                     return Gst.PadProbeReturn.REMOVE
                 if not startup_gate['reached']:
                     startup_gate['reached'] = True
@@ -992,7 +1011,7 @@ def render_native_nvmm(request):
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
-        scene_first_pts = {'value': None}
+        scene_first_pts = {'value': int(start * Gst.SECOND) if needs_segment_seek else None}
         # Audit CUDA output against the ordered NVDEC frame sequence. JetPack
         # keeps the actual timestamp in NVMM metadata through nvivafilter and
         # NVENC; assigning a replacement Gst.Buffer.pts at the Scene pad does
@@ -1232,13 +1251,17 @@ def render_native_nvmm(request):
                     end += buffer.duration
                 encoded_pts['end'] = max(encoded_pts['end'] or end, end)
             return Gst.PadProbeReturn.OK
-        clock_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
-        clock_library.br2k_scene_enable_pts_clock.argtypes = []
-        clock_library.br2k_scene_enable_pts_clock.restype = None
-        clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
-        clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
-        clock_library.br2k_scene_enable_pts_clock()
-        drawing_clock = {'first': None}
+        # A clean merge has no overlays. Keep frames in NVMM and use VIC for
+        # scaling, without loading the CUDA/ASS renderer or queuing unused
+        # drawing clocks. The same source→output PTS audit still applies.
+        if has_scene_objects:
+            clock_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
+            clock_library.br2k_scene_enable_pts_clock.argtypes = []
+            clock_library.br2k_scene_enable_pts_clock.restype = None
+            clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
+            clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
+            clock_library.br2k_scene_enable_pts_clock()
+        drawing_clock = {'first': int(start * Gst.SECOND) if needs_segment_seek else None}
         def supply_drawing_time(_pad, info):
             buffer = info.get_buffer()
             if not buffer:
@@ -1253,7 +1276,8 @@ def render_native_nvmm(request):
             if not clock_library.br2k_scene_push_frame_time(seconds):
                 return Gst.PadProbeReturn.DROP
             return Gst.PadProbeReturn.OK
-        composite.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, supply_drawing_time)
+        if has_scene_objects:
+            composite.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, supply_drawing_time)
         for name, element in [('decode', decoder), ('scene', composite), ('encode', encode)]:
             element.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, count_buffer, name)
         output_digest = hashlib.sha256()
@@ -1294,15 +1318,17 @@ def render_native_nvmm(request):
                 seek_target = demux if demux else pipeline
                 segment_stop = int((start + duration) * Gst.SECOND)
                 startup_gate['seeking'] = True
-                seek_ok = seek_target.seek(
+                seek_event = Gst.Event.new_seek(
                     1.0,
                     Gst.Format.TIME,
                     Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT | Gst.SeekFlags.ACCURATE,
                     Gst.SeekType.SET,
-                    int(start * Gst.SECOND),
+                    int((start - seek_preroll_sec) * Gst.SECOND),
                     Gst.SeekType.SET,
                     segment_stop
                 )
+                startup_gate['seek_seqnum'] = seek_event.get_seqnum()
+                seek_ok = seek_target.send_event(seek_event)
                 if not seek_ok:
                     fail('原生 NVMM qtdemux 无法定位到分段起点。')
             native_nvmm_trace('waiting for EOS')
@@ -1324,6 +1350,8 @@ def render_native_nvmm(request):
                 if message.type == Gst.MessageType.EOS: break
                 error, debug = message.parse_error(); fail('原生 NVMM：' + str(error) + ('；' + str(debug) if debug else ''))
             try:
+                if not has_scene_objects:
+                    raise OSError('No Scene textures in a clean merge')
                 cache_library = ctypes.CDLL(CUDA_SCENE_CUSTOMER_LIBRARY)
                 cache_library.br2k_scene_cache_peak_bytes.restype = ctypes.c_ulonglong
                 cache_library.br2k_scene_texture_upload_count.restype = ctypes.c_ulonglong
@@ -1430,7 +1458,8 @@ def render_native_nvmm(request):
                 scene_coverage_ns / Gst.SECOND, encode_coverage_ns / Gst.SECOND, duration))
         return {
             'frames': counters['encode'], 'mediaSeconds': measured_media_seconds, 'mediaClock': media_clock, 'wallSeconds': wall_seconds,
-            'drawingClock': 'input-pts-fifo',
+            'drawingClock': 'input-pts-fifo' if has_scene_objects else 'none',
+            'seekPrerollSec': seek_preroll_sec,
             'textures': timeline_request.get('_textureStats'),
             'textureCache': cache_stats,
             'outputStorageVerified': output_container == 'mkv',
@@ -1464,6 +1493,8 @@ def render_native_nvmm(request):
     finally:
         if pipeline:
             pipeline.set_state(Gst.State.NULL)
+            pipeline.get_state(5 * Gst.SECOND)
+            pipeline = None
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -1584,7 +1615,13 @@ def main():
 
 if __name__ == '__main__':
     try:
-        sys.exit(main())
+        exit_code = main()
     except Exception as error:
         print('GPU Scene renderer failed: ' + str(error), file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
+    # Release GI callback cycles and stop GStreamer's task pool before Python
+    # unloads NVIDIA libraries. Otherwise a VIC task can still execute code
+    # inside libnvvic after libnvbufsurftransform's exit handler dlcloses it.
+    gc.collect()
+    Gst.deinit()
+    sys.exit(exit_code)
