@@ -1414,9 +1414,13 @@ class LiveRecordService {
         : `Jetson GPU Scene renderer 当前不可用，将保持 CPU Scene 导出：${gpuScene?.reason || '未安装 helper。'}`
     );
     const avatarComposite = this.getAvatarCompositeCapability();
+    const nativeSceneAvatar = gpuScene?.backend === 'cuda-gstreamer' &&
+      gpuScene.nativeNvmmScene && cudaSceneProduction.ok;
     this.log(
-      avatarComposite ? 'info' : 'warn',
-      avatarComposite
+      nativeSceneAvatar || avatarComposite ? 'info' : 'warn',
+      nativeSceneAvatar
+        ? 'Jetson CUDA Scene 可用：文字与头像纹理由 CPU 准备，最终视频画面叠加由 GPU 完成；实际任务链路以运行进度为准。'
+        : avatarComposite
         ? avatarComposite.value === 'cuda'
           ? '已验证 NVIDIA CUDA 真实头像合成链路；它独立于视频编码后端，Jetson GStreamer 编码同样可使用。'
           : `已验证 ${avatarComposite.label}；头像动画在 CPU 小面板生成，最终全画面透明叠加由 GPU 完成。`
