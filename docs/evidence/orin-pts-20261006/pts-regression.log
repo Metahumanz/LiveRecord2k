@@ -1,0 +1,15 @@
+✔ native NVMM progress is driven by media PTS rather than wall clock or frame count (8.069084ms)
+✔ native seek preserves every picture and Chinese overlay after a non-IDR sync sample (6875.331122ms)
+✔ native Scene drawing follows actual PTS across a two-second source gap (1668.941735ms)
+✔ native CUDA clock keeps requested fps for unknown caps and accepts precise rational rates (107.588852ms)
+✔ native MP4 edit-list gap preserves the original picture time and finite EOF (6723.551455ms)
+✔ low-rate HEVC clips starting inside an empty edit preserve black lead and Chinese glyph timing (2366.820369ms)
+✔ native NVMM CUDA Scene materializes a black lead and keeps muxed A/V at PTS zero (706.886441ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 18481.330166

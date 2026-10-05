@@ -1,0 +1,94 @@
+SPAWN 719175 gst-launch-1.0 ["-q","-e","fdsrc","fd=0","blocksize=1048576","!","rawvideoparse","width=720","height=1280","format=i420","framerate=1247/250","!","nvvidconv","!","video/x-raw(memory:NVMM),format=NV12,width=720,height=1280","!","nvv4l2h265enc","bitrate=15000000","!","h265parse","!","video/x-h265,stream-format=hvc1,alignment=au","!","matroskamux","streamable=true","!","filesink","location=/tmp/br2k-pts-20261006/bridge-4.987673550629382.mkv"]
+SPAWN 719176 /usr/lib/bili-record-2k/bin/ffmpeg-full ["-hide_banner","-y","-f","rawvideo","-pix_fmt","yuv420p","-video_size","720x1280","-framerate","1247/250","-i","pipe:0","-filter_complex_script","/tmp/br2k-pts-20261006/simple.filter","-map","[vout]","-t","10","-an","-r","1247/250","-c:v","rawvideo","-pix_fmt","yuv420p","-f","rawvideo","pipe:1"]
+SPAWN 719177 /usr/lib/bili-record-2k/bin/br2k-scene-gpu ["--decode-native","--input","/mnt/zzzz/哔哩录播2K/7953876-宴宁ccccc/20261005_201213-怎么这么快过一半了！/7953876_宴宁ccccc_20261005_201343.clean.mp4","--codec","hevc","--width","720","--height","1280","--fps","1247/250","--start","0","--duration","10","--converter","nvvidconv","--output-fd","3"]
+DECODE [ass] libass API version: 0x1701000
+[ass] libass source: tarball: 0.17.1
+[ass] Shaper: FriBidi 1.0.13 (SIMPLE) HarfBuzz-ng 8.3.0 (COMPLEX)
+
+DECODE [ass] Using font provider fontconfig
+
+DECODE NvMMLiteOpen : Block : BlockType = 279 
+
+DECODE NvMMLiteBlockCreate : Block : BlockType = 279 
+
+RENDER Input #0, rawvideo, from 'pipe:0':
+  Duration: N/A, start: 0.000000, bitrate: 55163 kb/s
+
+RENDER   Stream #0:0: Video: rawvideo (I420 / 0x30323449), yuv420p, 720x1280, 55163 kb/s, 5 fps, 4.99 tbr, 4.99 tbn
+Stream mapping:
+  Stream #0:0 (rawvideo) -> drawtext:default
+  drawtext:default -> Stream #0:0 (rawvideo)
+
+RENDER Output #0, rawvideo, to 'pipe:1':
+  Metadata:
+    encoder         : Lavf60.16.100
+
+RENDER   Stream #0:0: Video: rawvideo (I420 / 0x30323449), yuv420p(progressive), 720x1280, q=2-31, 55163 kb/s, 4.99 fps, 4.99 tbn
+    Metadata:
+      encoder         : Lavc60.31.102 rawvideo
+frame=    0 fps=0.0 q=0.0 size=       0kB time=N/A bitrate=N/A speed=N/A    
+ENCODE NvMMLiteOpen : Block : BlockType = 8 
+===== NvVideo: NVENC =====
+NvMMLiteBlockCreate : Block : BlockType = 8 
+
+ENCODE NvVideo: H265 : Profile : 1 
+
+ENCODE NVMEDIA: Need to set EMC bandwidth : 112800 
+
+DECODE NVMMLITE_NVVIDEODEC, <NvVideoBufferProcessing:6708> Consume the extra signalling for EOS 
+
+CLOSE 719177 0 null
+RENDER [out#0/rawvideo @ 0xaaab0cf7d910] video:67500kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.000000%
+frame=   50 fps=0.0 q=-0.0 Lsize=   67500kB time=00:00:09.82 bitrate=56289.1kbits/s speed=21.3x    
+
+CLOSE 719176 0 null
+CLOSE 719175 0 null
+PASS_BRIDGE 4.987673550629382
+SPAWN 719237 gst-launch-1.0 ["-q","-e","fdsrc","fd=0","blocksize=1048576","!","rawvideoparse","width=720","height=1280","format=i420","framerate=5/1","!","nvvidconv","!","video/x-raw(memory:NVMM),format=NV12,width=720,height=1280","!","nvv4l2h265enc","bitrate=15000000","!","h265parse","!","video/x-h265,stream-format=hvc1,alignment=au","!","matroskamux","streamable=true","!","filesink","location=/tmp/br2k-pts-20261006/bridge-5.mkv"]
+SPAWN 719238 /usr/lib/bili-record-2k/bin/ffmpeg-full ["-hide_banner","-y","-f","rawvideo","-pix_fmt","yuv420p","-video_size","720x1280","-framerate","5/1","-i","pipe:0","-filter_complex_script","/tmp/br2k-pts-20261006/simple.filter","-map","[vout]","-t","10","-an","-r","5/1","-c:v","rawvideo","-pix_fmt","yuv420p","-f","rawvideo","pipe:1"]
+SPAWN 719239 /usr/lib/bili-record-2k/bin/br2k-scene-gpu ["--decode-native","--input","/mnt/zzzz/哔哩录播2K/7953876-宴宁ccccc/20261005_201213-怎么这么快过一半了！/7953876_宴宁ccccc_20261005_201343.clean.mp4","--codec","hevc","--width","720","--height","1280","--fps","5/1","--start","0","--duration","10","--converter","nvvidconv","--output-fd","3"]
+DECODE [ass] libass API version: 0x1701000
+[ass] libass source: tarball: 0.17.1
+[ass] Shaper: FriBidi 1.0.13 (SIMPLE) HarfBuzz-ng 8.3.0 (COMPLEX)
+
+DECODE [ass] Using font provider fontconfig
+
+DECODE NvMMLiteOpen : Block : BlockType = 279 
+
+DECODE NvMMLiteBlockCreate : Block : BlockType = 279 
+
+RENDER Input #0, rawvideo, from 'pipe:0':
+  Duration: N/A, start: 0.000000, bitrate: 55296 kb/s
+
+RENDER   Stream #0:0: Video: rawvideo (I420 / 0x30323449), yuv420p, 720x1280, 55296 kb/s, 5 tbr, 5 tbn
+
+RENDER Stream mapping:
+  Stream #0:0 (rawvideo) -> drawtext:default
+  drawtext:default -> Stream #0:0 (rawvideo)
+
+RENDER Output #0, rawvideo, to 'pipe:1':
+  Metadata:
+    encoder         : Lavf60.16.100
+  Stream #0:0: Video: rawvideo (I420 / 0x30323449), yuv420p(progressive), 720x1280, q=2-31, 55296 kb/s, 5 fps, 
+RENDER 5 tbn
+    Metadata:
+      encoder         : Lavc60.31.102 rawvideo
+frame=    0 fps=0.0 q=0.0 size=       0kB time=N/A bitrate=N/A speed=N/A    
+ENCODE NvMMLiteOpen : Block : BlockType = 8 
+
+ENCODE ===== NvVideo: NVENC =====
+
+ENCODE NvMMLiteBlockCreate : Block : BlockType = 8 
+
+ENCODE NvVideo: H265 : Profile : 1 
+
+ENCODE NVMEDIA: Need to set EMC bandwidth : 141000 
+
+CLOSE 719239 0 null
+RENDER [out#0/rawvideo @ 0xaaaaf9932890] video:67500kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.000000%
+
+RENDER frame=   50 fps=0.0 q=-0.0 Lsize=   67500kB time=00:00:09.80 bitrate=56424.5kbits/s speed=22.1x    
+
+CLOSE 719238 0 null
+CLOSE 719237 0 null
+PASS_BRIDGE 5

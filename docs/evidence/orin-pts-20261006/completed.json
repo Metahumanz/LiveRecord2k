@@ -1,0 +1,181 @@
+{
+  "checkedAt": "2026-10-06T01:28:58.451595+08:00",
+  "outputPath": "/mnt/zzzz/哔哩录播2K/7953876_宴宁ccccc_20261005_201343.clip_0-2927.danmaku.mp4",
+  "bytes": 827620492,
+  "elapsedSec": 278.7374997138977,
+  "streams": [
+    {
+      "index": 0,
+      "codec_type": "video",
+      "codec_name": "hevc",
+      "width": 720,
+      "height": 1280,
+      "r_frame_rate": "5/1",
+      "avg_frame_rate": "2919800/585363",
+      "start_time": "0.021000",
+      "duration": "2926.815000"
+    },
+    {
+      "index": 1,
+      "codec_type": "audio",
+      "codec_name": "aac",
+      "width": null,
+      "height": null,
+      "r_frame_rate": "0/0",
+      "avg_frame_rate": "0/0",
+      "start_time": "0.000000",
+      "duration": "2926.826833"
+    }
+  ],
+  "format": {
+    "start_time": "0.000000",
+    "duration": "2926.836000",
+    "size": "827620492"
+  },
+  "presentationStarts": {
+    "1": 0.0,
+    "0": 0.021
+  },
+  "presentationEnds": {
+    "1": 2926.826833,
+    "0": 2926.815
+  },
+  "packetCounts": {
+    "1": 136998,
+    "0": 14599
+  },
+  "success": [
+    {
+      "id": "1791221298751-10f7a5cec83638",
+      "time": 1791221298751,
+      "level": "success",
+      "message": "Scene Graph 片段已导出：/mnt/zzzz/哔哩录播2K/7953876_宴宁ccccc_20261005_201343.clip_0-2927.danmaku.mp4"
+    }
+  ],
+  "logs": [
+    {
+      "id": "1791221020009-89050613ad475",
+      "time": 1791221020009,
+      "level": "info",
+      "message": "已加入导出队列 #1：烧录片段：7953876_宴宁ccccc_20261005_201343.clean.mp4 -> 7953876_宴宁ccccc_20261005_201343.clip_0-2927.danmaku.mp4"
+    },
+    {
+      "id": "1791221020212-1e8a5dd9761d28",
+      "time": 1791221020212,
+      "level": "info",
+      "message": "导出片段实际 PTS：视频 1.991s，音频 0.000s，A/V 起点差 -1.991s。"
+    },
+    {
+      "id": "1791221020304-9719941419595",
+      "time": 1791221020304,
+      "level": "info",
+      "message": "当前已是最新版本 0.9.4"
+    },
+    {
+      "id": "1791221029732-4cf9ecb0feb218",
+      "time": 1791221029732,
+      "level": "info",
+      "message": "Scene 构建：原始事件 1699，范围内事件 1699，Scene 对象 104808。"
+    },
+    {
+      "id": "1791221031538-9bd7cc806fb388",
+      "time": 1791221031538,
+      "level": "info",
+      "message": "导出临时媒体位于本机 /tmp/br2k-export-scene-4M2l34，预留 11.82 GB，验证后发布成片。"
+    },
+    {
+      "id": "1791221031540-936cd28885321",
+      "time": 1791221031540,
+      "level": "info",
+      "message": "CUDA Scene准入通过：runtime available=true backend=cuda-gstreamer reason=- nativeNvmmScene=true nativeNvmmReason=-"
+    },
+    {
+      "id": "1791221034758-4840dc81f78de",
+      "time": 1791221034758,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录真实源预检通过：10.00s，98.7fps，PTS bridge通过；正式导出使用分段NVMM链路。"
+    },
+    {
+      "id": "1791221036750-8334c4b0314e78",
+      "time": 1791221036750,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791221110622-c9a5faa9905a38",
+      "time": 1791221110622,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1：原生 NVMM 已生成 10 帧黑帧前导。"
+    },
+    {
+      "id": "1791221110623-7fbe85b10657b",
+      "time": 1791221110623,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1 性能：decode 162.95fps / scene 162.77fps / encode 162.77fps / total 162.77fps"
+    },
+    {
+      "id": "1791221110627-d7ff70c3c8a99",
+      "time": 1791221110627,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791221111201-635729962d11e",
+      "time": 1791221111201,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1 PTS 映射：source→Scene 8958 帧（最大 0.000ms），Scene→编码 8968 帧（最大 0.000ms），source→编码 8958 帧（最大 0.000ms）；封装诊断 1800.187s / 1800.000s。"
+    },
+    {
+      "id": "1791221112049-9b1a3c5f647e88",
+      "time": 1791221112049,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791221155629-0fa2fcb44c6898",
+      "time": 1791221155629,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2 性能：decode 160.42fps / scene 160.42fps / encode 160.42fps / total 160.42fps"
+    },
+    {
+      "id": "1791221155632-eb37df2936aba8",
+      "time": 1791221155632,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791221156080-8fc830d6bac27",
+      "time": 1791221156080,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2 PTS 映射：source→Scene 5631 帧（最大 0.000ms），Scene→编码 5631 帧（最大 0.000ms），source→编码 5631 帧（最大 0.000ms）；封装诊断 1126.815s / 1127.000s。"
+    },
+    {
+      "id": "1791221298751-10f7a5cec83638",
+      "time": 1791221298751,
+      "level": "success",
+      "message": "Scene Graph 片段已导出：/mnt/zzzz/哔哩录播2K/7953876_宴宁ccccc_20261005_201343.clip_0-2927.danmaku.mp4"
+    }
+  ],
+  "request": {
+    "mode": "burn",
+    "cleanPath": "/mnt/zzzz/哔哩录播2K/7953876-宴宁ccccc/20261005_201213-怎么这么快过一半了！/7953876_宴宁ccccc_20261005_201343.clean.mp4",
+    "danmakuPath": "/mnt/zzzz/哔哩录播2K/7953876-宴宁ccccc/20261005_201213-怎么这么快过一半了！/7953876_宴宁ccccc_20261005_201343.danmaku.jsonl",
+    "cssPath": "/mnt/zzzz/哔哩录播2K/7953876-宴宁ccccc/20261005_201213-怎么这么快过一半了！/7953876_宴宁ccccc_20261005_201343.danmaku.css",
+    "startTime": 0,
+    "endTime": 2927,
+    "outputDir": "/mnt/zzzz/哔哩录播2K",
+    "overlayMode": "danmaku-gift",
+    "danmakuArea": "quarter",
+    "stylePreset": "h5-card",
+    "styleLayout": {
+      "panelLeft": 0,
+      "superChatBottom": 524
+    },
+    "avatarMode": "high",
+    "codec": "hevc_nvv4l2",
+    "crf": 24
+  },
+  "sourceRetained": true,
+  "danmakuRetained": true,
+  "temporaryWorkspaceRemoved": true
+}
