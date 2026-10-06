@@ -13342,6 +13342,10 @@ try {
           graph: sampleGraph, directory, prefix, onChild, ffmpegPath: this.ffmpegPath, textMask: true });
         results.push({ sample, pixels });
       } catch (error) {
+        if (isCancelled?.() || error?.code === 'BR2K_MEDIA_CANCELLED') {
+          error.code = 'BR2K_MEDIA_CANCELLED';
+          throw error;
+        }
         error.diagnosticDirectory = directory;
         throw error;
       }
@@ -13884,11 +13888,11 @@ try {
         this.log('error', `音视频封装失败；已保留完整烧录视频 ${recovery.chunkPaths.join('、')} 与拼接清单 ${recovery.concatPath}。` +
           (recovery.recoveryPath ? `恢复清单：${recovery.recoveryPath}。` : '恢复清单未写入，以上文件仍可手动封装。'));
       }
-      if (error.diagnosticDirectory) {
+      cancelled = this.exportCancelRequested || error?.code === 'BR2K_MEDIA_CANCELLED';
+      if (error.diagnosticDirectory && !cancelled) {
         this.log('error', `Scene 失败诊断已保留：${error.diagnosticDirectory}`);
         sceneDirectory = '';
       }
-      cancelled = this.exportCancelRequested || error?.code === 'BR2K_MEDIA_CANCELLED';
       if (cancelled) {
         if (this.exportProgress?.id === progress.id) {
           finishFfmpegJobProgress(this.exportProgress, 'cancelled', '导出已取消');

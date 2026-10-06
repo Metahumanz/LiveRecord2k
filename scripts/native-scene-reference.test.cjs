@@ -8,6 +8,7 @@ const ffmpeg = process.env.FFMPEG_BIN || require('ffmpeg-static');
 const { runFfmpegJob, probeMediaFileInfo, probeMediaClipTimelineInfo } = require('../src/server/shared/helpers.cjs');
 const { writeSceneFilterScript } = require('../src/server/danmaku/scene-renderer.cjs');
 const { verifySceneOutputFrame } = require('../src/server/danmaku/scene-output-verifier.cjs');
+const { clipSceneGraph } = require('../src/server/danmaku/scene-graph.cjs');
 
 test('native rolling reference retains a 21 ms video lead without admitting missing text', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-native-reference-test-'));
@@ -47,5 +48,16 @@ test('native rolling reference retains a 21 ms video lead without admitting miss
     await assert.rejects(check(candidate, oldReference, oldClean, 'old'), { code: 'BR2K_SCENE_TEXT_VERIFICATION_FAILED' });
     assert.equal((await check(candidate, reference, clean, 'fixed')).ok, true);
     await assert.rejects(check(source, reference, clean, 'missing'), { code: 'BR2K_SCENE_TEXT_VERIFICATION_FAILED' });
+    // A later sample seeks within a source frame interval. Retain the
+    // residual PTS relative to that seek instead of zeroing its first picture.
+    const clipped = clipSceneGraph(graph, 0.3, 3, { shiftTime: true });
+    const seekReference = await writeSceneFilterScript(path.join(directory, 'seek.filter'), clipped,
+      { duration: 2.7, fps: 60, preserveInputClock: true, roundCoordinates: true });
+    const seekClean = await writeSceneFilterScript(path.join(directory, 'seek-clean.filter'), { ...clipped, objects: [] },
+      { duration: 2.7, fps: 60, preserveInputClock: true, roundCoordinates: true });
+    assert.equal((await verifySceneOutputFrame({ runJob: (...args) => runFfmpegJob(ffmpeg, ...args),
+      sourcePath: source, outputPath: candidate, referenceScript: seekReference.filterScriptPath,
+      cleanScript: seekClean.filterScriptPath, sourceStart: 0.3, time: 0.5, outputTime: 0.8,
+      graph: clipped, directory, prefix: 'seek', ffmpegPath: ffmpeg, textMask: true })).ok, true);
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
