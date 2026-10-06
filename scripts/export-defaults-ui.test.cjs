@@ -47,7 +47,7 @@ function createApp(server) {
     useMemo: callback => callback(), lazy: () => function LazyPage() {}, Suspense: 'suspense'
   };
   const recorder = {
-    getInitialState: async () => structuredClone(server.state),
+    getInitialState: async () => server.initialState || structuredClone(server.state),
     onStateChanged: callback => { subscriber = callback; return () => {}; },
     saveSettings: async patch => {
       server.patches.push(structuredClone(patch));
@@ -143,4 +143,74 @@ test('SSE state arriving before a render retains the latest uncommitted settings
   assert.equal(server.patches.at(-1).burnCrf, 29);
   assert.equal(server.state.settings.defaultExportMode, 'clean');
   assert.equal(page.draft.mode, 'clean');
+}));
+
+test('background state pushes preserve export edits before a source is selected', () => withWindow(async () => {
+  const server = fixture(), app = createApp(server);
+  let page = await openExport(app);
+  page.setDraft({ ...page.draft, mode: 'burn', stylePreset: 'minimal', styleLayout: { panelLeft: 234 },
+    avatarMode: 'limited', overlayMode: 'danmaku', danmakuArea: 'quarter' });
+  app.render();
+  app.pushState(server.state);
+  page = find(app.render(), node => typeof node.props?.saveStyleAsDefault === 'function').props;
+  assert.equal(page.draft.cleanPath, '');
+  assert.equal(page.draft.mode, 'burn');
+  assert.equal(page.draft.stylePreset, 'minimal');
+  assert.deepEqual(page.draft.styleLayout, { panelLeft: 234 });
+  await page.saveStyleAsDefault();
+  assert.equal(server.state.settings.defaultExportMode, 'burn');
+  assert.equal(server.state.settings.burnDanmakuArea, 'quarter');
+}));
+
+test('late initial GET cannot replace newer SSE defaults or edits already made on the page', () => withWindow(async () => {
+  const server = fixture();
+  const old = structuredClone(server.state);
+  let finishInitial;
+  server.initialState = new Promise(resolve => { finishInitial = resolve; });
+  const app = createApp(server);
+  app.render();
+  server.state.settings.defaultExportMode = 'burn';
+  app.pushState(server.state);
+  let tree = app.render();
+  find(tree, node => node.type === 'button' && find(node.props.children, child => child.props?.children === '剪辑导出')).props.onClick();
+  let page = find(app.render(), node => typeof node.props?.saveStyleAsDefault === 'function').props;
+  assert.equal(page.draft.mode, 'burn');
+  page.setDraft({ ...page.draft, stylePreset: 'bubble' });
+  app.render();
+  finishInitial(old);
+  await new Promise(resolve => setImmediate(resolve));
+  page = find(app.render(), node => typeof node.props?.saveStyleAsDefault === 'function').props;
+  assert.equal(page.state.settings.defaultExportMode, 'burn');
+  assert.equal(page.draft.stylePreset, 'bubble');
+  page.selectRecording(server.state.recordings[0]);
+  page = find(app.render(), node => typeof node.props?.saveStyleAsDefault === 'function').props;
+  assert.equal(page.draft.mode, 'burn');
+}));
+
+test('initial GET also preserves the recorder cache used by later incremental SSE messages', () => withWindow(async () => {
+  const originalFetch = global.fetch, originalEventSource = global.EventSource;
+  let resolveRequest, stream, unsubscribe;
+  const received = [];
+  global.fetch = () => new Promise(resolve => { resolveRequest = resolve; });
+  global.EventSource = class {
+    handlers = {};
+    constructor() { stream = this; }
+    addEventListener(name, handler) { this.handlers[name] = handler; }
+    emit(name, payload) { this.handlers[name]({ data: JSON.stringify(payload) }); }
+    close() {}
+  };
+  try {
+    const { recorder } = evaluate(transpile(path.join(root, 'recorderClient.ts')), require);
+    const old = fixture().state;
+    const newer = structuredClone(old);
+    newer.settings.defaultExportMode = 'burn';
+    const initial = recorder.getInitialState();
+    unsubscribe = recorder.onStateChanged(state => received.push(state));
+    stream.emit('state', newer);
+    resolveRequest({ ok: true, json: async () => old });
+    assert.equal((await initial).settings.defaultExportMode, 'burn');
+    stream.emit('log', { entries: [{ id: 'new-log', message: 'progress' }] });
+    assert.equal(received.at(-1).settings.defaultExportMode, 'burn');
+    assert.equal(received.at(-1).logs.at(-1).id, 'new-log');
+  } finally { unsubscribe?.(); global.fetch = originalFetch; global.EventSource = originalEventSource; }
 }));

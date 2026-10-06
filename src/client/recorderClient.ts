@@ -19,7 +19,11 @@ export class RecorderApiError extends Error {
 
 export const recorder: RecorderApi = {
   async getInitialState() {
-    const state = await api<AppState>('/api/state');
+    const previous = latestState;
+    const state = await api<AppState>('/api/state', undefined, { updateStateCache: false });
+    // A full SSE state can arrive before the initial GET. Keep its newer
+    // cache as the base for subsequent room/log/media incremental events.
+    if (latestState && latestState !== previous) return latestState;
     latestState = state;
     return state;
   },
@@ -104,7 +108,7 @@ export const recorder: RecorderApi = {
   }
 };
 
-async function api<T = unknown>(url: string, body?: unknown, options: { timeoutMs?: number } = {}): Promise<T> {
+async function api<T = unknown>(url: string, body?: unknown, options: { timeoutMs?: number; updateStateCache?: boolean } = {}): Promise<T> {
   const timeoutMs = options.timeoutMs === undefined ? 30000 : Math.max(0, options.timeoutMs);
   const controller = timeoutMs ? new AbortController() : null;
   const timer = timeoutMs
@@ -135,7 +139,7 @@ async function api<T = unknown>(url: string, body?: unknown, options: { timeoutM
       status: response.status
     });
   }
-  if (isAppState(payload)) {
+  if (isAppState(payload) && options.updateStateCache !== false) {
     latestState = payload;
   }
   return payload as T;

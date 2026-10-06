@@ -22,7 +22,7 @@ export function isBilibiliLoggedIn(state: AppState) {
   return /(?:^|;\s*)SESSDATA=[^;]+/i.test(state.settings.cookie);
 }
 
-export function hydrateExportDraft(current: ExportDraft, state: AppState): ExportDraft {
+export function hydrateExportDraft(current: ExportDraft, state: AppState, options: { initialize?: boolean } = {}): ExportDraft {
   const recordings = state.recordings.filter((recording) => recording.cleanPath);
   const currentRecording = current.cleanPath
     ? recordings.find((recording) => recording.cleanPath === current.cleanPath)
@@ -44,16 +44,18 @@ export function hydrateExportDraft(current: ExportDraft, state: AppState): Expor
   }
   return {
     ...current,
+    ...(options.initialize ? {
+      mode: state.settings.defaultExportMode || 'clean',
+      overlayMode: state.settings.burnOverlayMode,
+      danmakuArea: state.settings.burnDanmakuArea,
+      stylePreset: state.settings.sceneGraphDefaultStyle,
+      styleLayout: { ...state.settings.burnDanmakuStyleLayout },
+      avatarMode: state.settings.burnAvatarMode
+    } : {}),
     cleanPath: '',
-    mode: state.settings.defaultExportMode || 'clean',
     danmakuPath: '',
     cssPath: '',
-    endTime: '',
-    overlayMode: state.settings.burnOverlayMode,
-    danmakuArea: state.settings.burnDanmakuArea,
-    stylePreset: state.settings.sceneGraphDefaultStyle,
-    styleLayout: { ...state.settings.burnDanmakuStyleLayout },
-    avatarMode: state.settings.burnAvatarMode,
+    endTime: current.cleanPath ? '' : current.endTime,
     outputDir: current.outputDir || state.settings.outputDir
   };
 }

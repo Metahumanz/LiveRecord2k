@@ -86,6 +86,13 @@ export default function App() {
   const settingsAutoSaveTimerRef = useRef<number | null>(null);
   const settingsAutoRetryTimerRef = useRef<number | null>(null);
   const settingsHaveSavedRef = useRef(false);
+  const exportDraftInitializedRef = useRef(false);
+
+  function syncExportDraftFromServer(nextState: AppState) {
+    const initialize = !exportDraftInitializedRef.current;
+    exportDraftInitializedRef.current = true;
+    setExportDraft((current) => hydrateExportDraft(current, nextState, { initialize }));
+  }
 
   function replaceDirtySettingsFields(nextFields: Set<keyof AppSettings>) {
     const next = new Set(nextFields);
@@ -202,20 +209,22 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const load = () => recorder.getInitialState().then((nextState) => {
-      if (cancelled) return;
+      // SSE can initialize the page before this older GET finishes. It must
+      // not replace a newer state snapshot or reset edits made since then.
+      if (cancelled || settingsDraftRef.current) return;
       setInitialLoadError('');
       setState(nextState);
       syncSettingsDraftFromServer(nextState.settings, { resetDirty: true });
-      setExportDraft((current) => hydrateExportDraft(current, nextState));
+      syncExportDraftFromServer(nextState);
     }).catch((error) => {
-      if (!cancelled) setInitialLoadError(error instanceof Error ? error.message : '初始状态加载失败');
+      if (!cancelled && !settingsDraftRef.current) setInitialLoadError(error instanceof Error ? error.message : '初始状态加载失败');
     });
     void load();
     const unsubscribe = recorder.onStateChanged((nextState) => {
       setInitialLoadError('');
       setState(nextState);
       syncSettingsDraftFromServer(nextState.settings);
-      setExportDraft((current) => hydrateExportDraft(current, nextState));
+      syncExportDraftFromServer(nextState);
     });
     return () => {
       cancelled = true;
