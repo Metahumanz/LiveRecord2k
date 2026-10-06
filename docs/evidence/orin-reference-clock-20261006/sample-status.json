@@ -1,0 +1,113 @@
+{
+  "progress": null,
+  "logs": [
+    {
+      "id": "1791267358265-fd6f4eebf284e8",
+      "time": 1791267358265,
+      "level": "info",
+      "message": "可用硬件解码：H264 Jetson NVDEC H264（GStreamer nvv4l2decoder）；HEVC Jetson NVDEC HEVC（GStreamer nvv4l2decoder）"
+    },
+    {
+      "id": "1791267358265-d0f4a7247b1cc8",
+      "time": 1791267358265,
+      "level": "success",
+      "message": "Jetson hevc_nvv4l2 端到端烧录自检通过，可用于烧录。"
+    },
+    {
+      "id": "1791267358266-058e2a502baac8",
+      "time": 1791267358266,
+      "level": "success",
+      "message": "Jetson h264_nvv4l2 端到端烧录自检通过，可用于烧录。"
+    },
+    {
+      "id": "1791267358266-1d2d8b90aed8b",
+      "time": 1791267358266,
+      "level": "success",
+      "message": "Jetson GPU Scene renderer 已通过运行时 probe：cuda-gstreamer（/usr/lib/bili-record-2k/bin/br2k-scene-gpu）。视觉一致性自检通过，可用于生产 CUDA Scene。"
+    },
+    {
+      "id": "1791267358266-36f9005cb55b9",
+      "time": 1791267358266,
+      "level": "info",
+      "message": "Jetson CUDA Scene 可用：文字与头像纹理由 CPU 准备，最终视频画面叠加由 GPU 完成；实际任务链路以运行进度为准。"
+    },
+    {
+      "id": "1791267358276-8f91b5488a56c",
+      "time": 1791267358277,
+      "level": "info",
+      "message": "录像保存目录位于 cifs 挂载（/mnt/zzzz），跳过 POSIX 2770 规范化，以实际读写探针为准。"
+    },
+    {
+      "id": "1791267380045-0d2539689ba1d",
+      "time": 1791267380045,
+      "level": "info",
+      "message": "当前已是最新版本 0.9.4"
+    },
+    {
+      "id": "1791267580856-c0b6acb4c0d71",
+      "time": 1791267580856,
+      "level": "error",
+      "message": "导出文件名必须符合录播文件命名格式。"
+    },
+    {
+      "id": "1791267812819-9e81c36b4248b",
+      "time": 1791267812819,
+      "level": "error",
+      "message": "导出文件名必须符合录播文件命名格式。"
+    },
+    {
+      "id": "1791268165226-ea321400338898",
+      "time": 1791268165226,
+      "level": "info",
+      "message": "已加入导出队列 #1：烧录片段：883263_真栗_20261003_200838.merged.mp4 -> 883263_真栗_20261003_200838.merged.clip_0-300.danmaku.mp4"
+    },
+    {
+      "id": "1791268166575-5cb4e439873b08",
+      "time": 1791268166576,
+      "level": "info",
+      "message": "导出片段实际 PTS：视频 0.021s，音频 0.000s，A/V 起点差 -0.021s。"
+    },
+    {
+      "id": "1791268169887-d424b4afbb4618",
+      "time": 1791268169887,
+      "level": "info",
+      "message": "Scene 构建：原始事件 15653，范围内事件 496，Scene 对象 491。"
+    },
+    {
+      "id": "1791268169939-8587891ddd14c",
+      "time": 1791268169939,
+      "level": "info",
+      "message": "导出临时媒体位于本机 /tmp/br2k-export-scene-uKmUka，预留 1.63 GB，验证后发布成片。"
+    },
+    {
+      "id": "1791268169940-87df5dacf891d8",
+      "time": 1791268169940,
+      "level": "info",
+      "message": "CUDA Scene准入通过：runtime available=true backend=cuda-gstreamer reason=- nativeNvmmScene=true nativeNvmmReason=-"
+    },
+    {
+      "id": "1791268201616-d9948e11a4ab68",
+      "time": 1791268201616,
+      "level": "info",
+      "message": "Jetson CUDA Scene真实源预检通过：10.00s，90.6fps，PTS bridge通过；正式导出使用分段NVMM链路。"
+    },
+    {
+      "id": "1791268201642-e2386e7882df98",
+      "time": 1791268201642,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791268354309-48cc3b02d44a2",
+      "time": 1791268354310,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录：原生 NVMM 已生成 1 帧黑帧前导。"
+    },
+    {
+      "id": "1791268405540-4d1eb01abc84b",
+      "time": 1791268405540,
+      "level": "success",
+      "message": "Scene Graph 片段已导出：/mnt/zzzz/哔哩录播2K/.br2k-acceptance-reference-20261006/883263_真栗_20261003_200838.merged.clip_0-300.danmaku.mp4"
+    }
+  ]
+}
