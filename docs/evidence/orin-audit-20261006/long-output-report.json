@@ -1,0 +1,409 @@
+{
+  "file": "/mnt/zzzz/哔哩录播2K/883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4",
+  "size": 25716707752,
+  "media": {
+    "streams": [
+      {
+        "index": 0,
+        "codec_name": "hevc",
+        "codec_long_name": "unknown",
+        "profile": "1",
+        "codec_type": "video",
+        "codec_tag_string": "hvc1",
+        "codec_tag": "0x31637668",
+        "width": 3840,
+        "height": 2160,
+        "coded_width": 3840,
+        "coded_height": 2176,
+        "closed_captions": 0,
+        "film_grain": 0,
+        "has_b_frames": 0,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "pix_fmt": "yuv420p",
+        "level": 153,
+        "color_range": "tv",
+        "chroma_location": "left",
+        "field_order": "progressive",
+        "refs": 1,
+        "id": "0x1",
+        "r_frame_rate": "60/1",
+        "avg_frame_rate": "410749000/6872941",
+        "time_base": "1/16000",
+        "start_pts": 336,
+        "start_time": "0.021000",
+        "duration_ts": 219934112,
+        "duration": "13745.882000",
+        "bit_rate": "14790232",
+        "nb_frames": "821498",
+        "extradata_size": 103,
+        "disposition": {
+          "default": 1,
+          "dub": 0,
+          "original": 0,
+          "comment": 0,
+          "lyrics": 0,
+          "karaoke": 0,
+          "forced": 0,
+          "hearing_impaired": 0,
+          "visual_impaired": 0,
+          "clean_effects": 0,
+          "attached_pic": 0,
+          "timed_thumbnails": 0,
+          "non_diegetic": 0,
+          "captions": 0,
+          "descriptions": 0,
+          "metadata": 0,
+          "dependent": 0,
+          "still_image": 0
+        },
+        "tags": {
+          "language": "eng",
+          "handler_name": "VideoHandler",
+          "vendor_id": "[0][0][0][0]"
+        }
+      },
+      {
+        "index": 1,
+        "codec_name": "aac",
+        "codec_long_name": "unknown",
+        "profile": "1",
+        "codec_type": "audio",
+        "codec_tag_string": "mp4a",
+        "codec_tag": "0x6134706d",
+        "sample_fmt": "fltp",
+        "sample_rate": "48000",
+        "channels": 2,
+        "channel_layout": "stereo",
+        "bits_per_sample": 0,
+        "initial_padding": 0,
+        "id": "0x2",
+        "r_frame_rate": "0/0",
+        "avg_frame_rate": "0/0",
+        "time_base": "1/48000",
+        "start_pts": 0,
+        "start_time": "0.000000",
+        "duration_ts": 659802736,
+        "duration": "13745.890333",
+        "bit_rate": "162152",
+        "nb_frames": "641813",
+        "extradata_size": 5,
+        "disposition": {
+          "default": 1,
+          "dub": 0,
+          "original": 0,
+          "comment": 0,
+          "lyrics": 0,
+          "karaoke": 0,
+          "forced": 0,
+          "hearing_impaired": 0,
+          "visual_impaired": 0,
+          "clean_effects": 0,
+          "attached_pic": 0,
+          "timed_thumbnails": 0,
+          "non_diegetic": 0,
+          "captions": 0,
+          "descriptions": 0,
+          "metadata": 0,
+          "dependent": 0,
+          "still_image": 0
+        },
+        "tags": {
+          "language": "und",
+          "handler_name": "SoundHandler",
+          "vendor_id": "[0][0][0][0]"
+        }
+      }
+    ],
+    "format": {
+      "filename": "/mnt/zzzz/哔哩录播2K/883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4",
+      "nb_streams": 2,
+      "nb_programs": 0,
+      "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "start_time": "0.000000",
+      "duration": "13745.903000",
+      "size": "25716707752",
+      "bit_rate": "14966907",
+      "probe_score": 100,
+      "tags": {
+        "major_brand": "isom",
+        "minor_version": "512",
+        "compatible_brands": "isomiso2mp41",
+        "encoder": "Lavf60.16.100"
+      }
+    }
+  },
+  "defaultExportMode": "burn",
+  "logs": [
+    {
+      "id": "1791279639114-3c2733a751b058",
+      "time": 1791279639114,
+      "level": "info",
+      "message": "已加入导出队列 #1：烧录片段：883263_真栗_20261003_200838.merged.mp4 -> 883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4"
+    },
+    {
+      "id": "1791279640496-56709f50c43e5",
+      "time": 1791279640496,
+      "level": "info",
+      "message": "导出片段实际 PTS：视频 0.021s，音频 0.000s，A/V 起点差 -0.021s。"
+    },
+    {
+      "id": "1791279644504-21cda04c2952d8",
+      "time": 1791279644504,
+      "level": "info",
+      "message": "Scene 构建：原始事件 15653，范围内事件 15634，Scene 对象 25744。"
+    },
+    {
+      "id": "1791279644976-883023f0a85c18",
+      "time": 1791279644976,
+      "level": "info",
+      "message": "本机临时盘不足以保存整片中间文件，已改在输出磁盘工作目录 /mnt/zzzz/哔哩录播2K/.br2k-export-media-9cmCjx 编码及封装；Scene 请求和纹理仍在本机，验证后原子发布成片。"
+    },
+    {
+      "id": "1791279644978-9b694c65293608",
+      "time": 1791279644978,
+      "level": "info",
+      "message": "CUDA Scene准入通过：runtime available=true backend=cuda-gstreamer reason=- nativeNvmmScene=true nativeNvmmReason=-"
+    },
+    {
+      "id": "1791279676381-ec83b157f7b41",
+      "time": 1791279676381,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录真实源预检通过：10.00s，92.7fps，PTS bridge通过；正式导出使用分段NVMM链路。"
+    },
+    {
+      "id": "1791279676552-bea6076d2b8f4",
+      "time": 1791279676552,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791280631478-030e03708e0aa8",
+      "time": 1791280631478,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1：原生 NVMM 已生成 1 帧黑帧前导。"
+    },
+    {
+      "id": "1791280631478-4ec2052c421f98",
+      "time": 1791280631478,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1 性能：decode 111.17fps / scene 111.14fps / encode 111.14fps / total 111.14fps"
+    },
+    {
+      "id": "1791280631491-2ac580ce1340c8",
+      "time": 1791280631491,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791280658673-ba62d58545038",
+      "time": 1791280658673,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 1 PTS 映射：source→Scene 104924 帧（最大 0.000ms），Scene→编码 104925 帧（最大 0.000ms），source→编码 104924 帧（最大 0.000ms）；封装诊断 1800.001s / 1800.000s。"
+    },
+    {
+      "id": "1791280658866-eeb48e073daf38",
+      "time": 1791280658867,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791280728307-55c7cd1174fde8",
+      "time": 1791280728307,
+      "level": "error",
+      "message": "宴宁ccccc(7953876) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791281764912-2c6a3797f3f4a8",
+      "time": 1791281764912,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2 性能：decode 98.77fps / scene 98.77fps / encode 98.77fps / total 98.77fps"
+    },
+    {
+      "id": "1791281764924-a2e2a29dc947c8",
+      "time": 1791281764924,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791281777079-90e4863cd8a8b",
+      "time": 1791281777079,
+      "level": "info",
+      "message": "录像保存目录位于 cifs 挂载（/mnt/zzzz），跳过 POSIX 2770 规范化，以实际读写探针为准。"
+    },
+    {
+      "id": "1791281778223-8a033b700a0de8",
+      "time": 1791281778223,
+      "level": "success",
+      "message": "设置已保存。"
+    },
+    {
+      "id": "1791281794387-9a36f8a8b9cc8",
+      "time": 1791281794387,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 2 PTS 映射：source→Scene 107936 帧（最大 0.000ms），Scene→编码 107936 帧（最大 0.000ms），source→编码 107936 帧（最大 0.000ms）；封装诊断 1800.008s / 1800.000s。"
+    },
+    {
+      "id": "1791281794586-324099d83e9988",
+      "time": 1791281794586,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 3：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791282905116-4e52793eca8ec8",
+      "time": 1791282905116,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 3 性能：decode 98.06fps / scene 98.06fps / encode 98.06fps / total 98.06fps"
+    },
+    {
+      "id": "1791282905129-f7d9732d05fed",
+      "time": 1791282905129,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 3：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791282934496-56e03e2147d068",
+      "time": 1791282934496,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 3 PTS 映射：source→Scene 108000 帧（最大 0.000ms），Scene→编码 108000 帧（最大 0.000ms），source→编码 108000 帧（最大 0.000ms）；封装诊断 1800.000s / 1800.000s。"
+    },
+    {
+      "id": "1791282934710-710067d793b7c8",
+      "time": 1791282934710,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 4：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791284051446-f9cc347a94bfe8",
+      "time": 1791284051446,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 4 性能：decode 97.33fps / scene 97.33fps / encode 97.33fps / total 97.33fps"
+    },
+    {
+      "id": "1791284051467-5ac5eee2929c18",
+      "time": 1791284051467,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 4：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791284080802-bcaa136b6c05d8",
+      "time": 1791284080802,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 4 PTS 映射：source→Scene 108001 帧（最大 0.000ms），Scene→编码 108001 帧（最大 0.000ms），source→编码 108001 帧（最大 0.000ms）；封装诊断 1800.005s / 1800.000s。"
+    },
+    {
+      "id": "1791284081010-1d0005a7268218",
+      "time": 1791284081010,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 5：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791285226245-8e8fca86f6dbd",
+      "time": 1791285226245,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 5 性能：decode 95.08fps / scene 95.08fps / encode 95.08fps / total 95.08fps"
+    },
+    {
+      "id": "1791285226259-aa87ee998a148",
+      "time": 1791285226259,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 5：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791285255622-b801a3943f12",
+      "time": 1791285255622,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 5 PTS 映射：source→Scene 108002 帧（最大 0.000ms），Scene→编码 108002 帧（最大 0.000ms），source→编码 108002 帧（最大 0.000ms）；封装诊断 1800.011s / 1800.000s。"
+    },
+    {
+      "id": "1791285255744-fc3ffe1db0aec8",
+      "time": 1791285255744,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 6：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791286300313-9c21e72e113138",
+      "time": 1791286300313,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 6 性能：decode 104.35fps / scene 104.32fps / encode 104.32fps / total 104.32fps"
+    },
+    {
+      "id": "1791286300324-4c245194364f9",
+      "time": 1791286300324,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 6：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791286329573-77c7f09c519b4",
+      "time": 1791286329574,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 6 PTS 映射：source→Scene 108000 帧（最大 0.000ms），Scene→编码 108000 帧（最大 0.000ms），source→编码 108000 帧（最大 0.000ms）；封装诊断 1800.002s / 1800.000s。"
+    },
+    {
+      "id": "1791286329718-29906651c5ed",
+      "time": 1791286329718,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 7：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791287409807-1916dd9c01a16",
+      "time": 1791287409807,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 7 性能：decode 100.85fps / scene 100.82fps / encode 100.82fps / total 100.82fps"
+    },
+    {
+      "id": "1791287409818-1095b67c36a03",
+      "time": 1791287409818,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 7：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791287439024-aa9c9129b658e8",
+      "time": 1791287439025,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 7 PTS 映射：source→Scene 107881 帧（最大 0.000ms），Scene→编码 107881 帧（最大 0.000ms），source→编码 107881 帧（最大 0.000ms）；封装诊断 1799.999s / 1800.000s。"
+    },
+    {
+      "id": "1791287439190-8a5dde049372a",
+      "time": 1791287439190,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 8：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791288218552-ffa198e6336b98",
+      "time": 1791288218552,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 8 性能：decode 89.58fps / scene 89.58fps / encode 89.58fps / total 89.58fps"
+    },
+    {
+      "id": "1791288218564-5dd24be13ac918",
+      "time": 1791288218564,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 8：复用已通过 PTS 与存储校验的原生 MKV，跳过整片视频重封装。"
+    },
+    {
+      "id": "1791288237077-9e3110788524a",
+      "time": 1791288237077,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录 分段 8 PTS 映射：source→Scene 68753 帧（最大 0.000ms），Scene→编码 68753 帧（最大 0.000ms），source→编码 68753 帧（最大 0.000ms）；封装诊断 1145.882s / 1145.890s。"
+    },
+    {
+      "id": "1791288982329-8197ae44f1b0a",
+      "time": 1791288982329,
+      "level": "info",
+      "message": "当前已是最新版本 0.9.4"
+    },
+    {
+      "id": "1791289879728-1283522c03a658",
+      "time": 1791289879728,
+      "level": "success",
+      "message": "Scene Graph 片段已导出：/mnt/zzzz/哔哩录播2K/883263_真栗_20261003_200838.merged.clip_0-13745_89.danmaku.mp4"
+    },
+    {
+      "id": "1791299023368-00e4963ee18348",
+      "time": 1791299023368,
+      "level": "error",
+      "message": "真栗(883263) 监听异常：fetch failed"
+    }
+  ]
+}

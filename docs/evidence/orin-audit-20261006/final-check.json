@@ -1,0 +1,93 @@
+{
+  "idle": true,
+  "defaultExportMode": "burn",
+  "savedOnDisk": true,
+  "burnCodecs": [
+    "hevc_nvv4l2",
+    "h264_nvv4l2"
+  ],
+  "sceneGpu": {
+    "available": true,
+    "backend": "cuda-gstreamer",
+    "nativeNvmmScene": true
+  },
+  "visualConformance": {
+    "version": "ass-compat-v4",
+    "passed": true,
+    "reason": ""
+  },
+  "logs": [
+    {
+      "id": "1791302718608-70f99a521262b8",
+      "time": 1791302718608,
+      "level": "info",
+      "message": "录像保存目录位于 cifs 挂载（/mnt/zzzz），跳过 POSIX 2770 规范化，以实际读写探针为准。"
+    },
+    {
+      "id": "1791302737659-84c1ee146d8668",
+      "time": 1791302737659,
+      "level": "info",
+      "message": "当前已是最新版本 0.9.4"
+    },
+    {
+      "id": "1791303255464-d3a228915be13",
+      "time": 1791303255464,
+      "level": "info",
+      "message": "已加入导出队列 #1：烧录片段：883263_真栗_20261003_200838.merged.mp4 -> 883263_真栗_20261003_200838.merged.clip_0-20.danmaku.mp4"
+    },
+    {
+      "id": "1791303256948-961a5924b02c58",
+      "time": 1791303256948,
+      "level": "info",
+      "message": "导出片段实际 PTS：视频 0.021s，音频 0.000s，A/V 起点差 -0.021s。"
+    },
+    {
+      "id": "1791303260207-d86832696a53d",
+      "time": 1791303260207,
+      "level": "info",
+      "message": "Scene 构建：原始事件 15653，范围内事件 29，Scene 对象 28。"
+    },
+    {
+      "id": "1791303260237-afb7aca5047128",
+      "time": 1791303260237,
+      "level": "info",
+      "message": "导出临时媒体位于本机 /tmp/br2k-export-scene-ag2Dz2，预留 111.6 MB，验证后发布成片。"
+    },
+    {
+      "id": "1791303260239-8cf303f6594df8",
+      "time": 1791303260239,
+      "level": "info",
+      "message": "CUDA Scene准入通过：runtime available=true backend=cuda-gstreamer reason=- nativeNvmmScene=true nativeNvmmReason=-"
+    },
+    {
+      "id": "1791303292204-b5dbd27330be",
+      "time": 1791303292204,
+      "level": "info",
+      "message": "Jetson CUDA Scene真实源预检通过：10.00s，88.0fps，PTS bridge通过；正式导出使用分段NVMM链路。"
+    },
+    {
+      "id": "1791303292213-e859396b2bd79",
+      "time": 1791303292213,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791303299335-ca3f4a2045e128",
+      "time": 1791303299335,
+      "level": "info",
+      "message": "Jetson Scene Graph 烧录：原生 NVMM 已生成 1 帧黑帧前导。"
+    },
+    {
+      "id": "1791303300275-e24fd634681d88",
+      "time": 1791303300275,
+      "level": "info",
+      "message": "正在取消当前导出任务。"
+    },
+    {
+      "id": "1791303300366-f73d49be9b835",
+      "time": 1791303300366,
+      "level": "info",
+      "message": "已取消 Scene Graph 导出片段：883263_真栗_20261003_200838.merged.clip_0-20.danmaku.mp4"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "backendSha256": "65348575f64a8e340af5c0792b80ee1ef724cbb7600c2cc6cf08a2e707c0c8a1",
+  "indexSha256": "212a0b72f4af79bde09c81fb4adf03c85f111186df6d2b18283d6217764759fd",
+  "backendBackup": "/usr/lib/bili-record-2k/server.bundle.cjs.bak-20261006-before-audit",
+  "webBackup": "/usr/lib/bili-record-2k/dist.bak-20261006-before-audit"
+}
