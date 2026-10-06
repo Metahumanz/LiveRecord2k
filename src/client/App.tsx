@@ -122,32 +122,28 @@ export default function App() {
       setSettingsSaveError('');
       setSettingsSaveStatus('idle');
     }
-    setSettingsDraft((current) => {
-      const previous = current || settingsDraftRef.current;
-      if (!previous || options.resetDirty) {
-        settingsDraftRef.current = nextSettings;
-        return nextSettings;
-      }
-      const merged = { ...nextSettings };
+    const previous = settingsDraftRef.current;
+    const merged = { ...nextSettings };
+    if (previous && !options.resetDirty) {
       for (const key of settingsDirtyFieldsRef.current) {
         Object.assign(merged, { [key]: previous[key] });
       }
-      settingsDraftRef.current = merged;
-      return merged;
-    });
+    }
+    settingsDraftRef.current = merged;
+    setSettingsDraft(merged);
   }
 
   function updateSettingsDraft(nextSettings: Partial<AppSettings>, options: SettingsDraftUpdateOptions = {}) {
     const keys = Object.keys(nextSettings) as Array<keyof AppSettings>;
     if (!keys.length) return;
     const saveMode = options.saveMode ?? (options.autoSave === false ? 'commit' : 'debounced');
-    setSettingsDraft((current) => {
-      const previous = current || settingsDraftRef.current;
-      if (!previous) return current;
-      const next = { ...previous, ...nextSettings };
-      settingsDraftRef.current = next;
-      return next;
-    });
+    const previous = settingsDraftRef.current;
+    if (!previous) return;
+    const next = { ...previous, ...nextSettings };
+    // Explicit save can run before React renders this update. Keep the
+    // authoritative draft ready for commitSettingsDraft in the same event.
+    settingsDraftRef.current = next;
+    setSettingsDraft(next);
     settingsSaveCoordinatorRef.current.markChanged(nextSettings, { queue: saveMode !== 'commit' });
     syncDirtySettingsFieldsFromCoordinator();
     if (!settingsSaveCoordinatorRef.current.hasFailures()) {

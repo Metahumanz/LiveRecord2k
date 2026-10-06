@@ -77,6 +77,7 @@ const GROUPS = {
     'scene-cache-index.test.cjs',
     'scene-legacy-conformance.test.cjs',
     'settings-draft.test.cjs',
+    'export-defaults-ui.test.cjs',
     'settings-service.test.cjs',
     'sse-incremental.test.cjs',
     'update-service.test.cjs'
