@@ -255,7 +255,7 @@ function overlayShape(previous, imageLabel, output, object, offset) {
   let y = yOffset ? '(' + motionExpression(object, 'y') + '+' + ff(yOffset) + ')' : motionExpression(object, 'y');
   // CUDA places new bitmap/rich-text runs at the nearest pixel. FFmpeg's
   // default truncation shifted the reference by one pixel after card reflow.
-  if (object.type === 'Image' || object.props?.emojiText) {
+  if (source.roundCoordinates || object.type === 'Image' || object.props?.emojiText) {
     x = 'floor((' + x + ')+0.5)'; y = 'floor((' + y + ')+0.5)';
   }
   return '[' + previous + '][' + imageLabel + ']overlay=x=' + "'" + x + "'" +
@@ -483,6 +483,10 @@ function createSceneFilterScriptBase(scene, options) {
     ? ',fps=fps=' + ff(fps) + ':round=near,tpad=stop_mode=clone:stop_duration=' + ff(outputDuration) +
       ',trim=duration=' + ff(outputDuration) + ',setpts=PTS-STARTPTS'
     : source.normalizeFrameClock === true && !cudaTarget ? ',fps=fps=' + ff(fps) + ':round=near' : '';
+  // NVMM draws from the requested source PTS, including a small video lead.
+  // Resetting only the reference's first picture loses that lead (21 ms on
+  // a real 4K merge) and moves scrolling glyphs by more than a whole glyph edge.
+  const inputClock = source.preserveInputClock === true ? 'setpts=PTS' : 'setpts=PTS-STARTPTS';
   const filters = leadingVideoPaddingSec > 0.0005
     ? [
         '[0:v]settb=AVTB,setpts=PTS-STARTPTS' + (cudaTarget ? uploadBase : softwareFormat) + '[scene_source_0]',
@@ -491,7 +495,7 @@ function createSceneFilterScriptBase(scene, options) {
         '[scene_lead_0][scene_source_0]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
           ',setpts=PTS-STARTPTS' + frameClock + (cudaTarget ? '' : softwareFormat) + '[scene_base_0]'
       ]
-    : ['[0:v]settb=AVTB,setpts=PTS-STARTPTS' + frameClock + (cudaTarget ? uploadBase : softwareFormat) + '[scene_base_0]'];
+    : ['[0:v]settb=AVTB,' + inputClock + frameClock + (cudaTarget ? uploadBase : softwareFormat) + '[scene_base_0]'];
   let previous = 'scene_base_0';
   let index = 0;
   let cudaLayersInBatch = 0;
@@ -526,7 +530,7 @@ function createSceneFilterScriptBase(scene, options) {
         const output = 'scene_text_' + index;
         filters.push(textLayerFilter(variant, cpuImage, outputDuration, fps));
         if (cudaTarget) filters.push(uploadCudaLayer(cpuImage, image, variant));
-        filters.push(cudaTarget ? overlayCudaShape(previous, image, output, variant) : overlayShape(previous, image, output, variant));
+        filters.push(cudaTarget ? overlayCudaShape(previous, image, output, variant) : overlayShape(previous, image, output, variant, { roundCoordinates: source.roundCoordinates }));
         previous = output;
         index += 1;
         flushCudaBatch();
@@ -544,7 +548,7 @@ function createSceneFilterScriptBase(scene, options) {
       if (cudaTarget) filters.push(uploadCudaLayer(shadowCpuImage, shadowImage, object));
       filters.push(cudaTarget
         ? overlayCudaShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding })
-        : overlayShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding }));
+        : overlayShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding, roundCoordinates: source.roundCoordinates }));
       previous = shadowOutput;
       index += 1;
       flushCudaBatch();
@@ -554,7 +558,7 @@ function createSceneFilterScriptBase(scene, options) {
     const output = 'scene_layer_' + index;
     filters.push(['Avatar', 'Image'].includes(object.type) ? avatarFilter(object, cpuImage, outputDuration, fps) : objectShapeFilter(object, cpuImage, outputDuration, fps));
     if (cudaTarget) filters.push(uploadCudaLayer(cpuImage, image, object));
-    filters.push(cudaTarget ? overlayCudaShape(previous, image, output, object) : overlayShape(previous, image, output, object));
+    filters.push(cudaTarget ? overlayCudaShape(previous, image, output, object) : overlayShape(previous, image, output, object, { roundCoordinates: source.roundCoordinates }));
     previous = output;
     index += 1;
     flushCudaBatch();

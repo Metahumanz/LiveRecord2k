@@ -48,6 +48,7 @@ const GROUPS = {
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
     'danmaku-emoji.test.cjs',
+    'native-scene-reference.test.cjs',
     'desktop-cuda-capability.test.cjs',
     'desktop-burn-regression.test.cjs',
     'diagnostics.test.cjs',

@@ -12605,10 +12605,10 @@ try {
         if (assPath) await fsp.writeFile(textless, (await fsp.readFile(assPath, 'utf8')).split(/\r?\n/).filter(line =>
           !line.startsWith('Dialogue:') || /^Dialogue:\s*[^,]*,[^,]*,[^,]*,Shape,/.test(line)).join('\n'));
         const reference = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-reference.filter'), probeGraph,
-          { duration: probeDuration, fps, target: 'software', legacyAssPath: assPath });
+          { duration: probeDuration, fps, target: 'software', legacyAssPath: assPath, preserveInputClock: true, roundCoordinates: true });
         const clean = await writeSceneFilterScript(path.join(temporaryDir, 'preflight-clean.filter'),
           { ...probeGraph, objects: probeGraph.objects.filter(object => !['Text', 'Image'].includes(object.type)) },
-          { duration: probeDuration, fps, target: 'software', legacyAssPath: textless });
+          { duration: probeDuration, fps, target: 'software', legacyAssPath: textless, preserveInputClock: true, roundCoordinates: true });
         const at = Math.round(sample.time * fps) / fps;
         pixels = await verifySceneOutputFrame({
           runJob: (...args) => runFfmpegJob(this.ffmpegPath, ...args), sourcePath: cleanPath, outputPath,
@@ -13315,7 +13315,7 @@ try {
     }
   }
 
-  async verifyFinalSceneTextOutput({ graph, events, sceneOptions, cleanPath, outputPath, startTime, duration, fps, directory, onChild, isCancelled, onStage }) {
+  async verifyFinalSceneTextOutput({ graph, events, sceneOptions, cleanPath, outputPath, startTime, duration, fps, directory, onChild, isCancelled, onStage, nativeSceneClock = false }) {
     const samples = selectDistributedSceneSamples(graph, duration);
     const results = [];
     for (const [index, sample] of samples.entries()) {
@@ -13330,10 +13330,10 @@ try {
       if (ass) await fsp.writeFile(noText, (await fsp.readFile(ass, 'utf8')).split(/\r?\n/).filter(line =>
         !line.startsWith('Dialogue:') || /^Dialogue:\s*[^,]*,[^,]*,[^,]*,Shape,/.test(line)).join('\n'));
       const reference = await writeSceneFilterScript(path.join(directory, prefix + '.filter'), sampleGraph,
-        { duration: sample.duration, fps, target: 'software', legacyAssPath: ass });
+        { duration: sample.duration, fps, target: 'software', legacyAssPath: ass, preserveInputClock: nativeSceneClock, roundCoordinates: nativeSceneClock });
       const clean = await writeSceneFilterScript(path.join(directory, prefix + '-clean.filter'),
         { ...sampleGraph, objects: sampleGraph.objects.filter(object => !['Text', 'Image'].includes(object.type)) },
-        { duration: sample.duration, fps, target: 'software', legacyAssPath: noText });
+        { duration: sample.duration, fps, target: 'software', legacyAssPath: noText, preserveInputClock: nativeSceneClock, roundCoordinates: nativeSceneClock });
       const at = Math.round(sample.time * fps) / fps;
       try {
         const pixels = await verifySceneOutputFrame({ runJob: (...args) => runFfmpegJob(this.ffmpegPath, ...args),
@@ -13842,6 +13842,7 @@ try {
         graph, events: sceneResult.events,
         sceneOptions: { overlayMode, danmakuArea, stylePreset, styleLayout, videoInfo: recording.videoInfo || mediaInfo.videoInfo },
         cleanPath: recording.cleanPath, outputPath: temporaryOutputPath, startTime, duration, fps, directory: sceneDirectory,
+        nativeSceneClock: /NVMM/.test(String(progress.activePipeline?.sceneRenderer || '')),
         onChild: child => { this.exportProcess = child; if (child && this.exportCancelRequested) requestFfmpegStop(child, { graceful: false, timeoutMs: 1500 }); },
         isCancelled: () => this.exportCancelRequested, onStage: setExportStage
       });
