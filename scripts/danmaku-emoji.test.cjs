@@ -73,6 +73,17 @@ test('emoji-only messages participate in the visible-output gate and share bitma
   assert.ok(selectSceneSample(graph, 10).objectId);
 });
 
+test('Unicode bitmap cache recovers after temporary-file cleanup in the same process', async () => {
+  const asset = unicodeAsset('🛸');
+  const png = await fs.readFile(asset.filePath);
+  try {
+    await fs.rm(asset.filePath);
+    const graph = buildSceneGraph([{ type: 'danmaku', time: 0, text: '🛸' }], { videoInfo: { width: 640, height: 360 } });
+    const image = graph.assets.find(item => item.type === 'emoji');
+    assert.deepEqual(await fs.readFile(image.path), png);
+  } finally { await fs.writeFile(asset.filePath, png, { mode: 0o600 }); }
+});
+
 test('long superchat wraps its complete body in all four styles', () => {
   const text = '这是醒目留言，正文必须完整自动换行。'.repeat(4);
   for (const preset of ['current', 'h5-card', 'bubble', 'minimal']) {

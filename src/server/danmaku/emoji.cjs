@@ -75,7 +75,7 @@ function unicodeAsset(text) {
   const images = loadArtwork();
   const code = [rawCode, rawCode.replace(/-fe0f/g, '')].find(key => images[key]);
   if (!code) return null;
-  if (!materialized.has(code)) {
+  if (!materialized.has(code) || !fs.existsSync(materialized.get(code).filePath)) {
     // Acceptance tools and the system service may run as different users.
     // Each owns its private cache; never share a 0700 directory across users.
     const owner = crypto.createHash('sha1').update(os.userInfo().username).digest('hex').slice(0, 12);
