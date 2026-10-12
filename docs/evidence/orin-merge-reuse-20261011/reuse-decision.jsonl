@@ -1,0 +1,50 @@
+{
+  "source": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202615.clean.mp4",
+  "signatureMatches": true,
+  "assessment": {
+    "known": true,
+    "requiresNormalization": false,
+    "requiresPostMergeVerification": false,
+    "reason": ""
+  },
+  "timingInfo": {
+    "videoDurationSec": 13624.027625,
+    "audioDurationSec": 13624.0365,
+    "avDeltaSec": -0.02412499999991269,
+    "timingSafeForCopy": true
+  },
+  "timelineDetails": {
+    "containerDurationSec": 13624.04,
+    "videoDurationSec": 13624.027625,
+    "videoPresentationDurationSec": 13624.060625,
+    "audioDurationSec": 13624.0365,
+    "avDeltaSec": -0.02412499999991269,
+    "measuredAvDeltaSec": -0.02412499999991269,
+    "videoReorderAllowanceSec": 0.03299999999944703,
+    "containerDeltaSec": 0.003500000000713044,
+    "timingSafeForCopy": true,
+    "firstVideoPts": 0.017,
+    "firstVideoDts": 0,
+    "lastVideoPts": 13624.1,
+    "lastVideoDts": 13624,
+    "firstAudioPts": 0.006,
+    "firstAudioDts": 0.006,
+    "lastAudioPts": 13624,
+    "lastAudioDts": 13624,
+    "avStartDeltaSec": -0.011000000000000001,
+    "avEndDeltaSec": -0.1000000000003638,
+    "avBoundaryToleranceSec": 0.12,
+    "videoPtsMonotonic": false,
+    "videoDtsMonotonic": true,
+    "audioPtsMonotonic": true,
+    "audioDtsMonotonic": true,
+    "corruptPacketCount": 0,
+    "packetAuditMode": "leading-and-trailing-sample-plus-full-copy-scan",
+    "timingAdvisories": [],
+    "timelineHealth": "healthy",
+    "warnings": []
+  },
+  "reuseAsLoaded": false,
+  "reuseWithDetails": true
+}
+CURRENT {"recordingFound":true,"timing":{"videoDurationSec":13624.027625,"audioDurationSec":13624.0365,"avDeltaSec":-0.02412499999991269,"timingSafeForCopy":true,"containerDurationSec":13624.04,"videoPresentationDurationSec":13624.060625,"measuredAvDeltaSec":-0.02412499999991269,"videoReorderAllowanceSec":0.03299999999944703,"containerDeltaSec":0.003500000000713044,"firstVideoPts":0.017,"firstVideoDts":0,"lastVideoPts":13624.1,"lastVideoDts":13624,"firstAudioPts":0.006,"firstAudioDts":0.006,"lastAudioPts":13624,"lastAudioDts":13624,"avStartDeltaSec":-0.011000000000000001,"avEndDeltaSec":-0.1000000000003638,"avBoundaryToleranceSec":0.12,"videoPtsMonotonic":false,"videoDtsMonotonic":true,"audioPtsMonotonic":true,"audioDtsMonotonic":true,"corruptPacketCount":0,"packetAuditMode":"leading-and-trailing-sample-plus-full-copy-scan","timingAdvisories":[],"timelineHealth":"healthy","warnings":[]},"reuse":true}

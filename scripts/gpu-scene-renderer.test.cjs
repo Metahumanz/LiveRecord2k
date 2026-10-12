@@ -109,7 +109,7 @@ test('GPU Scene helper is rejected unless it declares every Scene Graph primitiv
     protocol: GPU_SCENE_PROTOCOL,
     backend: 'cuda-gstreamer',
     version: '0.1.0',
-    capabilities: ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale'],
+    capabilities: ['Text', 'Image', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale'],
     gstreamerElements: JETSON_CUDA_NVMM_REQUIRED_ELEMENTS
   }, 'cuda-gstreamer');
   assert.equal(full.ok, true);

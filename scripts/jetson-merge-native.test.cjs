@@ -74,3 +74,30 @@ test('admitted native failure stops without CPU or outer encoder restart, and ca
   options.isCancelled = () => true;
   await assert.rejects(app.runMergeJetsonNormalize(options), e => e.code === 'BR2K_MEDIA_CANCELLED');
 });
+
+test('native transcode forwards storage progress and publishes only the verified MKV', async t => {
+  const { app, options } = await setup(t);
+  app.ffmpegCapabilities.sceneGpuRenderer.nativeNvmmScene = true;
+  const reports = [], destination = path.join(path.dirname(options.encodedVideoPath), 'verified.mkv');
+  captured = async (_helper, args, callbacks) => {
+    const request = JSON.parse(await fs.readFile(args[1], 'utf8'));
+    await fs.writeFile(request.output.path, Buffer.alloc(2048, 3));
+    const lines = [
+      { nativeNvmmProgress: { mediaSeconds: 144, frames: 8640, pipelineFps: 120 } },
+      { nativeNvmmFinalizing: { phase: 'sync', verifiedBytes: 0, totalBytes: 2048 } },
+      { nativeNvmmFinalizing: { phase: 'storage', verifiedBytes: 2048, totalBytes: 2048, complete: true } },
+      { nativeNvmmMetrics: { ptsBridge: { ok: true }, outputStorageVerified: true, frames: 8640, mediaSeconds: 144 } }
+    ];
+    const stdout = lines.map(line => JSON.stringify(line)).join('\n') + '\n';
+    // The parser must handle records split across stdout chunk boundaries.
+    callbacks.onStdout(stdout.slice(0, 17)); callbacks.onStdout(stdout.slice(17));
+    return { status: 0, stdout, stderr: '' };
+  };
+  const graph = require('../src/server/danmaku/scene-graph.cjs').buildSceneGraph([], { videoInfo: options.targetVideo });
+  await app.runJetsonCudaSceneGraphTranscode({ ...options, graph, decoder: 'gstreamer-nvv4l2',
+    nativeDecode: { decoderPath: '/helper', cleanPath: options.cleanPath, sourceCodec: 'h264', sourceFrameRate: '60/1', duration: 144 },
+    nativeTimestampedOutput: true, nativeVideoOutputPath: destination, onFinalizing: report => reports.push(report) });
+  assert.deepEqual(reports.map(report => report.phase), ['sync', 'storage']);
+  assert.equal((await fs.stat(destination)).size, 2048);
+  await assert.rejects(fs.stat(options.encodedVideoPath), { code: 'ENOENT' });
+});

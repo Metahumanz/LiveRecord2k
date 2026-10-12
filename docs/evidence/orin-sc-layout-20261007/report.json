@@ -1,0 +1,309 @@
+{
+  "source": "/mnt/zzzz/哔哩录播2K/7953876_宴宁ccccc_20261005_201343.clip_0-2927.danmaku.mp4",
+  "canvas": {
+    "width": 720,
+    "height": 1280,
+    "fps": 5
+  },
+  "directory": "/tmp/br2k-sc-layout-20261007/result",
+  "tests": [
+    {
+      "preset": "current",
+      "checks": {
+        "user": {
+          "ok": true,
+          "glyphPixels": 1647,
+          "matchedPixels": 1624,
+          "matchedRatio": 0.9860352155434122,
+          "time": 2,
+          "rawMatchedRatio": 0.5428051001821493,
+          "rasterOffsetY": 1
+        },
+        "detail": {
+          "ok": true,
+          "glyphPixels": 5543,
+          "matchedPixels": 4014,
+          "matchedRatio": 0.724156593902219,
+          "time": 2
+        }
+      },
+      "metrics": {
+        "frames": 21,
+        "mediaSeconds": 3.978,
+        "mediaClock": "encode-pts",
+        "wallSeconds": 0.479712,
+        "drawingClock": "input-pts-fifo",
+        "seekPrerollSec": 8,
+        "textures": {
+          "uniqueTextures": 10,
+          "objectCount": 10,
+          "textureBytes": 349152,
+          "timelineRows": 30,
+          "prepareWallSeconds": 0.087554
+        },
+        "textureCache": {
+          "peakBytes": 349152,
+          "uploads": 10,
+          "limitBytes": 536870912
+        },
+        "outputStorageVerified": true,
+        "decode": 45.86084984323927,
+        "scene": 43.77626575945567,
+        "encode": 43.77626575945567,
+        "total": 43.77626575945567,
+        "pipelineFps": 43.77626575945567,
+        "ptsBridge": {
+          "ok": true,
+          "decodedFrames": 22,
+          "restoredFrames": 21,
+          "unmatchedSceneFrames": 0,
+          "leadingFrames": 0,
+          "encodedFrames": 21,
+          "minimumFrames": 18,
+          "sourceFirstPts": 30013000000,
+          "sourceLastPts": 34192000000,
+          "sourceToSceneFrames": 21,
+          "sourceToSceneMismatches": 0,
+          "sourceToSceneMaxDeltaSec": 0,
+          "sceneToEncodeFrames": 21,
+          "sceneToEncodeMismatches": 0,
+          "sceneToEncodeMaxDeltaSec": 0,
+          "sourceToEncodeFrames": 21,
+          "sourceToEncodeMismatches": 0,
+          "sourceToEncodeMaxDeltaSec": 0,
+          "pendingPeak": 4,
+          "pendingRemaining": 0,
+          "unmatchedEncodeFrames": 0,
+          "sceneCoverageSec": 4.178,
+          "encodeCoverageSec": 3.978,
+          "requestedDurationSec": 4,
+          "coverageToleranceSec": 0.6,
+          "observedFrameDurationSec": 0.2,
+          "diagnosticMinimumFrames": 18
+        }
+      }
+    },
+    {
+      "preset": "h5-card",
+      "checks": {
+        "user": {
+          "ok": true,
+          "glyphPixels": 605,
+          "matchedPixels": 605,
+          "matchedRatio": 1,
+          "time": 2
+        },
+        "detail": {
+          "ok": true,
+          "glyphPixels": 1738,
+          "matchedPixels": 1644,
+          "matchedRatio": 0.9459148446490219,
+          "time": 2
+        }
+      },
+      "metrics": {
+        "frames": 21,
+        "mediaSeconds": 3.978,
+        "mediaClock": "encode-pts",
+        "wallSeconds": 0.509846,
+        "drawingClock": "input-pts-fifo",
+        "seekPrerollSec": 8,
+        "textures": {
+          "uniqueTextures": 13,
+          "objectCount": 18,
+          "textureBytes": 242268,
+          "timelineRows": 18,
+          "prepareWallSeconds": 0.037813
+        },
+        "textureCache": {
+          "peakBytes": 192156,
+          "uploads": 11,
+          "limitBytes": 536870912
+        },
+        "outputStorageVerified": true,
+        "decode": 43.15028459574067,
+        "scene": 41.188908023207006,
+        "encode": 41.188908023207006,
+        "total": 41.188908023207006,
+        "pipelineFps": 41.188908023207006,
+        "ptsBridge": {
+          "ok": true,
+          "decodedFrames": 22,
+          "restoredFrames": 21,
+          "unmatchedSceneFrames": 0,
+          "leadingFrames": 0,
+          "encodedFrames": 21,
+          "minimumFrames": 18,
+          "sourceFirstPts": 30013000000,
+          "sourceLastPts": 34192000000,
+          "sourceToSceneFrames": 21,
+          "sourceToSceneMismatches": 0,
+          "sourceToSceneMaxDeltaSec": 0,
+          "sceneToEncodeFrames": 21,
+          "sceneToEncodeMismatches": 0,
+          "sceneToEncodeMaxDeltaSec": 0,
+          "sourceToEncodeFrames": 21,
+          "sourceToEncodeMismatches": 0,
+          "sourceToEncodeMaxDeltaSec": 0,
+          "pendingPeak": 5,
+          "pendingRemaining": 0,
+          "unmatchedEncodeFrames": 0,
+          "sceneCoverageSec": 4.178,
+          "encodeCoverageSec": 3.978,
+          "requestedDurationSec": 4,
+          "coverageToleranceSec": 0.6,
+          "observedFrameDurationSec": 0.2,
+          "diagnosticMinimumFrames": 18
+        }
+      }
+    },
+    {
+      "preset": "bubble",
+      "checks": {
+        "user": {
+          "ok": true,
+          "glyphPixels": 600,
+          "matchedPixels": 600,
+          "matchedRatio": 1,
+          "time": 2
+        },
+        "detail": {
+          "ok": true,
+          "glyphPixels": 2001,
+          "matchedPixels": 1895,
+          "matchedRatio": 0.9470264867566217,
+          "time": 2
+        }
+      },
+      "metrics": {
+        "frames": 21,
+        "mediaSeconds": 3.978,
+        "mediaClock": "encode-pts",
+        "wallSeconds": 0.403483,
+        "drawingClock": "input-pts-fifo",
+        "seekPrerollSec": 8,
+        "textures": {
+          "uniqueTextures": 13,
+          "objectCount": 18,
+          "textureBytes": 225068,
+          "timelineRows": 18,
+          "prepareWallSeconds": 0.028749
+        },
+        "textureCache": {
+          "peakBytes": 178412,
+          "uploads": 11,
+          "limitBytes": 536870912
+        },
+        "outputStorageVerified": true,
+        "decode": 54.525221632633844,
+        "scene": 52.04680246751413,
+        "encode": 52.04680246751413,
+        "total": 52.04680246751413,
+        "pipelineFps": 52.04680246751413,
+        "ptsBridge": {
+          "ok": true,
+          "decodedFrames": 22,
+          "restoredFrames": 21,
+          "unmatchedSceneFrames": 0,
+          "leadingFrames": 0,
+          "encodedFrames": 21,
+          "minimumFrames": 18,
+          "sourceFirstPts": 30013000000,
+          "sourceLastPts": 34192000000,
+          "sourceToSceneFrames": 21,
+          "sourceToSceneMismatches": 0,
+          "sourceToSceneMaxDeltaSec": 0,
+          "sceneToEncodeFrames": 21,
+          "sceneToEncodeMismatches": 0,
+          "sceneToEncodeMaxDeltaSec": 0,
+          "sourceToEncodeFrames": 21,
+          "sourceToEncodeMismatches": 0,
+          "sourceToEncodeMaxDeltaSec": 0,
+          "pendingPeak": 5,
+          "pendingRemaining": 0,
+          "unmatchedEncodeFrames": 0,
+          "sceneCoverageSec": 4.178,
+          "encodeCoverageSec": 3.978,
+          "requestedDurationSec": 4,
+          "coverageToleranceSec": 0.6,
+          "observedFrameDurationSec": 0.2,
+          "diagnosticMinimumFrames": 18
+        }
+      }
+    },
+    {
+      "preset": "minimal",
+      "checks": {
+        "user": {
+          "ok": true,
+          "glyphPixels": 509,
+          "matchedPixels": 509,
+          "matchedRatio": 1,
+          "time": 2
+        },
+        "detail": {
+          "ok": true,
+          "glyphPixels": 2425,
+          "matchedPixels": 2131,
+          "matchedRatio": 0.8787628865979381,
+          "time": 2
+        }
+      },
+      "metrics": {
+        "frames": 21,
+        "mediaSeconds": 3.978,
+        "mediaClock": "encode-pts",
+        "wallSeconds": 0.448407,
+        "drawingClock": "input-pts-fifo",
+        "seekPrerollSec": 8,
+        "textures": {
+          "uniqueTextures": 12,
+          "objectCount": 16,
+          "textureBytes": 170244,
+          "timelineRows": 16,
+          "prepareWallSeconds": 0.027065
+        },
+        "textureCache": {
+          "peakBytes": 148404,
+          "uploads": 11,
+          "limitBytes": 536870912
+        },
+        "outputStorageVerified": true,
+        "decode": 49.06257038806263,
+        "scene": 46.8324535522416,
+        "encode": 46.8324535522416,
+        "total": 46.8324535522416,
+        "pipelineFps": 46.8324535522416,
+        "ptsBridge": {
+          "ok": true,
+          "decodedFrames": 22,
+          "restoredFrames": 21,
+          "unmatchedSceneFrames": 0,
+          "leadingFrames": 0,
+          "encodedFrames": 21,
+          "minimumFrames": 18,
+          "sourceFirstPts": 30013000000,
+          "sourceLastPts": 34192000000,
+          "sourceToSceneFrames": 21,
+          "sourceToSceneMismatches": 0,
+          "sourceToSceneMaxDeltaSec": 0,
+          "sceneToEncodeFrames": 21,
+          "sceneToEncodeMismatches": 0,
+          "sceneToEncodeMaxDeltaSec": 0,
+          "sourceToEncodeFrames": 21,
+          "sourceToEncodeMismatches": 0,
+          "sourceToEncodeMaxDeltaSec": 0,
+          "pendingPeak": 5,
+          "pendingRemaining": 0,
+          "unmatchedEncodeFrames": 0,
+          "sceneCoverageSec": 4.178,
+          "encodeCoverageSec": 3.978,
+          "requestedDurationSec": 4,
+          "coverageToleranceSec": 0.6,
+          "observedFrameDurationSec": 0.2,
+          "diagnosticMinimumFrames": 18
+        }
+      }
+    }
+  ]
+}

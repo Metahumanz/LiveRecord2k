@@ -1,0 +1,100 @@
+{
+  "ok": true,
+  "directory": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/.br2k-merge-accept-J1b4Rl",
+  "sourceRetained": true,
+  "events": 2,
+  "media": {
+    "durationSec": 28.05,
+    "videoInfo": {
+      "codec": "h264 (avc1 / 0x31637661)",
+      "profile": "avc1 / 0x31637661",
+      "pixelFormat": "yuv420p",
+      "bitDepth": 8,
+      "colorSpace": "bt709",
+      "colorPrimaries": "bt709",
+      "colorTransfer": "bt709",
+      "hdr": false,
+      "width": 3840,
+      "height": 2160,
+      "fps": 60.009276106889295,
+      "rFrameRate": "60/1",
+      "avgFrameRate": "1682000/28029",
+      "timeBase": "1/16000",
+      "sampleAspectRatio": "1:1",
+      "colorRange": "tv",
+      "startTime": 0.021
+    },
+    "audioInfo": {
+      "codec": "aac (mp4a / 0x6134706D)",
+      "sampleRate": 48000,
+      "channelLayout": "stereo",
+      "timeBase": "1/48000",
+      "startTime": 0
+    }
+  },
+  "timing": {
+    "containerDurationSec": 28.05,
+    "videoDurationSec": 28.050625,
+    "videoPresentationDurationSec": 28.067625,
+    "audioDurationSec": 28.0505,
+    "avDeltaSec": -0.017125000000000057,
+    "measuredAvDeltaSec": -0.017125000000000057,
+    "videoReorderAllowanceSec": 0.01699999999999946,
+    "containerDeltaSec": -0.0006249999999994316,
+    "timingSafeForCopy": true
+  },
+  "storageStages": [
+    "正在回读校验分段 1/2：0 B / 23.9 MB",
+    "正在回读校验分段 1/2：23.9 MB / 23.9 MB"
+  ],
+  "logs": [
+    {
+      "level": "info",
+      "message": "真栗(883263) 已提交 2 个文件手动合并，按录制时间排序，保留所有源文件。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 合并中间文件使用本机临时盘：/tmp/br2k-merge-publish-sbSJtb，预留 94.4 MB；验收后发布，源分段保留至成功。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 正在合并 2 个续录片段：883263_sample_20261011_000000.manual-2ad8040c-a87c-4d00-8520-ed484ae8235d.merged.mp4。检测到分辨率、帧率或编码规格变化，将逐段重建时间轴并统一为 3840x2160，再无损拼接（临时工作区预留 94.4 MB）"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) MP4 合并预留 3.0 MB 前置索引，避免收尾搬移整片媒体。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 合并规范化计划：8秒 需要重编码，20秒 可无损复用；重编码剩余时间估算将排除复用分段。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：NVDEC 真实源预检通过（8.0秒，111.7fps），正式使用 NVDEC → NVMM 缩放 → NVENC。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2 原生性能：107.89fps；481帧，媒体 8.017秒。"
+    },
+    {
+      "level": "info",
+      "message": "真栗(883263) 分段 2/2 规格与时间轴健康，复用源视频及音频，跳过 20秒 重编码。"
+    },
+    {
+      "level": "success",
+      "message": "真栗(883263) 合并后时轴检查：视频 PTS 28.068s，音频 28.050s，音频短 0.017s。"
+    },
+    {
+      "level": "info",
+      "message": "Scene 构建：原始事件 2，范围内事件 2，Scene 对象 2，图片表情快照 0/0。"
+    },
+    {
+      "level": "success",
+      "message": "真栗(883263) 续录片段已合并：883263_sample_20261011_000000.manual-2ad8040c-a87c-4d00-8520-ed484ae8235d.merged.mp4，共 2 段，时长 28秒。"
+    }
+  ]
+}

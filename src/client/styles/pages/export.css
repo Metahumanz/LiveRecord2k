@@ -745,6 +745,13 @@
   background: linear-gradient(135deg, rgba(240, 207, 139, 0.97), rgba(226, 163, 64, 0.96));
 }
 
+.preview-side-superchat small,
+.preview-card.preview-superchat p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+}
+
 .preview-card {
   position: relative;
   display: grid;

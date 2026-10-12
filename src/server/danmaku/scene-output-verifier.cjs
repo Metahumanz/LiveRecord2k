@@ -16,7 +16,7 @@ function compareSceneTextPixels(actual, reference, clean, graph, time, textMask 
   const regions = textMask ? [{ type: 'Text', start: 0, end: Number.MAX_SAFE_INTEGER,
     frame: { x: 1, y: 1, width: width - 2, height: height - 2 } }] : graph.objects;
   for (const object of regions) {
-    if (object.render === false || object.type !== 'Text') continue;
+    if (object.render === false || !['Text', 'Image'].includes(object.type)) continue;
     const state = evaluateSceneObject(object, time);
     if (!state.visible || state.opacity < 0.5) continue;
     const left = Math.max(1, Math.floor(state.x));

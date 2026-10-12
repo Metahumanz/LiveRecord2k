@@ -58,7 +58,8 @@ function planDesktopSceneSegments(graph, duration, fps = 30, options = {}) {
 }
 
 function sampleSceneObject(graph, object, duration) {
-    if (object.render === false || object.type !== 'Text' || !String(object.props?.text || '').trim()) return null;
+    if (object.render === false || !['Text', 'Image'].includes(object.type) ||
+      !(object.type === 'Image' ? object.props?.assetId : String(object.props?.text || '').trim())) return null;
     if (duration > 1 && object.end - object.start < 0.5) return null;
     const time = Math.min(duration - 0.05, object.start + Math.min(2, (object.end - object.start) / 2));
     const state = evaluateSceneObject(object, time);

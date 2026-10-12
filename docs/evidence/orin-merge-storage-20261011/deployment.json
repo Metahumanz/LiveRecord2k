@@ -1,0 +1,9 @@
+{
+  "installed": true,
+  "version": "0.9.4",
+  "sha256": {
+    "/usr/lib/bili-record-2k/server.bundle.cjs": "4d568bd27c48c39084e7a43a1bdb747bab5d5a6f5cad633dd4343a9f02d5eafe",
+    "/usr/lib/bili-record-2k/bin/br2k-scene-gpu": "53105a56d5a7d0bcaaebce3c46cb809b694dc525d9af69c97e361bd75854a9f6",
+    "/var/lib/bili-record-2k/BiliRecord2K/cuda-scene-conformance.json": "7f884bab1aa38ad39c254fc6c49c8fc562d9a22886021f04d18efa80f813ea8f"
+  }
+}

@@ -1,0 +1,143 @@
+{
+  "jobs": [
+    {
+      "id": "merge-1791683717795-7q9wao",
+      "type": "merge",
+      "resource": "diskRead+diskWrite+gpuEncode",
+      "resources": [
+        "diskRead",
+        "diskWrite",
+        "gpuEncode"
+      ],
+      "resourceCosts": {
+        "diskRead": 2,
+        "diskWrite": 2,
+        "gpuEncode": 1
+      },
+      "priority": 70,
+      "status": "running",
+      "createdAt": 1791683719559,
+      "startedAt": 1791683719560
+    }
+  ],
+  "rooms": [
+    {
+      "id": "883263",
+      "recording": false,
+      "mergeProgress": {
+        "id": "merge-1791683717795-7q9wao",
+        "kind": "merge",
+        "status": "running",
+        "label": "手动合并 2 段录像",
+        "outputPath": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-b2e02d4f-bd49-4d73-be6f-e871b511c852.merged.mp4",
+        "roomId": "883263",
+        "codec": "h264_nvv4l2",
+        "codecKind": "hardware",
+        "decoder": "gstreamer-nvv4l2",
+        "decoderKind": "hardware",
+        "decoderLabel": "Jetson nvv4l2decoder",
+        "sourceFps": 60,
+        "encoderBackend": "Jetson nvv4l2h264enc",
+        "avatarCompositeBackend": "NVMM 硬件缩放",
+        "activePipeline": {
+          "decoder": "Jetson nvv4l2decoder",
+          "sceneRenderer": "NVMM 硬件缩放",
+          "encoder": "Jetson nvv4l2h264enc"
+        },
+        "stageFps": {
+          "decode": 126.0731974140057,
+          "scene": 126.0731974140057,
+          "encode": 126.01887893170755,
+          "total": 126.01887893170755,
+          "pipelineFps": 126.01887893170755
+        },
+        "startedAt": 1791683717795,
+        "updatedAt": 1791684225189,
+        "phase": "render",
+        "phaseStartedAt": 1791684150194,
+        "phaseCurrentTimeSec": 509.840292,
+        "phasePercent": 3.6471517672967706,
+        "phaseEstimatedRemainingSec": 6302.6263044442085,
+        "phaseDurationSec": 13979.135625,
+        "etaState": "ready",
+        "currentTimeSec": 509.840292,
+        "durationSec": 13979.135625,
+        "estimatedRemainingSec": 6302.6263044442085,
+        "renderFps": 128.2255493095218,
+        "realtimeFactor": 2.13709248849203,
+        "percent": 3.6471517672967706,
+        "message": "正在取消当前合并，源分段全部保留；后续直播合并不受影响",
+        "mergeGroup": "manual-b2e02d4f-bd49-4d73-be6f-e871b511c852",
+        "sourceCount": 2,
+        "manual": true,
+        "deleteSources": true,
+        "sourcePaths": [
+          "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.clean.mp4",
+          "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202615.clean.mp4"
+        ],
+        "stageLabel": "规范化分段 2/2（NVDEC 硬解、NVMM 缩放与硬编） · 本段 2分35秒 / 3小时47分4秒",
+        "stageProgress": null,
+        "stageStartedAt": 1791684150077,
+        "mergeMode": "normalize",
+        "mergeReason": "统一分段规格或修复时间轴后再拼接",
+        "workStartedAt": 1791683719562,
+        "segmentIndex": 2
+      }
+    },
+    {
+      "id": "7953876",
+      "recording": false,
+      "mergeProgress": null
+    }
+  ],
+  "logs": [
+    {
+      "id": "1791683719562-6c3e846c4fc29",
+      "time": 1791683719562,
+      "level": "info",
+      "message": "真栗(883263) 正在合并 2 个续录片段：883263_真栗_20261010_202014.manual-b2e02d4f-bd49-4d73-be6f-e871b511c852.merged.mp4。检测到分辨率、帧率或编码规格变化，将逐段重建时间轴并统一为 3840x2160，再无损拼接（临时工作区预留 34.45 GB）"
+    },
+    {
+      "id": "1791683719562-97eced2e79ccb",
+      "time": 1791683719562,
+      "level": "info",
+      "message": "真栗(883263) MP4 合并预留 116.0 MB 前置索引，避免收尾搬移整片媒体。"
+    },
+    {
+      "id": "1791683741696-6c0724ff73835",
+      "time": 1791683741696,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：NVDEC 真实源预检通过（30.0秒，119.8fps），正式使用 NVDEC → NVMM 缩放 → NVENC。"
+    },
+    {
+      "id": "1791683741699-bf7e41fe050858",
+      "time": 1791683741699,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791683922412-021a397f2f6b8",
+      "time": 1791683922412,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2 原生性能：118.68fps；21303帧，媒体 355.096秒。"
+    },
+    {
+      "id": "1791684150192-e86311a9ebb9c8",
+      "time": 1791684150192,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 2/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：NVDEC 真实源预检通过（30.0秒，115.6fps），正式使用 NVDEC → NVMM 缩放 → NVENC。"
+    },
+    {
+      "id": "1791684150194-852e7b75610a28",
+      "time": 1791684150194,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 2/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791684225189-394b73dd97fd58",
+      "time": 1791684225189,
+      "level": "info",
+      "message": "真栗(883263) 已请求取消本次合并；其他场次的合并任务不受影响。"
+    }
+  ]
+}

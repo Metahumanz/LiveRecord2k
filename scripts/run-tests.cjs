@@ -47,6 +47,10 @@ const GROUPS = {
     'recording-identity.test.cjs',
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
+    'danmaku-emoji.test.cjs',
+    'superchat-layout.test.cjs',
+    'native-scene-reference.test.cjs',
+    'scene-verification-cancel.test.cjs',
     'desktop-cuda-capability.test.cjs',
     'desktop-burn-regression.test.cjs',
     'diagnostics.test.cjs',
@@ -75,6 +79,7 @@ const GROUPS = {
     'scene-cache-index.test.cjs',
     'scene-legacy-conformance.test.cjs',
     'settings-draft.test.cjs',
+    'export-defaults-ui.test.cjs',
     'settings-service.test.cjs',
     'sse-incremental.test.cjs',
     'update-service.test.cjs'

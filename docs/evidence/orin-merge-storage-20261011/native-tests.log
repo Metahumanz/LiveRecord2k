@@ -1,0 +1,14 @@
+✔ merge admits a 30 second real source and runs native from the canonical input with the selected bitrate (11.2458ms)
+✔ formatted HEVC metadata selects h265parse without the H.264 rewrite (3.9357ms)
+✔ sparse frame clocks inspect a bounded larger interval instead of requiring frames inside a source PTS hole (4.4609ms)
+✔ a bitstream filter diagnostic is fatal to admission even if FFmpeg exited 0 (4.5767ms)
+✔ admitted native failure stops without CPU or outer encoder restart, and cancellation stays cancellation (6.3724ms)
+✔ native transcode forwards storage progress and publishes only the verified MKV (10.1425ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 211.4634

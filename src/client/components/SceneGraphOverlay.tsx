@@ -147,6 +147,8 @@ function SceneNode({
           fontWeight: numberValue(props.fontWeight, 400),
           lineHeight: numberValue(props.lineHeight, numberValue(props.fontSize, 20) * 1.2) + 'px',
           whiteSpace: 'pre-wrap',
+          textAlign: props.align === 'center' ? 'center' : 'left',
+          ...(props.verticalAlign === 'middle' ? { display: 'flex', alignItems: 'center', justifyContent: props.align === 'center' ? 'center' : 'flex-start' } : {}),
           WebkitTextStroke: numberValue(style.strokeWidth) + 'px ' + stringValue(style.stroke, 'transparent'),
           textShadow: shadowStyle(style)
         }}
@@ -154,6 +156,11 @@ function SceneNode({
         {textAt(object, time)}
       </div>
     );
+  }
+  if (object.type === 'Image') {
+    const asset = assets.get(stringValue(props.assetId));
+    return <img key={object.id} src={asset?.src || asset?.url} alt={stringValue(props.alt)} draggable={false}
+      style={{ ...base, objectFit: 'contain', border: 0 }} />;
   }
   if (object.type === 'Avatar') {
     const asset = assets.get(stringValue(props.assetId));

@@ -142,7 +142,7 @@ function createSceneRenderPlan(scene, options) {
     .slice()
     .sort((left, right) => Number(left.zIndex || 0) - Number(right.zIndex || 0) || String(left.id).localeCompare(String(right.id)))
     .map((object) => {
-      const asset = object.type === 'Avatar' && object.props && object.props.assetId
+      const asset = ['Avatar', 'Image'].includes(object.type) && object.props && object.props.assetId
         ? assets.get(String(object.props.assetId)) || null
         : null;
       return {
@@ -216,7 +216,7 @@ function objectShapeFilter(object, label, duration, fps, options) {
     ',format=rgba' + roundedMask + dynamicScaleFilter(object) + fadeFilters(object) + padded + blurred + '[' + label + ']';
 }
 
-function avatarFilter(object, label, duration) {
+function avatarFilter(object, label, duration, fps = 30) {
   const width = Math.max(2, Math.ceil(number(object.frame && object.frame.width, 1)));
   const height = Math.max(2, Math.ceil(number(object.frame && object.frame.height, 1)));
   const path = object.asset && object.asset.path;
@@ -231,20 +231,36 @@ function avatarFilter(object, label, duration) {
     );
   }
   const radius = Math.min(width, height) / 2;
-  const alpha = "if(lte((X-W/2)^2+(Y-H/2)^2\\," + ff(radius * radius) + ")\\,alpha(X\\,Y)\\,0)";
+  let alpha = object.type === 'Image' ? "alpha(X\\,Y)" : "if(lte((X-W/2)^2+(Y-H/2)^2\\," + ff(radius * radius) + ")\\,alpha(X\\,Y)\\,0)";
+  const clip = object.style?.clip;
+  if (object.type === 'Image' && clip) {
+    const x = motionExpression(object, 'x').replace(/\bt\b/g, 'T');
+    const y = motionExpression(object, 'y').replace(/\bt\b/g, 'T');
+    alpha = "if(between(X+(" + x + ")\\," + ff(clip.x) + '\\,' + ff(Number(clip.x) + Number(clip.width)) +
+      ')*between(Y+(' + y + ')\\,' + ff(clip.y) + '\\,' + ff(Number(clip.y) + Number(clip.height)) + ')\\,' + alpha + '\\,0)';
+  }
   const opacity = Math.max(0, Math.min(1, number(object.style && object.style.opacity, 1)));
   const start = Math.max(0, number(object.start));
   const life = Math.max(0.001, Math.min(duration, number(object.end, duration)) - start);
-  return "movie='" + quoteFilter(path) + "',loop=loop=-1:size=1:start=0,trim=duration=" + ff(life) +
-    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB,scale=' + width + ':' + height + ',format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=' + "'" + alpha + "',colorchannelmixer=aa=" + ff(opacity) + fadeFilters(object) + dynamicScaleFilter(object) + '[' + label + ']';
+  const imageRate = object.type === 'Image' ? ',fps=' + ff(fps) : '';
+  const imageScale = object.type === 'Image' && object.props?.objectFit === 'contain'
+    ? ',scale=' + width + ':' + height + ':force_original_aspect_ratio=decrease,format=rgba,pad=' + width + ':' + height + ':(ow-iw)/2:(oh-ih)/2:color=black@0'
+    : ',scale=' + width + ':' + height;
+  return "movie='" + quoteFilter(path) + "',loop=loop=-1:size=1:start=0" + imageRate + ',trim=duration=' + ff(life) +
+    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB' + imageScale + ',format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=' + "'" + alpha + "',colorchannelmixer=aa=" + ff(opacity) + fadeFilters(object) + dynamicScaleFilter(object) + '[' + label + ']';
 }
 
 function overlayShape(previous, imageLabel, output, object, offset) {
   const source = offset || {};
   const xOffset = number(source.x);
   const yOffset = number(source.y);
-  const x = xOffset ? '(' + motionExpression(object, 'x') + '+' + ff(xOffset) + ')' : motionExpression(object, 'x');
-  const y = yOffset ? '(' + motionExpression(object, 'y') + '+' + ff(yOffset) + ')' : motionExpression(object, 'y');
+  let x = xOffset ? '(' + motionExpression(object, 'x') + '+' + ff(xOffset) + ')' : motionExpression(object, 'x');
+  let y = yOffset ? '(' + motionExpression(object, 'y') + '+' + ff(yOffset) + ')' : motionExpression(object, 'y');
+  // CUDA places new bitmap/rich-text runs at the nearest pixel. FFmpeg's
+  // default truncation shifted the reference by one pixel after card reflow.
+  if (source.roundCoordinates || object.type === 'Image' || object.props?.emojiText) {
+    x = 'floor((' + x + ')+0.5)'; y = 'floor((' + y + ')+0.5)';
+  }
   return '[' + previous + '][' + imageLabel + ']overlay=x=' + "'" + x + "'" +
     ':y=' + "'" + y + "'" +
     ":enable='" + objectEnable(object) + "':eof_action=pass:repeatlast=0:format=auto[" + output + ']';
@@ -380,11 +396,11 @@ function directTextFilter(previous, output, object) {
 }
 
 function canDrawTextDirectly(object) {
-  return object.type === 'Text' && number(object.props?.fontSize) >= 20 &&
+  return object.type === 'Text' && !object.props?.emojiText && number(object.props?.fontSize) >= 20 &&
     !(object.animations || []).some((animation) => animation.type === 'Scale');
 }
 
-function createSceneFilterScript(scene, options) {
+function createSceneFilterScriptBase(scene, options) {
   const source = options || {};
   const plan = createSceneRenderPlan(scene, source);
   const fps = Math.max(1, number(source.fps, 30));
@@ -470,6 +486,10 @@ function createSceneFilterScript(scene, options) {
     ? ',fps=fps=' + ff(fps) + ':round=near,tpad=stop_mode=clone:stop_duration=' + ff(outputDuration) +
       ',trim=duration=' + ff(outputDuration) + ',setpts=PTS-STARTPTS'
     : source.normalizeFrameClock === true && !cudaTarget ? ',fps=fps=' + ff(fps) + ':round=near' : '';
+  // NVMM draws from the requested source PTS, including a small video lead.
+  // Resetting only the reference's first picture loses that lead (21 ms on
+  // a real 4K merge) and moves scrolling glyphs by more than a whole glyph edge.
+  const inputClock = source.preserveInputClock === true ? 'setpts=PTS' : 'setpts=PTS-STARTPTS';
   const filters = leadingVideoPaddingSec > 0.0005
     ? [
         '[0:v]settb=AVTB,setpts=PTS-STARTPTS' + (cudaTarget ? uploadBase : softwareFormat) + '[scene_source_0]',
@@ -478,7 +498,7 @@ function createSceneFilterScript(scene, options) {
         '[scene_lead_0][scene_source_0]concat=n=2:v=1:a=0,trim=duration=' + ff(outputDuration) +
           ',setpts=PTS-STARTPTS' + frameClock + (cudaTarget ? '' : softwareFormat) + '[scene_base_0]'
       ]
-    : ['[0:v]settb=AVTB,setpts=PTS-STARTPTS' + frameClock + (cudaTarget ? uploadBase : softwareFormat) + '[scene_base_0]'];
+    : ['[0:v]settb=AVTB,' + inputClock + frameClock + (cudaTarget ? uploadBase : softwareFormat) + '[scene_base_0]'];
   let previous = 'scene_base_0';
   let index = 0;
   let cudaLayersInBatch = 0;
@@ -513,14 +533,14 @@ function createSceneFilterScript(scene, options) {
         const output = 'scene_text_' + index;
         filters.push(textLayerFilter(variant, cpuImage, outputDuration, fps));
         if (cudaTarget) filters.push(uploadCudaLayer(cpuImage, image, variant));
-        filters.push(cudaTarget ? overlayCudaShape(previous, image, output, variant) : overlayShape(previous, image, output, variant));
+        filters.push(cudaTarget ? overlayCudaShape(previous, image, output, variant) : overlayShape(previous, image, output, variant, { roundCoordinates: source.roundCoordinates }));
         previous = output;
         index += 1;
         flushCudaBatch();
       }
       continue;
     }
-    if (!['Avatar', 'Rect', 'Card', 'SuperChat', 'Gift'].includes(object.type)) continue;
+    if (!['Image', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift'].includes(object.type)) continue;
     const shadow = objectShadow(object);
     if (shadow) {
       const shadowImage = 'scene_shadow_image_' + index;
@@ -531,7 +551,7 @@ function createSceneFilterScript(scene, options) {
       if (cudaTarget) filters.push(uploadCudaLayer(shadowCpuImage, shadowImage, object));
       filters.push(cudaTarget
         ? overlayCudaShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding })
-        : overlayShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding }));
+        : overlayShape(previous, shadowImage, shadowOutput, object, { x: shadow.offsetX - padding, y: shadow.offsetY - padding, roundCoordinates: source.roundCoordinates }));
       previous = shadowOutput;
       index += 1;
       flushCudaBatch();
@@ -539,9 +559,9 @@ function createSceneFilterScript(scene, options) {
     const image = 'scene_image_' + index;
     const cpuImage = cudaTarget ? image + '_cpu' : image;
     const output = 'scene_layer_' + index;
-    filters.push(object.type === 'Avatar' ? avatarFilter(object, cpuImage, outputDuration) : objectShapeFilter(object, cpuImage, outputDuration, fps));
+    filters.push(['Avatar', 'Image'].includes(object.type) ? avatarFilter(object, cpuImage, outputDuration, fps) : objectShapeFilter(object, cpuImage, outputDuration, fps));
     if (cudaTarget) filters.push(uploadCudaLayer(cpuImage, image, object));
-    filters.push(cudaTarget ? overlayCudaShape(previous, image, output, object) : overlayShape(previous, image, output, object));
+    filters.push(cudaTarget ? overlayCudaShape(previous, image, output, object) : overlayShape(previous, image, output, object, { roundCoordinates: source.roundCoordinates }));
     previous = output;
     index += 1;
     flushCudaBatch();
@@ -551,6 +571,26 @@ function createSceneFilterScript(scene, options) {
     plan,
     script: filters.join(';\n') + '\n'
   };
+}
+
+function createSceneFilterScript(scene, options = {}) {
+  const generated = createSceneFilterScriptBase(scene, options);
+  const images = generated.plan.objects.filter(o => o.type === 'Image');
+  if (!options.legacyAssPath || !images.length) return generated;
+  const filters = [generated.script.trim().replace(/\[vout\](?=[;\s]*$)/, '[scene_emoji_base]')];
+  let previous = 'scene_emoji_base';
+  images.forEach((object, index) => {
+    const label = 'emoji_image_' + index;
+    const output = 'emoji_layer_' + index;
+    filters.push(avatarFilter(object, label + '_cpu', options.outputDuration || generated.plan.duration, options.fps || 30));
+    if (generated.plan.target === 'cuda') {
+      filters.push(uploadCudaLayer(label + '_cpu', label, object));
+      filters.push(overlayCudaShape(previous, label, output, object));
+    } else filters.push(overlayShape(previous, label + '_cpu', output, object));
+    previous = output;
+  });
+  filters.push('[' + previous + ']null[vout]');
+  return { ...generated, script: filters.join(';\n') + '\n' };
 }
 
 async function writeSceneFilterScript(filePath, scene, options) {

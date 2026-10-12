@@ -7,6 +7,7 @@
 // their own placement decisions.
 
 const STYLE_PRESETS = require('../../shared/danmaku-style-presets.json');
+const { graphemes, isEmptyGuardToast, resolveEmojiText } = require('./emoji.cjs');
 const {
   createMessageTimeline: createLegacyMessageTimeline,
   getMessageItemMetrics: getLegacyMessageItemMetrics,
@@ -194,6 +195,8 @@ function eventDuration(event, style) {
 }
 
 function glyphWidthFactor(character) {
+  if (character === '\u3000') return 1;
+  if (character.length > 1 && /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(character)) return 1;
   if (!character) return 0;
   const code = character.codePointAt(0) || 0;
   if (/\s/.test(character)) return 0.34;
@@ -207,7 +210,7 @@ function glyphWidthFactor(character) {
 
 function measureText(text, fontSize) {
   const size = Math.max(1, Number(fontSize) || 1);
-  return round(Array.from(String(text || '')).reduce((total, character) => total + glyphWidthFactor(character) * size, 0));
+  return round(graphemes(text).reduce((total, character) => total + glyphWidthFactor(character) * size, 0));
 }
 
 function truncateTextToWidth(text, maximumWidth, fontSize) {
@@ -216,7 +219,7 @@ function truncateTextToWidth(text, maximumWidth, fontSize) {
   if (measureText(source, fontSize) <= width) return source;
   const ellipsis = '…';
   let output = '';
-  for (const character of Array.from(source)) {
+  for (const character of graphemes(source)) {
     const candidate = output + character;
     if (measureText(candidate + ellipsis, fontSize) > width) break;
     output = candidate;
@@ -231,8 +234,8 @@ function wrapTextToWidthLines(text, maximumWidth, fontSize, maximumLines) {
   const lines = [];
   let line = '';
   let truncated = false;
-  for (const character of Array.from(source)) {
-    if (character === '\n') {
+  for (const character of graphemes(source)) {
+    if (character === '\n' || character === '\r' || character === '\r\n') {
       lines.push(line);
       line = '';
       if (lines.length >= maxLines) {
@@ -391,9 +394,9 @@ function messageMetrics(event, style, sideStream) {
   const fontSize = Math.max(12, style.boxFontSize);
   const metaFontSize = Math.max(12, Math.floor(fontSize * 0.8));
   const inset = Math.max(style.giftRadius / 2, fontSize / 2);
-  const lines = wrapTextToWidthLines(event.text, panelWidth - inset * 2, fontSize / 1.25, 3);
-  const headerHeight = fontSize + metaFontSize + style.giftRadius / 2;
-  const bodyHeight = lines.length * fontSize + style.giftRadius / 2;
+  const lines = wrapTextToWidthLines(event.text, panelWidth - inset * 2, fontSize, 64);
+  const headerHeight = (fontSize + metaFontSize) * 1.2 + Math.max(8, style.giftRadius * 2 / 3);
+  const bodyHeight = lines.length * fontSize * 1.2 + style.giftRadius / 2;
   return { width: panelWidth, height: headerHeight + bodyHeight, fontSize, metaFontSize, avatar: Math.max(26, Math.round(fontSize * 1.3)), gap: 8, radius: cardRadius(style, fontSize, panelWidth, headerHeight + bodyHeight), headerHeight, bodyHeight, lines, textWidth: panelWidth - inset * 2, inset };
 }
 
@@ -588,7 +591,7 @@ function layoutMessages(events, style, sideStream) {
 
 function resolvePalette(event, style) {
   const preset = style.visualPreset;
-  if (event.type === 'superchat') return { background: '#B2602A', header: '#FFF5ED', accent: '#653617', text: '#FFFFFF', detail: '#313131' };
+  if (event.type === 'superchat') return { background: '#B2602A', header: '#FFF5ED', accent: '#653617', text: '#FFFFFF', username: '#653617', detail: '#313131' };
   if (event.type === 'guard') return { background: '#FCE8D8', header: '#FCE8D8', accent: '#8A3619', text: '#005029', detail: '#005443' };
   if (event.type === 'gift') return { background: '#E8F3F7', header: '#E8F3F7', accent: '#C46CFF', text: '#005029', detail: '#005443' };
   if (preset === 'bubble') return { background: '#F7E5FA', header: '#F7E5FA', accent: '#2F2230', text: '#2F2230', detail: '#514355' };
@@ -604,13 +607,14 @@ class LayoutEngine {
     this.sourceStyle = resolveStyle(source.style, source.stylePreset, source.styleLayout);
     this.style = adaptStyleToCanvas(this.sourceStyle, source.videoInfo);
     this.videoInfo = source.videoInfo;
+    this.emojiAssets = source.emojiAssets || source.avatarAssets || {};
   }
 
   layout(events) {
     const sorted = (Array.isArray(events) ? events : [])
-      .filter((event) => event && ['danmaku', 'gift', 'superchat', 'guard'].includes(event.type))
+      .filter((event) => event && !isEmptyGuardToast(event) && ['danmaku', 'gift', 'superchat', 'guard'].includes(event.type))
       .filter((event) => this.overlayMode === 'danmaku' ? event.type === 'danmaku' : true)
-      .map((event) => Object.assign({}, event, { videoTime: eventTime(event), time: eventTime(event) }))
+      .map((event) => Object.assign({}, resolveEmojiText(event, event._emojiAssets || this.emojiAssets), { videoTime: eventTime(event), time: eventTime(event) }))
       .sort((left, right) => eventTime(left) - eventTime(right));
     const sideStream = this.style.visualPreset !== 'current' && SCENE_STYLE_PRESETS.includes(this.style.visualPreset);
     // The three alternate styles originated in the ASS renderer.  Their

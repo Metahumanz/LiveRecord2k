@@ -1766,11 +1766,12 @@ function runJetsonNativeDecodeSceneEncodeJob({
 } = {}) {
   return new Promise((resolve, reject) => {
     const results = {
-      decoder: { code: null, stderr: '', error: null },
-      renderer: { code: null, stderr: '', error: null },
-      encoder: { code: null, stderr: '', error: null }
+      decoder: { code: null, signal: '', stderr: '', error: null },
+      renderer: { code: null, signal: '', stderr: '', error: null },
+      encoder: { code: null, signal: '', stderr: '', error: null }
     };
     let decoder; let renderer; let encoder; let settled = false; let timer = null;
+    let firstFailureRole = '';
     const startedAt = Date.now();
     const counters = { decodedBytes: 0, sceneBytes: 0 };
     let metricsTimer = null;
@@ -1817,13 +1818,15 @@ function runJetsonNativeDecodeSceneEncodeJob({
       // Once ffmpeg-full has rendered its requested duration it closes the
       // raw stdin; fdsink then reports EPIPE while the decoder is being torn
       // down. Renderer + encoder are the authoritative finite stages.
-      const failed = Object.entries(results).find(([role, item]) =>
-        role !== 'decoder' && (item.error || item.code !== 0)
-      );
+      const failed = firstFailureRole
+        ? [firstFailureRole, results[firstFailureRole]]
+        : Object.entries(results).find(([role, item]) => role !== 'decoder' && (item.error || item.code !== 0));
       if (!failed) return resolve();
       const [role, item] = failed;
-      const error = new Error(`Jetson 原生硬解 / Scene Graph / 硬编链路失败（${role}）：${String(item.stderr || item.error?.message || `退出码 ${item.code}`).replace(/\s+/g, ' ').trim().slice(-3000)}`);
+      const error = new Error(`Jetson 原生硬解 / Scene Graph / 硬编链路失败（${role}，退出码 ${item.code ?? '-'}，信号 ${item.signal || '-'}）：${String(item.error?.message || item.stderr || '没有错误输出').replace(/\s+/g, ' ').trim().slice(-3000)}`);
       error.primaryProcess = role === 'renderer' ? 'ffmpeg' : 'gstreamer';
+      error.exitCode = item.code;
+      error.signal = item.signal;
       error.gstreamerStderr = `${results.decoder.stderr}\n${results.encoder.stderr}`.slice(-8000);
       error.ffmpegStderr = results.renderer.stderr.slice(-8000);
       reject(error);
@@ -1832,11 +1835,29 @@ function runJetsonNativeDecodeSceneEncodeJob({
       child.stderr.on('data', (chunk) => {
         const text = chunk.toString('utf8'); results[role].stderr = `${results[role].stderr}${text}`.slice(-8000); callback?.(text);
       });
-      child.on('error', (error) => { results[role].error = error; if (role !== 'decoder') stopAll(); finish(); });
+      child.on('error', (error) => {
+        results[role].error = error;
+        if (role !== 'decoder') { firstFailureRole ||= role; stopAll(); }
+        finish();
+      });
       // Node reports `null` for a SIGKILL exit. Store a concrete failing
       // value so the bridge always settles instead of leaving export progress
       // stuck after one leg aborts and the other legs are cleaned up.
-      child.on('close', (code) => { results[role].code = code === null ? -1 : code; if (code !== 0 && role !== 'decoder') stopAll(); finish(); });
+      child.on('close', (code, signal) => {
+        results[role].code = code === null ? -1 : code;
+        results[role].signal = signal || '';
+        if (code !== 0 && role !== 'decoder') { firstFailureRole ||= role; stopAll(); }
+        if (role === 'renderer' && code === 0) {
+          // Finite rendering closes raw stdin before an upstream decoder
+          // necessarily reaches EOF. Stop only that producer; the encoder
+          // still needs to consume renderer stdout and flush its muxer.
+          try { if (decoder?.exitCode === null) decoder.kill('SIGKILL'); } catch {}
+          // Cancellation must remain effective while NVENC drains after the
+          // finite renderer has exited. Transfer the active process handle.
+          if (encoder?.exitCode === null) onChild?.(encoder);
+        }
+        finish();
+      });
     };
     try {
       encoder = spawn(gstreamerPath, encoderArgs, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
@@ -1847,7 +1868,16 @@ function runJetsonNativeDecodeSceneEncodeJob({
       decoder.stdio[3].on('data', (chunk) => { counters.decodedBytes += Math.max(0, Number(chunk?.length) || 0); });
       renderer.stdout.on('data', (chunk) => { counters.sceneBytes += Math.max(0, Number(chunk?.length) || 0); });
       decoder.stdio[3].on('error', () => {}); renderer.stdout.on('error', () => {});
-      renderer.stdin.on('error', () => stopAll()); encoder.stdin.on('error', () => stopAll());
+      renderer.stdin.on('error', (error) => {
+        if (error.code === 'EPIPE' || error.code === 'ERR_STREAM_DESTROYED') {
+          try { if (decoder?.exitCode === null) decoder.kill('SIGKILL'); } catch {}
+          return;
+        }
+        results.renderer.error = error; firstFailureRole ||= 'renderer'; stopAll();
+      });
+      encoder.stdin.on('error', (error) => {
+        results.encoder.error = error; firstFailureRole ||= 'encoder'; stopAll();
+      });
       onChild?.(renderer);
       attach(decoder, 'decoder', onDecoderStderr);
       attach(renderer, 'renderer', onFfmpegStderr);

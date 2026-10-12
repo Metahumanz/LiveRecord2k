@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from collections import deque
 from fractions import Fraction
 
@@ -43,7 +44,7 @@ except Exception as error:  # pragma: no cover - executed on the Jetson only
     sys.exit(2)
 
 PROTOCOL = 'bili-record2k.gpu-scene-render/v1'
-CAPABILITIES = ['Text', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale']
+CAPABILITIES = ['Text', 'Image', 'Avatar', 'Rect', 'Card', 'SuperChat', 'Gift', 'Move', 'Fade', 'Scale']
 REQUIRED_ELEMENTS = ['appsrc', 'glupload', 'glvideomixer', 'gldownload', 'videoconvert', 'nvvidconv', 'nvv4l2h264enc', 'nvv4l2h265enc']
 # nvivafilter is Jetson's supported CUDA callback bridge for NVMM allocated by
 # nvvidconv.  Do not insert the direct V4l2Memory-only test element here.
@@ -225,6 +226,10 @@ class LibassTextRenderer:
         primary = self.ass_color(style.get('fill') or '#ffffff')
         outline = self.ass_color(style.get('stroke') or '#000000')
         content = str(props.get('assText') or self.escape(props.get('text')))
+        anchor = props.get('assAnchor') or {}
+        alignment = (5 if props.get('align') == 'center' else 4) if anchor else 7
+        offset_x += number(anchor.get('x'))
+        offset_y += number(anchor.get('y'))
         script = '''[Script Info]
 ScriptType: v4.00+
 PlayResX: %d
@@ -234,8 +239,8 @@ Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackC
 Style: SceneText,%s,%.4f,%s,&H00000000&,%s,&H00000000&,%d,0,0,0,100,100,0,0,1,%.4f,0,7,0,0,0,1
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(%.4f,%.4f)\\bord%.4f\\shad0}%s
-''' % (width, height, family, size, primary, outline, bold, stroke, offset_x, offset_y, stroke, content)
+Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an%d\\pos(%.4f,%.4f)\\bord%.4f\\shad0}%s
+''' % (width, height, family, size, primary, outline, bold, stroke, alignment, offset_x, offset_y, stroke, content)
         return self.render_script(script, width, height)
 
     def render_drawings(self, drawings, width, height):
@@ -294,6 +299,18 @@ def rasterize_texture(entry):
             top = draw.multiline_textbbox((0, 0), text, font=font, spacing=0)[1]
             draw.multiline_text((0, -top), text, font=font,
                                 fill=rgba(style.get('fill'), 1), stroke_width=stroke, stroke_fill=rgba(style.get('stroke'), 1), spacing=0)
+    elif kind == 'Image':
+        source = str((entry.get('asset') or {}).get('path') or '')
+        # Static bitmap texture: preserve transparency and the whole image.
+        with Image.open(source) as bitmap:
+            bitmap.seek(0)
+            bitmap = bitmap.convert('RGBA')
+            if props.get('objectFit') == 'contain':
+                ratio = min(width / bitmap.width, height / bitmap.height)
+                fitted = bitmap.resize((max(1, round(bitmap.width * ratio)), max(1, round(bitmap.height * ratio))), Image.Resampling.LANCZOS)
+                image.alpha_composite(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+            else:
+                image = bitmap.resize((width, height), Image.Resampling.LANCZOS)
     elif kind == 'Avatar':
         vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
         drawings = props.get('assDrawings') if isinstance(props.get('assDrawings'), list) else None
@@ -481,7 +498,16 @@ def prepare_cuda_timeline(request, work_dir):
             clip = style.get('clip') if isinstance(style.get('clip'), dict) else {}
             clip_width = number(clip.get('width'), -1)
             clip_height = number(clip.get('height'), -1)
-            rows.append([left + timeline_offset, right + timeline_offset, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
+            row_start, row_end = left + timeline_offset, right + timeline_offset
+            if entry.get('_legacyAssMetrics'):
+                # The compatibility oracle's assTime() floors to centiseconds.
+                # A fractional video lead otherwise shifts a moving, wrapped
+                # card by several pixels relative to that same ASS geometry.
+                row_start = math.floor(row_start * 100 + 1e-7) / 100
+                row_end = math.floor(row_end * 100 + 1e-7) / 100
+                if row_end <= row_start:
+                    continue
+            rows.append([row_start, row_end, initial['x'], initial['y'], initial['width'], initial['height'], initial['alpha'],
                          final['x'], final['y'], final['width'], final['height'], final['alpha'], raw_path, texture_width, texture_height,
                          number(clip.get('x'), 0), number(clip.get('y'), 0), clip_width, clip_height])
         report_preparation_progress(entry_index, force=entry_index == len(entries))
@@ -719,7 +745,16 @@ def decode_native(args):
     input_path = str(args.input or '')
     if not os.path.isfile(input_path): fail('原生解码输入不存在：' + input_path)
     width, height = int(args.width), int(args.height)
-    fps = max(1.0, number(args.fps, 30))
+    # Node passes rational GStreamer caps (for example 5/1 or 60000/1001).
+    # float() rejected those strings and silently used 30, over-producing
+    # decoded frames and provoking a pipe close at every finite render end.
+    try:
+        fps = float(Fraction(str(args.fps)))
+    except (ValueError, ZeroDivisionError):
+        fail('原生 NVDEC 缺少有效帧率：' + str(args.fps))
+    if not math.isfinite(fps) or fps <= 0:
+        fail('原生 NVDEC 缺少有效帧率：' + str(args.fps))
+    fps = max(1.0, fps)
     start = max(0.0, number(args.start, 0))
     duration = max(0.001, number(args.duration, 0))
     parser_factory = 'h265parse' if str(args.codec).lower() == 'hevc' else 'h264parse'
@@ -830,6 +865,34 @@ def probe_native_edit_list_lead(input_path):
         probe.set_state(Gst.State.NULL)
 
 
+def verify_native_output_storage(output_path, expected_bytes, expected_digest, report):
+    """Audit persisted bytes without making a progressing SMB read look idle."""
+    actual_digest = hashlib.sha256()
+    actual_bytes = 0
+    report({'phase': 'sync', 'verifiedBytes': 0, 'totalBytes': expected_bytes})
+    with open(output_path, 'rb') as completed_file:
+        os.fsync(completed_file.fileno())
+        if hasattr(os, 'posix_fadvise'):
+            os.posix_fadvise(completed_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        report({'phase': 'storage', 'verifiedBytes': 0, 'totalBytes': expected_bytes})
+        last_report = time.monotonic()
+        while True:
+            data = completed_file.read(1024 * 1024)
+            if not data:
+                break
+            actual_digest.update(data)
+            actual_bytes += len(data)
+            now = time.monotonic()
+            # Only completed reads reset the parent's idle watchdog. A blocked
+            # fsync/read still times out; no unconditional heartbeat masks it.
+            if now - last_report >= 0.25:
+                report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes})
+                last_report = now
+    if actual_bytes != expected_bytes or actual_digest.digest() != expected_digest:
+        fail('共享盘输出字节与编码封装输出不一致（写入或回读损坏），已拒绝发布；请检查 SMB 存储链路。')
+    report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes, 'complete': True})
+
+
 def render_native_nvmm(request):
     """Decode, composite and encode entirely in NVMM for one finite request."""
     check_request(request)
@@ -919,10 +982,10 @@ def render_native_nvmm(request):
                 # Re-basing it after the black source would add that gap a
                 # second time and final mux would trim the lead away.
                 'concat name=timeline_lead adjust-base=false ! queue ! %s '
-                'videotestsrc name=black-lead pattern=black num-buffers=%d ! '
+                'videotestsrc name=black-lead pattern=black num-buffers=%d timestamp-offset=%d ! '
                 'video/x-raw,format=I420,width=%d,height=%d,framerate=%s ! nvvidconv ! %s ! queue ! timeline_lead. '
                 '%s ! queue ! timeline_lead.'
-            ) % (encoder_branch, leading_video_frames, width, height, fps_caps(fps), caps, source_branch)
+            ) % (encoder_branch, leading_video_frames, int(start * Gst.SECOND), width, height, fps_caps(fps), caps, source_branch)
         else:
             launch = source_branch + ' ! ' + encoder_branch
         native_nvmm_trace('pipeline=' + launch)
@@ -988,7 +1051,12 @@ def render_native_nvmm(request):
         # probes. Admit the very first buffer of the new seek segment even
         # if it arrives before the synchronous seek call returns.
         startup_pad = decoder.get_static_pad('src')
-        needs_segment_seek = start > 0.0001
+        # A clip beginning inside the MP4 empty edit has no source pictures
+        # to seek past. Seeking here flushes concat's already-running black
+        # branch; its zero-based buffers also preceded the requested clock
+        # and reached CUDA as negative drawing times. Decode from the start
+        # while the finite black branch fills the requested leading interval.
+        needs_segment_seek = start > 0.0001 and not leading_video_frames
         # Some Jetson encoder MP4s mark non-IDR I pictures as sync samples.
         # Seeking to the nearest such picture leaves NVDEC without reference
         # state until the next IDR. Decode a bounded preroll in NVMM, then
@@ -1011,7 +1079,7 @@ def render_native_nvmm(request):
         negotiated_fps = {'value': ''}
         encoded_pts = {'first': None, 'end': None}
         eos_at_target = {'sent': False}
-        scene_first_pts = {'value': int(start * Gst.SECOND) if needs_segment_seek else None}
+        scene_first_pts = {'value': int(start * Gst.SECOND) if start > 0.0001 else None}
         # Audit CUDA output against the ordered NVDEC frame sequence. JetPack
         # keeps the actual timestamp in NVMM metadata through nvivafilter and
         # NVENC; assigning a replacement Gst.Buffer.pts at the Scene pad does
@@ -1261,7 +1329,7 @@ def render_native_nvmm(request):
             clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
             clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
             clock_library.br2k_scene_enable_pts_clock()
-        drawing_clock = {'first': int(start * Gst.SECOND) if needs_segment_seek else None}
+        drawing_clock = {'first': int(start * Gst.SECOND) if start > 0.0001 else None}
         def supply_drawing_time(_pad, info):
             buffer = info.get_buffer()
             if not buffer:
@@ -1362,20 +1430,8 @@ def render_native_nvmm(request):
         finally:
             pipeline.set_state(Gst.State.NULL)
         if output_container == 'mkv':
-            actual_digest = hashlib.sha256()
-            actual_bytes = 0
-            with open(output['path'], 'rb') as completed_file:
-                os.fsync(completed_file.fileno())
-                if hasattr(os, 'posix_fadvise'):
-                    os.posix_fadvise(completed_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                while True:
-                    data = completed_file.read(1024 * 1024)
-                    if not data:
-                        break
-                    actual_digest.update(data)
-                    actual_bytes += len(data)
-            if actual_bytes != output_bytes['count'] or actual_digest.digest() != output_digest.digest():
-                fail('共享盘输出字节与编码封装输出不一致（写入或回读损坏），已拒绝发布；请检查 SMB 存储链路。')
+            verify_native_output_storage(output['path'], output_bytes['count'], output_digest.digest(),
+                lambda metrics: print(json.dumps({'nativeNvmmFinalizing': metrics}, ensure_ascii=False), flush=True))
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
         media_clock = 'frame-fallback'

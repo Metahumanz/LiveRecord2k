@@ -1,0 +1,141 @@
+{
+  "mode": "after",
+  "exitCode": 0,
+  "idleTimedOut": false,
+  "wallSeconds": 25.116748532047495,
+  "storagePhaseReached": true,
+  "reports": [
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "sync",
+        "verifiedBytes": 0,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 0,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 9437184,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 18874368,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 28311552,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 37748736,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 47185920,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 56623104,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 66060288,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 75497472,
+        "totalBytes": 81918221
+      }
+    },
+    {
+      "nativeNvmmFinalizing": {
+        "phase": "storage",
+        "verifiedBytes": 81918221,
+        "totalBytes": 81918221,
+        "complete": true
+      }
+    },
+    {
+      "nativeNvmmMetrics": {
+        "frames": 2750,
+        "mediaSeconds": 44.999666666,
+        "mediaClock": "encode-pts",
+        "wallSeconds": 24.473189,
+        "drawingClock": "none",
+        "seekPrerollSec": 0.0,
+        "textures": {
+          "uniqueTextures": 0,
+          "objectCount": 0,
+          "textureBytes": 0,
+          "timelineRows": 0,
+          "prepareWallSeconds": 0.000291
+        },
+        "textureCache": {},
+        "outputStorageVerified": true,
+        "decode": 112.36786509514555,
+        "scene": 112.36786509514555,
+        "encode": 112.36786509514555,
+        "total": 112.36786509514555,
+        "pipelineFps": 112.36786509514555,
+        "ptsBridge": {
+          "ok": true,
+          "decodedFrames": 2750,
+          "restoredFrames": 2750,
+          "unmatchedSceneFrames": 0,
+          "leadingFrames": 0,
+          "encodedFrames": 2750,
+          "minimumFrames": 2700,
+          "sourceFirstPts": 17000000,
+          "sourceLastPts": 45000000000,
+          "sourceToSceneFrames": 2750,
+          "sourceToSceneMismatches": 0,
+          "sourceToSceneMaxDeltaSec": 0.0,
+          "sceneToEncodeFrames": 2750,
+          "sceneToEncodeMismatches": 0,
+          "sceneToEncodeMaxDeltaSec": 0.0,
+          "sourceToEncodeFrames": 2750,
+          "sourceToEncodeMismatches": 0,
+          "sourceToEncodeMaxDeltaSec": 0.0,
+          "pendingPeak": 5,
+          "pendingRemaining": 0,
+          "unmatchedEncodeFrames": 0,
+          "sceneCoverageSec": 44.999666666,
+          "encodeCoverageSec": 44.999666666,
+          "requestedDurationSec": 45.017,
+          "coverageToleranceSec": 0.051,
+          "observedFrameDurationSec": 0.017,
+          "diagnosticMinimumFrames": 2700
+        }
+      }
+    }
+  ],
+  "stderrTail": "[ass] libass API version: 0x1701000\n[ass] libass source: tarball: 0.17.1\n[ass] Shaper: FriBidi 1.0.13 (SIMPLE) HarfBuzz-ng 8.3.0 (COMPLEX)\n[ass] Using font provider fontconfig\nNvMMLiteOpen : Block : BlockType = 261 \nNvMMLiteBlockCreate : Block : BlockType = 261 \nNvMMLiteOpen : Block : BlockType = 4 \n===== NvVideo: NVENC =====\nNvMMLiteBlockCreate : Block : BlockType = 4 \nH264: Profile = 66 Level = 0 \nNVMEDIA: Need to set EMC bandwidth : 5744000 \nTEST_STORAGE_READ_START\n"
+}

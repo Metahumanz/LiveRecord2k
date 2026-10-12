@@ -86,6 +86,13 @@ export default function App() {
   const settingsAutoSaveTimerRef = useRef<number | null>(null);
   const settingsAutoRetryTimerRef = useRef<number | null>(null);
   const settingsHaveSavedRef = useRef(false);
+  const exportDraftInitializedRef = useRef(false);
+
+  function syncExportDraftFromServer(nextState: AppState) {
+    const initialize = !exportDraftInitializedRef.current;
+    exportDraftInitializedRef.current = true;
+    setExportDraft((current) => hydrateExportDraft(current, nextState, { initialize }));
+  }
 
   function replaceDirtySettingsFields(nextFields: Set<keyof AppSettings>) {
     const next = new Set(nextFields);
@@ -122,32 +129,28 @@ export default function App() {
       setSettingsSaveError('');
       setSettingsSaveStatus('idle');
     }
-    setSettingsDraft((current) => {
-      const previous = current || settingsDraftRef.current;
-      if (!previous || options.resetDirty) {
-        settingsDraftRef.current = nextSettings;
-        return nextSettings;
-      }
-      const merged = { ...nextSettings };
+    const previous = settingsDraftRef.current;
+    const merged = { ...nextSettings };
+    if (previous && !options.resetDirty) {
       for (const key of settingsDirtyFieldsRef.current) {
         Object.assign(merged, { [key]: previous[key] });
       }
-      settingsDraftRef.current = merged;
-      return merged;
-    });
+    }
+    settingsDraftRef.current = merged;
+    setSettingsDraft(merged);
   }
 
   function updateSettingsDraft(nextSettings: Partial<AppSettings>, options: SettingsDraftUpdateOptions = {}) {
     const keys = Object.keys(nextSettings) as Array<keyof AppSettings>;
     if (!keys.length) return;
     const saveMode = options.saveMode ?? (options.autoSave === false ? 'commit' : 'debounced');
-    setSettingsDraft((current) => {
-      const previous = current || settingsDraftRef.current;
-      if (!previous) return current;
-      const next = { ...previous, ...nextSettings };
-      settingsDraftRef.current = next;
-      return next;
-    });
+    const previous = settingsDraftRef.current;
+    if (!previous) return;
+    const next = { ...previous, ...nextSettings };
+    // Explicit save can run before React renders this update. Keep the
+    // authoritative draft ready for commitSettingsDraft in the same event.
+    settingsDraftRef.current = next;
+    setSettingsDraft(next);
     settingsSaveCoordinatorRef.current.markChanged(nextSettings, { queue: saveMode !== 'commit' });
     syncDirtySettingsFieldsFromCoordinator();
     if (!settingsSaveCoordinatorRef.current.hasFailures()) {
@@ -206,20 +209,22 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     const load = () => recorder.getInitialState().then((nextState) => {
-      if (cancelled) return;
+      // SSE can initialize the page before this older GET finishes. It must
+      // not replace a newer state snapshot or reset edits made since then.
+      if (cancelled || settingsDraftRef.current) return;
       setInitialLoadError('');
       setState(nextState);
       syncSettingsDraftFromServer(nextState.settings, { resetDirty: true });
-      setExportDraft((current) => hydrateExportDraft(current, nextState));
+      syncExportDraftFromServer(nextState);
     }).catch((error) => {
-      if (!cancelled) setInitialLoadError(error instanceof Error ? error.message : '初始状态加载失败');
+      if (!cancelled && !settingsDraftRef.current) setInitialLoadError(error instanceof Error ? error.message : '初始状态加载失败');
     });
     void load();
     const unsubscribe = recorder.onStateChanged((nextState) => {
       setInitialLoadError('');
       setState(nextState);
       syncSettingsDraftFromServer(nextState.settings);
-      setExportDraft((current) => hydrateExportDraft(current, nextState));
+      syncExportDraftFromServer(nextState);
     });
     return () => {
       cancelled = true;

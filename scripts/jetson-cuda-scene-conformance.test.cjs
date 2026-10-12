@@ -29,7 +29,7 @@ const SAMPLE_TIMES = [1.6, 2.2];
 // Both outputs use the same nvv4l2 encoder, so these limits measure renderer
 // divergence rather than normal H.265 quantisation noise.
 const EVENTS = [
-  { type: 'danmaku', time: 0.25, uid: 1, user: '普通观众', text: 'CUDA 与 ASS 的基准弹幕正文', color: 0xffffff },
+  { type: 'danmaku', time: 0.25, uid: 1, user: '普通观众', text: 'CUDA 😀 与 ASS 的基准弹幕正文👍🏽', color: 0xffffff },
   { type: 'superchat', time: 0.75, duration: 5, uid: 2, user: '头像用户', text: '圆角、阴影、淡入淡出和移动的基准醒目留言。', price: 30 },
   { type: 'gift', time: 1.5, duration: 5, uid: 3, user: '礼物用户', giftName: '测试礼物', count: 3, price: 1 }
 ];
@@ -124,7 +124,7 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
         // use the recording clock and must not receive this fixture offset.
         const eventOffset = Math.ceil(leadingVideoPaddingSec * CANVAS.fps - 1e-7) / CANVAS.fps;
         await fs.writeFile(assPath, createAss(EVENTS.map((event) => ({ ...event, time: event.time + eventOffset })),
-          { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS }), 'utf8');
+          { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, renderEmojiImages: true }), 'utf8');
         const caseResult = {
           preset, leadingVideoPaddingSec, passed: false,
           coverage: Object.fromEntries(CUDA_SCENE_CONFORMANCE_COVERAGE.map((key) => [key, true])),
@@ -134,7 +134,11 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
         // Both finite sources and the helper now use the same whole-frame
         // lead, avoiding a one-frame phase difference at a fractional lead.
         const helperDuration = totalDuration;
-        const assScript = await writeSceneFilterScript(path.join(directory, `${id}.ass.filter`), scene, {
+        const referenceScene = { ...scene, objects: scene.objects.map(o => o.type !== 'Image' ? o : {
+          ...o, start: o.start + eventOffset, end: o.end + eventOffset,
+          animations: o.animations.map(a => ({ ...a, start: a.start + eventOffset, end: a.end + eventOffset }))
+        }) };
+        const assScript = await writeSceneFilterScript(path.join(directory, `${id}.ass.filter`), referenceScene, {
           duration: DURATION, outputDuration: totalDuration, leadingVideoPaddingSec: eventOffset, fps: CANVAS.fps, target: 'jetson', legacyAssPath: assPath
         });
         const baselinePath = path.join(directory, `${id}.ass.h265`);

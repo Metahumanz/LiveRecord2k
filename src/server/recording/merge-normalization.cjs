@@ -8,7 +8,8 @@ function canReuseMergeSegment(mediaInfo, targetVideoInfo, timingInfo, assessment
   const audio = mediaInfo?.audioInfo;
   if (!video || !audio || !timingInfo || timingInfo.timingSafeForCopy !== true ||
       assessment?.requiresNormalization || assessment?.requiresPostMergeVerification ||
-      Number(timingInfo.corruptPacketCount || 0) > 0) return false;
+      Number(timingInfo.corruptPacketCount || 0) > 0 ||
+      timingInfo.videoDtsMonotonic === false || timingInfo.audioDtsMonotonic === false) return false;
   const targetAudio = { codec: 'aac', sampleRate: 48000, channelLayout: 'stereo' };
   const signature = createConcatStreamSignature({ videoInfo: video, audioInfo: audio });
   if (signature !== createConcatStreamSignature({ videoInfo: targetVideoInfo, audioInfo: targetAudio })) return false;
@@ -16,8 +17,19 @@ function canReuseMergeSegment(mediaInfo, targetVideoInfo, timingInfo, assessment
   if (hevc !== /hevc|h265/i.test(video.codec || '')) return false;
   if (!hevc && !/h264|avc/i.test(video.codec || '')) return false;
   const frameSec = 1 / Math.max(1, Number(targetVideoInfo.fps) || 30);
-  return typeof timingInfo.avStartDeltaSec === 'number' && typeof timingInfo.avEndDeltaSec === 'number' &&
-    Math.abs(timingInfo.avStartDeltaSec) <= frameSec && Math.abs(timingInfo.avEndDeltaSec) <= 0.08;
+  // Last packet PTS marks its start, not the track's presentation endpoint.
+  // B-frame reorder and audio packet duration can put those packet starts
+  // 100ms apart while the full copy scan proves only 24ms of end drift.
+  // Prefer the verified presentation endpoints; retain the conservative
+  // packet-boundary check for older metadata without a complete scan.
+  const hasPresentationEnds = Number.isFinite(timingInfo.videoPresentationDurationSec) &&
+    timingInfo.videoPresentationDurationSec > 0 && Number.isFinite(timingInfo.audioDurationSec) &&
+    timingInfo.audioDurationSec > 0;
+  const endDeltaSec = hasPresentationEnds
+    ? timingInfo.audioDurationSec - timingInfo.videoPresentationDurationSec
+    : timingInfo.avEndDeltaSec;
+  return Number.isFinite(timingInfo.avStartDeltaSec) && Number.isFinite(endDeltaSec) &&
+    Math.abs(timingInfo.avStartDeltaSec) <= frameSec && Math.abs(endDeltaSec) <= 0.08;
 }
 
 function canScaleMergeOnGpu(sourceVideo, targetVideo) {

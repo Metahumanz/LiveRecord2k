@@ -41,6 +41,9 @@ test('CUDA Scene production gate rejects an unexecuted visual report', () => {
 test('CUDA Scene rejects a passing report from the old layout and lead clock', () => {
   assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v1' }).ok, false);
   assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v2' }).ok, false);
+  assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v4' }).ok, false);
+  assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v5' }).ok, false);
+  assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v6' }).ok, false);
 });
 
 test('CUDA Scene production gate requires every legacy style, lead-in and visual coverage item', () => {

@@ -1,0 +1,194 @@
+{
+  "version": "ass-compat-v7",
+  "passed": true,
+  "executedAt": 1791687064610,
+  "cases": [
+    {
+      "preset": "h5-card",
+      "leadingVideoPaddingSec": 0,
+      "passed": true,
+      "coverage": {
+        "danmaku": true,
+        "avatar": true,
+        "superchat": true,
+        "gift": true,
+        "roundedCorners": true,
+        "shadow": true,
+        "move": true,
+        "fade": true
+      },
+      "metrics": {
+        "meanAbsRgb": 1.0801070601851857,
+        "changedRatio": 0.018936631944444445
+      },
+      "samples": [
+        {
+          "time": 1.6,
+          "meanAbsRgb": 1.0801070601851857,
+          "changedRatio": 0.018936631944444445
+        },
+        {
+          "time": 2.2,
+          "meanAbsRgb": 0.7687876157404536,
+          "changedRatio": 0.008828125
+        }
+      ]
+    },
+    {
+      "preset": "h5-card",
+      "leadingVideoPaddingSec": 1.019,
+      "passed": true,
+      "coverage": {
+        "danmaku": true,
+        "avatar": true,
+        "superchat": true,
+        "gift": true,
+        "roundedCorners": true,
+        "shadow": true,
+        "move": true,
+        "fade": true
+      },
+      "metrics": {
+        "meanAbsRgb": 1.0090465856481357,
+        "changedRatio": 0.019153645833333333
+      },
+      "samples": [
+        {
+          "time": 2.6333333333333337,
+          "meanAbsRgb": 1.0090465856481357,
+          "changedRatio": 0.019153645833333333
+        },
+        {
+          "time": 3.2333333333333334,
+          "meanAbsRgb": 0.7687876157404536,
+          "changedRatio": 0.008828125
+        }
+      ]
+    },
+    {
+      "preset": "bubble",
+      "leadingVideoPaddingSec": 0,
+      "passed": true,
+      "coverage": {
+        "danmaku": true,
+        "avatar": true,
+        "superchat": true,
+        "gift": true,
+        "roundedCorners": true,
+        "shadow": true,
+        "move": true,
+        "fade": true
+      },
+      "metrics": {
+        "meanAbsRgb": 1.1256250000004353,
+        "changedRatio": 0.0122265625
+      },
+      "samples": [
+        {
+          "time": 1.6,
+          "meanAbsRgb": 1.1256250000004353,
+          "changedRatio": 0.0122265625
+        },
+        {
+          "time": 2.2,
+          "meanAbsRgb": 0.7289308449070644,
+          "changedRatio": 0.004704861111111111
+        }
+      ]
+    },
+    {
+      "preset": "bubble",
+      "leadingVideoPaddingSec": 1.019,
+      "passed": true,
+      "coverage": {
+        "danmaku": true,
+        "avatar": true,
+        "superchat": true,
+        "gift": true,
+        "roundedCorners": true,
+        "shadow": true,
+        "move": true,
+        "fade": true
+      },
+      "metrics": {
+        "meanAbsRgb": 1.3692563657409331,
+        "changedRatio": 0.016927083333333332
+      },
+      "samples": [
+        {
+          "time": 2.6333333333333337,
+          "meanAbsRgb": 1.3692563657409331,
+          "changedRatio": 0.016927083333333332
+        },
+        {
+          "time": 3.2333333333333334,
+          "meanAbsRgb": 0.7289308449070644,
+          "changedRatio": 0.004704861111111111
+        }
+      ]
+    },
+    {
+      "preset": "minimal",
+      "leadingVideoPaddingSec": 0,
+      "passed": true,
+      "coverage": {
+        "danmaku": true,
+        "avatar": true,
+        "superchat": true,
+        "gift": true,
+        "roundedCorners": true,
+        "shadow": true,
+        "move": true,
+        "fade": true
+      },
+      "metrics": {
+        "meanAbsRgb": 0.9736458333333322,
+        "changedRatio": 0.012847222222222222
+      },
+      "samples": [
+        {
+          "time": 1.6,
+          "meanAbsRgb": 0.9736458333333322,
+          "changedRatio": 0.012847222222222222
+        },
+        {
+          "time": 2.2,
+          "meanAbsRgb": 0.7785315393518399,
+          "changedRatio": 0.010477430555555556
+        }
+      ]
+    },
+    {
+      "preset": "minimal",
+      "leadingVideoPaddingSec": 1.019,
+      "passed": true,
+      "coverage": {
+        "danmaku": true,
+        "avatar": true,
+        "superchat": true,
+        "gift": true,
+        "roundedCorners": true,
+        "shadow": true,
+        "move": true,
+        "fade": true
+      },
+      "metrics": {
+        "meanAbsRgb": 0.9315610532407212,
+        "changedRatio": 0.013042534722222223
+      },
+      "samples": [
+        {
+          "time": 2.6333333333333337,
+          "meanAbsRgb": 0.9315610532407212,
+          "changedRatio": 0.013042534722222223
+        },
+        {
+          "time": 3.2333333333333334,
+          "meanAbsRgb": 0.7785315393518399,
+          "changedRatio": 0.010477430555555556
+        }
+      ]
+    }
+  ],
+  "reason": ""
+}

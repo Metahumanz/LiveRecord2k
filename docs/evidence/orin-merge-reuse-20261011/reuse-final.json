@@ -1,0 +1,198 @@
+{
+  "progress": {
+    "id": "merge-1791690965631-gn0dky",
+    "kind": "merge",
+    "status": "completed",
+    "label": "手动合并 2 段录像",
+    "outputPath": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.mp4",
+    "roomId": "883263",
+    "codec": "h264_nvv4l2",
+    "codecKind": "hardware",
+    "decoder": "",
+    "decoderKind": "",
+    "decoderLabel": "",
+    "sourceFps": 60,
+    "encoderBackend": "Jetson nvv4l2h264enc",
+    "avatarCompositeBackend": "",
+    "activePipeline": {
+      "decoder": "",
+      "sceneRenderer": "",
+      "encoder": "无损拼接（不重编码）"
+    },
+    "startedAt": 1791690965631,
+    "updatedAt": 1791692142529,
+    "phase": "verify",
+    "phaseStartedAt": 1791692142529,
+    "phaseCurrentTimeSec": 0,
+    "phasePercent": 100,
+    "phaseEstimatedRemainingSec": null,
+    "phaseDurationSec": 0,
+    "etaState": "unavailable",
+    "currentTimeSec": 13979.135625,
+    "durationSec": 13979.135625,
+    "estimatedRemainingSec": 0,
+    "renderFps": null,
+    "realtimeFactor": null,
+    "percent": 100,
+    "message": "续录分段已合并，已删除所选 2 个源文件",
+    "mergeGroup": "manual-498ba453-a5e7-4125-9624-848ec391b0fd",
+    "sourceCount": 2,
+    "manual": true,
+    "deleteSources": true,
+    "sourcePaths": [
+      "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.clean.mp4",
+      "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202615.clean.mp4"
+    ],
+    "stageLabel": "合并已验收，正在清理所选源文件",
+    "stageProgress": null,
+    "stageStartedAt": 1791692134136,
+    "mergeMode": "normalize",
+    "mergeReason": "统一分段规格或修复时间轴后再拼接",
+    "workStartedAt": 1791690966686,
+    "segmentIndex": 2,
+    "cleanupStarted": true,
+    "deletedSourceCount": 2,
+    "deletedArtifactCount": 14
+  },
+  "logs": [
+    {
+      "id": "1791690966680-369ccb16f1aae8",
+      "time": 1791690966680,
+      "level": "info",
+      "message": "真栗(883263) 本机临时盘不足，合并中间文件改存输出盘：/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/.br2k-merge-media-EmOn2N，预留 34.45 GB；验收后发布，源分段保留至成功。"
+    },
+    {
+      "id": "1791690966686-10fe06a060bc68",
+      "time": 1791690966686,
+      "level": "info",
+      "message": "真栗(883263) 正在合并 2 个续录片段：883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.mp4。检测到分辨率、帧率或编码规格变化，将逐段重建时间轴并统一为 3840x2160，再无损拼接（临时工作区预留 34.45 GB）"
+    },
+    {
+      "id": "1791690966686-d59175e7e756c8",
+      "time": 1791690966686,
+      "level": "info",
+      "message": "真栗(883263) MP4 合并预留 116.0 MB 前置索引，避免收尾搬移整片媒体。"
+    },
+    {
+      "id": "1791690966712-7d457b7054d568",
+      "time": 1791690966712,
+      "level": "info",
+      "message": "真栗(883263) 合并规范化计划：5分55秒 需要重编码，3小时47分4秒 可无损复用；重编码剩余时间估算将排除复用分段。"
+    },
+    {
+      "id": "1791690980569-dfcfccee372c18",
+      "time": 1791690980569,
+      "level": "info",
+      "message": "真栗(883263) 正在自动重试合并续录分段（1/3）。"
+    },
+    {
+      "id": "1791690984391-da9418f03dfc38",
+      "time": 1791690984391,
+      "level": "info",
+      "message": "当前已是最新版本 0.9.4"
+    },
+    {
+      "id": "1791690988209-687bdcda4014b8",
+      "time": 1791690988209,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：NVDEC 真实源预检通过（30.0秒，118.9fps），正式使用 NVDEC → NVMM 缩放 → NVENC。"
+    },
+    {
+      "id": "1791690988216-08c7c37450bc6",
+      "time": 1791690988216,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2（Jetson NVDEC H264（GStreamer nvv4l2decoder） 硬件解码）：将在子进程实际启动后报告 CUDA Scene 运行链路。"
+    },
+    {
+      "id": "1791691002293-de4abf7ded2118",
+      "time": 1791691002293,
+      "level": "error",
+      "message": "宴宁ccccc(7953876) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691003788-fcbc75eaebbc88",
+      "time": 1791691003788,
+      "level": "error",
+      "message": "真栗(883263) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691144989-9ad811ee563dc8",
+      "time": 1791691144989,
+      "level": "error",
+      "message": "宴宁ccccc(7953876) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691146487-1655e4d5d09f78",
+      "time": 1791691146487,
+      "level": "error",
+      "message": "真栗(883263) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691166288-1457bf09e7298",
+      "time": 1791691166288,
+      "level": "error",
+      "message": "宴宁ccccc(7953876) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691169941-27714f0efb466",
+      "time": 1791691169941,
+      "level": "info",
+      "message": "真栗(883263) 规范化分段 1/2 原生性能：118.04fps；21303帧，媒体 355.096秒。"
+    },
+    {
+      "id": "1791691498815-3552877d6bdad8",
+      "time": 1791691498815,
+      "level": "error",
+      "message": "宴宁ccccc(7953876) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691560407-1e3b3b9ca80a08",
+      "time": 1791691560407,
+      "level": "info",
+      "message": "真栗(883263) 分段 2/2 规格与时间轴健康，复用源视频及音频，跳过 3小时47分4秒 重编码。"
+    },
+    {
+      "id": "1791691776567-9ecaa0061157c8",
+      "time": 1791691776567,
+      "level": "error",
+      "message": "真栗(883263) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791691977506-890f69fc83df6",
+      "time": 1791691977506,
+      "level": "success",
+      "message": "真栗(883263) 合并后时轴检查：视频 PTS 13979.181s，音频 13979.163s，音频短 0.018s。"
+    },
+    {
+      "id": "1791692101800-65708b8640a5a8",
+      "time": 1791692101800,
+      "level": "error",
+      "message": "真栗(883263) 监听异常：fetch failed"
+    },
+    {
+      "id": "1791692122915-dfe5c580f8e7e8",
+      "time": 1791692122915,
+      "level": "info",
+      "message": "Scene 构建：原始事件 13216，范围内事件 13216，Scene 对象 554869，图片表情快照 2414/2501。"
+    },
+    {
+      "id": "1791692122915-21b1a6a4451c78",
+      "time": 1791692122915,
+      "level": "warn",
+      "message": "图片表情缺少 87 项快照，将保留对应原文字；请检查录制时图片下载日志和快照清单。"
+    },
+    {
+      "id": "1791692142528-f4382af8fa39f",
+      "time": 1791692142528,
+      "level": "success",
+      "message": "手动合并成片及配套文件已保存，已删除所选源文件与配套文件 14 项。"
+    },
+    {
+      "id": "1791692142530-06d262b63d647",
+      "time": 1791692142530,
+      "level": "success",
+      "message": "真栗(883263) 续录片段已合并：883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.mp4，共 2 段，时长 3小时52分59秒。"
+    }
+  ],
+  "jobs": []
+}

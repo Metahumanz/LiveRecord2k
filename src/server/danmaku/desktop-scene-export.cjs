@@ -11,8 +11,11 @@ const { parseFfmpegProgressTime, probeMediaFileInfo, probeMediaTimelineHealth, p
 
 async function runDesktopSceneExport(options) {
   const { graph, events, cleanPath, outputPath, startTime = 0, duration, fps, codec, crf, container, directory,
-    policy, decoder, includeAudio, copyAudio, writeLegacyAss, runJob, runFallback, onStderr, onChild, onFallback,
+    decoder, includeAudio, copyAudio, writeLegacyAss, runJob, runFallback, onStderr, onChild, onFallback,
     onStage, onProgress, onDiagnostics, isCancelled, ffmpegPath, sceneOptions } = options;
+  // Raster emoji add finite image streams even to the legacy ASS path.
+  // Keep long desktop exports within the same object/time resource budget.
+  const policy = { ...options.policy, segmented: options.policy.segmented || graph.objects.some(o => o.type === 'Image') };
   const checkCancelled = () => {
     if (!isCancelled?.()) return;
     const error = new Error('Scene 烧录已取消。');
@@ -114,12 +117,12 @@ async function runDesktopSceneExport(options) {
     // text disappears. Its difference from the oracle is a glyph-only mask,
     // even if the ASS compatibility layout differs from preview geometry.
     const cleanLayer = await writeSceneFilterScript(path.join(directory, 'preflight-clean.filter'),
-      { ...sampleGraph, objects: sampleGraph.objects.filter((object) => object.type !== 'Text') },
+      { ...sampleGraph, objects: sampleGraph.objects.filter((object) => !['Text', 'Image'].includes(object.type)) },
       { duration: sample.duration, fps, target: 'software', legacyAssPath: textlessAss,
         leadingVideoPaddingSec: sampleLayer.leadingVideoPaddingSec, normalizeFrameClock: policy.segmented });
     // Verify optimised text against the established texture renderer rather
     // than regenerating the candidate's drawtext chain as its own oracle.
-    const referenceLayer = policy.segmented
+    const referenceLayer = policy.segmented && policy.renderer !== 'libass-legacy-compatibility'
       ? await writeSceneFilterScript(path.join(directory, 'preflight-reference.filter'), sampleGraph,
         { duration: sample.duration, fps, target: 'software', directText: false,
           leadingVideoPaddingSec: sampleLayer.leadingVideoPaddingSec, normalizeFrameClock: true })
