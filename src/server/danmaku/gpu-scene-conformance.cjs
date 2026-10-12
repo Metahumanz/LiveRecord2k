@@ -4,9 +4,9 @@
 // a complete, current visual run. A helper's advertised primitives are not
 // evidence that its pixels, alpha or timeline are compatible.
 
-// v4 adds wrapped superchat bodies and emoji image primitives. Older reports
+// v7 normalizes recorded image-emote URLs and preserves bitmap aspect ratios. Older reports
 // cannot authorize a renderer/layout that has not passed the new fixtures.
-const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v4';
+const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v7';
 const CUDA_SCENE_CONFORMANCE_PRESETS = ['h5-card', 'bubble', 'minimal'];
 const CUDA_SCENE_CONFORMANCE_LEADS = [0, 1.019];
 const CUDA_SCENE_CONFORMANCE_COVERAGE = [

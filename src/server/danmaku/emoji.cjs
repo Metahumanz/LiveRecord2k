@@ -18,7 +18,10 @@ function imageUrl(value) {
   try {
     const url = new URL(value.startsWith('//') ? 'https:' + value : value);
     if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password &&
-      /(^|\.)(hdslb\.com|biliimg\.com)$/.test(url.hostname)) return url.href;
+      /(^|\.)(hdslb\.com|biliimg\.com)$/.test(url.hostname)) {
+      url.protocol = 'https:';
+      return url.href;
+    }
   } catch {}
   return '';
 }
@@ -113,9 +116,10 @@ function resolveEmojiText(event, assets = {}) {
     return placeholder;
   };
   for (const emote of (event?.emoticons || []).slice(0, 256).sort((a, b) => b.token.length - a.token.length)) {
-    const supplied = assets[emote.url];
-    if (!emote.token || !imageUrl(emote.url) || !supplied?.filePath) continue;
-    const placeholder = add(emote.token, { key: 'remote:' + emote.url, ...supplied, url: emote.url });
+    const url = imageUrl(emote.url);
+    const supplied = assets[url] || assets[emote.url] || assets[url.replace(/^https:/, 'http:')];
+    if (!emote.token || !url || !supplied?.filePath) continue;
+    const placeholder = add(emote.token, { ...supplied, key: 'remote:' + url, url });
     text = text.split(emote.token).join(placeholder);
   }
   text = graphemes(text).map(glyph => {

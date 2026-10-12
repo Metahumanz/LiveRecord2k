@@ -225,6 +225,10 @@ class LibassTextRenderer:
         primary = self.ass_color(style.get('fill') or '#ffffff')
         outline = self.ass_color(style.get('stroke') or '#000000')
         content = str(props.get('assText') or self.escape(props.get('text')))
+        anchor = props.get('assAnchor') or {}
+        alignment = (5 if props.get('align') == 'center' else 4) if anchor else 7
+        offset_x += number(anchor.get('x'))
+        offset_y += number(anchor.get('y'))
         script = '''[Script Info]
 ScriptType: v4.00+
 PlayResX: %d
@@ -234,8 +238,8 @@ Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackC
 Style: SceneText,%s,%.4f,%s,&H00000000&,%s,&H00000000&,%d,0,0,0,100,100,0,0,1,%.4f,0,7,0,0,0,1
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an7\\pos(%.4f,%.4f)\\bord%.4f\\shad0}%s
-''' % (width, height, family, size, primary, outline, bold, stroke, offset_x, offset_y, stroke, content)
+Dialogue: 0,0:00:00.00,0:00:01.00,SceneText,,0,0,0,,{\\an%d\\pos(%.4f,%.4f)\\bord%.4f\\shad0}%s
+''' % (width, height, family, size, primary, outline, bold, stroke, alignment, offset_x, offset_y, stroke, content)
         return self.render_script(script, width, height)
 
     def render_drawings(self, drawings, width, height):
@@ -299,7 +303,13 @@ def rasterize_texture(entry):
         # Static bitmap texture: preserve transparency and the whole image.
         with Image.open(source) as bitmap:
             bitmap.seek(0)
-            image = bitmap.convert('RGBA').resize((width, height), Image.Resampling.LANCZOS)
+            bitmap = bitmap.convert('RGBA')
+            if props.get('objectFit') == 'contain':
+                ratio = min(width / bitmap.width, height / bitmap.height)
+                fitted = bitmap.resize((max(1, round(bitmap.width * ratio)), max(1, round(bitmap.height * ratio))), Image.Resampling.LANCZOS)
+                image.alpha_composite(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+            else:
+                image = bitmap.resize((width, height), Image.Resampling.LANCZOS)
     elif kind == 'Avatar':
         vector = props.get('vector') if props.get('role') == 'legacy-ass-avatar-vector' else None
         drawings = props.get('assDrawings') if isinstance(props.get('assDrawings'), list) else None

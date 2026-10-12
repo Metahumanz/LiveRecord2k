@@ -5,7 +5,7 @@ const os = require('node:os');
 const { discoverExportedClips } = require('../recording/exported-clips.cjs');
 const { canReuseMergeSegment, canScaleMergeOnGpu, canNormalizeNativeNvmm, createJetsonNvdecCanonicalInputArgs } = require('../recording/merge-normalization.cjs');
 const crypto = require('node:crypto');
-const { emojiAssetId } = require('../danmaku/emoji.cjs');
+const { emojiAssetId, imageUrl: normalizeEmojiUrl } = require('../danmaku/emoji.cjs');
 const { spawn } = require('node:child_process');
 const {
   selectDesktopScenePath, selectSceneSample, selectDistributedSceneSamples, classifyDecodeFailure, AUTO_LONG_BURN_SECONDS
@@ -6218,7 +6218,12 @@ try {
       sourceCachePath: normalized.sceneCachePath || '',
       capturedEventCount: events.length
     });
-    this.log('info', `Scene 构建：原始事件 ${events.length}，范围内事件 ${prepareAssEvents(events, { overlayMode: options.overlayMode || this.settings.burnOverlayMode, startTime: options.clipStart || 0, endTime: Number.isFinite(options.clipEnd) ? options.clipEnd : requestedDuration > 0 ? requestedDuration : undefined }).length}，Scene 对象 ${graph.objects.length}。`);
+    const preparedEvents = prepareAssEvents(events, { overlayMode: options.overlayMode || this.settings.burnOverlayMode, startTime: options.clipStart || 0, endTime: Number.isFinite(options.clipEnd) ? options.clipEnd : requestedDuration > 0 ? requestedDuration : undefined });
+    const imageEmotes = preparedEvents.flatMap(event => event.emoticons || []);
+    const matchedImageEmotes = imageEmotes.filter(emote => avatarAssets[normalizeEmojiUrl(emote.url)]?.filePath).length;
+    graph.metadata.imageEmotes = { recorded: imageEmotes.length, matched: matchedImageEmotes, missing: imageEmotes.length - matchedImageEmotes };
+    this.log('info', `Scene 构建：原始事件 ${events.length}，范围内事件 ${preparedEvents.length}，Scene 对象 ${graph.objects.length}，图片表情快照 ${matchedImageEmotes}/${imageEmotes.length}。`);
+    if (matchedImageEmotes < imageEmotes.length) this.log('warn', `图片表情缺少 ${imageEmotes.length - matchedImageEmotes} 项快照，将保留对应原文字；请检查录制时图片下载日志和快照清单。`);
     return {
       graph,
       // The legacy ASS compatibility renderer must consume the exact same
@@ -6226,7 +6231,7 @@ try {
       // recording may still receive a final buffered event while an export is
       // being prepared.
       events: events.map(event => event.emoticons?.length ? { ...event, _emojiAssets: Object.fromEntries(
-        event.emoticons.filter(emote => avatarAssets[emote.url]?.filePath).map(emote => [emote.url, avatarAssets[emote.url]])
+        event.emoticons.filter(emote => avatarAssets[normalizeEmojiUrl(emote.url)]?.filePath).map(emote => [normalizeEmojiUrl(emote.url), avatarAssets[normalizeEmojiUrl(emote.url)]])
       ) } : event),
       eventCount: events.length,
       scenePath: normalized.scenePath || deriveSceneGraphPath(normalized.cleanPath)

@@ -395,7 +395,7 @@ function messageMetrics(event, style, sideStream) {
   const metaFontSize = Math.max(12, Math.floor(fontSize * 0.8));
   const inset = Math.max(style.giftRadius / 2, fontSize / 2);
   const lines = wrapTextToWidthLines(event.text, panelWidth - inset * 2, fontSize, 64);
-  const headerHeight = fontSize + metaFontSize + style.giftRadius / 2;
+  const headerHeight = (fontSize + metaFontSize) * 1.2 + Math.max(8, style.giftRadius * 2 / 3);
   const bodyHeight = lines.length * fontSize * 1.2 + style.giftRadius / 2;
   return { width: panelWidth, height: headerHeight + bodyHeight, fontSize, metaFontSize, avatar: Math.max(26, Math.round(fontSize * 1.3)), gap: 8, radius: cardRadius(style, fontSize, panelWidth, headerHeight + bodyHeight), headerHeight, bodyHeight, lines, textWidth: panelWidth - inset * 2, inset };
 }
@@ -591,7 +591,7 @@ function layoutMessages(events, style, sideStream) {
 
 function resolvePalette(event, style) {
   const preset = style.visualPreset;
-  if (event.type === 'superchat') return { background: '#B2602A', header: '#FFF5ED', accent: '#653617', text: '#FFFFFF', detail: '#313131' };
+  if (event.type === 'superchat') return { background: '#B2602A', header: '#FFF5ED', accent: '#653617', text: '#FFFFFF', username: '#653617', detail: '#313131' };
   if (event.type === 'guard') return { background: '#FCE8D8', header: '#FCE8D8', accent: '#8A3619', text: '#005029', detail: '#005443' };
   if (event.type === 'gift') return { background: '#E8F3F7', header: '#E8F3F7', accent: '#C46CFF', text: '#005029', detail: '#005443' };
   if (preset === 'bubble') return { background: '#F7E5FA', header: '#F7E5FA', accent: '#2F2230', text: '#2F2230', detail: '#514355' };

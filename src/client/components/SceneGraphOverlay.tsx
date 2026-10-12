@@ -147,6 +147,8 @@ function SceneNode({
           fontWeight: numberValue(props.fontWeight, 400),
           lineHeight: numberValue(props.lineHeight, numberValue(props.fontSize, 20) * 1.2) + 'px',
           whiteSpace: 'pre-wrap',
+          textAlign: props.align === 'center' ? 'center' : 'left',
+          ...(props.verticalAlign === 'middle' ? { display: 'flex', alignItems: 'center', justifyContent: props.align === 'center' ? 'center' : 'flex-start' } : {}),
           WebkitTextStroke: numberValue(style.strokeWidth) + 'px ' + stringValue(style.stroke, 'transparent'),
           textShadow: shadowStyle(style)
         }}

@@ -1,0 +1,122 @@
+[
+  {
+    "preset": "h5-card",
+    "id": "legacy-29b61e9b225f-user",
+    "inkBounds": [
+      1,
+      8,
+      100,
+      22
+    ],
+    "offsetX": 50.5,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "h5-card",
+    "id": "legacy-a7ad76f3f78c-user",
+    "inkBounds": [
+      1,
+      8,
+      100,
+      22
+    ],
+    "offsetX": 50.5,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "h5-card",
+    "id": "legacy-29b61e9b225f-price",
+    "inkBounds": [
+      20,
+      9,
+      70,
+      18
+    ],
+    "offsetX": 0.29999999999999716,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "h5-card",
+    "id": "legacy-a7ad76f3f78c-price",
+    "inkBounds": [
+      20,
+      9,
+      70,
+      18
+    ],
+    "offsetX": 0.29999999999999716,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "bubble",
+    "id": "legacy-29b61e9b225f-user",
+    "inkBounds": [
+      0,
+      8,
+      96,
+      21
+    ],
+    "offsetX": 48.0,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "bubble",
+    "id": "legacy-a7ad76f3f78c-user",
+    "inkBounds": [
+      0,
+      8,
+      96,
+      21
+    ],
+    "offsetX": 48.0,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "bubble",
+    "id": "legacy-29b61e9b225f-price",
+    "inkBounds": [
+      19,
+      8,
+      66,
+      17
+    ],
+    "offsetX": 0.3999999999999986,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "bubble",
+    "id": "legacy-a7ad76f3f78c-price",
+    "inkBounds": [
+      19,
+      8,
+      66,
+      17
+    ],
+    "offsetX": 0.3999999999999986,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "minimal",
+    "id": "legacy-29b61e9b225f-price",
+    "inkBounds": [
+      17,
+      4,
+      49,
+      10
+    ],
+    "offsetX": 0.0,
+    "offsetY": 0.5
+  },
+  {
+    "preset": "minimal",
+    "id": "legacy-a7ad76f3f78c-price",
+    "inkBounds": [
+      17,
+      4,
+      49,
+      10
+    ],
+    "offsetX": 0.0,
+    "offsetY": 0.5
+  }
+]

@@ -48,6 +48,7 @@ const GROUPS = {
     'codec-selection.test.cjs',
     'danmaku-ass.test.cjs',
     'danmaku-emoji.test.cjs',
+    'superchat-layout.test.cjs',
     'native-scene-reference.test.cjs',
     'scene-verification-cancel.test.cjs',
     'desktop-cuda-capability.test.cjs',

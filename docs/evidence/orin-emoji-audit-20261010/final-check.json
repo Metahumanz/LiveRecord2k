@@ -1,0 +1,36 @@
+{
+  "service": "active",
+  "gpu": {
+    "available": true,
+    "backend": "cuda-gstreamer",
+    "nativeNvmmScene": true
+  },
+  "visual": {
+    "version": "ass-compat-v7",
+    "passed": true,
+    "reason": ""
+  },
+  "jobs": [],
+  "export": null,
+  "rooms": [
+    {
+      "id": "883263",
+      "recording": false,
+      "burning": false,
+      "lastError": null,
+      "monitoring": true
+    },
+    {
+      "id": "7953876",
+      "recording": false,
+      "burning": false,
+      "lastError": null,
+      "monitoring": true
+    }
+  ],
+  "selfTestLogs": [
+    "Jetson hevc_nvv4l2 端到端烧录自检通过，可用于烧录。",
+    "Jetson h264_nvv4l2 端到端烧录自检通过，可用于烧录。",
+    "Jetson GPU Scene renderer 已通过运行时 probe：cuda-gstreamer（/usr/lib/bili-record-2k/bin/br2k-scene-gpu）。视觉一致性自检通过，可用于生产 CUDA Scene。"
+  ]
+}

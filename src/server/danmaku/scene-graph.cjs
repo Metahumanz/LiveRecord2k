@@ -242,7 +242,7 @@ function legacyShape(graph, id, segment, x, y, width, height, color, radius, zIn
   }));
 }
 
-function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, weight) {
+function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, weight, box) {
   const appearance = legacyAssColor(color);
   // ASS tags are formatting instructions, never message content.  In
   // particular the minimal preset used `\b1...\b0` inside one legacy dialogue;
@@ -252,7 +252,7 @@ function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, wei
   const width = Math.max(2, Math.ceil(Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)), 1) + fontSize));
   graph.objects.push(sceneObject('Text', id, { start: segment.start, end: segment.end, zIndex }, {
     zIndex,
-    frame: frame(number(segment.x1) + x, number(segment.y1) + y, width, Math.max(1, fontSize * 1.25 * lines.length)),
+    frame: frame(number(segment.x1) + x, number(segment.y1) + y, box?.width ?? width, box?.height ?? Math.max(1, fontSize * 1.25 * lines.length)),
     animations: legacySegmentAnimations(segment, x, y),
     props: {
       text: sourceText,
@@ -260,7 +260,8 @@ function legacyText(graph, id, segment, x, y, text, fontSize, color, zIndex, wei
       fontSize,
       fontWeight: weight || 400,
       lineHeight: fontSize * 1.13,
-      align: 'left'
+      align: box?.align || 'left',
+      ...(box ? { verticalAlign: 'middle', assAnchor: { x: box.align === 'center' ? box.width / 2 : 0, y: box.height / 2 } } : {})
     },
     style: { fill: appearance.fill, opacity: appearance.opacity, stroke: '', strokeWidth: 0, shadow: null }
   }));
@@ -377,19 +378,21 @@ function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAs
     const metrics = getMinimalSideInteractionMetrics(style, event);
     const price = sideInteractionPrice(event);
     const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
-    const username = truncateTextToWidth(event.user || '观众', textWidth * 0.35, metrics.fontSize);
+    const username = truncateTextToWidth(event.user || '观众', metrics.usernameWidth ?? textWidth * 0.35, metrics.fontSize);
     const detail = truncateTextToWidth(sideInteractionText(event), textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
-    const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
+    const dotY = metrics.dotY ?? Math.max(0, (metrics.height - metrics.dotSize) / 2);
     const textX = metrics.dotSize + metrics.gap * 2;
     legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, '&H250D1416&', metrics.radius, 16);
     legacyShape(graph, prefix + '-dot', segment, metrics.gap, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
     legacyText(graph, prefix + '-user', segment, textX, metrics.paddingY, username, metrics.fontSize, '&H00FFFFFF&', 23, 700);
-    legacyText(graph, prefix + '-detail', segment, metrics.detailLines ? metrics.bodyX : textX + estimateTextWidth(username, metrics.fontSize), metrics.detailLines ? metrics.paddingY + metrics.fontSize : metrics.paddingY, metrics.detailLines ? metrics.detailLines.join('\\N') : ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23);
+    legacyText(graph, prefix + '-detail', segment, metrics.detailLines ? metrics.bodyX : textX + estimateTextWidth(username, metrics.fontSize), metrics.detailLines ? (metrics.detailY ?? metrics.paddingY + metrics.fontSize) : metrics.paddingY, metrics.detailLines ? metrics.detailLines.join('\\N') : ' · ' + detail, metrics.fontSize, '&H00FFFFFF&', 23, event.type === 'superchat' ? 700 : 400);
     if (price) {
-      const priceWidth = Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize);
-      const priceX = metrics.width - priceWidth;
-      legacyShape(graph, prefix + '-price-bg', segment, priceX, metrics.paddingY, priceWidth, metrics.fontSize, '&H10E9EFED&', metrics.fontSize / 2, 24);
-      legacyText(graph, prefix + '-price', segment, priceX + metrics.fontSize / 2, metrics.paddingY, price, metrics.fontSize * 0.82, '&H00323026&', 25, 700);
+      const priceWidth = metrics.priceWidth ?? Math.max(54, estimateTextWidth(price, metrics.fontSize) + metrics.fontSize);
+      const priceX = metrics.priceX ?? (metrics.width - priceWidth);
+      const priceY = metrics.priceY ?? metrics.paddingY;
+      legacyShape(graph, prefix + '-price-bg', segment, priceX, priceY, priceWidth, metrics.fontSize, '&H10E9EFED&', metrics.fontSize / 2, 24);
+      legacyText(graph, prefix + '-price', segment, event.type === 'superchat' ? priceX : priceX + metrics.fontSize / 2, priceY, price, metrics.fontSize * 0.82, '&H00323026&', 25, 700,
+        event.type === 'superchat' ? { width: priceWidth, height: metrics.fontSize, align: 'center' } : undefined);
     }
     return;
   }
@@ -399,16 +402,20 @@ function addLegacySideInteraction(graph, prefix, event, style, segment, avatarAs
   const textWidth = price ? metrics.textWidthWithPrice : metrics.textWidth;
   const username = truncateTextToWidth(event.user || '观众', textWidth, metrics.fontSize);
   const detail = metrics.detailLines ? metrics.detailLines.join('\\N') : truncateTextToWidth(sideInteractionText(event), textWidth, metrics.metaFontSize);
-  const textY = metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2));
+  const textY = metrics.textY ?? (metrics.padding + Math.max(0, Math.floor((metrics.avatarSize - metrics.fontSize - metrics.metaFontSize) / 2)));
   legacyShape(graph, prefix + '-card', segment, 0, 0, metrics.width, metrics.height, palette.background, metrics.radius, 16);
   addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets);
-  legacyText(graph, prefix + '-user', segment, metrics.contentX, textY, username, metrics.fontSize, palette.username, 23, 700);
-  legacyText(graph, prefix + '-detail', segment, metrics.contentX, textY + metrics.fontSize, detail, metrics.metaFontSize, palette.detail, 23);
+  legacyText(graph, prefix + '-user', segment, metrics.contentX, textY, username, metrics.fontSize, palette.username, 23, 700,
+    metrics.nameHeight ? { width: textWidth, height: metrics.nameHeight, align: 'left' } : undefined);
+  legacyText(graph, prefix + '-detail', segment, metrics.detailX ?? metrics.contentX, metrics.detailY ?? (textY + metrics.fontSize), detail, metrics.detailFontSize ?? metrics.metaFontSize, palette.detail, 23, metrics.detailWeight ?? 400);
   if (price) {
-    const priceWidth = Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2);
-    const priceX = metrics.width - metrics.padding - priceWidth;
-    legacyShape(graph, prefix + '-price-bg', segment, priceX, metrics.padding, priceWidth, metrics.metaFontSize + metrics.padding, palette.priceBackground, (metrics.metaFontSize + metrics.padding) / 2, 24);
-    legacyText(graph, prefix + '-price', segment, priceX + metrics.metaFontSize * 0.6, metrics.padding + metrics.padding / 2, price, metrics.metaFontSize, palette.priceText, 25, 700);
+    const priceWidth = metrics.priceWidth ?? Math.max(72, estimateTextWidth(price, metrics.metaFontSize) + metrics.metaFontSize * 1.2);
+    const priceX = metrics.priceX ?? (metrics.width - metrics.padding - priceWidth);
+    const priceY = metrics.priceY ?? metrics.padding;
+    const priceHeight = metrics.priceHeight ?? metrics.metaFontSize + metrics.padding;
+    legacyShape(graph, prefix + '-price-bg', segment, priceX, priceY, priceWidth, priceHeight, palette.priceBackground, priceHeight / 2, 24);
+    legacyText(graph, prefix + '-price', segment, metrics.priceHeight ? priceX : priceX + metrics.metaFontSize * 0.6, metrics.priceHeight ? priceY : priceY + metrics.padding / 2, price, metrics.metaFontSize, palette.priceText, 25, 700,
+      metrics.priceHeight ? { width: priceWidth, height: priceHeight, align: 'center' } : undefined);
   }
 }
 
@@ -503,30 +510,39 @@ function addMessageNode(graph, entry, layout, avatarAssets) {
   const avatarSize = number(metrics.avatar, Math.max(24, number(metrics.fontSize) * 1.3));
   const gap = number(metrics.gap, 8);
   const contentX = hasAvatar ? avatarSize + gap * 1.5 : number(metrics.inset, number(metrics.radius) / 2);
+  const avatarY = Math.max(0, ((isSuperChat && !layout.sideStream ? number(metrics.headerHeight) : base.height) - avatarSize) / 2);
   if (hasAvatar) {
     const assetId = avatarAsset(graph, event, avatarAssets);
     graph.objects.push(sceneObject('Avatar', eventId + '-avatar', sharedEntry, {
       parentId: eventId,
       zIndex: 25,
-      frame: frame(base.x + gap, base.y + Math.max(0, (base.height - avatarSize) / 2), avatarSize, avatarSize),
-      animations: commonAnimations(sharedEntry, gap, Math.max(0, (base.height - avatarSize) / 2)),
+      frame: frame(base.x + gap, base.y + avatarY, avatarSize, avatarSize),
+      animations: commonAnimations(sharedEntry, gap, avatarY),
       props: { assetId, uid: Number(event.uid || 0) || undefined, fallbackLabel: String(event.user || '观众').slice(0, 1), shape: layout.style.visualPreset === 'minimal' ? 'dot' : 'circle' },
       style: { fill: palette.accent, borderColor: '#ffffff', borderWidth: 1, shadow: { color: '#000000', blur: 2, offsetX: 0, offsetY: 1, opacity: 0.25 } }
     }));
   }
 
   const textX = base.x + contentX;
-  const user = String(event.user || '用户');
   const fontSize = number(metrics.fontSize, layout.style.boxFontSize);
+  const userWidth = Math.max(1, base.width - contentX - gap);
+  const user = truncateTextToWidth(event.user || '用户', userWidth, fontSize);
   const metaFontSize = number(metrics.metaFontSize, Math.max(12, fontSize * 0.8));
-  const topPadding = Math.max(4, number(metrics.radius) / 3);
+  const topPadding = isSuperChat && !layout.sideStream
+    ? Math.max(0, (number(metrics.headerHeight) - (fontSize + metaFontSize) * 1.2) / 2)
+    : Math.max(4, number(metrics.radius) / 3);
   textObject(graph, sharedEntry, eventId + '-user', eventId, user, textX, base.y + topPadding, frame(0, 0, Math.max(1, base.width - contentX - gap), fontSize * 1.2), {
     fontFamily: layout.style.fontFamily,
     fontSize,
     fontWeight: 700,
-    fill: palette.text,
+    fill: palette.username || palette.text,
     zIndex: 30
   });
+  if (isSuperChat && !layout.sideStream) {
+    textObject(graph, sharedEntry, eventId + '-price', eventId, 'CNY ' + String(Number(event.price) || 0), textX, base.y + topPadding + fontSize * 1.2, frame(0, 0, userWidth, metaFontSize * 1.2), {
+      fontFamily: layout.style.fontFamily, fontSize: metaFontSize, fontWeight: 700, fill: palette.detail, zIndex: 30
+    });
+  }
 
   let detail = '';
   if (isSideChat) {
@@ -548,7 +564,7 @@ function addMessageNode(graph, entry, layout, avatarAssets) {
   textObject(graph, sharedEntry, eventId + '-detail', eventId, detail, bodyX, detailY, frame(0, 0, bodyWidth, Math.max(detailSize * 1.3, base.height - (detailY - base.y))), {
     fontFamily: layout.style.fontFamily,
     fontSize: detailSize,
-    fontWeight: 400,
+    fontWeight: isSuperChat ? 700 : 400,
     fill: detailColor,
     zIndex: 31
   }, {
@@ -594,7 +610,7 @@ function addEmojiNodes(graph, begin, tokens, legacy) {
       if (!run) return;
       const props = { ...object.props, text: run, emojiText: true };
       delete props.assText; delete props.textKeyframes;
-      graph.objects.push({ ...object, id: object.id + '-run-' + index++, frame: frame(object.frame.x + runX, object.frame.y + y, Math.max(size, object.frame.width - runX), lineHeight * 1.3), props,
+      graph.objects.push({ ...object, id: object.id + '-run-' + index++, frame: frame(object.frame.x + runX, object.frame.y + y, Math.max(size, object.frame.width - runX), props.assAnchor ? object.frame.height : lineHeight * 1.3), props,
         animations: translated(runX, y) });
       run = '';
     };
@@ -604,10 +620,11 @@ function addEmojiNodes(graph, begin, tokens, legacy) {
       if (!asset) { if (!run) runX = x; run += glyph; x += glyphWidthFactor(glyph) * advanceSize; continue; }
       flush();
       const id = emojiAssetId(asset.key);
+      const emojiY = y + (object.props.assAnchor ? object.props.assAnchor.y - advanceSize / 2 : 0);
       if (!graph.assets.some(a => a.id === id)) graph.assets.push({ id, type: 'emoji', path: asset.filePath, url: asset.url || '', key: asset.key });
       graph.objects.push({ ...object, id: object.id + '-emoji-' + index++, type: 'Image',
-        frame: frame(object.frame.x + x, object.frame.y + y, advanceSize, advanceSize),
-        props: { assetId: id, role: 'emoji', alt: asset.text }, style: { opacity: object.style.opacity ?? 1, clip: object.style.clip }, animations: translated(x, y) });
+        frame: frame(object.frame.x + x, object.frame.y + emojiY, advanceSize, advanceSize),
+        props: { assetId: id, role: 'emoji', alt: asset.text, objectFit: 'contain' }, style: { opacity: object.style.opacity ?? 1, clip: object.style.clip }, animations: translated(x, emojiY) });
       x += advanceSize;
     }
     flush();

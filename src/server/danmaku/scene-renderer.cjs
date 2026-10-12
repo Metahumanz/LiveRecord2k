@@ -243,8 +243,11 @@ function avatarFilter(object, label, duration, fps = 30) {
   const start = Math.max(0, number(object.start));
   const life = Math.max(0.001, Math.min(duration, number(object.end, duration)) - start);
   const imageRate = object.type === 'Image' ? ',fps=' + ff(fps) : '';
+  const imageScale = object.type === 'Image' && object.props?.objectFit === 'contain'
+    ? ',scale=' + width + ':' + height + ':force_original_aspect_ratio=decrease,format=rgba,pad=' + width + ':' + height + ':(ow-iw)/2:(oh-ih)/2:color=black@0'
+    : ',scale=' + width + ':' + height;
   return "movie='" + quoteFilter(path) + "',loop=loop=-1:size=1:start=0" + imageRate + ',trim=duration=' + ff(life) +
-    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB,scale=' + width + ':' + height + ',format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=' + "'" + alpha + "',colorchannelmixer=aa=" + ff(opacity) + fadeFilters(object) + dynamicScaleFilter(object) + '[' + label + ']';
+    ',setpts=PTS-STARTPTS+' + ff(start) + '/TB' + imageScale + ',format=rgba,geq=r=r(X\\,Y):g=g(X\\,Y):b=b(X\\,Y):a=' + "'" + alpha + "',colorchannelmixer=aa=" + ff(opacity) + fadeFilters(object) + dynamicScaleFilter(object) + '[' + label + ']';
 }
 
 function overlayShape(previous, imageLabel, output, object, offset) {

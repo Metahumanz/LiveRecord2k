@@ -6,7 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { normalizeDanmakuEvent, prepareAssEvents, createAss, resolveDanmakuStyle, getSideInteractionCardMetrics, getMinimalSideInteractionMetrics, wrapTextToWidthLines, estimateTextWidth } = require('../src/server/danmaku/ass.cjs');
-const { graphemes, unicodeAsset } = require('../src/server/danmaku/emoji.cjs');
+const { graphemes, unicodeAsset, imageUrl, resolveEmojiText } = require('../src/server/danmaku/emoji.cjs');
 const { buildSceneGraph, evaluateSceneObject } = require('../src/server/danmaku/scene-graph.cjs');
 const { createSceneFilterScript } = require('../src/server/danmaku/scene-renderer.cjs');
 const { LiveRecordService } = require('../src/server/app/service.cjs');
@@ -52,6 +52,38 @@ test('DANMU_MSG stores single and embedded Bilibili emotes, rejects arbitrary ho
   }
   const invalid = command('[测试]', true); invalid.info[0][13].url = 'http://127.0.0.1/private.png';
   assert.equal(normalizeDanmakuEvent(invalid, timing).emoticons, undefined);
+});
+
+test('historical HTTP emotes match HTTPS snapshots through capture, merge, Scene and ASS', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-emoji-http-'));
+  try {
+    const service = new LiveRecordService();
+    const png = await fs.readFile(unicodeAsset('😀').filePath);
+    service.fetchAvatarImageAsset = async () => ({ body: png, contentType: 'image/png' });
+    const session = { cleanPath: path.join(directory, 'source.clean.mp4') };
+    const event = { type: 'danmaku', time: 0, text: '晚上好[测试]', emoticons: [{ token: '[测试]', url: url.replace('https:', 'http:') }] };
+    assert.equal(imageUrl(event.emoticons[0].url), url);
+    assert.equal(imageUrl('//i0.hdslb.com/bfs/emote/test.png'), url);
+    service.queueRecordingEmojiCapture(session, event);
+    assert.equal(await service.flushAvatarCapture(session), true);
+    await service.scheduleAvatarManifestWrite(session, 'completed');
+    const merged = { cleanPath: path.join(directory, 'merged.mp4'), avatarManifestPath: path.join(directory, 'merged.danmaku.avatars.json') };
+    await service.mergeAvatarManifests([session], merged.avatarManifestPath);
+    const assets = await service.getSceneAvatarAssets(merged);
+    const resolved = resolveEmojiText(event, assets);
+    assert.equal(Object.keys(resolved.emojiTokens).length, 1);
+    assert.ok(!resolved.text.includes('[测试]'));
+    service.readSceneEventsForRecording = async () => [event];
+    service.settings.burnDanmakuStylePreset = 'h5-card';
+    const result = await service.buildSceneGraphForRecording(merged, { stylePreset: 'h5-card', avatarAssets: assets });
+    assert.ok(result.graph.objects.some(o => o.type === 'Image' && o.props.alt === '[测试]'));
+    assert.deepEqual(result.graph.metadata.imageEmotes, { recorded: 1, matched: 1, missing: 0 });
+    assert.ok(result.events[0]._emojiAssets[url]?.filePath, '兼容 ASS 必须复用同一快照');
+    const ass = createAss(result.events, { stylePreset: 'h5-card', renderEmojiImages: true });
+    assert.ok(!ass.includes('[测试]'), 'ASS 不能把已匹配图片重复画成文字');
+    const oldAssets = { [event.emoticons[0].url]: assets[url] };
+    assert.equal(Object.keys(resolveEmojiText(event, oldAssets).emojiTokens).length, 1);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
 
 test('grapheme wrapping keeps flags, skin tones, ZWJ families and keycaps together', () => {
@@ -177,5 +209,33 @@ test('FFmpeg actually burns visible color emoji through direct and ASS compatibi
       }
       assert.ok(yellow >= 8, preset + ' 必须在预期表情位置烧录出彩色像素，实际 ' + yellow);
     }
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('FFmpeg preserves a wide image-emote ratio inside its glyph cell', async () => {
+  const executable = process.env.FFMPEG_BIN || require('ffmpeg-static');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-emoji-ratio-'));
+  try {
+    const assetPath = path.join(directory, 'wide.png');
+    await run(executable, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=200x60', '-frames:v', '1', assetPath]);
+    const graph = buildSceneGraph([{ type: 'danmaku', time: 0, text: '[宽图]', emoticons: [{ token: '[宽图]', url }] }],
+      { videoInfo: { width: 640, height: 360 }, emojiAssets: { [url]: { filePath: assetPath } } });
+    const image = graph.objects.find(o => o.type === 'Image');
+    assert.equal(image.props.objectFit, 'contain');
+    const filter = path.join(directory, 'filter');
+    await fs.writeFile(filter, createSceneFilterScript(graph, { target: 'software', duration: 4, fps: 25 }).script);
+    const output = path.join(directory, 'actual.rgb');
+    await run(executable, ['-v','error','-y','-filter_complex_threads','1','-f','lavfi','-i','color=c=black:s=640x360:r=25:d=4',
+      '-filter_complex_script',filter,'-map','[vout]','-ss','2','-frames:v','1','-pix_fmt','rgb24','-f','rawvideo',output]);
+    const pixels = await fs.readFile(output), state = evaluateSceneObject(image, 2);
+    let left=640,right=0,top=360,bottom=0;
+    for(let y=Math.max(0,Math.floor(state.y));y<Math.min(360,Math.ceil(state.y+image.frame.height));y++) {
+      for(let x=Math.max(0,Math.floor(state.x));x<Math.min(640,Math.ceil(state.x+image.frame.width));x++) {
+        const i=(y*640+x)*3;
+        if(pixels[i]>180 && pixels[i+1]<80 && pixels[i+2]<80) {left=Math.min(left,x);right=Math.max(right,x);top=Math.min(top,y);bottom=Math.max(bottom,y);}
+      }
+    }
+    assert.ok(right>left && bottom>top);
+    assert.ok((right-left+1)/(bottom-top+1)>2.5, '200×60 表情不能挤成正方形');
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
