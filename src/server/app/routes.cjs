@@ -307,10 +307,10 @@ function serveAccessLoginPage(service, response, errorMessage = '', statusCode =
   const configured = service.accessAuth.isConfigured(service.settings);
   const username = escapeHtml(service.settings?.accessUsername || 'admin');
   const message = errorMessage
-    ? `<div class="notice error">${escapeHtml(errorMessage)}</div>`
+    ? `<div class="notice error" role="alert">${escapeHtml(errorMessage)}</div>`
     : configured
       ? '<div class="notice">此服务正在监听外部网络，登录后才能进入管理界面。</div>'
-      : '<div class="notice error">远程访问密码尚未配置。请先通过本机 WebUI 设置；全新 Linux 安装可在首次 bootstrap 时提供密码。</div>';
+      : '<div class="notice error" role="alert">远程访问密码尚未配置。请先通过本机 WebUI 设置；全新 Linux 安装可在首次 bootstrap 时提供密码。</div>';
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -318,16 +318,39 @@ function serveAccessLoginPage(service, response, errorMessage = '', statusCode =
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>远程访问登录 · 哔哩录播 2K</title>
   <style>
-    :root{color-scheme:dark;font-family:Inter,"Microsoft YaHei UI",system-ui,sans-serif;background:#0b1017;color:#edf3fb}
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 20% 0,#19324a 0,transparent 38%),#0b1017}
-    main{width:min(420px,100%);padding:32px;border:1px solid #2a3b4d;border-radius:22px;background:rgba(17,25,35,.94);box-shadow:0 24px 80px rgba(0,0,0,.45)}
-    .eyebrow{margin:0 0 8px;color:#63d4ff;font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}h1{margin:0 0 10px;font-size:27px}p{color:#aebccc;line-height:1.65}
-    .notice{margin:20px 0;padding:12px 14px;border-radius:12px;background:#152b3a;color:#bfeaff;font-size:14px}.notice.error{background:#3b2025;color:#ffd3d8}
-    label{display:grid;gap:8px;margin-top:16px;color:#cbd6e2;font-size:14px;font-weight:650}input{width:100%;padding:12px 13px;border:1px solid #34475a;border-radius:11px;background:#0d151f;color:#fff;font:inherit;outline:none}input:focus{border-color:#56c9f5;box-shadow:0 0 0 3px rgba(86,201,245,.14)}
-    button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:12px;background:linear-gradient(135deg,#38bdf8,#0ea5e9);color:#061019;font:inherit;font-weight:800;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}.foot{margin:18px 0 0;text-align:center;font-size:12px;color:#75869a}
+    :root{color-scheme:dark;font-size:17px;font-family:Inter,"Microsoft YaHei UI","Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f1418;color:#edf4f1;font-synthesis:none;text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;min-height:100svh;display:grid;place-items:center;padding:32px 20px;background:#0f1418}
+    main{width:min(440px,100%);min-width:0;padding:28px;border:1px solid rgba(255,255,255,.09);border-radius:8px;background:rgba(18,25,30,.78)}
+    .brand{display:flex;align-items:center;gap:14px;padding-bottom:24px;border-bottom:1px solid rgba(255,255,255,.08)}.brand-icon{width:56px;height:56px;flex:0 0 56px;border-radius:8px;box-shadow:0 12px 32px rgba(0,0,0,.28)}.brand-name{margin:0;font-size:24px;font-weight:900;line-height:1.18}.brand-caption{margin:5px 0 0;color:#92a39e;font-size:13px;line-height:1.4}
+    h1{margin:24px 0 0;font-size:20px;line-height:1.4;font-weight:900}.notice{margin:14px 0 20px;padding:12px 14px;border-radius:7px;background:rgba(121,222,213,.08);color:#aebfba;font-size:14px;line-height:1.65;overflow-wrap:anywhere}.notice.error{background:rgba(239,91,103,.15);color:#ffabb2}
+    label{display:grid;gap:8px;margin-top:14px;color:#aebfba;font-size:15px;font-weight:800}input{width:100%;min-width:0;padding:12px 13px;border:1px solid rgba(255,255,255,.11);border-radius:7px;background:#0d1418;color:#edf4f1;font:inherit;outline:0}input:focus{border-color:#75d9d0;box-shadow:0 0 0 3px rgba(117,217,208,.14)}
+    button{width:100%;min-height:44px;display:flex;align-items:center;justify-content:center;gap:8px;margin-top:22px;padding:12px 16px;border:0;border-radius:7px;background:#79ded5;color:#10201f;font:inherit;font-weight:900;cursor:pointer;transition:background 120ms ease}button:hover:not(:disabled){background:#8debe2}button:focus-visible{outline:2px solid #75d9d0;outline-offset:3px}button:disabled{opacity:.5;cursor:not-allowed}button svg{width:20px;height:20px;flex:0 0 20px}.foot{margin:20px 0 0;color:#92a39e;font-size:12px;line-height:1.65;text-align:center}
+    @media(max-width:480px){body{padding:24px 16px}main{padding:22px}.brand-name{font-size:22px}}
+    @media(prefers-reduced-motion:reduce){button{transition:none}}
   </style>
 </head>
-<body><main><p class="eyebrow">BiliRecord2K</p><h1>远程管理登录</h1>${message}<form method="post" action="/api/access/login"><label>用户名<input name="username" autocomplete="username" value="${username}" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button type="submit"${configured ? '' : ' disabled'}>进入管理界面</button></form><p class="foot">会话 12 小时后失效；连续失败会触发临时限速。</p></main></body></html>`;
+<body><main aria-labelledby="login-title">
+  <div class="brand">
+    <svg class="brand-icon" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect width="256" height="256" rx="54" fill="#101820"/>
+      <path d="M0 74C44 40 87 24 130 28C181 33 218 62 256 110V256H0V74Z" fill="#16343A"/>
+      <path d="M256 0V66C220 55 188 58 160 77C128 99 110 134 86 162C62 190 34 203 0 202V0H256Z" fill="#26484D"/>
+      <path d="M194 57C217 66 236 81 256 103V148C236 123 218 108 197 100C164 87 136 100 112 133C96 155 83 172 66 184C47 198 25 204 0 202V166C29 169 50 160 68 140C82 124 94 102 111 82C133 55 160 44 194 57Z" fill="#77DAD1"/>
+      <circle cx="76" cy="76" r="23" fill="#F35B68"/><circle cx="76" cy="76" r="10" fill="#FFE8E9"/>
+      <path d="M105 82C105 71 117 65 126 71L180 104C189 110 189 124 180 130L126 163C117 169 105 163 105 152V82Z" fill="#F4C173"/>
+      <path d="M46 198H92V212H46V198ZM46 181H62V198H46V181ZM76 164H92V198H76V164ZM46 150H92V164H46V150Z" fill="#F7FBF9"/>
+      <path d="M113 150H129V212H113V150ZM129 178H144V194H129V178ZM146 150H164V168H146V150ZM146 194H164V212H146V194Z" fill="#F7FBF9"/>
+    </svg>
+    <div><p class="brand-name">哔哩录播 2K</p><p class="brand-caption">BiliRecord2K</p></div>
+  </div>
+  <h1 id="login-title">远程管理登录</h1>${message}
+  <form method="post" action="/api/access/login">
+    <label>用户名<input name="username" autocomplete="username" value="${username}" required></label>
+    <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit"${configured ? '' : ' disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6M15 12H3M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/></svg>进入管理界面</button>
+  </form>
+  <p class="foot">会话 12 小时后失效；连续失败会触发临时限速。</p>
+</main></body></html>`;
   response.writeHead(statusCode, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
