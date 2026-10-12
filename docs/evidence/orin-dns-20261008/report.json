@@ -1,0 +1,16 @@
+{
+  "count": 65,
+  "failedSamples": [],
+  "domains": {
+    "api.live.bilibili.com": 11,
+    "api.bilibili.com": 11,
+    "www-api.widewired.com.cn": 11,
+    "github.com": 11,
+    "www.bilibili.com": 11,
+    "api.github.com": 10
+  },
+  "vpnDnsActiveSamples": 65,
+  "startedAt": "2026-10-08T12:20:02.063Z",
+  "endedAt": "2026-10-08T12:21:18.842Z",
+  "maxFetchMs": 236
+}
