@@ -1,0 +1,9 @@
+{
+  "mode": "before",
+  "exitCode": -9,
+  "idleTimedOut": true,
+  "wallSeconds": 23.476115128956735,
+  "storagePhaseReached": true,
+  "reports": [],
+  "stderrTail": "[ass] libass API version: 0x1701000\n[ass] libass source: tarball: 0.17.1\n[ass] Shaper: FriBidi 1.0.13 (SIMPLE) HarfBuzz-ng 8.3.0 (COMPLEX)\n[ass] Using font provider fontconfig\nNvMMLiteOpen : Block : BlockType = 261 \nNvMMLiteBlockCreate : Block : BlockType = 261 \nNvMMLiteOpen : Block : BlockType = 4 \n===== NvVideo: NVENC =====\nNvMMLiteBlockCreate : Block : BlockType = 4 \nH264: Profile = 66 Level = 0 \nNVMEDIA: Need to set EMC bandwidth : 5744000 \nTEST_STORAGE_READ_START\n"
+}

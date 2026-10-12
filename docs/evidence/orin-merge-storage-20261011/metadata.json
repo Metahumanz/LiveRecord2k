@@ -1,0 +1,70 @@
+[
+  {
+    "file": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.clean.mp4.metadata.json",
+    "exists": true,
+    "data": {
+      "durationSec": 355.1,
+      "videoInfo": {
+        "codec": "h264 (avc1 / 0x31637661)",
+        "profile": "avc1 / 0x31637661",
+        "pixelFormat": "yuv420p",
+        "bitDepth": 8,
+        "colorSpace": "bt709",
+        "colorPrimaries": "bt709",
+        "colorTransfer": "bt709",
+        "hdr": false,
+        "width": 2560,
+        "height": 1440,
+        "fps": 59.99222745398428,
+        "rFrameRate": "60/1",
+        "avgFrameRate": "2662875/44387",
+        "timeBase": "1/16000",
+        "sampleAspectRatio": "1:1",
+        "colorRange": "tv",
+        "startTime": 0.017
+      },
+      "audioInfo": null,
+      "timelineHealth": "healthy",
+      "timingInfo": {
+        "videoDurationSec": 355.079625,
+        "audioDurationSec": 355.05516666666665,
+        "avDeltaSec": -0.040458333333333485,
+        "timingSafeForCopy": true
+      }
+    }
+  },
+  {
+    "file": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202615.clean.mp4.metadata.json",
+    "exists": true,
+    "data": {
+      "durationSec": 13624.04,
+      "videoInfo": {
+        "codec": "h264 (avc1 / 0x31637661)",
+        "profile": "avc1 / 0x31637661",
+        "pixelFormat": "yuv420p",
+        "bitDepth": 8,
+        "colorSpace": "bt709",
+        "colorPrimaries": "bt709",
+        "colorTransfer": "bt709",
+        "hdr": false,
+        "width": 3840,
+        "height": 2160,
+        "fps": 60.000001467994096,
+        "rFrameRate": "60/1",
+        "avgFrameRate": "817442000/13624033",
+        "timeBase": "1/16000",
+        "sampleAspectRatio": "1:1",
+        "colorRange": "tv",
+        "startTime": 0.017
+      },
+      "audioInfo": null,
+      "timelineHealth": "healthy",
+      "timingInfo": {
+        "videoDurationSec": 13624.027625,
+        "audioDurationSec": 13624.0365,
+        "avDeltaSec": -0.02412499999991269,
+        "timingSafeForCopy": true
+      }
+    }
+  }
+]

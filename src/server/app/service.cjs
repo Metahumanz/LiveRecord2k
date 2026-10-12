@@ -1158,6 +1158,7 @@ class LiveRecordService {
     this.mergeProcesses = new Map();
     this.mergeCancelRequests = new Set();
     this.mergeCancelledSelections = new Map();
+    this.mergeFailedSelections = new Map();
     this.mergePreemptRequests = new Set();
     this.mergeRoomTasks = new Map();
     this.mergeInFlightGroups = new Map();
@@ -1612,6 +1613,9 @@ class LiveRecordService {
       this.mergeCancelledSelections = new Map((store.mergeCancelledSelections || [])
         .filter(item => item?.roomId && item?.mergeGroup && Array.isArray(item.sourcePaths) && item.sourcePaths.length >= 2)
         .map(item => [this.getMergeRetryKey(item.roomId, item.mergeGroup), item]));
+      this.mergeFailedSelections = new Map((store.mergeFailedSelections || [])
+        .filter(item => item?.roomId && item?.mergeGroup && Array.isArray(item.sourcePaths) && item.sourcePaths.length >= 2)
+        .map(item => [this.getMergeRetryKey(item.roomId, item.mergeGroup), item]));
       for (const savedRoom of store.rooms || []) {
         const room = this.normalizeRoom(savedRoom);
         const cancelled = savedRoom.cancelledMergeProgress;
@@ -1658,6 +1662,7 @@ class LiveRecordService {
       mediaJobs: [],
       mergeCancelledGroups: [...this.mergeCancelRequests],
       mergeCancelledSelections: [...this.mergeCancelledSelections.values()],
+      mergeFailedSelections: [...this.mergeFailedSelections.values()],
       segmentCleanups: Array.from(this.pendingSegmentCleanups.values())
     });
   }
@@ -7425,6 +7430,13 @@ try {
     return cleared;
   }
 
+  clearFailedMergeSelection(roomId, sourcePaths) {
+    for (const [key, failure] of this.mergeFailedSelections) {
+      if (failure.roomId === roomId && failure.sourcePaths.length === sourcePaths.length &&
+          failure.sourcePaths.every(source => sourcePaths.includes(source))) this.mergeFailedSelections.delete(key);
+    }
+  }
+
   async getPendingMergeGroupForRoom(room, preferredGroup = '') {
     if (!room?.id) return null;
     const roomId = String(room.id);
@@ -7457,6 +7469,9 @@ try {
       .sort((left, right) => Number(right.segments.at(-1)?.startedAt || 0) - Number(left.segments.at(-1)?.startedAt || 0));
     for (const candidate of candidates) {
       if (preferredGroup !== candidate.mergeGroup && this.isCancelledMergeSelection(room.id, candidate.segments)) continue;
+      if (!preferredGroup && [...this.mergeFailedSelections.values()].some(failure => failure.roomId === room.id &&
+          failure.sourcePaths.length === candidate.segments.length &&
+          candidate.segments.every(segment => failure.sourcePaths.includes(segment.cleanPath)))) continue;
       const outputPath = this.getReconnectMergeOutputPath(candidate.allSegments, candidate.segments);
       if (preferredGroup && candidate.mergeGroup !== preferredGroup) continue;
       if (await isExistingFile(outputPath)) {
@@ -7485,6 +7500,7 @@ try {
       isFfmpegMemoryPressureError(error) ||
       error?.code === 'MERGE_SEGMENT_UNDECODABLE' ||
       error?.code === 'BR2K_DISK_SPACE_INSUFFICIENT' ||
+      error?.code === 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT' ||
       error?.code === 'ENOSPC' ||
       error?.code === 'MERGE_AV_TIMELINE_UNSAFE'
     ) {
@@ -7600,6 +7616,7 @@ try {
     this.clearMergeRetryState(room.id, pending.mergeGroup);
     this.mergeCancelRequests.delete(this.getMergeRetryKey(room.id, pending.mergeGroup));
     if (pending.sourcePaths) this.clearCancelledMergeSelection(room.id, pending.sourcePaths);
+    if (pending.sourcePaths) this.clearFailedMergeSelection(room.id, pending.sourcePaths);
     if (room.cancelledMergeProgress?.mergeGroup === pending.mergeGroup) delete room.cancelledMergeProgress;
     await this.saveStore();
     if (room.mergeProgress?.kind === 'merge') {
@@ -7645,6 +7662,7 @@ try {
     segments.sort((left, right) => Number(left.startedAt || 0) - Number(right.startedAt || 0) || left.cleanPath.localeCompare(right.cleanPath));
     const groupId = `manual-${crypto.randomUUID()}`;
     this.clearCancelledMergeSelection(room.id, cleanPaths);
+    this.clearFailedMergeSelection(room.id, cleanPaths);
     delete room.cancelledMergeProgress;
     const outputPath = deriveSiblingPath(segments[0].cleanPath, `${groupId}.merged`, getContainerFromPath(segments[0].cleanPath));
     const key = this.getMergeRetryKey(room.id, groupId);
@@ -8382,9 +8400,12 @@ try {
                 progressStallTimeoutMs: MERGE_PROGRESS_STALL_TIMEOUT_MS,
                 progressValueFromText: parseFfmpegProgressTime,
                 finalizationTimeoutMs,
-                onFinalizationStart: () => {
+                finalizationMediaDurationSec: args.includes('-moov_size') ? mergeDurationSec : undefined,
+                onFinalizationStart: (reason) => {
                   finalizationStarted = true;
-                  stageLabel = '正在前置 MP4 索引（无需重新编码）';
+                  stageLabel = reason === 'media-end'
+                    ? '正在写入 MP4 索引并等待磁盘落盘（无需重新编码）'
+                    : '正在前置 MP4 索引（无需重新编码）';
                   if (room.mergeProgress?.id !== progress.id) return;
                   sawMediaProgress = true;
                   room.mergeProgress.stageLabel = stageLabel;
@@ -8400,7 +8421,7 @@ try {
                     ? `${stageLabel}超过 ${Math.ceil(watchdogError.ffmpegStallTimeoutMs / 1000)} 秒，已终止；所有源分段均已保留。`
                     : `${stageLabel}连续 ${Math.ceil(
                     MERGE_PROGRESS_STALL_TIMEOUT_MS / 1000
-                  )} 秒没有媒体进度，已终止；源分段会保留并自动重试。`;
+                  )} 秒没有媒体进度，已终止；所有源分段均已保留。`;
                   watchdogError.message = message;
                   if (room.mergeProgress?.id === progress.id) {
                     room.mergeProgress.message = message;
@@ -8540,6 +8561,15 @@ try {
                     timelineAlignment,
                     isCancelled: isStopped,
                     onProgress: (sec) => onStderr(`out_time_us=${Math.round(sec * 1000000)}`),
+                    onFinalizing: (metrics) => {
+                      if (room.mergeProgress?.id !== progress.id) return;
+                      const stage = metrics.phase === 'storage'
+                        ? `正在回读校验分段 ${index + 1}/${segments.length}：${formatBytes(metrics.verifiedBytes)} / ${formatBytes(metrics.totalBytes)}`
+                        : `正在同步分段 ${index + 1}/${segments.length} 到工作盘`;
+                      progress.estimatedRemainingSec = null;
+                      progress.stageFps = undefined;
+                      this.setMergeProgressStage(room, progress, stage);
+                    },
                     onStageMetrics: (metrics) => {
                       if (room.mergeProgress?.id !== progress.id) return;
                       if (setFfmpegJobStageFps(progress, metrics)) this.markRoomDirty(room.id);
@@ -9135,6 +9165,11 @@ try {
         ? `合并 FFmpeg 疑似因内存不足而中止（请检查系统内存/事件日志）：${String(error.message).slice(-900)}`
         : `合并失败：${String(error.message).slice(-900)}`;
       if (room.mergeProgress?.id === progress.id) {
+        if (!cancelled && !preempted && error?.code === 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT') {
+          this.mergeFailedSelections.set(mergeKey, { roomId: room.id, mergeGroup,
+            sourcePaths: [...progress.sourcePaths], code: error.code, message: error.message });
+          await this.saveStore().catch(storeError => this.log('warn', `保存合并失败状态失败：${compactLogLine(storeError.message)}`));
+        }
         finishFfmpegJobProgress(
           room.mergeProgress,
           cancelled ? 'cancelled' : preempted ? 'retrying' : 'error',
@@ -12831,6 +12866,9 @@ try {
             onStage?.(`正在预渲染 CUDA Scene 纹理：${prepared}/${total} 个对象${rows ? `（${rows} 个动画片段）` : ''}`);
             onPreparing?.(metrics);
           },
+          onFinalizing: (metrics) => onStage?.(metrics.phase === 'storage'
+            ? `正在回读校验原生分段 ${index + 1}：${formatBytes(metrics.verifiedBytes)} / ${formatBytes(metrics.totalBytes)}`
+            : `正在同步原生分段 ${index + 1} 到工作盘`),
           onChild,
           onPipeline: (pipeline) => this.setProgressPipeline(this.exportProgress, pipeline),
           // This mux only closes an internal MKV window. The whole export
@@ -13072,6 +13110,7 @@ try {
     onStageMetrics,
     onProgress,
     onPreparing,
+    onFinalizing,
     onPhase,
     beforeRetry,
     onFallback,
@@ -13144,6 +13183,7 @@ try {
         if (renderer.nativeNvmmScene) {
           let nativeStdoutRemainder = '';
           let nativeAttemptMediaSeconds = 0;
+          let nativeFinalizing = null;
           const consumeNativeReportLine = (line) => {
             let parsed;
             try {
@@ -13170,6 +13210,9 @@ try {
               });
             } else if (parsed?.nativeNvmmPreparing && typeof parsed.nativeNvmmPreparing === 'object') {
               onPreparing?.(parsed.nativeNvmmPreparing);
+            } else if (parsed?.nativeNvmmFinalizing && typeof parsed.nativeNvmmFinalizing === 'object') {
+              nativeFinalizing = parsed.nativeNvmmFinalizing;
+              onFinalizing?.(nativeFinalizing);
             }
           };
           const nativeTimeoutMs = Math.max(30_000, Math.ceil((nativeDecode.duration || duration) * 5_000));
@@ -13213,7 +13256,9 @@ try {
           if (nativeStdoutRemainder) consumeNativeReportLine(nativeStdoutRemainder);
           if (nativeResult.status !== 0 || nativeResult.error || nativeResult.timedOut || nativeResult.idleTimedOut) {
             const timeoutReason = nativeResult.idleTimedOut
-              ? `原生 NVMM 连续 ${Math.round(effectiveIdleTimeoutMs / 1000)} 秒没有输出进展，已终止停滞的分段；已处理媒体 ${nativeAttemptMediaSeconds.toFixed(1)} 秒。`
+              ? nativeFinalizing
+                ? `原生视频${nativeFinalizing.phase === 'sync' ? '同步' : '回读校验'}连续 ${Math.round(effectiveIdleTimeoutMs / 1000)} 秒没有存储进展，已停止；已校验 ${formatBytes(nativeFinalizing.verifiedBytes)} / ${formatBytes(nativeFinalizing.totalBytes)}。`
+                : `原生 NVMM 连续 ${Math.round(effectiveIdleTimeoutMs / 1000)} 秒没有输出进展，已终止停滞的分段；已处理媒体 ${nativeAttemptMediaSeconds.toFixed(1)} 秒。`
               : nativeResult.timedOut
                 ? `原生 NVMM 分段超过 ${Math.round(nativeTimeoutMs / 1000)} 秒运行时限，已终止；已处理媒体 ${nativeAttemptMediaSeconds.toFixed(1)} 秒。`
                 : '';
@@ -13226,6 +13271,7 @@ try {
               exitCode: nativeResult.status, signal: nativeResult.signal, timedOut: nativeResult.timedOut,
               idleTimedOut: nativeResult.idleTimedOut,
               processedMediaSeconds: nativeAttemptMediaSeconds,
+              finalizing: nativeFinalizing,
               stderrTail: redactSensitive(nativeResult.stderr || '').slice(-1000),
               stdoutTail: redactSensitive(nativeResult.stdout || '').slice(-1000)
             };

@@ -1,0 +1,98 @@
+{
+  "service": "active",
+  "sourcesUnchanged": true,
+  "manualRetryStatus": "cancelled",
+  "mediaJobs": [],
+  "gpu": {
+    "available": true,
+    "backend": "cuda-gstreamer",
+    "nativeNvmmScene": true,
+    "reason": null
+  },
+  "logs": [
+    {
+      "id": "1791687155199-cb0bc4ec8bd468",
+      "time": 1791687155199,
+      "level": "success",
+      "message": "WebUI 后端已启动，ffmpeg: /bin/ffmpeg"
+    },
+    {
+      "id": "1791687155200-939b4f7ef4815",
+      "time": 1791687155200,
+      "level": "info",
+      "message": "正在后台探测 ffmpeg、显卡能力和录像库。"
+    },
+    {
+      "id": "1791687155273-c7fc9b3ed8798",
+      "time": 1791687155273,
+      "level": "warn",
+      "message": "系统 FFmpeg 不满足 Scene Graph 绘制要求（缺少 drawtext、libass），已自动切换内置完整 ARM64 FFmpeg。"
+    },
+    {
+      "id": "1791687155826-95370dc979dfb",
+      "time": 1791687155826,
+      "level": "info",
+      "message": "宴宁ccccc(7953876) 开播推送监听已连接。"
+    },
+    {
+      "id": "1791687155835-124e0e621ca7d",
+      "time": 1791687155835,
+      "level": "info",
+      "message": "真栗(883263) 开播推送监听已连接。"
+    },
+    {
+      "id": "1791687196419-85624610b4b8e8",
+      "time": 1791687196419,
+      "level": "info",
+      "message": "可用弹幕版编码：Jetson V4L2 H.265 硬件编码、Jetson V4L2 H.264 硬件编码"
+    },
+    {
+      "id": "1791687196421-9cf86af497b56",
+      "time": 1791687196422,
+      "level": "info",
+      "message": "当前弹幕版编码：Jetson V4L2 H.265 硬件编码（选中的编码器 hevc_nvv4l2，实际后端 Jetson H.265 硬编（GStreamer nvv4l2h265enc + nvvidconv））"
+    },
+    {
+      "id": "1791687196422-126f2817ea103",
+      "time": 1791687196422,
+      "level": "info",
+      "message": "可用硬件解码：H264 Jetson NVDEC H264（GStreamer nvv4l2decoder）；HEVC Jetson NVDEC HEVC（GStreamer nvv4l2decoder）"
+    },
+    {
+      "id": "1791687196422-001e991d13396",
+      "time": 1791687196422,
+      "level": "success",
+      "message": "Jetson hevc_nvv4l2 端到端烧录自检通过，可用于烧录。"
+    },
+    {
+      "id": "1791687196422-8aab7331b596",
+      "time": 1791687196422,
+      "level": "success",
+      "message": "Jetson h264_nvv4l2 端到端烧录自检通过，可用于烧录。"
+    },
+    {
+      "id": "1791687196423-51c843b6fbd9c",
+      "time": 1791687196423,
+      "level": "success",
+      "message": "Jetson GPU Scene renderer 已通过运行时 probe：cuda-gstreamer（/usr/lib/bili-record-2k/bin/br2k-scene-gpu）。视觉一致性自检通过，可用于生产 CUDA Scene。"
+    },
+    {
+      "id": "1791687196423-d3c7fa11494e6",
+      "time": 1791687196423,
+      "level": "info",
+      "message": "Jetson CUDA Scene 可用：文字与头像纹理由 CPU 准备，最终视频画面叠加由 GPU 完成；实际任务链路以运行进度为准。"
+    },
+    {
+      "id": "1791687196433-165d6928a52378",
+      "time": 1791687196433,
+      "level": "info",
+      "message": "录像保存目录位于 cifs 挂载（/mnt/zzzz），跳过 POSIX 2770 规范化，以实际读写探针为准。"
+    },
+    {
+      "id": "1791687217444-f2711bbcb17bf8",
+      "time": 1791687217445,
+      "level": "info",
+      "message": "当前已是最新版本 0.9.4"
+    }
+  ]
+}

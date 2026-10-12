@@ -17,6 +17,7 @@ function migrateStore(input) {
     segmentCleanups: Array.isArray(source.segmentCleanups) ? source.segmentCleanups : [],
     mergeCancelledGroups: Array.isArray(source.mergeCancelledGroups)
       ? source.mergeCancelledGroups.filter(key => typeof key === 'string' && key.includes('\u0000')) : [],
+    mergeFailedSelections: Array.isArray(source.mergeFailedSelections) ? source.mergeFailedSelections : [],
     mergeCancelledSelections: Array.isArray(source.mergeCancelledSelections) ? source.mergeCancelledSelections
       : (Array.isArray(source.rooms) ? source.rooms : []).filter(room => room.cancelledMergeProgress?.manual)
         .map(room => ({ roomId: room.id, mergeGroup: room.cancelledMergeProgress.mergeGroup,

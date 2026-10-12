@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from collections import deque
 from fractions import Fraction
 
@@ -864,6 +865,34 @@ def probe_native_edit_list_lead(input_path):
         probe.set_state(Gst.State.NULL)
 
 
+def verify_native_output_storage(output_path, expected_bytes, expected_digest, report):
+    """Audit persisted bytes without making a progressing SMB read look idle."""
+    actual_digest = hashlib.sha256()
+    actual_bytes = 0
+    report({'phase': 'sync', 'verifiedBytes': 0, 'totalBytes': expected_bytes})
+    with open(output_path, 'rb') as completed_file:
+        os.fsync(completed_file.fileno())
+        if hasattr(os, 'posix_fadvise'):
+            os.posix_fadvise(completed_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        report({'phase': 'storage', 'verifiedBytes': 0, 'totalBytes': expected_bytes})
+        last_report = time.monotonic()
+        while True:
+            data = completed_file.read(1024 * 1024)
+            if not data:
+                break
+            actual_digest.update(data)
+            actual_bytes += len(data)
+            now = time.monotonic()
+            # Only completed reads reset the parent's idle watchdog. A blocked
+            # fsync/read still times out; no unconditional heartbeat masks it.
+            if now - last_report >= 0.25:
+                report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes})
+                last_report = now
+    if actual_bytes != expected_bytes or actual_digest.digest() != expected_digest:
+        fail('共享盘输出字节与编码封装输出不一致（写入或回读损坏），已拒绝发布；请检查 SMB 存储链路。')
+    report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes, 'complete': True})
+
+
 def render_native_nvmm(request):
     """Decode, composite and encode entirely in NVMM for one finite request."""
     check_request(request)
@@ -1401,20 +1430,8 @@ def render_native_nvmm(request):
         finally:
             pipeline.set_state(Gst.State.NULL)
         if output_container == 'mkv':
-            actual_digest = hashlib.sha256()
-            actual_bytes = 0
-            with open(output['path'], 'rb') as completed_file:
-                os.fsync(completed_file.fileno())
-                if hasattr(os, 'posix_fadvise'):
-                    os.posix_fadvise(completed_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                while True:
-                    data = completed_file.read(1024 * 1024)
-                    if not data:
-                        break
-                    actual_digest.update(data)
-                    actual_bytes += len(data)
-            if actual_bytes != output_bytes['count'] or actual_digest.digest() != output_digest.digest():
-                fail('共享盘输出字节与编码封装输出不一致（写入或回读损坏），已拒绝发布；请检查 SMB 存储链路。')
+            verify_native_output_storage(output['path'], output_bytes['count'], output_digest.digest(),
+                lambda metrics: print(json.dumps({'nativeNvmmFinalizing': metrics}, ensure_ascii=False), flush=True))
         wall_seconds = max(0.001, (GLib.get_monotonic_time() - wall_started) / GLib.USEC_PER_SEC)
         measured_media_seconds = 0.0
         media_clock = 'frame-fallback'

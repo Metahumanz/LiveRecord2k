@@ -28,6 +28,12 @@ const LEAD_SECONDS = 1.019;
 const WIDTH = 320;
 const HEIGHT = 180;
 
+test('native storage verification reports completed reads and rejects corruption or blocked I/O', async t => {
+  if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('在 Orin Python 运行时验证存储校验契约');
+  const result = await run('/usr/bin/python3', [path.join(__dirname, 'jetson-storage-verification.py')]);
+  assert.match(result.stdout, /blocked I\/O passed/);
+});
+
 test('native seek preserves every picture and Chinese overlay after a non-IDR sync sample', async t => {
   if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('需要 Orin NVDEC/NVMM/NVENC 实机');
   const result = await run('/usr/bin/python3', [path.join(__dirname, 'jetson-native-seek-regression.py')]);

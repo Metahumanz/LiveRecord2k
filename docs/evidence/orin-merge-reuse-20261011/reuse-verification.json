@@ -1,0 +1,124 @@
+{
+  "jobId": "merge-1791690965631-gn0dky",
+  "status": "completed",
+  "elapsedSec": 1176.898,
+  "outputPath": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.mp4",
+  "probe": {
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "codec_type": "video",
+        "width": 3840,
+        "height": 2160,
+        "avg_frame_rate": "419372500/6989563",
+        "start_time": "0.021000",
+        "duration": "13979.126000"
+      },
+      {
+        "codec_name": "aac",
+        "codec_type": "audio",
+        "sample_rate": "48000",
+        "channels": 2,
+        "avg_frame_rate": "0/0",
+        "start_time": "0.000000",
+        "duration": "13979.162500"
+      }
+    ],
+    "format": {
+      "duration": "13979.162500",
+      "size": "18670530471"
+    }
+  },
+  "recording": {
+    "valid": true,
+    "durationSec": 13979.16,
+    "fileSize": 18670530471,
+    "eventCount": 13216,
+    "sceneStatus": "ready",
+    "sceneEventCount": 13216,
+    "timingInfo": {
+      "containerDurationSec": 13979.16,
+      "videoDurationSec": 13979.147625,
+      "videoPresentationDurationSec": 13979.180625,
+      "audioDurationSec": 13979.1625,
+      "avDeltaSec": -0.018125000000509317,
+      "measuredAvDeltaSec": -0.018125000000509317,
+      "videoReorderAllowanceSec": 0.03300000000126602,
+      "containerDeltaSec": -0.002500000000509317,
+      "timingSafeForCopy": true,
+      "sourceSegments": [
+        {
+          "index": 1,
+          "videoDurationSec": 355.095625,
+          "audioDurationSec": 355.05516666666665,
+          "avDeltaSec": -0.040458333333333485,
+          "timingSafeForCopy": true,
+          "error": ""
+        },
+        {
+          "index": 2,
+          "videoDurationSec": 13624.04,
+          "audioDurationSec": 13624.0365,
+          "avDeltaSec": -0.02412499999991269,
+          "timingSafeForCopy": true,
+          "error": ""
+        }
+      ]
+    },
+    "timelineHealth": {
+      "containerDurationSec": 13979.16,
+      "videoDurationSec": 13979.147625,
+      "videoPresentationDurationSec": 13979.180625,
+      "audioDurationSec": 13979.1625,
+      "avDeltaSec": -0.018125000000509317,
+      "measuredAvDeltaSec": -0.018125000000509317,
+      "videoReorderAllowanceSec": 0.03300000000126602,
+      "containerDeltaSec": -0.002500000000509317,
+      "timingSafeForCopy": true,
+      "timelineHealth": "healthy",
+      "warnings": []
+    }
+  },
+  "artifacts": {
+    "danmakuPath": {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.danmaku.jsonl",
+      "exists": true,
+      "size": 4281883
+    },
+    "cssPath": {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.danmaku.css",
+      "exists": true,
+      "size": 697
+    },
+    "avatarManifestPath": {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.danmaku.avatars.json",
+      "exists": true,
+      "size": 748044
+    },
+    "sceneCachePath": {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.scene.jsonl",
+      "exists": false,
+      "size": null
+    },
+    "scenePath": {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-498ba453-a5e7-4125-9624-848ec391b0fd.merged.scene.json",
+      "exists": true,
+      "size": 366139375
+    }
+  },
+  "jsonlLineCount": 13216,
+  "sources": [
+    {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.clean.mp4",
+      "exists": false
+    },
+    {
+      "path": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202615.clean.mp4",
+      "exists": false
+    }
+  ],
+  "deletedSourceCount": 2,
+  "cleanupError": null,
+  "remainingMergeWorkspaces": []
+}

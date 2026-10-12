@@ -86,6 +86,47 @@ test('deterministic A/V timeline failure does not re-encode the whole group agai
   assert.equal(app.mergeRetryStates.size, 0);
 });
 
+test('committed native failure stops both automatic and manual merge retries without discarding the cause', () => {
+  for (const manual of [false, true]) {
+    const app = createMergeTestService();
+    const room = { id: '883263', mergeProgress: { kind: 'merge', mergeGroup: 'session', status: 'error', message: '尾部没有 EOS；源分段保留' } };
+    const error = require('../src/server/recording/jetson-policy.cjs').createCommittedJetsonNativeRuntimeError(13624, new Error('idle timeout'));
+    app.mergeRetryStates.set(app.getMergeRetryKey(room.id, 'session'), { attempts: 1, timer: setTimeout(() => assert.fail('must not retry'), 1000) });
+    assert.equal(app.scheduleMergeRetry(room, 'session', {}, error,
+      manual ? { manualOptions: { cleanPaths: ['first.mp4', 'second.mp4'] } } : {}), false);
+    assert.equal(app.mergeRetryStates.size, 0);
+    assert.equal(room.mergeProgress.status, 'error');
+    assert.equal(room.mergeProgress.message, '尾部没有 EOS；源分段保留');
+  }
+});
+
+test('committed failure selection survives restart, leaves later sessions eligible, and permits explicit retry', async t => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-native-merge-restart-'));
+  t.after(() => fsp.rm(directory, { recursive: true, force: true }));
+  const app = createMergeTestService(), room = { id: '883263', recording: false };
+  app.rooms.set(room.id, room);
+  app.storePath = path.join(directory, 'settings.json'); app.stateStore = new AtomicJsonStore(app.storePath);
+  app.saveStore = LiveRecordService.prototype.saveStore;
+  const files = [0, 1, 2, 3].map(i => path.join(directory, `segment${i}.clean.mp4`));
+  await Promise.all(files.map(file => fsp.writeFile(file, 'source')));
+  app.recordings = files.map((cleanPath, index) => ({ cleanPath, roomId: room.id, valid: true,
+    mergeGroup: index < 2 ? 'failed-session' : 'later-session', mergeSequence: index % 2 + 1,
+    startedAt: index < 2 ? 100 + index : 1 + index, durationSec: 10, segmentTargetDurationSec: 600,
+    mergeOutputPath: path.join(directory, index < 2 ? 'failed.merged.mp4' : 'later.merged.mp4') }));
+  app.mergeFailedSelections.set(app.getMergeRetryKey(room.id, 'failed-session'), {
+    roomId: room.id, mergeGroup: 'failed-session', sourcePaths: files.slice(0, 2), code: 'BR2K_NATIVE_RUNTIME_FAILED_AFTER_COMMIT' });
+  await app.saveStore();
+  const restarted = createMergeTestService(); restarted.storePath = app.storePath; restarted.stateStore = new AtomicJsonStore(app.storePath);
+  await restarted.loadStore();
+  const restored = restarted.getRoom(room.id);
+  assert.equal((await restarted.getPendingMergeGroupForRoom(restored)).mergeGroup, 'later-session');
+  assert.equal((await restarted.getPendingMergeGroupForRoom(restored, 'failed-session')).mergeGroup, 'failed-session');
+  let retry;
+  restarted.finalizeReconnectGroup = async (_room, group) => { retry = group; };
+  await restarted.retryMerge(room.id, 'failed-session');
+  assert.equal(retry, 'failed-session'); assert.equal(restarted.mergeFailedSelections.size, 0);
+});
+
 test('automatic cancellation survives restart and explicit retry releases only the selected session', async t => {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-auto-cancel-retry-'));
   t.after(() => fsp.rm(directory, { recursive: true, force: true }));
@@ -425,6 +466,46 @@ test('faststart finalization survives the media watchdog but retains a bounded t
   await assert.rejects(run('setInterval(() => {}, 100)', 600), error =>
     error.code === 'FFMPEG_FINALIZATION_TIMEOUT' && error.ffmpegNoProgress && error.ffmpegStallTimeoutMs === 600);
   assert.equal(finalized, 2);
+});
+
+test('reserved MP4 index flush at the known media end gets bounded finalization time without a faststart log', async () => {
+  const reasons = [];
+  const run = (time, tail, finalizationTimeoutMs = 1600) => runFfmpegJob(process.execPath, ['-e',
+    `process.stderr.write('out_time_us=${Math.round(time * 1_000_000)}\\nprogress=continue\\n'); ${tail}`], () => {}, {
+      progressStallTimeoutMs: 200, finalizationTimeoutMs,
+      finalizationMediaDurationSec: 13979.14,
+      progressValueFromText: parseFfmpegProgressTime,
+      onFinalizationStart: reason => reasons.push(reason)
+    });
+  await run(13979.11, 'setTimeout(() => process.exit(0), 800)');
+  assert.deepEqual(reasons, ['media-end']);
+  await assert.rejects(run(13977, 'setInterval(() => {}, 100)'), error => error.code === 'FFMPEG_NO_PROGRESS');
+  assert.deepEqual(reasons, ['media-end']);
+  // Repeated end timestamps must not extend a genuinely blocked flush forever.
+  await assert.rejects(run(13979.11,
+    "setInterval(() => process.stderr.write('out_time_us=13979120000\\n'), 30)", 600), error =>
+    error.code === 'FFMPEG_FINALIZATION_TIMEOUT' && error.ffmpegStallTimeoutMs === 600);
+  assert.deepEqual(reasons, ['media-end', 'media-end']);
+});
+
+test('fast concat final progress can precede the trailer by 37 media seconds without being a stalled middle segment', async () => {
+  const run = async (lastTime) => {
+    const reasons = [];
+    const job = runFfmpegJob(process.execPath, ['-e',
+      `process.stderr.write('out_time_us=13890000000\\n'); setTimeout(() => process.stderr.write('out_time_us=${lastTime * 1_000_000}\\n'), 100); setTimeout(() => process.exit(0), 800);`], () => {}, {
+        progressStallTimeoutMs: 250, finalizationTimeoutMs: 1600,
+        finalizationMediaDurationSec: 13979.135625,
+        progressValueFromText: parseFfmpegProgressTime,
+        onFinalizationStart: reason => reasons.push(reason)
+      });
+    return { job, reasons };
+  };
+  const tail = await run(13942);
+  await tail.job;
+  assert.deepEqual(tail.reasons, ['media-end']);
+  const middle = await run(13900);
+  await assert.rejects(middle.job, error => error.code === 'FFMPEG_NO_PROGRESS');
+  assert.deepEqual(middle.reasons, []);
 });
 
 test('a source PTS boundary offset is advisory when measured A/V duration remains in sync', () => {

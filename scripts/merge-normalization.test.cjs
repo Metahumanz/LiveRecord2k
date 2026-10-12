@@ -21,6 +21,21 @@ test('unsafe timestamps, unknown timing and noncanonical audio cannot enter mixe
   assert.equal(canReuseMergeSegment({ ...media, audioInfo: { ...media.audioInfo, sampleRate: 44100 } }, video, timing, {}, 'h264_nvv4l2'), false);
 });
 
+test('B-frame packet tail offsets do not force a healthy four-hour matching segment to re-encode', () => {
+  const recorded = { ...timing, avStartDeltaSec: -0.011, avEndDeltaSec: -0.1000000000003638,
+    videoPresentationDurationSec: 13624.060625, audioDurationSec: 13624.0365,
+    measuredAvDeltaSec: -0.02412499999991269, videoPtsMonotonic: false,
+    videoDtsMonotonic: true, audioDtsMonotonic: true };
+  assert(canReuseMergeSegment(media, video, recorded, {}, 'h264_nvv4l2'));
+  for (const patch of [
+    { audioDurationSec: 13624.36 }, { videoPresentationDurationSec: 13623.8 },
+    { avStartDeltaSec: 0.2 }, { corruptPacketCount: 1 },
+    { videoDtsMonotonic: false }, { audioDtsMonotonic: false }, { timingSafeForCopy: false },
+    { videoPresentationDurationSec: undefined }, { audioDurationSec: NaN }
+  ]) assert.equal(canReuseMergeSegment(media, video, { ...recorded, ...patch }, {}, 'h264_nvv4l2'), false);
+  assert.equal(canReuseMergeSegment(media, video, recorded, { requiresPostMergeVerification: true }, 'h264_nvv4l2'), false);
+});
+
 test('GPU scaling preserves aspect ratio and rejects HDR and unsupported bit depth', () => {
   assert(canScaleMergeOnGpu({ ...video, width: 1920, height: 1080 }, video));
   for (const patch of [{ width: 1080, height: 1920 }, { hdr: true }, { bitDepth: 10 }, { width: 0 }])

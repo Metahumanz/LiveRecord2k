@@ -1590,9 +1590,19 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
     let stalledError = null;
     let lastProgressValue = Number.NEGATIVE_INFINITY;
     let lastProgressAt = Date.now();
+    let lastProgressRate = 0;
     let finalizingAt = 0;
     const finalizationTimeoutMs = Math.max(progressStallTimeoutMs, Number(options.finalizationTimeoutMs) || 15 * 60_000);
+    const finalizationMediaDurationSec = Number(options.finalizationMediaDurationSec);
+    const finalizationMediaToleranceSec = Math.max(0, Math.min(0.5, Number(options.finalizationMediaToleranceSec) || 0.25));
     let stallTimer = null;
+
+    const beginFinalization = (reason) => {
+      if (finalizingAt) return;
+      finalizingAt = Date.now();
+      lastProgressAt = finalizingAt;
+      options.onFinalizationStart?.(reason);
+    };
 
     const finish = (callback, value) => {
       if (settled) return;
@@ -1603,12 +1613,12 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
 
     const triggerProgressStall = () => {
       if (settled || stalledError || !progressValueFromText || child.exitCode !== null || child.signalCode) return;
-      const elapsedMs = Date.now() - lastProgressAt;
+      const elapsedMs = Date.now() - (finalizingAt || lastProgressAt);
       const timeoutMs = finalizingAt ? finalizationTimeoutMs : progressStallTimeoutMs;
       if (elapsedMs < timeoutMs) return;
       stalledError = new Error(
         finalizingAt
-          ? `FFmpeg MP4 索引前置超过 ${Math.ceil(timeoutMs / 1000)} 秒，已终止该处理进程。`
+          ? `FFmpeg 封装收尾超过 ${Math.ceil(timeoutMs / 1000)} 秒，已终止该处理进程。`
           : `FFmpeg 已连续 ${Math.ceil(timeoutMs / 1000)} 秒没有输出媒体进度，已终止该处理进程。`
       );
       stalledError.code = finalizingAt ? 'FFMPEG_FINALIZATION_TIMEOUT' : 'FFMPEG_NO_PROGRESS';
@@ -1632,20 +1642,40 @@ function runFfmpegJob(ffmpegPath, args, onStderr, options = {}) {
       const text = chunk.toString('utf8');
       stderr = `${stderr}${text}`.slice(-8000);
       if (!finalizingAt && /Starting second pass:\s*moving the moov atom/i.test(stderr)) {
-        finalizingAt = Date.now();
-        lastProgressAt = finalizingAt;
-        options.onFinalizationStart?.();
+        beginFinalization('faststart');
       }
+      let reachedMediaEnd = false;
       if (progressValueFromText) {
         try {
           const progressValue = Number(progressValueFromText(text));
           if (Number.isFinite(progressValue) && progressValue > lastProgressValue + 0.0001) {
+            const now = Date.now();
+            if (Number.isFinite(lastProgressValue) && now > lastProgressAt) {
+              lastProgressRate = Math.max(0, (progressValue - lastProgressValue) * 1000 / (now - lastProgressAt));
+            }
             lastProgressValue = progressValue;
-            lastProgressAt = Date.now();
+            lastProgressAt = now;
+          }
+          // Reserved MP4 indexes do not emit the faststart second-pass message.
+          // Only callers with a known media endpoint may grant trailer/flush
+          // time; this remains a fixed deadline and never means output success.
+          // A fast copy can process tens of media seconds between reports, and
+          // its last progress report precedes the blocking trailer write.
+          // Allow at most two wall seconds of measured throughput, further
+          // bounded by 0.5% of the known duration and 120 media seconds.
+          const mediaEndWindowSec = Math.max(finalizationMediaToleranceSec,
+            Math.min(120, finalizationMediaDurationSec * 0.005, lastProgressRate * 2));
+          if (Number.isFinite(finalizationMediaDurationSec) && finalizationMediaDurationSec > 0 &&
+              Number.isFinite(progressValue) && progressValue > 0 &&
+              progressValue >= finalizationMediaDurationSec - mediaEndWindowSec) {
+            reachedMediaEnd = true;
           }
         } catch {}
       }
       onStderr?.(text);
+      // Deliver the last media timestamp before the caller switches its UI to
+      // trailer/flush waiting, otherwise short muxes lose their only progress.
+      if (reachedMediaEnd) beginFinalization('media-end');
     });
     child.on('error', (error) => finish(reject, stalledError || error));
     child.on('close', (code, signal) => {

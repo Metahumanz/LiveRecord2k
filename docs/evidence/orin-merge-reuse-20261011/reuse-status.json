@@ -1,0 +1,106 @@
+{
+  "progress": {
+    "id": "merge-1791688626550-lw7s6f",
+    "kind": "merge",
+    "status": "running",
+    "label": "手动合并 2 段录像",
+    "outputPath": "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.manual-44b038da-1af6-46c3-b3c9-bbb67c0fd10f.merged.mp4",
+    "roomId": "883263",
+    "codec": "h264_nvv4l2",
+    "codecKind": "hardware",
+    "decoder": "gstreamer-nvv4l2",
+    "decoderKind": "hardware",
+    "decoderLabel": "Jetson NVDEC H264（GStreamer nvv4l2decoder）",
+    "sourceFps": 60,
+    "encoderBackend": "Jetson H.264 硬编（GStreamer nvv4l2h264enc + nvvidconv）",
+    "activePipeline": {
+      "decoder": "Jetson NVDEC H264（GStreamer nvv4l2decoder）",
+      "sceneRenderer": "",
+      "encoder": "Jetson H.264 硬编（GStreamer nvv4l2h264enc + nvvidconv）"
+    },
+    "startedAt": 1791688626550,
+    "updatedAt": 1791688627813,
+    "phase": "prepare",
+    "phaseStartedAt": 1791688627813,
+    "phaseCurrentTimeSec": 0,
+    "phasePercent": 0,
+    "phaseEstimatedRemainingSec": null,
+    "phaseDurationSec": 355.095625,
+    "etaState": "estimating",
+    "currentTimeSec": 0,
+    "durationSec": 13979.135625,
+    "estimatedRemainingSec": null,
+    "renderFps": null,
+    "realtimeFactor": null,
+    "percent": 0,
+    "message": "规范化分段 1/2：正在准备兼容码流并验收硬解",
+    "mergeGroup": "manual-44b038da-1af6-46c3-b3c9-bbb67c0fd10f",
+    "sourceCount": 2,
+    "manual": true,
+    "deleteSources": true,
+    "sourcePaths": [
+      "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202014.clean.mp4",
+      "/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/883263_真栗_20261010_202615.clean.mp4"
+    ],
+    "stageLabel": "规范化分段 1/2：正在准备兼容码流并验收硬解",
+    "stageProgress": null,
+    "stageStartedAt": 1791688627810,
+    "mergeMode": "normalize",
+    "mergeReason": "统一分段规格或修复时间轴后再拼接",
+    "workStartedAt": 1791688627766,
+    "segmentIndex": 1
+  },
+  "logs": [
+    {
+      "id": "1791688627761-917f68ff202f1",
+      "time": 1791688627761,
+      "level": "info",
+      "message": "真栗(883263) 本机临时盘不足，合并中间文件改存输出盘：/mnt/zzzz/哔哩录播2K/883263-真栗/20261010_202011-全b站最通透直播间/.br2k-merge-media-bPJIlK，预留 34.45 GB；验收后发布，源分段保留至成功。"
+    },
+    {
+      "id": "1791688627767-b43ad37def9de8",
+      "time": 1791688627767,
+      "level": "info",
+      "message": "真栗(883263) 正在合并 2 个续录片段：883263_真栗_20261010_202014.manual-44b038da-1af6-46c3-b3c9-bbb67c0fd10f.merged.mp4。检测到分辨率、帧率或编码规格变化，将逐段重建时间轴并统一为 3840x2160，再无损拼接（临时工作区预留 34.45 GB）"
+    },
+    {
+      "id": "1791688627767-892fe958d480a8",
+      "time": 1791688627767,
+      "level": "info",
+      "message": "真栗(883263) MP4 合并预留 116.0 MB 前置索引，避免收尾搬移整片媒体。"
+    },
+    {
+      "id": "1791688627801-0275b47ec121e",
+      "time": 1791688627801,
+      "level": "info",
+      "message": "真栗(883263) 合并规范化计划：5分55秒 需要重编码，3小时47分4秒 可无损复用；重编码剩余时间估算将排除复用分段。"
+    },
+    {
+      "id": "1791688634121-aa941c439c099",
+      "time": 1791688634121,
+      "level": "error",
+      "message": "真栗(883263) 监听异常：fetch failed"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "merge-1791688626550-lw7s6f",
+      "type": "merge",
+      "resource": "diskRead+diskWrite+gpuEncode",
+      "resources": [
+        "diskRead",
+        "diskWrite",
+        "gpuEncode"
+      ],
+      "resourceCosts": {
+        "diskRead": 2,
+        "diskWrite": 2,
+        "gpuEncode": 1
+      },
+      "priority": 70,
+      "status": "running",
+      "createdAt": 1791688627763,
+      "startedAt": 1791688627764
+    }
+  ]
+}

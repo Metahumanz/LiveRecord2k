@@ -1,0 +1,64 @@
+
+> live-record-2k@0.9.4 test
+> node scripts/run-tests.cjs quick
+
+PASS av-clock-regression.test.cjs 0.2s
+PASS ass-filter.test.cjs 0.3s
+PASS auth.test.cjs 0.5s
+PASS avatar-capture.test.cjs 0.4s
+PASS client-code-splitting.test.cjs 0.3s
+PASS merge-normalization.test.cjs 0.3s
+PASS manual-merge-ui.test.cjs 0.5s
+PASS merge-sidecar-progress.test.cjs 0.4s
+PASS jetson-merge-native.test.cjs 0.4s
+PASS recording-identity.test.cjs 0.4s
+PASS codec-selection.test.cjs 0.4s
+PASS superchat-layout.test.cjs 0.4s
+PASS scene-verification-cancel.test.cjs 0.6s
+PASS desktop-cuda-capability.test.cjs 0.3s
+PASS danmaku-emoji.test.cjs 1.5s
+PASS diagnostics.test.cjs 0.2s
+PASS exported-clips.test.cjs 0.3s
+PASS danmaku-ass.test.cjs 2.4s
+PASS gpu-scene-conformance.test.cjs 0.4s
+PASS gpu-scene-renderer.test.cjs 0.3s
+PASS jetson-native-output.test.cjs 0.3s
+PASS scene-audio-mux.test.cjs 0.3s
+PASS jetson-native-bridge.test.cjs 1.6s
+PASS native-scene-reference.test.cjs 4.8s
+PASS jetson-self-test.test.cjs 0.3s
+PASS keyframe-preview.test.cjs 0.2s
+PASS preview-editor-contract.test.cjs 0.2s
+PASS maintenance-confirmation.test.cjs 0.2s
+PASS maintenance-service.test.cjs 0.4s
+PASS media-publication.test.cjs 0.3s
+PASS scene-mux-recovery.test.cjs 3.5s
+PASS media-storage.test.cjs 0.3s
+PASS release-notes.test.cjs 0.2s
+PASS room-monitor-scheduler.test.cjs 0.2s
+PASS room-behavior.test.cjs 0.4s
+PASS room-monitor-service.test.cjs 0.4s
+PASS room-removal.test.cjs 0.3s
+PASS safety.test.cjs 0.3s
+PASS scene-cache-index.test.cjs 0.3s
+PASS jetson-export-recovery.test.cjs 5.2s
+PASS settings-draft.test.cjs 0.6s
+PASS scene-legacy-conformance.test.cjs 2.3s
+PASS export-defaults-ui.test.cjs 0.8s
+PASS settings-service.test.cjs 0.5s
+PASS sse-incremental.test.cjs 0.5s
+PASS update-service.test.cjs 0.5s
+SLOW desktop-burn-regression.test.cjs 14.2s
+PASS scene-graph.test.cjs 9.6s
+
+最慢的测试文件：
+- 14.2s desktop-burn-regression.test.cjs
+- 9.6s scene-graph.test.cjs
+- 5.2s jetson-export-recovery.test.cjs
+- 4.8s native-scene-reference.test.cjs
+- 3.5s scene-mux-recovery.test.cjs
+- 2.4s danmaku-ass.test.cjs
+- 2.3s scene-legacy-conformance.test.cjs
+- 1.6s jetson-native-bridge.test.cjs
+- 1.5s danmaku-emoji.test.cjs
+- 0.8s export-defaults-ui.test.cjs
