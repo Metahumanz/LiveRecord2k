@@ -6,7 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { normalizeDanmakuEvent, prepareAssEvents, createAss, resolveDanmakuStyle, getSideInteractionCardMetrics, getMinimalSideInteractionMetrics, wrapTextToWidthLines, estimateTextWidth } = require('../src/server/danmaku/ass.cjs');
-const { graphemes, unicodeAsset, imageUrl, resolveEmojiText } = require('../src/server/danmaku/emoji.cjs');
+const { graphemes, unicodeAsset, imageUrl, emojiWidthFactor, resolveEmojiText } = require('../src/server/danmaku/emoji.cjs');
 const { buildSceneGraph, evaluateSceneObject } = require('../src/server/danmaku/scene-graph.cjs');
 const { createSceneFilterScript } = require('../src/server/danmaku/scene-renderer.cjs');
 const { LiveRecordService } = require('../src/server/app/service.cjs');
@@ -212,22 +212,45 @@ test('FFmpeg actually burns visible color emoji through direct and ASS compatibi
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
 
-test('FFmpeg preserves a wide image-emote ratio inside its glyph cell', async () => {
+test('FFmpeg burns wide emotes at text height and reserves room for following text in all styles', async () => {
   const executable = process.env.FFMPEG_BIN || require('ffmpeg-static');
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-emoji-ratio-'));
   try {
     const assetPath = path.join(directory, 'wide.png');
     await run(executable, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=200x60', '-frames:v', '1', assetPath]);
-    const graph = buildSceneGraph([{ type: 'danmaku', time: 0, text: '[宽图]', emoticons: [{ token: '[宽图]', url }] }],
-      { videoInfo: { width: 640, height: 360 }, emojiAssets: { [url]: { filePath: assetPath } } });
-    const image = graph.objects.find(o => o.type === 'Image');
+    for (const preset of ['current', 'h5-card', 'bubble', 'minimal']) {
+    const events = [{ type: 'danmaku', time: 0, text: '中[宽图]文😀字', emoticons: [{ token: '[宽图]', url, width: 1, height: 1 }] }];
+    const options = { stylePreset: preset, styleLayout: { superChatWidth: 1200, boxFontSize: 48 },
+      videoInfo: { width: 640, height: 360 }, emojiAssets: { [url]: { filePath: assetPath } } };
+    const graph = buildSceneGraph(events, options);
+    const image = graph.objects.find(o => o.type === 'Image' && evaluateSceneObject(o, 2).visible);
     assert.equal(image.props.objectFit, 'contain');
-    const filter = path.join(directory, 'filter');
-    await fs.writeFile(filter, createSceneFilterScript(graph, { target: 'software', duration: 4, fps: 25 }).script);
+    const suffix = graph.objects.find(o => o.type === 'Text' && o.props.text === '文' && evaluateSceneObject(o, 2).visible);
+    assert.ok(suffix, preset + ' must retain the text after the emote');
+    assert.ok(Math.abs(image.frame.height - suffix.props.fontSize) < 0.01, preset + ' emote height must match the text font size');
+    assert.ok(Math.abs(suffix.frame.x - image.frame.x - image.frame.width) < 0.02, preset + ' must reserve the actual emote width');
+    assert.equal(emojiWidthFactor({ filePath: assetPath, width: 1, height: 1 }), 200/60, 'saved PNG must override stale/absent protocol size');
+    const unicode = graph.objects.find(o => o.type === 'Image' && o.props.alt === '😀' && evaluateSceneObject(o, 2).visible);
+    assert.equal(unicode.frame.height, suffix.props.fontSize, preset + ' Unicode emoji must also use full text height');
+    const filter = path.join(directory, preset + '.filter');
+    const assPath = path.join(directory, preset + '.ass');
+    const ass = createAss(events, { ...options, renderEmojiImages: true });
+    assert.ok(!/[\ue000-\uf8ff]/u.test(ass), 'private placeholders must never reach libass');
+    assert.ok(!ass.includes('br2k-emoji:'), 'internal image markers must be completely resolved into ASS runs');
+    await fs.writeFile(assPath, ass);
+    await fs.writeFile(filter, createSceneFilterScript(graph, { target: 'software', duration: 4, fps: 25,
+      ...(preset === 'current' ? {} : { legacyAssPath: assPath }) }).script);
     const output = path.join(directory, 'actual.rgb');
     await run(executable, ['-v','error','-y','-filter_complex_threads','1','-f','lavfi','-i','color=c=black:s=640x360:r=25:d=4',
       '-filter_complex_script',filter,'-map','[vout]','-ss','2','-frames:v','1','-pix_fmt','rgb24','-f','rawvideo',output]);
     const pixels = await fs.readFile(output), state = evaluateSceneObject(image, 2);
+    if (process.env.BR2K_EMOJI_TEST_FRAMES) {
+      const target = path.resolve(process.env.BR2K_EMOJI_TEST_FRAMES);
+      await fs.mkdir(target, { recursive: true });
+      await run(executable, ['-v','error','-y','-f','rawvideo','-pixel_format','rgb24','-video_size','640x360','-i',output,'-frames:v','1',path.join(target,preset+'.png')]);
+      await fs.writeFile(path.join(target,preset+'.json'), JSON.stringify(graph, null, 2));
+      await fs.writeFile(path.join(target,preset+'.ass'), ass);
+    }
     let left=640,right=0,top=360,bottom=0;
     for(let y=Math.max(0,Math.floor(state.y));y<Math.min(360,Math.ceil(state.y+image.frame.height));y++) {
       for(let x=Math.max(0,Math.floor(state.x));x<Math.min(640,Math.ceil(state.x+image.frame.width));x++) {
@@ -237,5 +260,33 @@ test('FFmpeg preserves a wide image-emote ratio inside its glyph cell', async ()
     }
     assert.ok(right>left && bottom>top);
     assert.ok((right-left+1)/(bottom-top+1)>2.5, '200×60 表情不能挤成正方形');
+    assert.ok(bottom-top+1 >= image.frame.height * 0.85, preset + ' wide emote must not shrink to a third of text height');
+    const suffixState = evaluateSceneObject(suffix, 2);
+    let textPixels = 0;
+    for(let y=Math.max(0,Math.floor(suffixState.y));y<Math.min(360,Math.ceil(suffixState.y+suffix.props.fontSize*1.3));y++) {
+      for(let x=Math.max(0,Math.floor(suffixState.x));x<Math.min(640,Math.ceil(suffixState.x+suffix.props.fontSize));x++) {
+        const i=(y*640+x)*3;
+        if(pixels[i]>150 && pixels[i+1]>150 && pixels[i+2]>150) textPixels++;
+      }
+    }
+    assert.ok(textPixels >= 6, preset + ' must burn the following Chinese glyph in its reserved position, actual ' + textPixels);
+    }
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('SC wrapping accounts for wide emotes without splitting or overlapping them', () => {
+  for (const preset of ['current', 'h5-card', 'bubble', 'minimal']) {
+    const events = [{ type: 'superchat', time: 0, user: '测试', price: 30, text: '中[宽图]文'.repeat(8),
+      emoticons: [{ token: '[宽图]', url, width: 200, height: 60 }] }];
+    const options = { stylePreset: preset, styleLayout: { superChatWidth: 300 },
+      videoInfo: { width: 1920, height: 1080 }, emojiAssets: { [url]: { filePath: unicodeAsset('😀').filePath, width: 200, height: 60 } } };
+    // Use metadata fallback with an unavailable header: old non-PNG snapshots
+    // have the same layout contract, while PNG dimensions take precedence.
+    options.emojiAssets[url].filePath = 'missing-wide-snapshot.png';
+    const graph = buildSceneGraph(events, options);
+    const images = graph.objects.filter(o => o.type === 'Image' && o.props.alt === '[宽图]' && evaluateSceneObject(o, 2).visible);
+    assert.equal(images.length, 8, preset);
+    assert.ok(new Set(images.map(o => o.frame.y)).size > 1, preset + ' must wrap');
+    for (const image of images) assert.ok(Math.abs(image.frame.width / image.frame.height - 200/60) < 0.001);
+  }
 });

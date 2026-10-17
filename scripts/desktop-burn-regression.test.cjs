@@ -44,7 +44,7 @@ test('desktop admission rejects old, future and missing environment reports at t
   const report = { version: CUDA_SCENE_CONFORMANCE_VERSION, backend: 'cuda-ffmpeg', passed: true, executedAt: now,
     environmentFingerprint: 'machine', cases: ['h5-card', 'bubble', 'minimal'].flatMap((preset) => [0, 1.019].map((leadingVideoPaddingSec) => ({
       preset, leadingVideoPaddingSec, passed: true, metrics: { meanAbsRgb: 0, changedRatio: 0 },
-      coverage: Object.fromEntries(['danmaku', 'avatar', 'superchat', 'gift', 'roundedCorners', 'shadow', 'move', 'fade'].map((key) => [key, true]))
+      coverage: Object.fromEntries(['danmaku', 'avatar', 'superchat', 'gift', 'roundedCorners', 'shadow', 'move', 'fade', 'emoji', 'wideEmote'].map((key) => [key, true]))
     }))) };
   assert.equal(canUseDesktopCudaSceneProduction(capability, report, { now }).ok, true);
   for (const changes of [{ executedAt: now - DESKTOP_CUDA_REPORT_MAX_AGE_MS - 1 }, { executedAt: now + 61_000 },

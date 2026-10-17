@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const readline = require('node:readline');
 const crypto = require('node:crypto');
-const { graphemes, unicodeAsset, emojiAssetId } = require('./emoji.cjs');
+const { graphemes, unicodeAsset, emojiAssetId, emojiWidthFactor } = require('./emoji.cjs');
 const {
   LayoutEngine,
   MESSAGE_ANIMATION_SEC,
@@ -345,9 +345,9 @@ function addLegacyAvatar(graph, prefix, event, style, segment, avatarAssets) {
 
 function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
   if (style.visualPreset === 'minimal') {
-    const metrics = getMinimalSideChatMetrics(style, event.text);
+    const metrics = getMinimalSideChatMetrics(style, event.text, event.emojiTokens);
     const username = truncateTextToWidth(event.user || '观众', metrics.textWidth * 0.35, metrics.fontSize);
-    const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+    const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize, event.emojiTokens, 1.22);
     const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
     const textX = metrics.dotSize + metrics.gap;
     legacyShape(graph, prefix + '-dot', segment, 0, dotY, metrics.dotSize, metrics.dotSize, sideAvatarColor(event), metrics.dotSize / 2, 20);
@@ -357,7 +357,7 @@ function addLegacySideChat(graph, prefix, event, style, segment, avatarAssets) {
     legacyRichText(graph, prefix + '-line', segment, textX, 0, `\\b1${username}\\b0 · ${detail}`, metrics.fontSize, '&H00DCE8E8&', 23);
     return;
   }
-  const metrics = getSideChatMetrics(style, event.text);
+  const metrics = getSideChatMetrics(style, event.text, event.emojiTokens);
   const palette = sideChatPalette(style);
   const username = truncateTextToWidth(event.user || '观众', metrics.contentWidth * 0.72, metrics.metaFontSize);
   const nameWidth = Math.min(metrics.contentWidth * 0.78, Math.max(metrics.metaFontSize * 2.3, estimateTextWidth(username, metrics.metaFontSize) + metrics.metaFontSize));
@@ -620,12 +620,13 @@ function addEmojiNodes(graph, begin, tokens, legacy) {
       if (!asset) { if (!run) runX = x; run += glyph; x += glyphWidthFactor(glyph) * advanceSize; continue; }
       flush();
       const id = emojiAssetId(asset.key);
-      const emojiY = y + (object.props.assAnchor ? object.props.assAnchor.y - advanceSize / 2 : 0);
+      const emojiWidth = size * emojiWidthFactor(asset);
+      const emojiY = y + (object.props.assAnchor ? object.props.assAnchor.y - size / 2 : 0);
       if (!graph.assets.some(a => a.id === id)) graph.assets.push({ id, type: 'emoji', path: asset.filePath, url: asset.url || '', key: asset.key });
       graph.objects.push({ ...object, id: object.id + '-emoji-' + index++, type: 'Image',
-        frame: frame(object.frame.x + x, object.frame.y + emojiY, advanceSize, advanceSize),
+        frame: frame(object.frame.x + x, object.frame.y + emojiY, emojiWidth, size),
         props: { assetId: id, role: 'emoji', alt: asset.text, objectFit: 'contain' }, style: { opacity: object.style.opacity ?? 1, clip: object.style.clip }, animations: translated(x, emojiY) });
-      x += advanceSize;
+      x += emojiWidth;
     }
     flush();
   }
@@ -653,7 +654,7 @@ function buildSceneGraph(events, options) {
       generator: 'LayoutEngine',
       generatedAt: new Date().toISOString(),
       sourceEventCount: Array.isArray(events) ? events.length : 0,
-      layoutVersion: 2,
+      layoutVersion: 3,
       // Preview and every renderer can consume the same resolved bounds;
       // they no longer need to infer a region from lane count alone.
       layoutBounds: {

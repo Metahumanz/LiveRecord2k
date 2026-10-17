@@ -4,13 +4,13 @@
 // a complete, current visual run. A helper's advertised primitives are not
 // evidence that its pixels, alpha or timeline are compatible.
 
-// v7 normalizes recorded image-emote URLs and preserves bitmap aspect ratios. Older reports
+// v8 sizes emotes against text height and reserves their actual layout width. Older reports
 // cannot authorize a renderer/layout that has not passed the new fixtures.
-const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v7';
+const CUDA_SCENE_CONFORMANCE_VERSION = 'ass-compat-v8';
 const CUDA_SCENE_CONFORMANCE_PRESETS = ['h5-card', 'bubble', 'minimal'];
 const CUDA_SCENE_CONFORMANCE_LEADS = [0, 1.019];
 const CUDA_SCENE_CONFORMANCE_COVERAGE = [
-  'danmaku', 'avatar', 'superchat', 'gift', 'roundedCorners', 'shadow', 'move', 'fade'
+  'danmaku', 'avatar', 'superchat', 'gift', 'roundedCorners', 'shadow', 'move', 'fade', 'emoji', 'wideEmote'
 ];
 // Both reference and CUDA paths are H.265 encoded before comparison on the
 // Orin, so a small encoder-domain tolerance is necessary. It is deliberately

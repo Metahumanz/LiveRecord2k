@@ -44,6 +44,17 @@ test('CUDA Scene rejects a passing report from the old layout and lead clock', (
   assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v4' }).ok, false);
   assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v5' }).ok, false);
   assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v6' }).ok, false);
+  assert.equal(validateCudaSceneConformance({ ...passingReport(), version: 'ass-compat-v7' }).ok, false);
+});
+
+test('CUDA Scene requires measured Unicode and wide-image emote coverage', () => {
+  for (const key of ['emoji', 'wideEmote']) {
+    const report = passingReport();
+    report.cases[0].coverage[key] = false;
+    const result = validateCudaSceneConformance(report);
+    assert.equal(result.ok, false);
+    assert.match(result.reason, new RegExp(key));
+  }
 });
 
 test('CUDA Scene production gate requires every legacy style, lead-in and visual coverage item', () => {
