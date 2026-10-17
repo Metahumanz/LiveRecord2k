@@ -321,7 +321,6 @@ Jetson 导出有三个能力层级：兼容路径是 `CPU decode / FFmpeg Scene 
 
 启动时会依次进行能力探测、CUDA Scene runtime probe、视觉一致性门禁和当前真实录像约 5 秒的 preflight，通过后才正式使用连续 NVMM 链。preflight 失败时，正式任务从 0 开始直接走兼容链；正式 NVMM 已经运行较长时间后失败时，会停止任务并保留明确错误，不会偷偷把整部长录像从 0 重新 CPU 渲染。
 
-Jetson 的依赖边界、诊断命令、服务用户检查和日志判断方式见 [docs/jetson.md](docs/jetson.md)。
 
 正式 NVMM 在前 5 秒内失败时仍允许兼容链回退一次；超过 5 秒后失败会停止任务，并在“软件维护”中保留脱敏的导出失败诊断报告。
 
@@ -431,7 +430,6 @@ Linux/Windows quick、Linux integration，以及按路径触发的 Package check
 Release workflow：
 指定媒体回归、TypeScript/Vite 构建、FFmpeg smoke、Windows 包构建、Linux x64/ARM64 原生构建与包结构验证，以及 Ed25519 update manifest 生成和复验。Release workflow 不会再次运行全部 `npm test`。
 
-Windows MSIX 的单用户安装、签名和静默更新源配置见 [docs/windows-msix.md](docs/windows-msix.md)。
 
 如果不想构建结束后自动打开资源管理器，可以设置：
 
