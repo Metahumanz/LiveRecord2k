@@ -31,6 +31,12 @@ export type StreamChoice = {
   host: string;
 };
 
+export type ResolutionMergePlan = {
+  sourceCount: number;
+  groups: Array<{ index: number; label: string; width: number; height: number; sourcePaths: string[];
+    sourceCount: number; action: 'merge' | 'keep'; reason: string }>;
+};
+
 export type RecordingState = {
   id?: string;
   roomId?: string;
@@ -54,6 +60,7 @@ export type RecordingState = {
   mergeSequence?: number;
   mergeOutputPath?: string;
   mergedFrom?: string[];
+  resolutionMerge?: { retained: boolean; directory: string; reason?: string; label?: string } | null;
   durationSec?: number;
   fileSize?: number;
   valid?: boolean;
@@ -425,6 +432,11 @@ export type AvatarPreparationDiagnostics = {
 };
 
 export type FfmpegJobProgress = {
+  resolutionMode?: 'single' | 'groups';
+  batchIndex?: number;
+  batchCount?: number;
+  batchLabel?: string;
+  batchDirectory?: string;
   mergeGroup?: string;
   manual?: boolean;
   sourcePaths?: string[];
@@ -652,7 +664,8 @@ export type RecorderApi = {
   stopRecording: (roomId: string) => Promise<AppState>;
   cancelMerge: (roomId: string, jobId?: string) => Promise<AppState>;
   retryMerge: (roomId: string) => Promise<AppState>;
-  mergeRecordings: (cleanPaths: string[], deleteSources?: boolean) => Promise<AppState>;
+  mergeRecordings: (cleanPaths: string[], deleteSources?: boolean, resolutionMode?: 'single' | 'groups') => Promise<AppState>;
+  planRecordingMerge: (cleanPaths: string[]) => Promise<ResolutionMergePlan>;
   startPreview: (roomId: string) => Promise<PreviewStartResult>;
   startExportPreview: (request: { cleanPath: string }) => Promise<ExportPreviewResult>;
   cancelExportPreview: () => Promise<AppState>;

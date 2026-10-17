@@ -123,6 +123,16 @@
   color: #eef9f6;
 }
 
+.merge-group-plan ol {
+  display: grid;
+  gap: 8px;
+  padding-left: 24px;
+  font-size: 13px;
+  color: #d7ebe6;
+}
+
+.merge-group-plan li p { margin: 4px 0; }
+
 .merge-confirm-list {
   display: grid;
   gap: 7px;

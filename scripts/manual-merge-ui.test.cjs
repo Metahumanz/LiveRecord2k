@@ -78,6 +78,9 @@ test('merge progress renders its true media progress with the existing visual cl
     phase: 'mux', phaseCurrentTimeSec: 600, phaseDurationSec: 3600, phasePercent: 16.7,
     mergeMode: 'copy', mergeReason: '分段规格一致，直接无损拼接', stageLabel: '无损拼接', message: '正在无损拼接' } }));
   assert.match(copy, /拼接 17%/); assert.match(copy, /分段规格一致，直接无损拼接/);
+  const grouped = renderToStaticMarkup(React.createElement(JobProgress, { progress: { ...progress,
+    phase: 'mux', phaseCurrentTimeSec: 600, phaseDurationSec: 3600, batchIndex: 1, batchCount: 3, batchLabel: '3840×2160' } }));
+  assert.match(grouped, /分组 1\/3/); assert.match(grouped, /本组已处理/); assert.doesNotMatch(grouped, /整体已处理/);
   assert.doesNotMatch(copy, /预渲染纹理|正在渲染/);
   const cancelled = renderToStaticMarkup(React.createElement(JobProgress, { progress: { ...progress,
     status: 'cancelled', message: '合并已取消，源分段已保留' } }));
@@ -180,6 +183,18 @@ test('nearby segments from different known live sessions stay in separate sugges
     group.recordings.map(row => row.cleanPath)), [['new-live.mp4', 'new-live-2.mp4'], ['first.mp4', 'second.mp4']]);
 });
 
+test('stable retained tail recordings remain eligible for later same-live suggestions', () => {
+  const start = Date.parse('2026-10-16T20:00:00+08:00');
+  const selected = [
+    { cleanPath: 'tail.mp4', roomId: '883263', startedAt: start, durationSec: 60, valid: true,
+      resolutionMerge: { retained: true, reason: '' } },
+    { cleanPath: 'next.mp4', roomId: '883263', startedAt: start+60000, durationSec: 60, valid: true }
+  ];
+  assert.equal(getSameLiveMergeSuggestions(selected, rooms).length, 1);
+  selected[0].resolutionMerge.reason = '段内参数变化，独立保留';
+  assert.equal(getSameLiveMergeSuggestions(selected, rooms).length, 0);
+});
+
 test('a missing session id between two known broadcasts cannot bridge them', () => {
   const start = Date.parse('2026-09-26T20:00:00+08:00');
   const recordings = [
@@ -221,11 +236,32 @@ test('one-click and manual paths require a separate explicit confirmation of sou
   assert.doesNotMatch(html, /checked=""/);
   assert.equal(submissions, 0);
   const dialog = MergeConfirmation(props).props.children;
-  dialog.props.children[5].props.children[1].props.onClick();
+  dialog.props.children.find(child => child?.props?.className === 'split-buttons merge-confirm-actions').props.children[1].props.onClick();
   assert.equal(submissions, 1);
   const blocked = renderToStaticMarkup(React.createElement(MergeConfirmation, { ...props, reason: '该房间正在录制' }));
   assert.match(blocked, /该房间正在录制/);
   assert.match(blocked, /disabled=""/);
+});
+
+test('manual confirmation lists resolutions, exact ordered groups and independent retention before submit', () => {
+  const selected = [
+    { cleanPath: '4k-a.mp4', startedAt: 1, durationSec: 2, videoInfo: { width: 3840, height: 2160 } },
+    { cleanPath: '4k-b.mp4', startedAt: 2, durationSec: 2, videoInfo: { width: 3840, height: 2160 } },
+    { cleanPath: 'changing.mp4', startedAt: 3, durationSec: 2, videoInfo: { width: 3840, height: 2160 } }
+  ];
+  const plan = { sourceCount: 3, groups: [
+    { index: 1, label: '3840×2160', sourcePaths: ['4k-a.mp4', '4k-b.mp4'], sourceCount: 2, action: 'merge', reason: '' },
+    { index: 2, label: '段内参数变化', sourcePaths: ['changing.mp4'], sourceCount: 1, action: 'keep', reason: '独立保留，避免强制重编码' }
+  ] };
+  const props = { selected, plan, reason: '', busy: false, deleteSources: false, onConfirm() {}, onCancel() {}, onDeleteSourcesChange() {} };
+  const html = renderToStaticMarkup(React.createElement(MergeConfirmation, props));
+  assert.match(html, /按连续同分辨率分组（推荐）/); assert.match(html, /第 1 组/); assert.match(html, /3840×2160/);
+  assert.match(html, /段内参数变化/); assert.match(html, /独立保留项不删除/);
+  const pending = MergeConfirmation({ ...props, plan: null, planLoading: true }).props.children;
+  const button = pending.props.children.find(child => child?.props?.className === 'split-buttons merge-confirm-actions').props.children[1];
+  assert.equal(button.props.disabled, true);
+  const single = renderToStaticMarkup(React.createElement(MergeConfirmation, { ...props, resolutionMode: 'single' }));
+  assert.match(single, /统一到最高分辨率/); assert.match(single, /耗时明显增加/);
 });
 
 test('cross-room, missing ownership, active tasks and unfinished sources remain blocked with visible reasons', () => {

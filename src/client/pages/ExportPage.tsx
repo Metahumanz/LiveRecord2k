@@ -22,7 +22,7 @@ import {
   getManualMergeSelection, getSameLiveMergeSuggestions, ManualMergeControls, ManualMergeProgress,
   MergeConfirmation, SameLiveMergeSuggestions
 } from '../components/ManualMergeControls';
-import type { AppSettings, AppState, ExportDraft, ExportResult, ExportedClip, RecordingState, SceneMuxRecovery } from '../types';
+import type { AppSettings, AppState, ExportDraft, ExportResult, ExportedClip, RecordingState, SceneMuxRecovery, ResolutionMergePlan } from '../types';
 import {
   burnAvatarModeOptions,
   danmakuAreaOptions,
@@ -75,11 +75,25 @@ export function ExportPage({
   const [deleteMergeSources, setDeleteMergeSources] = useState(false);
   const [pendingMergePaths, setPendingMergePaths] = useState<string[] | null>(null);
   const mergeSubmissionRef = useRef(false);
+  const [mergeResolutionMode, setMergeResolutionMode] = useState<'groups' | 'single'>('groups');
+  const [mergePlan, setMergePlan] = useState<ResolutionMergePlan | null>(null);
+  const [mergePlanLoading, setMergePlanLoading] = useState(false);
+  const [mergePlanError, setMergePlanError] = useState('');
   const { selected: mergeRecordings, reason: mergeReason } = getManualMergeSelection(recordings, mergeSelection, state.rooms);
   const { selected: pendingMergeRecordings, reason: pendingMergeReason } = getManualMergeSelection(
     recordings, pendingMergePaths || [], state.rooms
   );
   const sameLiveSuggestions = getSameLiveMergeSuggestions(recordings, state.rooms);
+  useEffect(() => {
+    let active = true;
+    setMergePlan(null); setMergePlanError('');
+    if (!pendingMergePaths || mergeResolutionMode !== 'groups' || pendingMergeReason) { setMergePlanLoading(false); return; }
+    setMergePlanLoading(true);
+    recorder.planRecordingMerge(pendingMergePaths).then(plan => { if (active) setMergePlan(plan); })
+      .catch(error => { if (active) setMergePlanError(String(error?.message || error)); })
+      .finally(() => { if (active) setMergePlanLoading(false); });
+    return () => { active = false; };
+  }, [pendingMergePaths, mergeResolutionMode, pendingMergeReason]);
   const [mediaDuration, setMediaDuration] = useState(0);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [decodedVideoSize, setDecodedVideoSize] = useState<{ width: number; height: number } | null>(null);
@@ -435,15 +449,17 @@ export function ExportPage({
             onMerge={() => setPendingMergePaths(mergeRecordings.map(recording => recording.cleanPath))} />
 
           {pendingMergePaths ? <MergeConfirmation selected={pendingMergeRecordings} reason={pendingMergeReason}
+            resolutionMode={mergeResolutionMode} onResolutionModeChange={setMergeResolutionMode}
+            plan={mergePlan} planLoading={mergePlanLoading || (mergeResolutionMode === 'groups' && !mergePlan && !mergePlanError)} planError={mergePlanError}
             deleteSources={deleteMergeSources} busy={busy.has('manual-merge')}
             onDeleteSourcesChange={setDeleteMergeSources}
             onCancel={() => { if (!mergeSubmissionRef.current) setPendingMergePaths(null); }}
             onConfirm={async () => {
-              if (pendingMergeReason || mergeSubmissionRef.current) return;
+              if (pendingMergeReason || mergeSubmissionRef.current || (mergeResolutionMode === 'groups' && !mergePlan)) return;
               mergeSubmissionRef.current = true;
               const paths = pendingMergeRecordings.map(recording => recording.cleanPath);
               try {
-                if (await run('manual-merge', () => recorder.mergeRecordings(paths, deleteMergeSources))) {
+                if (await run('manual-merge', () => recorder.mergeRecordings(paths, deleteMergeSources, mergeResolutionMode))) {
                   setMergeSubmitted(true);
                   setPendingMergePaths(null);
                   setDeleteMergeSources(false);
@@ -498,6 +514,8 @@ export function ExportPage({
                     <span className="recording-meta">
                       {filename(recording.cleanPath)}
                       {recording.fileSize ? ` · ${formatFileSize(recording.fileSize)}` : ''}
+                      {recording.videoInfo?.width && recording.videoInfo?.height ? ` · ${recording.videoInfo.width}×${recording.videoInfo.height}` : ' · 分辨率未知'}
+                      {recording.resolutionMerge?.retained ? ` · 独立保留：${recording.resolutionMerge.label || '单段'}` : ''}
                       {recording.valid === false ? ` · ${recording.validReason || '不可用'}` : ''}
                     </span>
                   </span>

@@ -1,5 +1,5 @@
 import { CircleAlert, ListChecks, Merge, X, Square, RotateCcw } from 'lucide-react';
-import type { RecordingState, RoomState } from '../types';
+import type { RecordingState, RoomState, ResolutionMergePlan } from '../types';
 import { filename, formatDateTime, formatTimelineTime } from '../utils';
 import { JobProgress } from './common';
 
@@ -23,6 +23,7 @@ export function getSameLiveMergeSuggestions(recordings: RecordingState[], rooms:
     const startedAt = Number(recording.startedAt);
     const durationSec = Number(recording.durationSec);
     if (!room || recording.valid === false || ['capturing', 'finalizing'].includes(recording.containerStage || '') ||
+      (recording.resolutionMerge?.retained && recording.resolutionMerge.reason) ||
       mergedSources.has(recording.cleanPath.toLowerCase()) ||
       !Number.isFinite(startedAt) || startedAt <= 0 || !Number.isFinite(durationSec) || durationSec <= 0) continue;
     const group = byRoom.get(room.id) || { room, recordings: [] };
@@ -89,7 +90,8 @@ export function SameLiveMergeSuggestions({ suggestions, recordings, rooms, busy,
   </div>;
 }
 
-export function MergeConfirmation({ selected, reason, deleteSources, busy, onDeleteSourcesChange, onCancel, onConfirm }: {
+export function MergeConfirmation({ selected, reason, deleteSources, busy, onDeleteSourcesChange, onCancel, onConfirm,
+  resolutionMode = 'groups', onResolutionModeChange, plan, planLoading = false, planError = '' }: {
   selected: RecordingState[];
   reason: string;
   deleteSources: boolean;
@@ -97,16 +99,37 @@ export function MergeConfirmation({ selected, reason, deleteSources, busy, onDel
   onDeleteSourcesChange: (value: boolean) => void;
   onCancel: () => void;
   onConfirm: () => void;
+  resolutionMode?: 'single' | 'groups';
+  onResolutionModeChange?: (mode: 'single' | 'groups') => void;
+  plan?: ResolutionMergePlan | null;
+  planLoading?: boolean;
+  planError?: string;
 }) {
   return <div className="merge-confirm-backdrop"><div className="merge-confirmation" role="dialog" aria-modal="true"
     aria-labelledby="merge-confirm-title" onKeyDown={event => { if (event.key === 'Escape' && !busy) onCancel(); }}>
     <h3 id="merge-confirm-title">确认合并 {selected.length} 段录像</h3>
     <p className="field-help">请核对是否属于同一场直播。系统会按开始时间排序；时间相近不能保证是同场。</p>
+    <label className="field"><span>合并方式</span>
+      <select value={resolutionMode} disabled={busy} onChange={event => onResolutionModeChange?.(event.target.value as 'single' | 'groups')}>
+        <option value="groups">按连续同分辨率分组（推荐）</option>
+        <option value="single">统一成一个文件（跨规格可能长时间重编码）</option>
+      </select>
+    </label>
+    {resolutionMode === 'groups' ? <div className="merge-group-plan" role="status">
+      <p className="field-help">按时间顺序分组，不跨越不同分辨率拼接；编码或帧率不兼容也会分开。多组结果放入同一子文件夹，独立保留项在清单中标明原路径。</p>
+      {planLoading ? <p className="field-help">正在逐段检查完整码流并生成分组方案，大文件可能需要几分钟……</p> : null}
+      {planError ? <p className="warning-line">分组检查失败：{planError}</p> : null}
+      {plan ? <ol>{plan.groups.map(group => <li key={group.index}>
+        <strong>第 {group.index} 组 · {group.label} · {group.sourceCount} 段 · {group.action === 'merge' ? '合成一个文件' : '独立保留原录像'}</strong>
+        {group.reason ? <p className="field-help">{group.reason}</p> : null}
+      </li>)}</ol> : null}
+    </div> : <p className="warning-line">所有选段统一到最高分辨率；规格变化时可能整段重编码，耗时明显增加。</p>}
     <ol className="merge-confirm-list">{selected.map((recording, index) => {
       const previous = selected[index - 1];
       const gapSec = previous ? (recording.startedAt - previous.startedAt) / 1000 - Number(previous.durationSec || 0) : null;
       return <li key={recording.cleanPath}>
-        <span>{formatDateTime(recording.startedAt)} · {formatTimelineTime(Number(recording.durationSec || 0))}</span>
+        <span>{formatDateTime(recording.startedAt)} · {formatTimelineTime(Number(recording.durationSec || 0))} · {recording.videoInfo?.width && recording.videoInfo?.height ? `${recording.videoInfo.width}×${recording.videoInfo.height}` : '分辨率待检查'}
+          {plan ? ` · 第 ${plan.groups.find(group => group.sourcePaths.includes(recording.cleanPath))?.index || '?'} 组` : ''}</span>
         <strong title={recording.cleanPath}>{filename(recording.cleanPath)}</strong>
         {gapSec != null ? <small>{gapSec >= 0 ? `与上一段间隔 ${formatTimelineTime(gapSec)}` : `与上一段重叠 ${formatTimelineTime(-gapSec)}`}</small> : null}
       </li>;
@@ -114,12 +137,12 @@ export function MergeConfirmation({ selected, reason, deleteSources, busy, onDel
     <label className="field-help merge-confirm-delete">
       <input type="checkbox" checked={deleteSources} disabled={busy}
         onChange={event => onDeleteSourcesChange(event.target.checked)} />
-      合并验证成功后删除所选源录像及配套弹幕、头像和 Scene 文件
+      合并验证成功后删除所选源录像及配套弹幕、头像和 Scene 文件{resolutionMode === 'groups' ? '（独立保留项不删除）' : ''}
     </label>
     {reason ? <div className="warning-line" role="status"><CircleAlert size={16} /><span>{reason}</span></div> : null}
     <div className="split-buttons merge-confirm-actions">
       <button type="button" className="wide-button" disabled={busy} onClick={onCancel} autoFocus>返回核对</button>
-      <button type="button" className="wide-button primary" disabled={busy || Boolean(reason)} onClick={onConfirm}>
+      <button type="button" className="wide-button primary" disabled={busy || Boolean(reason) || (resolutionMode === 'groups' && (planLoading || Boolean(planError)))} onClick={onConfirm}>
         <Merge size={18} />{busy ? '正在提交合并' : `确认合并 ${selected.length} 段`}
       </button>
     </div>
@@ -200,7 +223,7 @@ export function ManualMergeControls({ selecting, count, reason, busy, onToggle, 
     {selecting ? reason && count >= 2 ? <div className="warning-line manual-merge-hint" role="status">
       <CircleAlert size={16} /><span>{reason}</span>
     </div> : <p className="field-help manual-merge-hint" role="status">
-      {reason || `按录制时间先后合并，${deleteSources ? '验证成功后删除所选源文件' : '保留源文件'}；进度显示在本页和对应直播间卡片。`}
+      {reason || `按录制时间先后处理，默认按连续同分辨率分组；确认窗口可核对分组及独立保留项。${deleteSources ? '验证成功后删除被成片替代的源文件' : '保留源文件'}；进度显示在本页和对应直播间卡片。`}
     </p> : null}
   </>;
 }
