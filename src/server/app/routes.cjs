@@ -198,6 +198,7 @@ async function handleApi(service, parsed, port, request, response, access) {
     '/api/rooms/merge/cancel': () => service.cancelMerge(body.roomId, body.jobId),
     '/api/rooms/merge/retry': () => service.retryMerge(body.roomId, body.mergeGroup),
     '/api/recordings/merge': () => service.mergeSelectedRecordings(body),
+    '/api/recordings/merge/plan': () => service.planSelectedRecordingMerge(body),
     '/api/rooms/preview/start': () => service.startPreview(body.roomId),
     '/api/rooms/burn': () => service.startBurnDanmaku(body.roomId, body.options || {}),
     '/api/rooms/burn/cancel': () => service.cancelBurnDanmaku(body.roomId),

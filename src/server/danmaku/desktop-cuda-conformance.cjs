@@ -25,7 +25,7 @@ const {
 
 const CANVAS = { width: 640, height: 360, fps: 60 };
 const DURATION = 2;
-const DESKTOP_RENDERER_REVISION = 'ass-alpha-v2';
+const DESKTOP_RENDERER_REVISION = 'ass-alpha-v3';
 const SAMPLE_TIMES = [0.9, 1.6];
 const EVENTS = [
   { type: 'danmaku', time: 0.25, uid: 1, user: '普通观众', text: 'CUDA 与 ASS 的基准弹幕正文', color: 0xffffff },
@@ -35,7 +35,10 @@ const EVENTS = [
 const SCENARIOS = [
   { id: 'danmaku', events: [EVENTS[0]], coverage: ['danmaku', 'move', 'fade'] },
   { id: 'superchat', events: [EVENTS[1]], coverage: ['avatar', 'superchat', 'roundedCorners', 'shadow', 'fade'] },
-  { id: 'gift', events: [EVENTS[2]], coverage: ['avatar', 'gift', 'roundedCorners', 'shadow', 'move', 'fade'] }
+  { id: 'gift', events: [EVENTS[2]], coverage: ['avatar', 'gift', 'roundedCorners', 'shadow', 'move', 'fade'] },
+  { id: 'emoji', events: [{ ...EVENTS[0], text: '中[宽图]文😀字',
+    emoticons: [{ token: '[宽图]', url: 'https://i0.hdslb.com/bfs/emote/conformance-wide.png', width: 200, height: 60 }] }],
+    coverage: ['emoji', 'wideEmote'] }
 ];
 
 function defaultRunProcess(command, args) {
@@ -146,6 +149,9 @@ async function runDesktopCudaSceneConformance(options = {}) {
     cases: []
   };
   try {
+    const emotePath = path.join(directory, 'wide-emote.png');
+    await runProcess(ffmpeg, ['-v','error','-y','-f','lavfi','-i','color=c=0xff5577:s=200x60','-frames:v','1',emotePath]);
+    const emojiAssets = { 'https://i0.hdslb.com/bfs/emote/conformance-wide.png': { filePath: emotePath } };
     for (const preset of CUDA_SCENE_CONFORMANCE_PRESETS) {
       for (const leadingVideoPaddingSec of CUDA_SCENE_CONFORMANCE_LEADS) {
         const id = `${preset}-${String(leadingVideoPaddingSec).replace('.', '_')}`;
@@ -158,8 +164,8 @@ async function runDesktopCudaSceneConformance(options = {}) {
         for (const scenario of SCENARIOS) {
           const scenarioId = `${id}-${scenario.id}`;
           const assPath = path.join(directory, `${scenarioId}.ass`);
-          await fs.writeFile(assPath, createAss(scenario.events, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS }), 'utf8');
-          const scene = buildSceneGraph(scenario.events, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, durationSec: DURATION });
+          await fs.writeFile(assPath, createAss(scenario.events, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, renderEmojiImages: true, emojiAssets }), 'utf8');
+          const scene = buildSceneGraph(scenario.events, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, durationSec: DURATION, emojiAssets });
           const baseline = await writeSceneFilterScript(path.join(directory, `${scenarioId}.ass.filter`), scene, {
             duration: DURATION, outputDuration: totalDuration, leadingVideoPaddingSec, fps: CANVAS.fps, target: 'software', legacyAssPath: assPath
           });

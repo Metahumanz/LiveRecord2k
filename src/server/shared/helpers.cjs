@@ -3212,6 +3212,7 @@ async function discoverRecordingFiles(outputDir, options = {}) {
         ignoredDanmakuCount: 0,
         danmakuCommandCounts: {},
         videoInfo: mediaInfo.videoInfo,
+        resolutionMerge: metadata?.resolutionMerge || null,
         liveSessionId: String(metadata?.liveSessionId || ''),
         mergeGroup: String(metadata?.mergeGroup || ''),
         mergeSequence: Number(metadata?.mergeSequence || 0),

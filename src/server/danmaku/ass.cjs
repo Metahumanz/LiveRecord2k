@@ -6,7 +6,7 @@ const {
   sourceIdFromCommand
 } = require('./dedupe.cjs');
 const DANMAKU_STYLE_PRESETS = require('../../shared/danmaku-style-presets.json');
-const { graphemes, parseEmoticons, maskEmojiText, isEmptyGuardToast } = require('./emoji.cjs');
+const { graphemes, parseEmoticons, maskEmojiText, isEmptyGuardToast, emojiWidthFactor } = require('./emoji.cjs');
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
@@ -895,9 +895,9 @@ function renderRollingDanmaku(event, style, start, y, duration) {
       start,
       start + duration,
       'Danmaku',
-      `{\\1c${color}\\move(${style.playWidth + 60},${y},-${estimateTextWidth(event.text, style.danmakuFontSize)},${y})}${assEscape(
+      `{\\1c${color}\\move(${style.playWidth + 60},${y},-${estimateTextWidth(event.text, style.danmakuFontSize, event.emojiTokens)},${y})}${assEscape(
         event.text
-      )}`
+      , event.emojiTokens, style.danmakuFontSize)}`
     )
   ];
 }
@@ -923,7 +923,7 @@ function getRollingDanmakuDuration(event, style) {
 function chooseRollingDanmakuLane(lanes, event, style) {
   const requestedStart = getDanmakuEventVideoTime(event);
   const duration = getRollingDanmakuDuration(event, style);
-  const textWidth = Math.max(1, estimateTextWidth(event.text, style.danmakuFontSize));
+  const textWidth = Math.max(1, estimateTextWidth(event.text, style.danmakuFontSize, event.emojiTokens));
   const travelDistance = Math.max(1, Number(style.playWidth) || DEFAULT_DANMAKU_STYLE.playWidth) + 60 + textWidth;
   const velocity = travelDistance / duration;
   let best = { row: 0, start: requestedStart, duration, score: Number.POSITIVE_INFINITY };
@@ -1026,8 +1026,8 @@ function getMessageItemMetrics(event, style, options = {}) {
   if (options.sideStream === true) {
     if (event.type === 'danmaku') {
       return visualPresetFromStyle(style) === 'minimal'
-        ? getMinimalSideChatMetrics(style, event.text)
-        : getSideChatMetrics(style, event.text);
+        ? getMinimalSideChatMetrics(style, event.text, event.emojiTokens)
+        : getSideChatMetrics(style, event.text, event.emojiTokens);
     }
     return visualPresetFromStyle(style) === 'minimal'
       ? getMinimalSideInteractionMetrics(style, event)
@@ -1042,7 +1042,7 @@ function getMessageItemMetrics(event, style, options = {}) {
   if (event.type === 'gift') {
     return getGiftCardMetrics(style, event);
   }
-  return getSideChatMetrics(style, event.text);
+  return getSideChatMetrics(style, event.text, event.emojiTokens);
 }
 
 function createMessageTimeline(events, styleValues = {}, options = {}) {
@@ -1355,7 +1355,7 @@ function segmentShapeOptions(segment, clip, offsetX = 0, offsetY = 0, corners) {
   };
 }
 
-function getSideChatMetrics(style, text) {
+function getSideChatMetrics(style, text, tokens) {
   const showMeta = visualPresetFromStyle(style) === 'h5-card';
   const fontSize = Math.max(16, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.92));
   const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
@@ -1366,14 +1366,14 @@ function getSideChatMetrics(style, text) {
   const paddingX = Math.max(8, Math.round(fontSize * 0.38));
   const paddingY = Math.max(5, Math.round(fontSize * 0.28));
   const textWidth = Math.max(fontSize * 3, contentWidth - paddingX * 2);
-  const wrappedLines = wrapTextToWidthLines(text, textWidth, fontSize / 1.22, 2);
+  const wrappedLines = wrapTextToWidthLines(text, textWidth, fontSize / 1.22, 2, tokens, 1.22);
   const lineHeight = Math.max(fontSize, Math.round(fontSize * 1.13));
   const bubbleHeight = Math.max(lineHeight + paddingY * 2, wrappedLines.length * lineHeight + paddingY * 2);
   const bubbleWidth = Math.min(
     contentWidth,
     Math.max(
       fontSize * 3,
-      ...wrappedLines.map((line) => estimateTextWidth(line, fontSize / 1.22) + paddingX * 2)
+      ...wrappedLines.map((line) => estimateTextWidth(line, fontSize / 1.22, tokens, 1.22) + paddingX * 2)
     )
   );
   const metaHeight = showMeta ? metaFontSize + Math.max(3, Math.round(fontSize * 0.12)) : 0;
@@ -1398,7 +1398,7 @@ function getSideChatMetrics(style, text) {
   };
 }
 
-function getMinimalSideChatMetrics(style, text) {
+function getMinimalSideChatMetrics(style, text, tokens) {
   const fontSize = Math.max(14, Math.floor((Number(style.boxFontSize) || DEFAULT_DANMAKU_STYLE.boxFontSize) * 0.72));
   const width = Math.max(220, Number(style.superChatWidth) || DEFAULT_DANMAKU_STYLE.superChatWidth);
   const dotSize = Math.max(8, Math.round(fontSize * 0.55));
@@ -1411,7 +1411,7 @@ function getMinimalSideChatMetrics(style, text) {
     gap,
     fontSize,
     textWidth,
-    text: truncateTextToWidth(text, textWidth, fontSize / 1.22)
+    text: truncateTextToWidth(text, textWidth, fontSize / 1.22, tokens, 1.22)
   };
 }
 
@@ -1434,7 +1434,7 @@ function getSideInteractionCardMetrics(style, event = {}) {
     const priceY = priceStacked ? padding + avatarSize + avatarGap : padding + (avatarSize - priceHeight) / 2;
     const headerHeight = Math.max(avatarSize + padding * 2, priceY + priceHeight + padding);
     const detailWidth = Math.max(1, width - padding * 2);
-    const detailLines = wrapTextToWidthLines(event.text, detailWidth, fontSize / 1.22, 64);
+    const detailLines = wrapTextToWidthLines(event.text, detailWidth, fontSize / 1.22, 64, event.emojiTokens, 1.22);
     const height = Math.ceil(headerHeight + Math.max(1, detailLines.length) * fontSize * 1.13 + padding);
     return {
       width, height, radius: getCardRadius(style, fontSize, width, height), padding,
@@ -1479,7 +1479,7 @@ function getMinimalSideInteractionMetrics(style, event = {}) {
     const priceStacked = Boolean(price) && bodyWidth - priceWidth - gap < fontSize * 3;
     const priceY = priceStacked ? paddingY + fontSize * 1.25 + gap : paddingY;
     const detailY = Math.max(paddingY + fontSize * 1.25, priceY + fontSize) + gap;
-    const detailLines = wrapTextToWidthLines(event.text, bodyWidth, fontSize / 1.22, 64);
+    const detailLines = wrapTextToWidthLines(event.text, bodyWidth, fontSize / 1.22, 64, event.emojiTokens, 1.22);
     const usernameWidth = Math.max(1, priceStacked ? bodyWidth : bodyWidth - priceWidth - gap);
     return {
       detailLines, bodyX, width, height: detailY + Math.max(1, detailLines.length) * fontSize * 1.13 + paddingY,
@@ -1488,8 +1488,8 @@ function getMinimalSideInteractionMetrics(style, event = {}) {
       textWidth: bodyWidth, textWidthWithPrice: usernameWidth
     };
   }
-  const multiline = event.type === 'superchat' && (String(event.text || '').includes('\n') || estimateTextWidth(event.text, fontSize / 1.22) > Math.max(1, bodyWidth - priceReserve - estimateTextWidth(event.user || '观众', fontSize)));
-  const detailLines = multiline ? wrapTextToWidthLines(event.text, bodyWidth, fontSize / 1.22, 64) : null;
+  const multiline = event.type === 'superchat' && (String(event.text || '').includes('\n') || estimateTextWidth(event.text, fontSize / 1.22, event.emojiTokens, 1.22) > Math.max(1, bodyWidth - priceReserve - estimateTextWidth(event.user || '观众', fontSize)));
+  const detailLines = multiline ? wrapTextToWidthLines(event.text, bodyWidth, fontSize / 1.22, 64, event.emojiTokens, 1.22) : null;
   return {
     detailLines,
     bodyX,
@@ -1593,7 +1593,7 @@ function getSideAvatarPlacement(event, style, segment) {
   if (visualPresetFromStyle(style) === 'minimal' || !segment) {
     return null;
   }
-  const metrics = event.type === 'danmaku' ? getSideChatMetrics(style, event.text) : getSideInteractionCardMetrics(style, event);
+  const metrics = event.type === 'danmaku' ? getSideChatMetrics(style, event.text, event.emojiTokens) : getSideInteractionCardMetrics(style, event);
   const offsetX = event.type === 'danmaku' ? 0 : metrics.padding;
   const offsetY = event.type === 'danmaku' ? Math.max(0, (metrics.height - metrics.avatarSize) / 2) : metrics.padding;
   const size = Math.max(8, Number(metrics.avatarSize) || 0);
@@ -1701,7 +1701,7 @@ function renderSideChatSegment(event, style, segment, clip) {
   if (visualPresetFromStyle(style) === 'minimal') {
     return renderMinimalSideChatSegment(event, style, segment, clip);
   }
-  const metrics = getSideChatMetrics(style, event.text);
+  const metrics = getSideChatMetrics(style, event.text, event.emojiTokens);
   const palette = sideChatPalette(style);
   const username = truncateTextToWidth(event.user || '观众', metrics.contentWidth * 0.72, metrics.metaFontSize);
   const nameWidth = Math.min(
@@ -1734,7 +1734,7 @@ function renderSideChatSegment(event, style, segment, clip) {
             'BoxText',
             `{${textTag}${segmentPositionTag(segment, bubbleX + metrics.metaFontSize / 2, Math.max(0, (metrics.metaHeight - metrics.metaFontSize) / 2))}\\fs${assNumber(
               metrics.metaFontSize
-            )}\\1c${palette.metaText}\\b1}${assEscape(username)}`
+            )}\\1c${palette.metaText}\\b1}${assEscape(username, event.emojiTokens)}`
           )
         ]
       : []),
@@ -1757,15 +1757,15 @@ function renderSideChatSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, bubbleX + metrics.paddingX, bubbleY + metrics.paddingY)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c${palette.bubbleText}\\b1}${assEscape(metrics.wrappedText)}`
+      )}\\1c${palette.bubbleText}\\b1}${assEscape(metrics.wrappedText, event.emojiTokens, metrics.fontSize)}`
     )
   ];
 }
 
 function renderMinimalSideChatSegment(event, style, segment, clip) {
-  const metrics = getMinimalSideChatMetrics(style, event.text);
+  const metrics = getMinimalSideChatMetrics(style, event.text, event.emojiTokens);
   const username = truncateTextToWidth(event.user || '观众', metrics.textWidth * 0.35, metrics.fontSize);
-  const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize);
+  const detail = truncateTextToWidth(event.text || '', metrics.textWidth - estimateTextWidth(username, metrics.fontSize), metrics.fontSize, event.emojiTokens, 1.22);
   const textTag = `${clipTag(clip)}\\an7\\bord0\\shad0`;
   const dotY = Math.max(0, (metrics.height - metrics.dotSize) / 2);
   return [
@@ -1788,7 +1788,7 @@ function renderMinimalSideChatSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap, 0)}\\fs${assNumber(metrics.fontSize)}\\1c&H00DCE8E8&\\b1}${assEscape(
         username
-      )}{\\b0} · ${assEscape(detail)}`
+      , event.emojiTokens)}{\\b0} · ${assEscape(detail, event.emojiTokens, metrics.fontSize)}`
     )
   ];
 }
@@ -1829,7 +1829,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${metrics.nameHeight ? textTag.replace('\\an7', '\\an4') : textTag}${segmentPositionTag(segment, metrics.contentX, textY + (metrics.nameHeight || 0) / 2)}\\fs${assNumber(metrics.fontSize)}\\1c${palette.username}\\b1}${assEscape(
         username
-      )}`
+      , event.emojiTokens)}`
     ),
     dialogue(
       8,
@@ -1838,7 +1838,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.detailX ?? metrics.contentX, metrics.detailY ?? (textY + metrics.fontSize))}\\fs${assNumber(
         metrics.detailFontSize ?? metrics.metaFontSize
-      )}\\1c${palette.detail}\\b${metrics.detailWeight ? 1 : 0}}${assEscape(detail)}`
+      )}\\1c${palette.detail}\\b${metrics.detailWeight ? 1 : 0}}${assEscape(detail, event.emojiTokens, metrics.detailFontSize ?? metrics.metaFontSize)}`
     ),
     ...(price
       ? [
@@ -1861,7 +1861,7 @@ function renderSideInteractionCardSegment(event, style, segment, clip) {
             'BoxText',
             `{${metrics.priceHeight ? textTag.replace('\\an7', '\\an5') : textTag}${segmentPositionTag(segment, priceX + (metrics.priceHeight ? priceWidth / 2 : metrics.metaFontSize * 0.6), priceY + (metrics.priceHeight ? metrics.priceHeight / 2 : metrics.padding / 2))}\\fs${assNumber(
               metrics.metaFontSize
-            )}\\1c${palette.priceText}\\b1}${assEscape(price)}`
+            )}\\1c${palette.priceText}\\b1}${assEscape(price, event.emojiTokens)}`
           )
         ]
       : [])
@@ -1911,10 +1911,10 @@ function renderMinimalSideInteractionCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.dotSize + metrics.gap * 2, metrics.paddingY)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c&H00FFFFFF&\\b1}${assEscape(username)}{\\b0}${metrics.detailLines ? '' : ' · ' + assEscape(detail)}`
+      )}\\1c&H00FFFFFF&\\b1}${assEscape(username, event.emojiTokens)}{\\b0}${metrics.detailLines ? '' : ' · ' + assEscape(detail, event.emojiTokens, metrics.fontSize)}`
     ),
     ...(metrics.detailLines ? [dialogue(8, segment.start, segment.end, 'BoxText',
-      `{${textTag}${segmentPositionTag(segment, metrics.bodyX, metrics.detailY ?? (metrics.paddingY + metrics.fontSize))}\\fs${assNumber(metrics.fontSize)}\\1c&H00FFFFFF&\\b1}${assEscape(metrics.detailLines.join('\\N'))}`)] : []),
+      `{${textTag}${segmentPositionTag(segment, metrics.bodyX, metrics.detailY ?? (metrics.paddingY + metrics.fontSize))}\\fs${assNumber(metrics.fontSize)}\\1c&H00FFFFFF&\\b1}${assEscape(metrics.detailLines.join('\\N'), event.emojiTokens, metrics.fontSize)}`)] : []),
     ...(price
       ? [
           drawRoundedRect(
@@ -1936,7 +1936,7 @@ function renderMinimalSideInteractionCardSegment(event, style, segment, clip) {
             'BoxText',
             `{${event.type === 'superchat' ? textTag.replace('\\an7', '\\an5') : textTag}${segmentPositionTag(segment, priceX + (event.type === 'superchat' ? priceWidth / 2 : metrics.fontSize / 2), priceY + (event.type === 'superchat' ? metrics.fontSize / 2 : 0))}\\fs${assNumber(
               metrics.fontSize * 0.82
-            )}\\1c&H00323026&\\b1}${assEscape(price)}`
+            )}\\1c&H00323026&\\b1}${assEscape(price, event.emojiTokens)}`
           )
         ]
       : [])
@@ -1983,7 +1983,7 @@ function renderSuperChatCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c${palette.username}\\b1}${assEscape(username)}`
+      )}\\1c${palette.username}\\b1}${assEscape(username, event.emojiTokens)}`
     ),
     dialogue(
       7,
@@ -1992,7 +1992,7 @@ function renderSuperChatCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.fontSize + metrics.radius / 3)}\\fs${assNumber(
         metrics.metaFontSize
-      )}\\1c${palette.detail || '&H00313131&'}\\b0}${assEscape(`SuperChat CNY ${price}`)}`
+      )}\\1c${palette.detail || '&H00313131&'}\\b0}${assEscape(`SuperChat CNY ${price}`, event.emojiTokens)}`
     ),
     dialogue(
       7,
@@ -2001,7 +2001,7 @@ function renderSuperChatCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.headerHeight)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c${palette.bodyText || '&H00FFFFFF&'}\\b0}${assEscape(metrics.wrappedText)}`
+      )}\\1c${palette.bodyText || '&H00FFFFFF&'}\\b0}${assEscape(metrics.wrappedText, event.emojiTokens, metrics.fontSize)}`
     )
   ];
 }
@@ -2034,7 +2034,7 @@ function renderGuardCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
         metrics.fontSize
-      )}\\1c${palette.username}\\b0}${assEscape(username)}`
+      )}\\1c${palette.username}\\b0}${assEscape(username, event.emojiTokens)}`
     ),
     dialogue(
       7,
@@ -2045,7 +2045,7 @@ function renderGuardCardSegment(event, style, segment, clip) {
         metrics.metaFontSize
       )}\\1c${palette.detail || '&H00313131&'}\\b0}${assEscape(
         truncateTextToWidth(welcome, metrics.textWidth, metrics.metaFontSize)
-      )}`
+      , event.emojiTokens)}`
     )
   ];
 }
@@ -2089,7 +2089,7 @@ function renderGiftCardSegment(event, style, segment, clip) {
       'BoxText',
       `{${textTag}${segmentPositionTag(segment, metrics.insetX, metrics.radius / 3)}\\fs${assNumber(
         metrics.fontSize
-      )}\\fsp0.2\\1c${palette.username}\\b1}${assEscape(username)}`
+      )}\\fsp0.2\\1c${palette.username}\\b1}${assEscape(username, event.emojiTokens)}`
     ),
     dialogue(
       8,
@@ -2100,7 +2100,7 @@ function renderGiftCardSegment(event, style, segment, clip) {
         metrics.metaFontSize
       )}\\fsp0.15\\1c${palette.detail}\\b0}${assEscape(
         truncateTextToWidth(giftText, metrics.textWidth, metrics.metaFontSize)
-      )}`
+      , event.emojiTokens)}`
     )
   ];
 }
@@ -2307,7 +2307,36 @@ function assShapeColorTags(color) {
 }
 
 function dialogue(layer, start, end, style, text) {
-  return `Dialogue: ${layer},${assTime(start)},${assTime(end)},${style},,0,0,0,,${text}`;
+  const emit = value => `Dialogue: ${layer},${assTime(start)},${assTime(end)},${style},,0,0,0,,${value}`;
+  if (!text.includes('{br2k-emoji:')) return emit(text);
+  // Use the same explicit run positions as Scene. A font's blank advance
+  // (including scaled blanks) cannot be used as an image-width contract.
+  const head = text.match(/^\{[^}]*\}/)?.[0] || '';
+  const size = Number(head.match(/\\fs([\d.]+)/)?.[1]) || Number(text.match(/br2k-emoji:[\d.]+,([\d.]+)/)?.[1]) || 20;
+  const advance = style === 'Danmaku' ? size : size / 1.22;
+  const lineHeight = size * (style === 'Danmaku' ? 1.2 : 1.13);
+  let x = 0, y = 0, runX = 0, run = '', overrides = '';
+  const lines = [];
+  const position = tags => tags.replace(/\\pos\(([-\d.]+),([-\d.]+)\)/g,
+    (_, px, py) => `\\pos(${assNumber(Number(px) + runX)},${assNumber(Number(py) + y)})`)
+    .replace(/\\move\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)([^)]*)\)/g,
+      (_, x1, y1, x2, y2, rest) => `\\move(${assNumber(Number(x1) + runX)},${assNumber(Number(y1) + y)},${assNumber(Number(x2) + runX)},${assNumber(Number(y2) + y)}${rest})`);
+  const flush = () => {
+    if (run) lines.push(emit(position(head) + run));
+    run = '';
+  };
+  for (const part of text.slice(head.length).split(/(\{[^}]*\}|\\N)/)) {
+    const emoji = part.match(/^\{br2k-emoji:([\d.]+),[\d.]+\}$/);
+    if (emoji) { flush(); x += Number(emoji[1]); continue; }
+    if (part === '\\N') { flush(); x = 0; y += lineHeight; continue; }
+    if (part.startsWith('{')) { overrides += part; if (run) run += part; continue; }
+    if (!part) continue;
+    if (!run) { runX = x; run = overrides; }
+    run += part;
+    x += graphemes(part).reduce((total, glyph) => total + glyphWidthFactor(glyph) * advance, 0);
+  }
+  flush();
+  return lines.join('\n');
 }
 
 function assTime(seconds) {
@@ -2319,9 +2348,9 @@ function assTime(seconds) {
   return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
 }
 
-function assEscape(text) {
-  return String(text || '')
-    .replace(/[{}]/g, '')
+function assEscape(text, tokens, fontSize = 20) {
+  return graphemes(String(text || '').replace(/[{}]/g, '')).map(glyph => tokens?.[glyph]
+    ? `{br2k-emoji:${assNumber(emojiWidthFactor(tokens[glyph]) * fontSize)},${assNumber(fontSize)}}` : glyph).join('')
     .replace(/\r?\n/g, '\\N');
 }
 
@@ -2521,9 +2550,9 @@ function chooseLaneWithoutOverlap(lanes, start, duration) {
   return { row: best, start: displayStart };
 }
 
-function estimateTextWidth(text, fontSize) {
+function estimateTextWidth(text, fontSize, tokens, emojiScale = 1) {
   const length = graphemes(text).reduce((sum, char) => {
-    return sum + glyphWidthFactor(char);
+    return sum + (tokens?.[char] ? emojiWidthFactor(tokens[char]) * emojiScale : glyphWidthFactor(char));
   }, 0);
   return Math.ceil(length * fontSize);
 }
@@ -2566,17 +2595,17 @@ function truncateText(text, max) {
   return `${chars.slice(0, max - 1).join('')}…`;
 }
 
-function truncateTextToWidth(text, maxWidth, fontSize) {
+function truncateTextToWidth(text, maxWidth, fontSize, tokens, emojiScale = 1) {
   const original = String(text || '');
   const safeWidth = Math.max(20, Number(maxWidth) || 20);
-  if (estimateTextWidth(original, fontSize) <= safeWidth) {
+  if (estimateTextWidth(original, fontSize, tokens, emojiScale) <= safeWidth) {
     return original;
   }
   const chars = graphemes(original.replace(/…+$/u, ''));
   let output = '';
   for (const char of chars) {
     const next = `${output}${char}`;
-    if (estimateTextWidth(`${next}…`, fontSize) > safeWidth) {
+    if (estimateTextWidth(`${next}…`, fontSize, tokens, emojiScale) > safeWidth) {
       return output ? `${output}…` : '…';
     }
     output = next;
@@ -2602,7 +2631,7 @@ function wrapTextToWidth(text, maxWidth, fontSize, maxLines) {
   return wrapTextToWidthLines(text, maxWidth, fontSize, maxLines).join('\\N');
 }
 
-function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
+function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines, tokens, emojiScale = 1) {
   const chars = graphemes(text);
   const safeWidth = Math.max(20, Number(maxWidth) || 20);
   const safeMaxLines = Math.max(1, Math.floor(Number(maxLines) || 1));
@@ -2625,7 +2654,7 @@ function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
       continue;
     }
     const next = `${current}${char}`;
-    if (current && estimateTextWidth(next, fontSize) > safeWidth) {
+    if (current && estimateTextWidth(next, fontSize, tokens, emojiScale) > safeWidth) {
       lines.push(current);
       current = char;
       if (lines.length >= safeMaxLines) {
@@ -2643,7 +2672,7 @@ function wrapTextToWidthLines(text, maxWidth, fontSize, maxLines) {
     truncated = true;
   }
   if (truncated && lines.length > 0) {
-    lines[lines.length - 1] = truncateTextToWidth(`${lines[lines.length - 1]}…`, safeWidth, fontSize);
+    lines[lines.length - 1] = truncateTextToWidth(`${lines[lines.length - 1]}…`, safeWidth, fontSize, tokens, emojiScale);
   }
   return lines;
 }

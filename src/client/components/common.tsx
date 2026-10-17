@@ -204,7 +204,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
         : `已处理 ${stageProgress.completed} / ${stageProgress.total} 条头像记录（重复头像跳过）`
     : isMerge
     ? phase === 'render' || phase === 'mux'
-      ? `整体已处理 ${formatCompactDuration(phaseCurrentTime)} / ${formatCompactDuration(phaseDuration)}`
+      ? `${progress.batchCount ? '本组已处理' : '整体已处理'} ${formatCompactDuration(phaseCurrentTime)} / ${formatCompactDuration(phaseDuration)}`
       : phase === 'verify' ? progress.stageLabel || '检查合并结果与音画时间轴' : '检查分段媒体信息与可用空间'
     : phase === 'prepare'
     ? phaseDuration > 0
@@ -269,6 +269,7 @@ export function JobProgress({ progress }: { progress: FfmpegJobProgress }) {
       <div className="job-progress-details" title={fullProgressTitle || progress.outputPath || ''}>
         <span className="job-progress-message">{primaryMessage}</span>
         {isMerge && progress.mergeReason ? <span className="job-progress-meta">{progress.mergeReason}</span> : null}
+        {isMerge && progress.batchCount ? <span className="job-progress-meta">分组 {progress.batchIndex}/{progress.batchCount} · {progress.batchLabel} · 各组保持原分辨率</span> : null}
         {timingDetails.length ? <span className="job-progress-meta">{timingDetails.join(' · ')}</span> : null}
         {rateDetails.length ? <span className="job-progress-meta">{rateDetails.join(' · ')}</span> : null}
         {backendDetails.length ? <span className="job-progress-meta backend">{backendDetails.join(' · ')}</span> : null}

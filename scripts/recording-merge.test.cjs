@@ -474,7 +474,7 @@ test('a 900ms merged A/V gap is repaired and the verified output is kept', async
   }
 });
 
-test('eleven mixed reconnect segments are normalized sequentially before the final copy concat', async () => {
+test('explicit single-file mode normalizes eleven mixed segments sequentially before the final copy concat', async () => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-bounded-merge-'));
   const sourcePaths = Array.from({ length: 11 }, (_unused, index) =>
     path.join(tempDir, `segment-${String(index + 1).padStart(2, '0')}.clean.mp4`)
@@ -523,7 +523,9 @@ test('eleven mixed reconnect segments are normalized sequentially before the fin
     }));
     service.recordings = segments;
 
-    const merged = await service.mergeReconnectGroupIfNeeded(room, 'bounded-group', segments.at(-1));
+    const merged = await service.performMergeReconnectGroup(room, 'bounded-group', segments.at(-1), {
+      segments, outputPath, deleteSources: false, resolutionMode: 'single'
+    });
 
     assert.equal(merged.cleanPath, outputPath);
     const mergedInfo = await probeMediaFileInfo(ffmpegPath, outputPath);

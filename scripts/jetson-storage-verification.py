@@ -1,7 +1,7 @@
 """Exercise the actual helper verifier without requiring GI or Jetson hardware."""
-import ast, hashlib, io, pathlib, types, sys
+import ast, hashlib, io, pathlib, types, sys, os
 
-helper = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parents[1] / 'assets/scene-renderer/jetson/br2k-scene-gpu.py'
+helper = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(os.environ['BR2K_JETSON_NVMM_HELPER']) if os.environ.get('BR2K_JETSON_NVMM_HELPER') else pathlib.Path(__file__).resolve().parents[1] / 'assets/scene-renderer/jetson/br2k-scene-gpu.py'
 tree = ast.parse(helper.read_text(encoding='utf-8'))
 function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'verify_native_output_storage')
 data = b'a' * (5 * 1024 * 1024)

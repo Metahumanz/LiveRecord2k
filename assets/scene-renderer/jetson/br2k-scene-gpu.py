@@ -678,8 +678,14 @@ def create_cuda_nvmm_pipeline(request, work_dir):
     parse = make_element(parser, 'scene-parse')
     sink = make_element('filesink', 'scene-output')
     sink.set_property('location', output['path'])
-    for element in [base, convert, nv_caps, composite, out_caps, encode, parse, sink]: pipeline.add(element)
-    if not link_many(base, convert, nv_caps, composite, out_caps, encode, parse, sink): fail('无法连接 I420 → NVMM → nvivafilter CUDA Scene → nvv4l2 管线。')
+    elements = [base, convert, nv_caps, composite, out_caps, encode, parse]
+    if str(output.get('container') or '').lower() == 'mkv':
+        mux = make_element('matroskamux', 'scene-mux')
+        mux.set_property('streamable', True)
+        elements.append(mux)
+    elements.append(sink)
+    for element in elements: pipeline.add(element)
+    if not link_many(*elements): fail('无法连接 I420 → NVMM → nvivafilter CUDA Scene → nvv4l2 管线。')
     return pipeline, base
 
 
@@ -695,6 +701,7 @@ def render(request, input_stream=None):
     output = request['output']
     frame_size = int(output['width']) * int(output['height']) * 3 // 2
     work_dir = tempfile.mkdtemp(prefix='br2k-scene-gpu-')
+    pipeline = None
     try:
         pipeline, base = (create_cuda_nvmm_pipeline(request, work_dir) if request.get('backend') == 'cuda-gstreamer' else create_pipeline(request, work_dir))
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE: fail('无法启动 GPU Scene 管线。')
@@ -727,8 +734,12 @@ def render(request, input_stream=None):
             if message.type == Gst.MessageType.EOS: break
             error, debug = message.parse_error()
             fail('GPU Scene GStreamer：' + str(error) + ('；' + str(debug) if debug else ''))
-        pipeline.set_state(Gst.State.NULL)
     finally:
+        # A truncated raw producer must also stop NVIDIA worker threads.
+        # Leaving the pipeline PLAYING can hang Gst.deinit() after reporting
+        # the frame-count error, preventing the caller from retaining/retrying.
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -889,7 +900,9 @@ def verify_native_output_storage(output_path, expected_bytes, expected_digest, r
                 report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes})
                 last_report = now
     if actual_bytes != expected_bytes or actual_digest.digest() != expected_digest:
-        fail('共享盘输出字节与编码封装输出不一致（写入或回读损坏），已拒绝发布；请检查 SMB 存储链路。')
+        report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes,
+                'failed': True, 'expectedSha256': expected_digest.hex(), 'actualSha256': actual_digest.hexdigest()})
+        fail('工作盘输出字节与编码封装输出不一致，已拒绝发布（预期 %d 字节，回读 %d 字节）；请检查存储链路。' % (expected_bytes, actual_bytes))
     report({'phase': 'storage', 'verifiedBytes': actual_bytes, 'totalBytes': expected_bytes, 'complete': True})
 
 
@@ -935,7 +948,11 @@ def render_native_nvmm(request):
         timeline_request['output'] = dict(output, fps=fps)
         # Captured Scene events already use the recording's media clock. A
         # container empty edit is part of that clock, not an extra Scene delay.
-        timeline_request['timelineOffsetSec'] = max(0.0, materialized_lead_sec - edit_list_lead_sec)
+        # concat adjust-base=false retains each source picture's media PTS.
+        # The black lead fills that clock; it does not move the source or its
+        # Scene events. Rounding a 5 ms lead to a frame and subtracting the
+        # edit again shifted moving glyphs even though the PTS bridge passed.
+        timeline_request['timelineOffsetSec'] = 0.0
         timeline_request['reportPreparation'] = True
         timeline = prepare_cuda_timeline(timeline_request, work_dir)
         os.environ['BR2K_CUDA_SCENE_TIMELINE'] = timeline
@@ -1329,7 +1346,10 @@ def render_native_nvmm(request):
             clock_library.br2k_scene_push_frame_time.argtypes = [ctypes.c_double]
             clock_library.br2k_scene_push_frame_time.restype = ctypes.c_int
             clock_library.br2k_scene_enable_pts_clock()
-        drawing_clock = {'first': int(start * Gst.SECOND) if start > 0.0001 else None}
+        # Zero is a real clip origin too. Anchoring a whole-file export at
+        # its first decoded picture erased a small edit-list lead, while a
+        # mid-file preflight correctly retained its residual source PTS.
+        drawing_clock = {'first': int(start * Gst.SECOND)}
         def supply_drawing_time(_pad, info):
             buffer = info.get_buffer()
             if not buffer:

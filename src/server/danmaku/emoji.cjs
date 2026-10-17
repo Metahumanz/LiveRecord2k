@@ -8,6 +8,33 @@ const zlib = require('node:zlib');
 const segmenter = new Intl.Segmenter('zh', { granularity: 'grapheme' });
 let artwork;
 const materialized = new Map();
+const imageRatios = new Map();
+
+// Size against the text height, not a square letter cell. Inspect the saved
+// PNG once; older recordings may omit dimensions (or advertise stale ones).
+function emojiWidthFactor(asset) {
+  let width = Number(asset?.width), height = Number(asset?.height);
+  const filePath = asset?.filePath;
+  if (filePath) {
+    if (!imageRatios.has(filePath)) {
+      let ratio = 0, fd;
+      try {
+        fd = fs.openSync(filePath, 'r');
+        const header = Buffer.alloc(24);
+        if (fs.readSync(fd, header, 0, 24, 0) === 24 && header.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) {
+          const w = header.readUInt32BE(16), h = header.readUInt32BE(20);
+          if (w > 0 && h > 0) ratio = w / h;
+        }
+      } catch {} finally { if (fd !== undefined) fs.closeSync(fd); }
+      if (imageRatios.size >= 8192) imageRatios.delete(imageRatios.keys().next().value);
+      imageRatios.set(filePath, ratio);
+    }
+    const ratio = imageRatios.get(filePath);
+    if (ratio) { width = ratio; height = 1; }
+  }
+  // Bound unusually wide banners so they cannot consume an entire card.
+  return Math.max(0.25, Math.min(4, width > 0 && height > 0 ? width / height : 1));
+}
 
 function graphemes(text) {
   return Array.from(segmenter.segment(String(text || '')), item => item.segment);
@@ -119,7 +146,7 @@ function resolveEmojiText(event, assets = {}) {
     const url = imageUrl(emote.url);
     const supplied = assets[url] || assets[emote.url] || assets[url.replace(/^https:/, 'http:')];
     if (!emote.token || !url || !supplied?.filePath) continue;
-    const placeholder = add(emote.token, { ...supplied, key: 'remote:' + url, url });
+    const placeholder = add(emote.token, { width: emote.width, height: emote.height, ...supplied, key: 'remote:' + url, url });
     text = text.split(emote.token).join(placeholder);
   }
   text = graphemes(text).map(glyph => {
@@ -131,7 +158,9 @@ function resolveEmojiText(event, assets = {}) {
 
 function maskEmojiText(event, assets = {}) {
   const resolved = resolveEmojiText(event, assets);
-  const output = { ...event, text: graphemes(resolved.text).map(c => resolved.emojiTokens[c] ? '\u3000' : c).join('') };
+  // Keep token identities through wrapping/measurement. ASS masks them only
+  // when emitting dialogue, with the same width reserved by Scene layout.
+  const output = { ...resolved };
   for (const field of ['user', 'giftName']) {
     if (event[field]) output[field] = graphemes(event[field]).map(c => unicodeAsset(c) ? '\u3000' : c).join('');
   }
@@ -146,4 +175,4 @@ function isEmptyGuardToast(event) {
     !Number(event.totalPrice || event.price);
 }
 
-module.exports = { graphemes, imageUrl, parseEmoticons, unicodeAsset, emojiAssetId, resolveEmojiText, maskEmojiText, isEmptyGuardToast };
+module.exports = { graphemes, imageUrl, parseEmoticons, unicodeAsset, emojiAssetId, emojiWidthFactor, resolveEmojiText, maskEmojiText, isEmptyGuardToast };

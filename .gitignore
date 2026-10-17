@@ -10,3 +10,7 @@ smoke-output/
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+
+# Local handoff notes and private connection details: never commit.
+/docs/local/
+/docs/evidence/

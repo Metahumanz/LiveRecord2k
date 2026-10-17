@@ -1046,7 +1046,8 @@ function createBurnRawVideoArgs({
   sourceCodec = '',
   videoWidth = 0,
   videoHeight = 0,
-  directRaw = false
+  directRaw = false,
+  normalizeFrameClock = false
 }) {
   const hasStart = Number.isFinite(Number(startTime)) && Number(startTime) > 0;
   const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
@@ -1085,8 +1086,19 @@ function createBurnRawVideoArgs({
       videoWidth,
       videoHeight
     });
-    if (leadingGraph) args.push('-filter_complex', leadingGraph, '-map', '[vout]');
-    else args.push('-map', '0:v:0');
+    // Output -r alone can terminate before a sparse VFR window's boundary.
+    // Materialize its clock before rawvideo drops timestamps, holding the
+    // last valid picture through gaps while Scene/audio keep advancing.
+    const clock = normalizeFrameClock && hasDuration
+      ? `fps=${formatGstreamerFramerate(fps)}:start_time=0,tpad=stop_mode=clone:stop_duration=${formatFfmpegSeconds(duration)},trim=duration=${formatFfmpegSeconds(duration)}`
+      : '';
+    if (leadingGraph) args.push('-filter_complex', clock
+      ? leadingGraph.replace(/\[vout\]\s*$/, '[raw_clock_input]') + `;[raw_clock_input]${clock}[vout]`
+      : leadingGraph, '-map', '[vout]');
+    else {
+      args.push('-map', '0:v:0');
+      if (clock) args.push('-vf', clock);
+    }
   } else if (hasFilterScript) {
     args.push('-filter_complex_script', avatarOverlay.filterScriptPath, '-map', '[vout]');
   } else {
@@ -2030,6 +2042,14 @@ function estimateMp4IndexReserveBytes(durationSec, fps = 60) {
   return bytes <= 512 * mib ? bytes : 0;
 }
 
+function createMergeKeyframeHeaderArgs(codec) {
+  // Native Jetson marks intra pictures as seek points even when they are not
+  // IDRs. concat's automatic H.264 BSF only repeats headers at IDRs. Embed the
+  // current segment's SPS/PPS at every marked keyframe before concatenation;
+  // doing this after concat would repeat only the first segment's headers.
+  return /h264|avc/i.test(codec || '') ? ['-bsf:v', 'h264_mp4toannexb,dump_extra=freq=keyframe'] : [];
+}
+
 function createConcatCopyArgs({ concatPath, outputPath, container, streamCodec, moovReserveBytes = 0 }) {
   const args = ['-hide_banner', '-nostats', '-progress', 'pipe:2', '-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-map', '0', '-c', 'copy'];
   if (container === 'mp4') {
@@ -2098,7 +2118,8 @@ function createNormalizeSegmentArgs({
   sourceCodec = '',
   decoderThreads = 2,
   recoverySeekSec = 0,
-  timelineAlignment = null
+  timelineAlignment = null,
+  preserveVideoFilterState = false
 }) {
   const width = makeEvenDimension(targetVideoInfo?.width);
   const height = makeEvenDimension(targetVideoInfo?.height);
@@ -2144,6 +2165,7 @@ function createNormalizeSegmentArgs({
   if (safeRecoverySeekSec > 0) {
     args.push('-ss', formatFfmpegSeconds(safeRecoverySeekSec));
   }
+  if (preserveVideoFilterState) args.push('-reinit_filter', '0');
   args.push('-i', inputPath);
   // The damaged prefix recovery only needs to seek the video decoder. Open a
   // second, unseeked input for audio so those first seconds remain audible
@@ -2195,6 +2217,7 @@ function createNormalizeSegmentArgs({
   }
   args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-map', '[aout]');
   appendMergeEncodeArgs(args, { container, targetVideoInfo, videoCodec, softwareThreads });
+  args.push(...createMergeKeyframeHeaderArgs(videoCodec));
   args.push(outputPath);
   return args;
 }
@@ -2212,7 +2235,8 @@ function createNormalizeRawVideoArgs({
   sourceCodec = '',
   decoderThreads = 2,
   recoverySeekSec = 0,
-  timelineAlignment = null
+  timelineAlignment = null,
+  preserveVideoFilterState = false
 }) {
   const width = makeEvenDimension(targetVideoInfo?.width);
   const height = makeEvenDimension(targetVideoInfo?.height);
@@ -2249,6 +2273,10 @@ function createNormalizeRawVideoArgs({
   if (safeRecoverySeekSec > 0) {
     args.push('-ss', formatFfmpegSeconds(safeRecoverySeekSec));
   }
+  // Rebuilding this graph at an in-band resolution change resets setpts/fps
+  // and discards queued pictures. Scale handles new input sizes itself; keep
+  // the original presentation clock and frame count through the transition.
+  if (preserveVideoFilterState) args.push('-reinit_filter', '0');
   args.push('-i', inputPath);
 
   const videoDurationFilter = normalizedDuration > 0 ? `trim=duration=${formatFfmpegSeconds(normalizedDuration)},` : '';
@@ -2363,6 +2391,7 @@ function createNormalizeEncodedVideoMuxArgs({
     if (isHevcCodec(codec)) args.push('-tag:v', 'hvc1');
     args.push('-movflags', '+faststart');
   }
+  args.push(...createMergeKeyframeHeaderArgs(codec));
   args.push(outputPath);
   return args;
 }
@@ -2727,6 +2756,7 @@ module.exports = {
   createClipCopyArgs,
   createSceneAssRemuxArgs,
   createConcatCopyArgs,
+  createMergeKeyframeHeaderArgs,
   estimateMp4IndexReserveBytes,
   createNormalizeSegmentArgs,
   createNormalizeRawVideoArgs,

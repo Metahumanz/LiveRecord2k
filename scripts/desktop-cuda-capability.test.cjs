@@ -64,7 +64,7 @@ test('desktop CUDA conformance cache is tied to the runtime fingerprint', () => 
     cases: [
       ...['h5-card', 'bubble', 'minimal'].flatMap((preset) => [0, 1.019].map((leadingVideoPaddingSec) => ({
         preset, leadingVideoPaddingSec, passed: true,
-        coverage: { danmaku: true, avatar: true, superchat: true, gift: true, roundedCorners: true, shadow: true, move: true, fade: true },
+        coverage: { danmaku: true, avatar: true, superchat: true, gift: true, roundedCorners: true, shadow: true, move: true, fade: true, emoji: true, wideEmote: true },
         metrics: { meanAbsRgb: 0, changedRatio: 0 }
       })))
     ]

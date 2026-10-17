@@ -65,6 +65,20 @@ test('a bitstream filter diagnostic is fatal to admission even if FFmpeg exited 
   assert.equal(await app.runMergeJetsonNormalize(options), 'compatibility'); assert.equal(cpu, 1);
 });
 
+test('known in-band parameter changes choose continuous CPU decode before native admission', async t => {
+  const { app, options } = await setup(t);
+  options.streamHeaders = { parameterSetsStable: false };
+  captured = () => { throw new Error('must not prepare a fixed-header native input'); };
+  app.probeJetsonNativeSceneForSource = () => { throw new Error('must not admit only the initial resolution'); };
+  app.runJetsonGstreamerTranscode = async opts => {
+    assert.equal(opts.decoder, 'software');
+    assert.equal(opts.rawWidth, options.sourceVideo.width);
+    assert.equal(opts.rawHeight, options.sourceVideo.height);
+    return 'continuous';
+  };
+  assert.equal(await app.runMergeJetsonNormalize(options), 'continuous');
+});
+
 test('admitted native failure stops without CPU or outer encoder restart, and cancellation stays cancellation', async t => {
   const { app, options } = await setup(t); captured = async () => ({ status: 0, stderr: '' });
   app.probeJetsonNativeSceneForSource = async () => ({ ok: true, durationSec: 30 });

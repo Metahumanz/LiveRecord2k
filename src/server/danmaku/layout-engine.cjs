@@ -7,7 +7,7 @@
 // their own placement decisions.
 
 const STYLE_PRESETS = require('../../shared/danmaku-style-presets.json');
-const { graphemes, isEmptyGuardToast, resolveEmojiText } = require('./emoji.cjs');
+const { graphemes, isEmptyGuardToast, resolveEmojiText, emojiWidthFactor } = require('./emoji.cjs');
 const {
   createMessageTimeline: createLegacyMessageTimeline,
   getMessageItemMetrics: getLegacyMessageItemMetrics,
@@ -208,26 +208,26 @@ function glyphWidthFactor(character) {
   return 0.56;
 }
 
-function measureText(text, fontSize) {
+function measureText(text, fontSize, tokens, emojiScale = 1) {
   const size = Math.max(1, Number(fontSize) || 1);
-  return round(graphemes(text).reduce((total, character) => total + glyphWidthFactor(character) * size, 0));
+  return round(graphemes(text).reduce((total, character) => total + (tokens?.[character] ? emojiWidthFactor(tokens[character]) * emojiScale : glyphWidthFactor(character)) * size, 0));
 }
 
-function truncateTextToWidth(text, maximumWidth, fontSize) {
+function truncateTextToWidth(text, maximumWidth, fontSize, tokens, emojiScale = 1) {
   const source = String(text || '');
   const width = Math.max(1, Number(maximumWidth) || 1);
-  if (measureText(source, fontSize) <= width) return source;
+  if (measureText(source, fontSize, tokens, emojiScale) <= width) return source;
   const ellipsis = '…';
   let output = '';
   for (const character of graphemes(source)) {
     const candidate = output + character;
-    if (measureText(candidate + ellipsis, fontSize) > width) break;
+    if (measureText(candidate + ellipsis, fontSize, tokens, emojiScale) > width) break;
     output = candidate;
   }
   return output ? output + ellipsis : ellipsis;
 }
 
-function wrapTextToWidthLines(text, maximumWidth, fontSize, maximumLines) {
+function wrapTextToWidthLines(text, maximumWidth, fontSize, maximumLines, tokens, emojiScale = 1) {
   const source = String(text || '');
   const width = Math.max(1, Number(maximumWidth) || 1);
   const maxLines = Math.max(1, Math.floor(Number(maximumLines) || 1));
@@ -245,7 +245,7 @@ function wrapTextToWidthLines(text, maximumWidth, fontSize, maximumLines) {
       continue;
     }
     const candidate = line + character;
-    if (line && measureText(candidate, fontSize) > width) {
+    if (line && measureText(candidate, fontSize, tokens, emojiScale) > width) {
       lines.push(line);
       line = character;
       if (lines.length >= maxLines) {
@@ -257,7 +257,7 @@ function wrapTextToWidthLines(text, maximumWidth, fontSize, maximumLines) {
     line = candidate;
   }
   if (!truncated && lines.length < maxLines && line) lines.push(line);
-  if (truncated && lines.length) lines[lines.length - 1] = truncateTextToWidth(lines[lines.length - 1] + '…', width, fontSize);
+  if (truncated && lines.length) lines[lines.length - 1] = truncateTextToWidth(lines[lines.length - 1] + '…', width, fontSize, tokens, emojiScale);
   return lines.length ? lines : [''];
 }
 
@@ -309,7 +309,7 @@ function layoutRolling(events, style, area) {
     if (event.type !== 'danmaku') continue;
     const requestedStart = eventTime(event);
     const duration = rollingDuration(event, style);
-    const textWidth = Math.max(1, measureText(event.text, style.danmakuFontSize));
+    const textWidth = Math.max(1, measureText(event.text, style.danmakuFontSize, event.emojiTokens));
     const travel = Math.max(1, style.playWidth + 60 + textWidth);
     const velocity = travel / duration;
     let candidate = { row: 0, start: requestedStart, score: Number.POSITIVE_INFINITY };
@@ -366,8 +366,8 @@ function messageMetrics(event, style, sideStream) {
     const gap = Math.max(5, Math.round(fontSize * 0.3));
     const textWidth = Math.max(fontSize * 4, panelWidth - avatar - gap * 3);
     const lines = preset === 'minimal'
-      ? [truncateTextToWidth(event.text, textWidth, fontSize / 1.22)]
-      : wrapTextToWidthLines(event.text, textWidth, fontSize / 1.22, 2);
+      ? [truncateTextToWidth(event.text, textWidth, fontSize / 1.22, event.emojiTokens, 1.22)]
+      : wrapTextToWidthLines(event.text, textWidth, fontSize / 1.22, 2, event.emojiTokens, 1.22);
     const lineHeight = Math.max(fontSize, Math.round(fontSize * 1.14));
     const height = preset === 'minimal'
       ? Math.max(avatar, Math.round(fontSize * 1.25))
@@ -394,7 +394,7 @@ function messageMetrics(event, style, sideStream) {
   const fontSize = Math.max(12, style.boxFontSize);
   const metaFontSize = Math.max(12, Math.floor(fontSize * 0.8));
   const inset = Math.max(style.giftRadius / 2, fontSize / 2);
-  const lines = wrapTextToWidthLines(event.text, panelWidth - inset * 2, fontSize, 64);
+  const lines = wrapTextToWidthLines(event.text, panelWidth - inset * 2, fontSize, 64, event.emojiTokens);
   const headerHeight = (fontSize + metaFontSize) * 1.2 + Math.max(8, style.giftRadius * 2 / 3);
   const bodyHeight = lines.length * fontSize * 1.2 + style.giftRadius / 2;
   return { width: panelWidth, height: headerHeight + bodyHeight, fontSize, metaFontSize, avatar: Math.max(26, Math.round(fontSize * 1.3)), gap: 8, radius: cardRadius(style, fontSize, panelWidth, headerHeight + bodyHeight), headerHeight, bodyHeight, lines, textWidth: panelWidth - inset * 2, inset };

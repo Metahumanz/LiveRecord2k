@@ -113,8 +113,14 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-cuda-conformance-'));
   const report = { version: CUDA_SCENE_CONFORMANCE_VERSION, passed: false, executedAt: Date.now(), cases: [] };
   try {
+    const emotePath = path.join(directory, 'wide-emote.png');
+    const emoteUrl = 'https://i0.hdslb.com/bfs/emote/conformance-wide.png';
+    await run(ffmpeg, ['-v','error','-y','-f','lavfi','-i','color=c=0xff5577:s=200x60','-frames:v','1',emotePath]);
+    const emojiAssets = { [emoteUrl]: { filePath: emotePath } };
+    const events = EVENTS.map(event => event.type === 'danmaku' ? { ...event,
+      text: '中[宽图]文😀字', emoticons: [{ token: '[宽图]', url: emoteUrl, width: 200, height: 60 }] } : event);
     for (const preset of CUDA_SCENE_CONFORMANCE_PRESETS) {
-      const scene = buildSceneGraph(EVENTS, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, durationSec: DURATION });
+      const scene = buildSceneGraph(events, { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, durationSec: DURATION, emojiAssets });
       for (const leadingVideoPaddingSec of CUDA_SCENE_CONFORMANCE_LEADS) {
         const id = `${preset}-${String(leadingVideoPaddingSec).replace('.', '_')}`;
         const assPath = path.join(directory, `${id}.ass`);
@@ -123,8 +129,8 @@ test('Jetson CUDA Scene pixels conform to frozen ASS compatibility fixtures', as
         // request moves its textures. Production recording events already
         // use the recording clock and must not receive this fixture offset.
         const eventOffset = Math.ceil(leadingVideoPaddingSec * CANVAS.fps - 1e-7) / CANVAS.fps;
-        await fs.writeFile(assPath, createAss(EVENTS.map((event) => ({ ...event, time: event.time + eventOffset })),
-          { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, renderEmojiImages: true }), 'utf8');
+        await fs.writeFile(assPath, createAss(events.map((event) => ({ ...event, time: event.time + eventOffset })),
+          { stylePreset: preset, overlayMode: 'danmaku-gift', videoInfo: CANVAS, renderEmojiImages: true, emojiAssets }), 'utf8');
         const caseResult = {
           preset, leadingVideoPaddingSec, passed: false,
           coverage: Object.fromEntries(CUDA_SCENE_CONFORMANCE_COVERAGE.map((key) => [key, true])),
