@@ -95,6 +95,8 @@ function buildExportDiagnosticReport(context = {}, error = null) {
     fallback: context.fallback,
     completedOutputPath: context.completedOutputPath,
     recovery: context.recovery,
+    chunkRecovery: context.chunkRecovery,
+    storage: context.storage,
     lastError: error ? {
       code: error.code,
       message: error.message,

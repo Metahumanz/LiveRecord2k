@@ -11,6 +11,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const test = require('node:test');
+const { createGpuSceneRenderRequest } = require('../src/server/danmaku/gpu-scene-renderer.cjs');
+const { writeSceneFilterScript } = require('../src/server/danmaku/scene-renderer.cjs');
+const { verifySceneOutputFrame } = require('../src/server/danmaku/scene-output-verifier.cjs');
+const { runFfmpegJob } = require('../src/server/shared/helpers.cjs');
 
 test('native NVMM progress is driven by media PTS rather than wall clock or frame count', async () => {
   const source = await fs.readFile(process.env.BR2K_JETSON_NVMM_HELPER || path.join(__dirname, '..', 'assets', 'scene-renderer', 'jetson', 'br2k-scene-gpu.py'), 'utf8');
@@ -27,6 +31,46 @@ const FPS = 30;
 const LEAD_SECONDS = 1.019;
 const WIDTH = 320;
 const HEIGHT = 180;
+
+test('native rolling glyphs keep a 5 ms source lead both with and without a black frame', async t => {
+  if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('需要 Orin CUDA/NVMM 实机');
+  const helper = process.env.BR2K_JETSON_NVMM_HELPER || '/usr/lib/bili-record-2k/bin/br2k-scene-gpu';
+  const ffmpeg = process.env.BR2K_JETSON_NVMM_FFMPEG || '/usr/lib/bili-record-2k/bin/ffmpeg-full';
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-native-small-lead-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const source = path.join(dir, 'source.mp4'), output = path.join(dir, 'rendered.mkv');
+  const base = path.join(dir, 'base.mp4');
+  await run('gst-launch-1.0', ['-q', 'videotestsrc', 'num-buffers=120', 'pattern=black', '!',
+    'video/x-raw,format=I420,width=640,height=360,framerate=60/1', '!', 'nvvidconv', '!',
+    'video/x-raw(memory:NVMM),format=NV12', '!', 'nvv4l2h264enc', 'bitrate=1000000', '!',
+    'h264parse', '!', 'qtmux', '!', 'filesink', 'location=' + base]);
+  await run(ffmpeg, ['-v', 'error', '-y', '-itsoffset', '0.005', '-i', base,
+    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-map', '0:v', '-map', '1:a',
+    '-c:v', 'copy', '-c:a', 'aac', '-t', '2', source]);
+  const graph = { schema: 'bili-record2k.scene/v1', version: 1, canvas: { width: 640, height: 360, fps: 60 },
+    timeline: { start: 0, end: 2 }, assets: [], objects: [{
+    id: 'rolling', type: 'Text', start: 0, end: 2, frame: { x: 620, y: 30, width: 300, height: 50 },
+    props: { text: 'CLOCK TEST', fontFamily: 'Noto Sans CJK SC', fontSize: 36, fontWeight: 400 },
+    style: { fill: '#ffffff', stroke: '#000000', strokeWidth: 2 },
+    animations: [{ type: 'Move', start: 0, end: 2, from: { x: 620, y: 30 }, to: { x: -2180, y: 30 } }]
+  }] };
+  const opts = { duration: 2, fps: 60, preserveInputClock: true, roundCoordinates: true };
+  const reference = await writeSceneFilterScript(path.join(dir, 'reference.filter'), graph, opts);
+  const clean = await writeSceneFilterScript(path.join(dir, 'clean.filter'), { ...graph, objects: [] }, opts);
+  const check = candidate => verifySceneOutputFrame({ runJob: (...args) => runFfmpegJob(ffmpeg, ...args),
+    sourcePath: source, outputPath: candidate, referenceScript: reference.filterScriptPath,
+    cleanScript: clean.filterScriptPath, sourceStart: 0, time: 0.3, graph, directory: dir,
+    ffmpegPath: ffmpeg, textMask: true });
+  for (const timelineOffsetSec of [0, 0.005]) {
+    const request = createGpuSceneRenderRequest(graph, { backend: 'cuda-gstreamer', inputPath: source,
+      outputPath: output, codec: 'hevc_nvv4l2', fps: 56.87, duration: 2, timelineOffsetSec, container: 'mkv' });
+    Object.assign(request.input, { codec: 'h264', sourceFrameRate: '60/1' });
+    const requestPath = path.join(dir, 'request.json'); await fs.writeFile(requestPath, JSON.stringify(request));
+    await run(helper, ['--native-scene-request', requestPath]);
+    assert.equal((await check(output)).ok, true);
+  }
+  await assert.rejects(check(source), { code: 'BR2K_SCENE_TEXT_VERIFICATION_FAILED' });
+});
 
 test('native storage verification reports completed reads and rejects corruption or blocked I/O', async t => {
   if (process.env.BR2K_JETSON_NVMM_PTS !== '1') return t.skip('在 Orin Python 运行时验证存储校验契约');

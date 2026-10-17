@@ -7,6 +7,7 @@ function canReuseMergeSegment(mediaInfo, targetVideoInfo, timingInfo, assessment
   const video = mediaInfo?.videoInfo;
   const audio = mediaInfo?.audioInfo;
   if (!video || !audio || !timingInfo || timingInfo.timingSafeForCopy !== true ||
+      mediaInfo.streamHeaders?.parameterSetsStable === false ||
       assessment?.requiresNormalization || assessment?.requiresPostMergeVerification ||
       Number(timingInfo.corruptPacketCount || 0) > 0 ||
       timingInfo.videoDtsMonotonic === false || timingInfo.audioDtsMonotonic === false) return false;

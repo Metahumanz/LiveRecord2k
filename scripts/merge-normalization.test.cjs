@@ -13,6 +13,7 @@ test('healthy matching long segments retain their original packets, independent 
 });
 
 test('unsafe timestamps, unknown timing and noncanonical audio cannot enter mixed copy concat', () => {
+  assert.equal(canReuseMergeSegment({ ...media, streamHeaders: { parameterSetsStable: false } }, video, timing, {}, 'h264_nvv4l2'), false);
   for (const patch of [{ timingSafeForCopy: false }, { corruptPacketCount: 1 }, { avStartDeltaSec: 1 }, { avEndDeltaSec: 0.2 }])
     assert.equal(canReuseMergeSegment(media, video, { ...timing, ...patch }, {}, 'h264_nvv4l2'), false);
   assert.equal(canReuseMergeSegment(media, video, {}, {}, 'h264_nvv4l2'), false);

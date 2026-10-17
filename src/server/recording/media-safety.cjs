@@ -35,6 +35,8 @@ async function atomicReplaceFile(temporaryPath, outputPath, options = {}) {
           transform(chunk, _encoding, callback) { expectedHash.update(chunk); callback(null, chunk); } });
         await pipeline(fs.createReadStream(resolvedTemporary, { highWaterMark: PUBLISH_BUFFER_BYTES }), hashing,
           fs.createWriteStream(partialPath, { flags: 'wx', highWaterMark: PUBLISH_BUFFER_BYTES }), { signal: controller.signal });
+        const persisted = await fsp.open(partialPath, 'r+');
+        try { await persisted.sync(); } finally { await persisted.close(); }
         const actualHash = crypto.createHash('sha256');
         await pipeline(fs.createReadStream(partialPath, { highWaterMark: PUBLISH_BUFFER_BYTES }),
           new Writable({ highWaterMark: PUBLISH_BUFFER_BYTES, write(chunk, _encoding, callback) { actualHash.update(chunk); callback(); } }), { signal: controller.signal });
@@ -128,6 +130,16 @@ async function selectMergeMediaWorkspace(outputPath, options = {}) {
   };
 }
 
+async function planLocalSceneChunk(directory, duration, bitrate) {
+  const available = await getDiskAvailability(directory);
+  const bytesPerSecond = Math.max(15_000_000, Number(bitrate) || 0) / 8 * 1.25;
+  const scratchReserve = 256 * 1024 * 1024;
+  const capacity = Math.floor((available.freeBytes - DISK_HARD_MIN_BYTES - scratchReserve) / bytesPerSecond);
+  const minimum = Math.min(10, duration);
+  if (capacity < minimum) await assertDiskSpace(directory, { estimatedBytes: minimum * bytesPerSecond + scratchReserve });
+  return Math.min(duration, capacity);
+}
+
 module.exports = {
   DISK_WARNING_BYTES,
   DISK_HARD_MIN_BYTES,
@@ -135,5 +147,6 @@ module.exports = {
   getDiskAvailability,
   assertDiskSpace,
   selectSceneMediaWorkspace,
+  planLocalSceneChunk,
   selectMergeMediaWorkspace
 };

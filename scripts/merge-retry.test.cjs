@@ -398,6 +398,51 @@ test('mixed merge transcodes only incompatible segments and validates original-t
   for (const file of sourcePaths) assert((await fsp.stat(file)).size > 0);
 });
 
+test('a healthy-timestamp recording with an in-band resolution change is normalized before reuse', async t => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'br2k-inband-merge-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const app = createMergeTestService(); app.ffmpegPath = ffmpegPath; app.settings.outputDir = dir;
+  app.getMergeEncoderPlan = () => ({ preferred: 'libx264', fallback: '' });
+  const room = { id: '883263', recording: false }; app.rooms.set(room.id, room);
+  const logs = []; app.log = (_level, message) => logs.push(message);
+  const rawParts = [];
+  for (const [index, size] of ['640x360', '320x180'].entries()) {
+    const file = path.join(dir, `part-${index}.h264`);
+    const generated = await runCapturedProcess(ffmpegPath, ['-v', 'error', '-y', '-f', 'lavfi', '-i',
+      `testsrc2=size=${size}:rate=30:duration=1`, '-c:v', 'libx264', '-bf', '0', '-f', 'h264', file], { timeoutMs: 20000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    rawParts.push(await fsp.readFile(file));
+  }
+  const raw = path.join(dir, 'changing.h264'); await fsp.writeFile(raw, Buffer.concat(rawParts));
+  for (let i = 0; i < 2; i++) {
+    const cleanPath = path.join(dir, `883263_inband_20261016_00000${i}.clean.mp4`);
+    const generated = await runCapturedProcess(ffmpegPath, ['-v', 'error', '-y', '-r', '30', '-i',
+      i === 0 ? raw : path.join(dir, 'part-0.h264'), '-f', 'lavfi', '-i',
+      `sine=sample_rate=48000:duration=${i === 0 ? 2 : 1}`, '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-shortest', cleanPath], { timeoutMs: 20000 });
+    assert.equal(generated.status, 0, generated.stderr);
+    const media = await probeMediaFileInfo(ffmpegPath, cleanPath);
+    const timing = await probeMediaTimelineInfo(ffmpegPath, cleanPath, media);
+    assert.equal(media.videoInfo.width, 640, 'container hides the later resolution change');
+    app.recordings.push({ cleanPath, roomId: room.id, startedAt: i + 1, durationSec: media.durationSec,
+      valid: true, timelineHealth: { ...timing, timelineHealth: 'healthy', avStartDeltaSec: 0, avEndDeltaSec: timing.avDeltaSec } });
+  }
+  const { probeMergeStreamHeaders } = require('../src/server/recording/merge-stream-headers.cjs');
+  const headers = await probeMergeStreamHeaders(ffmpegPath, app.recordings[0].cleanPath, { codec: 'h264' });
+  assert.equal(headers.parameterSetsStable, false);
+  assert.equal(headers.spsVariants, 2);
+  assert.equal((await probeMergeStreamHeaders(ffmpegPath, app.recordings[1].cleanPath, { codec: 'h264' })).parameterSetsStable, true);
+  await app.mergeSelectedRecordings({ cleanPaths: app.recordings.map(row => row.cleanPath), deleteSources: false });
+  const merged = await [...app.mergeInFlightGroups.values()][0];
+  assert(merged?.cleanPath);
+  assert(logs.some(message => message.includes('段内 SPS/PPS 变化')), logs.join('\n'));
+  const decoded = await runCapturedProcess(ffmpegPath, ['-v', 'error', '-progress', 'pipe:1', '-i', merged.cleanPath,
+    '-map', '0:v:0', '-an', '-vf', 'setpts=N/(30*TB)', '-fps_mode', 'passthrough', '-f', 'null', '-'], { timeoutMs: 20000 });
+  assert.equal(decoded.status, 0, decoded.stderr); assert.equal(decoded.stderr.trim(), '');
+  const frameCounts = [...decoded.stdout.matchAll(/^frame=(\d+)/gm)].map(match => Number(match[1]));
+  assert(frameCounts.at(-1) >= 90, 'all three media seconds must survive the in-band parameter change');
+});
+
 test('manual selection rejects duplicate, cross-room and unfinished inputs', async () => {
   const app = createMergeTestService();
   app.recordings = [{ cleanPath: 'one.mp4', roomId: 'one', valid: true },

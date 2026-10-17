@@ -3,8 +3,20 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const test = require('node:test');
-const { assertDiskSpace, selectSceneMediaWorkspace, selectMergeMediaWorkspace, atomicReplaceFile } = require('../src/server/recording/media-safety.cjs');
+const { assertDiskSpace, selectSceneMediaWorkspace, selectMergeMediaWorkspace, atomicReplaceFile, planLocalSceneChunk } = require('../src/server/recording/media-safety.cjs');
 const GiB = 1024 ** 3;
+
+test('native chunks shrink to local capacity without consuming the disk reserve', async t => {
+  const { cache } = await volumes(t, 3 * GiB);
+  const seconds = await planLocalSceneChunk(cache, 1800, 25_000_000);
+  assert(seconds >= 10 && seconds < 1800);
+  assert(seconds * 25_000_000 / 8 * 1.25 + 256 * 1024 ** 2 + 2 * GiB <= 3 * GiB);
+});
+
+test('no native window starts when the local disk cannot fit ten seconds plus reserve', async t => {
+  const { cache } = await volumes(t, 2 * GiB);
+  await assert.rejects(planLocalSceneChunk(cache, 1800, 25_000_000), { code: 'BR2K_DISK_SPACE_INSUFFICIENT' });
+});
 
 async function volumes(t, localFree = 30 * GiB, remoteFree = 1000 * GiB, sameVolume = false) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-storage-'));

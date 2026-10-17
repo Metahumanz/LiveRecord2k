@@ -68,6 +68,48 @@ function options(temporaryDir) {
   };
 }
 
+test('a later native failure retains verified local chunks and a fresh service resumes from their hashes', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-native-checkpoint-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const cleanPath = path.join(dir, 'source.mp4');
+  await fs.writeFile(cleanPath, Buffer.alloc(2048));
+  const opts = { ...options(dir), cleanPath, finalOutputPath: path.join(dir, 'final.mp4'), duration: 30, nativeChunkSeconds: 10 };
+  const calls = [];
+  let failThird = true;
+  const make = () => {
+    const app = service();
+    app.lastExportDiagnosticPath = path.join(dir, 'config', 'last-export-diagnostic.json');
+    app.runJetsonCudaSceneGraphTranscode = async input => {
+      const start = input.nativeDecode.startTime;
+      calls.push(start);
+      assert.match(input.nativeVideoOutputPath, /export-chunks/);
+      if (start === 20 && failThird) {
+        input.onProgress(8);
+        throw new Error('simulated storage mismatch');
+      }
+      await fs.writeFile(input.nativeVideoOutputPath, Buffer.alloc(2048, start + 1));
+      return { nativeMetrics: { ptsBridge: { ok: true, sourceToSceneFrames: 600,
+        sceneToEncodeFrames: 600, sourceToEncodeFrames: 600 }, outputStorageVerified: true } };
+    };
+    return app;
+  };
+  let recovery;
+  await assert.rejects(make().runChunkedJetsonSceneGraphExport(opts), error => {
+    recovery = error.sceneChunkRecovery;
+    return recovery?.chunkCount === 2 && recovery.completedSeconds === 20;
+  });
+  const saved = JSON.parse(await fs.readFile(recovery.manifestPath, 'utf8'));
+  for (const chunk of saved.chunks) assert.equal((await fs.stat(chunk.path)).size, 2048);
+  failThird = false;
+  const result = await make().runChunkedJetsonSceneGraphExport(opts);
+  assert.deepEqual(calls, [0, 10, 20, 20]);
+  assert.equal(result.checkpoint.chunks.length, 3);
+  // Publication and final visual checks own cache deletion, not the mux call.
+  assert.equal((await fs.stat(saved.chunks[0].path)).size, 2048);
+  await result.checkpoint.discard();
+  await assert.rejects(fs.stat(recovery.manifestPath), { code: 'ENOENT' });
+});
+
 test('captured native helper stops after stdout progress stalls', async () => {
   const result = await helpers.runCapturedProcess(process.execPath, [
     '-e', 'process.stdout.write("progress\\n"); setInterval(() => {}, 1000)'
@@ -350,6 +392,30 @@ test('native cancellation exposes the child and stops without retry or mux', asy
     createMuxArgs: () => assert.fail('cancelled export started muxing')
   }), error => error.code === 'BR2K_MEDIA_CANCELLED');
   assert.equal(calls, 1);
+});
+
+test('CFR final verification samples actual frame times while native sampling retains source offsets', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'br2k-cfr-verification-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const app = service(), events = [{ type: 'danmaku', time: 12.1234, text: '滚动弹幕', uid: 1 }];
+  const graph = helpers.buildSceneGraph(events, { stylePreset: 'minimal', videoInfo: { width: 640, height: 360, fps: 60 }, durationSec: 40 });
+  const observed = [];
+  capturedVerification = async opts => {
+    observed.push(opts);
+    return { ok: true };
+  };
+  const opts = { graph, events, sceneOptions: {}, cleanPath: '/source.mp4', outputPath: '/output.mp4',
+    startTime: 0, duration: 40, fps: 60, directory: dir };
+  await app.verifyFinalSceneTextOutput({ ...opts, cfrSceneClock: true, cudaSceneCoordinates: true });
+  assert.ok(observed.length);
+  for (const sample of observed) {
+    assert.ok(Math.abs(sample.sourceStart * 60 - Math.round(sample.sourceStart * 60)) < 1e-7);
+    assert.ok(Math.abs(sample.outputTime * 60 - Math.round(sample.outputTime * 60)) < 1e-7);
+    assert.match(await fs.readFile(sample.referenceScript, 'utf8'), /fps=fps=60:round=near/);
+  }
+  observed.length = 0;
+  await app.verifyFinalSceneTextOutput({ ...opts, nativeSceneClock: true });
+  assert.ok(observed.some(sample => Math.abs(sample.sourceStart * 60 - Math.round(sample.sourceStart * 60)) > 1e-4));
 });
 
 test('preflight selects visible text later in the clip and rejects a blank sample before full rendering', async t => {
